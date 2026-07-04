@@ -295,14 +295,6 @@ type
           Result:=mcs;
         end
 
-        // 배열 원소 대입
-        else if (Cur.Kind=tkLBracket) and fArrayNames.Contains(nt.Text) then
-        begin
-          fPos:=fPos+1; idx:=ParseExpr; Expect(tkRBracket);
-          Expect(tkAssign); rhs:=ParseExpr;
-          Result:=new TArrayAssignStmtNode(nt.Text, idx, rhs);
-        end
-
         // 프로시저 호출
         else if (Cur.Kind=tkLParen) and fProcNames.Contains(nt.Text) then
         begin
@@ -315,13 +307,41 @@ type
           Expect(tkRParen); Result:=pcn;
         end
 
-        // 대입문 (일반 변수 또는 필드)
+        // 암시적 self 메서드 호출 (괄호 있음): 예) Show(); Close(42);
+        // 메서드 본문 안에서만 의미 있음. 로컬 메서드면 그대로, 아니면 외부
+        // 상속 타입(Reflection)에서 찾는다 — 실제 판별은 CodeGen 단계에서.
+        else if (fCurClass<>'') and (Cur.Kind=tkLParen) then
+        begin
+          mcs:=new TMethodCallStmtNode('', nt.Text); fPos:=fPos+1;
+          if Cur.Kind<>tkRParen then
+          begin
+            mcs.Args.Add(ParseExpr);
+            while Cur.Kind=tkComma do begin fPos:=fPos+1; mcs.Args.Add(ParseExpr); end;
+          end;
+          Expect(tkRParen); Result:=mcs;
+        end
+
+        // 암시적 self 메서드 호출 (괄호 없음, 인자 없음): 예) Show; Close;
+        else if (fCurClass<>'') and (Cur.Kind=tkSemicolon) then
+          Result:=new TMethodCallStmtNode('', nt.Text)
+
+        // 배열 원소 대입
+        else if (Cur.Kind=tkLBracket) and fArrayNames.Contains(nt.Text) then
+        begin
+          fPos:=fPos+1; idx:=ParseExpr; Expect(tkRBracket);
+          Expect(tkAssign); rhs:=ParseExpr;
+          Result:=new TArrayAssignStmtNode(nt.Text, idx, rhs);
+        end
+
+        // 대입문 (일반 변수 또는 필드/외부 속성)
         else
         begin
           Expect(tkAssign); rhs:=ParseExpr;
-          // 현재 클래스 메서드 안이고, 필드 이름이면 TFieldAssignStmtNode
-          if (fCurClass<>'') and fClassFields.ContainsKey(fCurClass)
-             and fClassFields[fCurClass].Contains(nt.Text) then
+          // 메서드 본문 안에서의 대입은 항상 필드/속성 쓰기로 취급한다.
+          // (메서드는 var 섹션보다 먼저 파싱되므로 전역변수 이름 목록을 알 수 없고,
+          //  실제로 이 경로로 전역변수에 대입하는 기존 코드도 없었음 — 지역 필드든
+          //  외부 상속 타입의 속성이든 CodeGen 단계에서 최종 판별한다.)
+          if fCurClass<>'' then
             Result:=new TFieldAssignStmtNode(nt.Text, rhs)
           else
             Result:=new TAssignStmtNode(nt.Text, rhs);

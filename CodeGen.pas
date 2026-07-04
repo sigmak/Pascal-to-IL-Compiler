@@ -43,6 +43,9 @@ type
 
     // 외부 .NET 어셈블리 (WPF/WinForm/Avalonia 등) — GenerateExe 전에 AddReferenceAssembly로 채워짐
     fLoadedAssemblies: List<Assembly>;
+    // 클래스명 → 그 클래스가 직접 상속한 "외부" 부모의 실제 System.Type
+    // (외부 타입 자신의 조상 체인은 Reflection이 알아서 다 검색해주므로 1단계만 기록하면 충분)
+    fClassExternalParentType: Dictionary<string, System.Type>;
 
     // 인터페이스 관련 (클래스보다 먼저 완전히 빌드됨)
     fInterfaceBuilders: Dictionary<string, TypeBuilder>;  // 인터페이스명 → TypeBuilder
@@ -100,6 +103,37 @@ type
       raise new Exception('필드를 찾을 수 없음: '+startClass+'.'+fname);
     end;
 
+    // 예외를 던지지 않는 버전 (외부 속성 폴백 판단용)
+    function TryFindFieldBuilder(startClass, fname: string; var fb: FieldBuilder): boolean;
+    var c: string;
+    begin
+      c:=startClass;
+      while c<>'' do
+      begin
+        if fFieldBuilders.ContainsKey(c) and fFieldBuilders[c].ContainsKey(fname) then
+        begin fb:=fFieldBuilders[c][fname]; Result:=true; exit; end;
+        if fClassParents.ContainsKey(c) then c:=fClassParents[c] else c:='';
+      end;
+      Result:=false;
+    end;
+
+    // startClass부터 지역 상속 체인을 따라 올라가며, "외부 어셈블리 타입을 직접
+    // 상속한" 클래스를 만나면 그 실제 System.Type을 반환한다 (없으면 nil).
+    // 그 이후의 조상들(예: Form의 부모인 ContainerControl, Control, ...)은
+    // .NET Reflection 자체가 알아서 찾아주므로 여기서 더 올라갈 필요 없음.
+    function FindExternalAncestorType(startClass: string): System.Type;
+    var c: string;
+    begin
+      c:=startClass;
+      while c<>'' do
+      begin
+        if fClassExternalParentType.ContainsKey(c) then
+        begin Result:=fClassExternalParentType[c]; exit; end;
+        if fClassParents.ContainsKey(c) then c:=fClassParents[c] else c:='';
+      end;
+      Result:=nil;
+    end;
+
     // 클래스 계층을 따라 올라가며 메서드를 정의한 (진짜 소유/override) 클래스의 MethodBuilder 탐색
     function FindInstanceMethod(startClass, mname: string): MethodBuilder;
     var c: string;
@@ -112,6 +146,20 @@ type
         if fClassParents.ContainsKey(c) then c:=fClassParents[c] else c:='';
       end;
       raise new Exception('알 수 없는 메서드 "'+startClass+'.'+mname+'"');
+    end;
+
+    // 예외를 던지지 않는 버전 (외부 메서드 폴백 판단용)
+    function TryFindInstanceMethod(startClass, mname: string; var mb: MethodBuilder): boolean;
+    var c: string;
+    begin
+      c:=startClass;
+      while c<>'' do
+      begin
+        if fInstanceMethods.ContainsKey(c) and fInstanceMethods[c].ContainsKey(mname) then
+        begin mb:=fInstanceMethods[c][mname]; Result:=true; exit; end;
+        if fClassParents.ContainsKey(c) then c:=fClassParents[c] else c:='';
+      end;
+      Result:=false;
     end;
 
     // 클래스 계층을 따라 올라가며 메서드의 선언된 반환 타입 탐색 (없으면 vtInteger)
@@ -353,6 +401,8 @@ type
       ae: TExprNode; wlS, wlI, rm: MethodInfo;
       et, at2: TVarType; fb: FieldBuilder; cn: string; vtVar: TVarType;
       eL, endL, ckL, bdL: &Label;
+      extType: System.Type; propInfo: PropertyInfo; extFld: System.Reflection.FieldInfo;
+      setter, emi: MethodInfo; argTypes: array of System.Type; ai: integer;
     begin
       if s is TWritelnStringStmtNode then
       begin
@@ -385,12 +435,39 @@ type
 
       else if s is TFieldAssignStmtNode then
       begin
-        // self.fieldName := 식
+        // self.fieldName := 식  (지역 필드) 또는 외부 상속 타입의 속성/필드 설정
         fas:=TFieldAssignStmtNode(s);
-        aIL.Emit(OpCodes.Ldarg_0); // self
-        EmitExpr(aIL, fas.ValueExpr);
-        fb:=FindFieldBuilder(fCurClassName, fas.FieldName);
-        aIL.Emit(OpCodes.Stfld, fb);
+        if TryFindFieldBuilder(fCurClassName, fas.FieldName, fb) then
+        begin
+          aIL.Emit(OpCodes.Ldarg_0); // self
+          EmitExpr(aIL, fas.ValueExpr);
+          aIL.Emit(OpCodes.Stfld, fb);
+        end
+        else
+        begin
+          extType:=FindExternalAncestorType(fCurClassName);
+          if extType=nil then
+            raise new Exception('필드/속성을 찾을 수 없음: '+fCurClassName+'.'+fas.FieldName);
+          propInfo:=extType.GetProperty(fas.FieldName);
+          if propInfo<>nil then
+          begin
+            setter:=propInfo.GetSetMethod;
+            if setter=nil then
+              raise new Exception('속성 "'+extType.FullName+'.'+fas.FieldName+'"에 setter가 없습니다 (읽기 전용).');
+            aIL.Emit(OpCodes.Ldarg_0);
+            EmitExpr(aIL, fas.ValueExpr);
+            aIL.Emit(OpCodes.Callvirt, setter);
+          end
+          else
+          begin
+            extFld:=extType.GetField(fas.FieldName);
+            if extFld=nil then
+              raise new Exception('외부 타입 "'+extType.FullName+'"에 필드/속성 "'+fas.FieldName+'"가 없습니다.');
+            aIL.Emit(OpCodes.Ldarg_0);
+            EmitExpr(aIL, fas.ValueExpr);
+            aIL.Emit(OpCodes.Stfld, extFld);
+          end;
+        end;
       end
 
       else if s is TAssignStmtNode then
@@ -405,31 +482,59 @@ type
 
       else if s is TMethodCallStmtNode then
       begin
-        // c.Init(10) → Ldloc c + args + Call
         mcs:=TMethodCallStmtNode(s);
-        cn:=GetVarClassName(mcs.ObjName);
-        vtVar:=GetVarType(mcs.ObjName);
-        if fLocals.ContainsKey(mcs.ObjName) then aIL.Emit(OpCodes.Ldloc, fLocals[mcs.ObjName])
-        else if fGlobals.ContainsKey(mcs.ObjName) then aIL.Emit(OpCodes.Ldloc, fGlobals[mcs.ObjName])
-        else raise new Exception('알 수 없는 변수 "'+mcs.ObjName+'"');
-        foreach ae in mcs.Args do EmitExpr(aIL, ae);
-        if cn='' then raise new Exception('알 수 없는 메서드 "'+cn+'.'+mcs.MethodName+'"');
-        // 인터페이스 타입 변수면 인터페이스 메서드로, 아니면 클래스 상속 체인에서 탐색
-        // (Stage 10에서는 fInstanceMethods[cn] 직접 조회 + Call만 사용해 상속받은
-        //  메서드 호출 시 실패할 수 있었는데, FindInstanceMethod + Callvirt로 통일)
-        if vtVar=vtInterface then
+        if mcs.ObjName='' then
         begin
-          var imi:=FindInterfaceMethod(cn, mcs.MethodName);
-          aIL.Emit(OpCodes.Callvirt, imi);
-          if imi.ReturnType<>typeof(System.Void) then aIL.Emit(OpCodes.Pop);
+          // 암시적 self 호출: Show; Close(); 등 — 지역 메서드 우선, 없으면 외부 상속 타입에서 탐색
+          aIL.Emit(OpCodes.Ldarg_0); // self
+          foreach ae in mcs.Args do EmitExpr(aIL, ae);
+          if TryFindInstanceMethod(fCurClassName, mcs.MethodName, imb) then
+          begin
+            aIL.Emit(OpCodes.Callvirt, imb);
+            if imb.ReturnType<>typeof(System.Void) then aIL.Emit(OpCodes.Pop);
+          end
+          else
+          begin
+            extType:=FindExternalAncestorType(fCurClassName);
+            if extType=nil then
+              raise new Exception('알 수 없는 메서드 "'+fCurClassName+'.'+mcs.MethodName+'"');
+            argTypes:=new System.Type[mcs.Args.Count];
+            for ai:=0 to mcs.Args.Count-1 do
+              argTypes[ai]:=VTC(InferType(mcs.Args[ai]), '');
+            emi:=extType.GetMethod(mcs.MethodName, argTypes);
+            if emi=nil then
+              raise new Exception('외부 타입 "'+extType.FullName+'"에 메서드 "'+mcs.MethodName+'"가 없습니다 (인자 '+argTypes.Length.ToString+'개).');
+            aIL.Emit(OpCodes.Callvirt, emi);
+            if emi.ReturnType<>typeof(System.Void) then aIL.Emit(OpCodes.Pop);
+          end;
         end
         else
         begin
-          imb:=FindInstanceMethod(cn, mcs.MethodName);
-          aIL.Emit(OpCodes.Callvirt, imb);
-          // void 메서드가 아닌 경우 반환값 버리기
-          if imb.ReturnType<>typeof(System.Void) then
-            aIL.Emit(OpCodes.Pop);
+          // c.Init(10) → Ldloc c + args + Call
+          cn:=GetVarClassName(mcs.ObjName);
+          vtVar:=GetVarType(mcs.ObjName);
+          if fLocals.ContainsKey(mcs.ObjName) then aIL.Emit(OpCodes.Ldloc, fLocals[mcs.ObjName])
+          else if fGlobals.ContainsKey(mcs.ObjName) then aIL.Emit(OpCodes.Ldloc, fGlobals[mcs.ObjName])
+          else raise new Exception('알 수 없는 변수 "'+mcs.ObjName+'"');
+          foreach ae in mcs.Args do EmitExpr(aIL, ae);
+          if cn='' then raise new Exception('알 수 없는 메서드 "'+cn+'.'+mcs.MethodName+'"');
+          // 인터페이스 타입 변수면 인터페이스 메서드로, 아니면 클래스 상속 체인에서 탐색
+          // (Stage 10에서는 fInstanceMethods[cn] 직접 조회 + Call만 사용해 상속받은
+          //  메서드 호출 시 실패할 수 있었는데, FindInstanceMethod + Callvirt로 통일)
+          if vtVar=vtInterface then
+          begin
+            var imi:=FindInterfaceMethod(cn, mcs.MethodName);
+            aIL.Emit(OpCodes.Callvirt, imi);
+            if imi.ReturnType<>typeof(System.Void) then aIL.Emit(OpCodes.Pop);
+          end
+          else
+          begin
+            imb:=FindInstanceMethod(cn, mcs.MethodName);
+            aIL.Emit(OpCodes.Callvirt, imb);
+            // void 메서드가 아닌 경우 반환값 버리기
+            if imb.ReturnType<>typeof(System.Void) then
+              aIL.Emit(OpCodes.Pop);
+          end;
         end;
       end
 
@@ -662,7 +767,10 @@ type
       if (cd.ParentName<>'') and fTypeBuilders.ContainsKey(cd.ParentName) then
         parentType:=fTypeBuilders[cd.ParentName]
       else if (cd.ParentName<>'') and cd.IsExternalParent then
-        parentType:=ResolveExternalType(cd.ParentName)
+      begin
+        parentType:=ResolveExternalType(cd.ParentName);
+        fClassExternalParentType[cd.Name]:=parentType;
+      end
       else
         parentType:=typeof(System.Object);
 
@@ -873,12 +981,16 @@ type
       fInterfaceBuilders:=new Dictionary<string, TypeBuilder>;
       fBuiltInterfaces:=new Dictionary<string, System.Type>;
       fLoadedAssemblies:=new List<Assembly>;
+      fClassExternalParentType:=new Dictionary<string, System.Type>;
       fResultLocal:=nil; fResultType:=vtInteger; fCurClassName:='';
     end;
 
     // WPF는 'PresentationFramework','PresentationCore','WindowsBase' (GAC),
     // WinForm은 'System.Windows.Forms','System.Drawing' (GAC),
     // AvaloniaUI는 GAC에 없으므로 dll 전체 경로를 넘겨야 함 (예: 'C:\...\Avalonia.Controls.dll').
+    // 주의: .NET Framework GAC는 짧은 이름만으로는 바인딩 실패할 수 있음 — 실패하면
+    // 'System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'
+    // 처럼 Version/Culture/PublicKeyToken까지 포함한 정식 이름으로 재시도할 것.
     // 어떤 프레임워크를 쓸지는 호출하는 쪽(디자이너)이 결정해서 이 메서드로 등록한다.
     procedure AddReferenceAssembly(nameOrPath: string);
     var asm: Assembly;
