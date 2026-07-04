@@ -1,0 +1,11 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project FileVersion="2" Name="Pascal-to-IL-Compiler" MainFile="Main.pas" OutputFileName="Pascal-to-IL-Compiler.exe" OutputDirectory="" ProjectType="ConsoleApp" IncludeDebugInfo="True" GenerateXMLDoc="False" CommandLineArguments="" AppIcon="" DeleteEXE="True" DeletePDB="True" Product="" Company="" Trademark="" Copyright="" Title="" Description="" MajorVersion="0" MinorVersion="0" BuildVersion="0" RevisionVersion="0">
+  <Items>
+    <Item Type="SourceFile" Name="Main.pas" Path="Main.pas" />
+    <Item Type="SourceFile" Name="AST.pas" Path="AST.pas" />
+    <Item Type="SourceFile" Name="Lexer.pas" Path="Lexer.pas" />
+    <Item Type="SourceFile" Name="Parser.pas" Path="Parser.pas" />
+    <Item Type="SourceFile" Name="CodeGen.pas" Path="CodeGen.pas" />
+    <Item Type="Reference" AssemblyName="System" FullAssemblyName="System.dll" />
+  </Items>
+</Project>
