@@ -15,7 +15,7 @@ uses
 
 const
   TestSource =
-    'program ExternalMemberTest;' + #10 +
+    'program StaticCallTest;' + #10 +
     'type' + #10 +
     '  TMyForm = class(System.Windows.Forms.Form)' + #10 +
     '  public' + #10 +
@@ -25,7 +25,6 @@ const
     'procedure TMyForm.Setup;' + #10 +
     'begin' + #10 +
     '  Text := ''Hello from Pascal-to-IL compiler'';' + #10 +
-    '  Dispose;' + #10 +
     'end;' + #10 +
     '' + #10 +
     'var' + #10 +
@@ -33,7 +32,8 @@ const
     'begin' + #10 +
     '  f := TMyForm.Create;' + #10 +
     '  f.Setup;' + #10 +
-    '  writeln(''완료: Text 속성 설정 + Dispose 메서드 호출 성공 (예외 없음)'');' + #10 +
+    '  writeln(''폼 준비 완료, Application.Run 호출 직전'');' + #10 +
+    '  System.Windows.Forms.Application.Run(f);' + #10 +
     'end.';
 
 var
@@ -42,7 +42,7 @@ var
   codegen: TCodeGenerator; outputName: string;
 
 begin
-  Writeln('=== Stage 15: 외부 상속 타입의 속성 설정/메서드 호출 (implicit self) ===');
+  Writeln('=== Stage 16: 외부 타입의 정적(static) 멤버 호출 (Application.Run) ===');
   Writeln('--- 입력 소스 ---'); Writeln(TestSource); Writeln;
 
   try
@@ -55,17 +55,18 @@ begin
     Writeln('[2/3] 구문분석 완료: 클래스 '+prog.ClassDecls.Count.ToString
       +'개, 메서드구현 '+prog.MethodImpls.Count.ToString+'개');
 
-    outputName:='ExternalMember_Test_Stage15.exe';
+    outputName:='StaticCall_Test_Stage16.exe';
     codegen:=new TCodeGenerator(prog);
-    // .NET Framework GAC는 짧은 이름만으로 바인딩 실패할 수 있어 정식 이름 사용
     codegen.AddReferenceAssembly('System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089');
     codegen.GenerateExe(outputName);
     Writeln('[3/3] 코드생성 완료: '+outputName+' 생성됨');
 
     Writeln;
     Writeln('=====================================================');
-    Writeln('성공! "'+outputName+'" 을 실행하면 다음이 출력되어야 합니다:');
-    Writeln('  완료: Text 속성 설정 + Dispose 메서드 호출 성공 (예외 없음)');
+    Writeln('성공! "'+outputName+'" 을 실행하면:');
+    Writeln('  1) 콘솔에 "폼 준비 완료, Application.Run 호출 직전" 출력');
+    Writeln('  2) "Hello from Pascal-to-IL compiler" 제목의 빈 윈도우 창이 실제로 뜸');
+    Writeln('  (창을 닫아야 프로세스가 종료됩니다)');
     Writeln('=====================================================');
   except
     on E: Exception do

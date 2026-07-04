@@ -402,7 +402,7 @@ type
       et, at2: TVarType; fb: FieldBuilder; cn: string; vtVar: TVarType;
       eL, endL, ckL, bdL: &Label;
       extType: System.Type; propInfo: PropertyInfo; extFld: System.Reflection.FieldInfo;
-      setter, emi: MethodInfo; argTypes: array of System.Type; ai: integer;
+      setter, emi: MethodInfo;
     begin
       if s is TWritelnStringStmtNode then
       begin
@@ -498,24 +498,20 @@ type
             extType:=FindExternalAncestorType(fCurClassName);
             if extType=nil then
               raise new Exception('알 수 없는 메서드 "'+fCurClassName+'.'+mcs.MethodName+'"');
-            argTypes:=new System.Type[mcs.Args.Count];
-            for ai:=0 to mcs.Args.Count-1 do
-              argTypes[ai]:=VTC(InferType(mcs.Args[ai]), '');
-            emi:=extType.GetMethod(mcs.MethodName, argTypes);
+            emi:=ResolveMethodByArity(extType, mcs.MethodName, mcs.Args.Count, false);
             if emi=nil then
-              raise new Exception('외부 타입 "'+extType.FullName+'"에 메서드 "'+mcs.MethodName+'"가 없습니다 (인자 '+argTypes.Length.ToString+'개).');
+              raise new Exception('외부 타입 "'+extType.FullName+'"에 메서드 "'+mcs.MethodName+'"가 없습니다 (인자 '+mcs.Args.Count.ToString+'개).');
             aIL.Emit(OpCodes.Callvirt, emi);
             if emi.ReturnType<>typeof(System.Void) then aIL.Emit(OpCodes.Pop);
           end;
         end
-        else
+        else if fLocals.ContainsKey(mcs.ObjName) or fGlobals.ContainsKey(mcs.ObjName) then
         begin
           // c.Init(10) → Ldloc c + args + Call
           cn:=GetVarClassName(mcs.ObjName);
           vtVar:=GetVarType(mcs.ObjName);
           if fLocals.ContainsKey(mcs.ObjName) then aIL.Emit(OpCodes.Ldloc, fLocals[mcs.ObjName])
-          else if fGlobals.ContainsKey(mcs.ObjName) then aIL.Emit(OpCodes.Ldloc, fGlobals[mcs.ObjName])
-          else raise new Exception('알 수 없는 변수 "'+mcs.ObjName+'"');
+          else aIL.Emit(OpCodes.Ldloc, fGlobals[mcs.ObjName]);
           foreach ae in mcs.Args do EmitExpr(aIL, ae);
           if cn='' then raise new Exception('알 수 없는 메서드 "'+cn+'.'+mcs.MethodName+'"');
           // 인터페이스 타입 변수면 인터페이스 메서드로, 아니면 클래스 상속 체인에서 탐색
@@ -535,6 +531,19 @@ type
             if imb.ReturnType<>typeof(System.Void) then
               aIL.Emit(OpCodes.Pop);
           end;
+        end
+        else
+        begin
+          // 로컬/전역 변수가 아니면 System.Windows.Forms.Application.Run(f) 처럼
+          // 외부 타입의 정적(static) 멤버 호출로 간주한다. 정적 호출은 인스턴스를
+          // 먼저 로드하지 않고 인자만 쌓은 뒤 Call(비가상)로 호출한다.
+          extType:=ResolveExternalType(mcs.ObjName);
+          foreach ae in mcs.Args do EmitExpr(aIL, ae);
+          emi:=ResolveMethodByArity(extType, mcs.MethodName, mcs.Args.Count, true);
+          if emi=nil then
+            raise new Exception('외부 타입 "'+extType.FullName+'"에 정적 메서드 "'+mcs.MethodName+'"가 없습니다 (인자 '+mcs.Args.Count.ToString+'개).');
+          aIL.Emit(OpCodes.Call, emi);
+          if emi.ReturnType<>typeof(System.Void) then aIL.Emit(OpCodes.Pop);
         end;
       end
 
@@ -751,6 +760,21 @@ type
 
       raise new Exception('외부 타입 "'+dottedName+'"을(를) 찾을 수 없습니다. '+
         'AddReferenceAssembly로 해당 타입이 들어있는 어셈블리를 먼저 등록했는지 확인하세요.');
+    end;
+
+    // 외부 타입에서 이름+인자개수로 메서드를 찾는다 (엄격한 타입 일치 대신 개수만 맞춰서
+    // 찾음 — 우리가 만든 파생 클래스 인스턴스를 부모 타입 매개변수에 넘기는 경우
+    // System.Type.GetMethod(name, exactArgTypes)로는 정확히 일치하지 않아 못 찾기 때문).
+    // 오버로드가 여러 개면 그중 인자 개수가 맞는 첫 번째를 사용한다 (단순화).
+    function ResolveMethodByArity(t: System.Type; mname: string; argCount: integer; isStatic: boolean): MethodInfo;
+    var flags: BindingFlags; mi: MethodInfo;
+    begin
+      if isStatic then flags:=BindingFlags.Public or BindingFlags.Static
+      else flags:=BindingFlags.Public or BindingFlags.Instance;
+      Result:=nil;
+      foreach mi in t.GetMethods(flags) do
+        if (mi.Name=mname) and (mi.GetParameters.Length=argCount) then
+        begin Result:=mi; exit; end;
     end;
 
     // 클래스 TypeBuilder 생성 (필드 + 메서드 정의만, 본문은 아직)
@@ -1056,6 +1080,10 @@ type
       mm:=mainTB.DefineMethod('Main',
         MethodAttributes.Public or MethodAttributes.Static,
         typeof(System.Void), nil);
+      // WinForm/WPF의 Application.Run 등 STA(단일 스레드 아파트먼트)가 필요한 호출을
+      // 위해 항상 [STAThread]를 붙여둔다 (콘솔/일반 프로그램에는 영향 없음).
+      mm.SetCustomAttribute(new CustomAttributeBuilder(
+        typeof(System.STAThreadAttribute).GetConstructor(System.Type.EmptyTypes), []));
       il:=mm.GetILGenerator;
 
       foreach vd in fProg.VarDecls do

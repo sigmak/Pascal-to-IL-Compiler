@@ -277,11 +277,21 @@ type
         nt:=Cur; fPos:=fPos+1;
 
         // 변수.메서드 → 메서드 호출 문장 (반환값 버림)
+        // 또는 System.Windows.Forms.Application.Run(f) 처럼 여러 단계 점(.)으로
+        // 연결된 외부 타입의 정적(static) 멤버 호출. 마지막 세그먼트가 메서드
+        // 이름이고, 그 앞부분 전체가 대상(지역 변수 또는 외부 타입 이름)이다.
+        // 실제로 지역 변수인지 외부 타입인지는 CodeGen 단계에서 판별한다.
         if Cur.Kind=tkDot then
         begin
-          fPos:=fPos+1;
-          var mname:=Expect(tkIdent);
-          mcs:=new TMethodCallStmtNode(nt.Text, mname.Text);
+          var segs:=new List<string>; segs.Add(nt.Text);
+          while Cur.Kind=tkDot do
+          begin
+            fPos:=fPos+1;
+            segs.Add(Expect(tkIdent).Text);
+          end;
+          var mname:=segs[segs.Count-1];
+          var qualifier:=string.Join('.', segs.GetRange(0, segs.Count-1));
+          mcs:=new TMethodCallStmtNode(qualifier, mname);
           if Cur.Kind=tkLParen then
           begin
             fPos:=fPos+1;
