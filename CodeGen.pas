@@ -41,6 +41,9 @@ type
     fMethodReturnTypes: Dictionary<string, Dictionary<string, TVarType>>; // 클래스명/인터페이스명 → 메서드명 → 반환타입
     fCtorBuilders: Dictionary<string, ConstructorBuilder>; // 클래스명 → 기본 생성자 (CreateType 전에도 참조 가능하도록 보관)
 
+    // 외부 .NET 어셈블리 (WPF/WinForm/Avalonia 등) — GenerateExe 전에 AddReferenceAssembly로 채워짐
+    fLoadedAssemblies: List<Assembly>;
+
     // 인터페이스 관련 (클래스보다 먼저 완전히 빌드됨)
     fInterfaceBuilders: Dictionary<string, TypeBuilder>;  // 인터페이스명 → TypeBuilder
     fBuiltInterfaces:   Dictionary<string, System.Type>;  // 인터페이스명 → 완성된 Type
@@ -625,6 +628,26 @@ type
       fBuiltInterfaces[id.Name]:=tb.CreateType;
     end;
 
+    // 외부 어셈블리(WPF/WinForm/Avalonia 등)에서 dottedName(예: System.Windows.Window)에
+    // 해당하는 Type을 찾는다. AddReferenceAssembly로 미리 등록된 어셈블리만 검색한다.
+    function ResolveExternalType(dottedName: string): System.Type;
+    var asm: Assembly; t: System.Type;
+    begin
+      // 1) 어셈블리 지정 없이 바로 찾히는 경우 (mscorlib/coreLib에 있는 타입 등)
+      t:=System.Type.GetType(dottedName);
+      if t<>nil then begin Result:=t; exit; end;
+
+      // 2) 등록된 참조 어셈블리들을 순서대로 검색
+      foreach asm in fLoadedAssemblies do
+      begin
+        t:=asm.GetType(dottedName);
+        if t<>nil then begin Result:=t; exit; end;
+      end;
+
+      raise new Exception('외부 타입 "'+dottedName+'"을(를) 찾을 수 없습니다. '+
+        'AddReferenceAssembly로 해당 타입이 들어있는 어셈블리를 먼저 등록했는지 확인하세요.');
+    end;
+
     // 클래스 TypeBuilder 생성 (필드 + 메서드 정의만, 본문은 아직)
     procedure BuildClassShell(modBuilder: ModuleBuilder; cd: TClassDeclNode);
     var
@@ -635,8 +658,11 @@ type
       methAttrs: MethodAttributes;
     begin
       // 부모 클래스가 있으면 그 TypeBuilder를 기반 타입으로 사용
+      // 로컬 클래스가 아니면(IsExternalParent) 참조된 외부 어셈블리에서 Reflection으로 찾는다
       if (cd.ParentName<>'') and fTypeBuilders.ContainsKey(cd.ParentName) then
         parentType:=fTypeBuilders[cd.ParentName]
+      else if (cd.ParentName<>'') and cd.IsExternalParent then
+        parentType:=ResolveExternalType(cd.ParentName)
       else
         parentType:=typeof(System.Object);
 
@@ -697,7 +723,13 @@ type
         // TypeBuilder에 대한 GetConstructor 호출을 지원하지 않음)
         parentCtor:=fCtorBuilders[cd.ParentName]
       else
-        parentCtor:=typeof(System.Object).GetConstructor(System.Type.EmptyTypes);
+      begin
+        // 로컬에서 만든 클래스가 아니면(System.Object 또는 외부 어셈블리 타입)
+        // parentType에서 직접 매개변수 없는 public 생성자를 찾는다.
+        parentCtor:=parentType.GetConstructor(System.Type.EmptyTypes);
+        if parentCtor=nil then
+          raise new Exception('부모 타입 "'+parentType.FullName+'"에 매개변수 없는 public 생성자가 없습니다.');
+      end;
       ctorIL.Emit(OpCodes.Call, parentCtor);
       ctorIL.Emit(OpCodes.Ret);
     end;
@@ -840,7 +872,28 @@ type
       fCtorBuilders:=new Dictionary<string, ConstructorBuilder>;
       fInterfaceBuilders:=new Dictionary<string, TypeBuilder>;
       fBuiltInterfaces:=new Dictionary<string, System.Type>;
+      fLoadedAssemblies:=new List<Assembly>;
       fResultLocal:=nil; fResultType:=vtInteger; fCurClassName:='';
+    end;
+
+    // WPF는 'PresentationFramework','PresentationCore','WindowsBase' (GAC),
+    // WinForm은 'System.Windows.Forms','System.Drawing' (GAC),
+    // AvaloniaUI는 GAC에 없으므로 dll 전체 경로를 넘겨야 함 (예: 'C:\...\Avalonia.Controls.dll').
+    // 어떤 프레임워크를 쓸지는 호출하는 쪽(디자이너)이 결정해서 이 메서드로 등록한다.
+    procedure AddReferenceAssembly(nameOrPath: string);
+    var asm: Assembly;
+    begin
+      asm:=nil;
+      try
+        if nameOrPath.ToLower.EndsWith('.dll') then
+          asm:=Assembly.LoadFrom(nameOrPath)
+        else
+          asm:=Assembly.Load(nameOrPath);
+      except
+        on E: Exception do
+          raise new Exception('어셈블리 "'+nameOrPath+'" 로드 실패: '+E.Message);
+      end;
+      if asm<>nil then fLoadedAssemblies.Add(asm);
     end;
 
     procedure GenerateExe(outName: string);

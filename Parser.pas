@@ -513,16 +513,27 @@ type
           cd:=new TClassDeclNode(cn);
 
           // 선택적 상속/인터페이스 구현: class(TParentName) 또는 class(IInterfaceName)
+          // 또는 class(System.Windows.Window) 처럼 점(.)으로 연결된 외부 .NET 타입
           if Cur.Kind=tkLParen then
           begin
             fPos:=fPos+1;
             var pname:=Expect(tkIdent).Text;
+            while Cur.Kind=tkDot do
+            begin
+              fPos:=fPos+1;
+              pname:=pname+'.'+Expect(tkIdent).Text;
+            end;
             if fClassNames.Contains(pname) then
               cd.ParentName:=pname
             else if fInterfaceNames.Contains(pname) then
               cd.InterfaceName:=pname
             else
-              raise new Exception('줄 '+Cur.Line.ToString+': 알 수 없는 부모 클래스/인터페이스 "'+pname+'"');
+            begin
+              // 로컬에 없는 이름 → 외부 어셈블리 타입으로 간주 (예: System.Windows.Window).
+              // 실제 존재 여부는 CodeGen 단계에서 참조된 어셈블리를 뒤져 확인한다.
+              cd.ParentName:=pname;
+              cd.IsExternalParent:=true;
+            end;
             Expect(tkRParen);
           end;
 
@@ -530,7 +541,9 @@ type
           fClassParent[cn]:=cd.ParentName;
 
           // 필드/메서드 이름 목록은 부모의 것을 상속하여 시작 (필드/메서드 참조 판별용)
-          if cd.ParentName<>'' then
+          // 외부 타입 상속인 경우 그 타입의 필드/메서드 목록을 알 수 없으므로 빈 목록으로 시작
+          // (외부 타입 멤버 접근은 Stage15 이후 과제)
+          if (cd.ParentName<>'') and (not cd.IsExternalParent) then
           begin
             fClassFields[cn]:=new List<string>(fClassFields[cd.ParentName]);
             fClassMethods[cn]:=new Dictionary<string, boolean>(fClassMethods[cd.ParentName]);

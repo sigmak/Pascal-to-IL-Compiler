@@ -239,12 +239,13 @@ type
   public
     Name: string;
     ParentName: string; // 부모 클래스 이름 ('' 이면 상속 없음, 암묵적으로 System.Object)
+    IsExternalParent: boolean; // true면 ParentName이 외부 .NET 어셈블리의 타입 (예: System.Windows.Window)
     InterfaceName: string; // 구현하는 인터페이스 이름 ('' 이면 없음). ParentName과 양자택일.
     Fields: List<TFieldDeclNode>;
     Methods: List<TMethodSignature>;
     constructor Create(n: string);
     begin
-      Name:=n; ParentName:=''; InterfaceName:='';
+      Name:=n; ParentName:=''; IsExternalParent:=false; InterfaceName:='';
       Fields:=new List<TFieldDeclNode>; Methods:=new List<TMethodSignature>;
     end;
   end;
