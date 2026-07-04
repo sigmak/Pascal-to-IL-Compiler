@@ -180,9 +180,11 @@ type
 
         else
         begin
-          // 현재 클래스 메서드 안에서 필드 참조인지 확인
-          if (fCurClass<>'') and fClassFields.ContainsKey(fCurClass)
-             and fClassFields[fCurClass].Contains(t.Text) then
+          // 메서드 본문 안에서의 식별자 읽기는 항상 필드/속성 읽기로 취급한다.
+          // (대입문과 동일한 이유 — var 섹션보다 메서드가 먼저 파싱되어 전역변수
+          //  이름을 알 수 없고, 이 경로로 전역변수를 읽는 기존 코드도 없었음.
+          //  지역 필드든 외부 상속 타입의 속성이든 CodeGen 단계에서 최종 판별한다.)
+          if fCurClass<>'' then
             Result:=new TFieldReadExprNode(t.Text)
           else
             Result:=new TVarRefNode(t.Text);

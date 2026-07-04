@@ -195,7 +195,31 @@ type
       else if e is TLengthExprNode then Result:=vtInteger
       else if e is TResultRefNode then Result:=fResultType
       else if e is TNewObjectExprNode then Result:=vtObject
-      else if e is TFieldReadExprNode then Result:=vtInteger // 단순화: 필드는 정수
+      else if e is TFieldReadExprNode then
+      begin
+        // 지역 필드는 기존처럼 단순화(정수로 간주, 기존 동작 유지).
+        // 외부 상속 타입의 속성/필드면 실제 CLR 타입을 봐서 string 여부만 구분한다
+        // (Writeln 등에서 string/정수 분기가 정확해야 하므로).
+        var _fr:=TFieldReadExprNode(e); var _fb: FieldBuilder;
+        if TryFindFieldBuilder(fCurClassName, _fr.FieldName, _fb) then
+          Result:=vtInteger
+        else
+        begin
+          var _extType:=FindExternalAncestorType(fCurClassName);
+          if _extType<>nil then
+          begin
+            var _pi:=_extType.GetProperty(_fr.FieldName);
+            if (_pi<>nil) and (_pi.PropertyType=typeof(string)) then Result:=vtString
+            else
+            begin
+              var _fi:=_extType.GetField(_fr.FieldName);
+              if (_fi<>nil) and (_fi.FieldType=typeof(string)) then Result:=vtString
+              else Result:=vtInteger;
+            end;
+          end
+          else Result:=vtInteger;
+        end;
+      end
       else if e is TMethodCallExprNode then
         Result:=FindMethodReturnType(GetVarClassName(TMethodCallExprNode(e).ObjName),
                                       TMethodCallExprNode(e).MethodName)
@@ -251,11 +275,36 @@ type
 
       else if e is TFieldReadExprNode then
       begin
-        // self.fieldName 읽기 (인스턴스 메서드 안)
+        // self.fieldName 읽기 (인스턴스 메서드 안) — 지역 필드 또는 외부 상속 타입의 속성/필드
         fr:=TFieldReadExprNode(e);
-        aIL.Emit(OpCodes.Ldarg_0); // self
-        fb:=FindFieldBuilder(fCurClassName, fr.FieldName);
-        aIL.Emit(OpCodes.Ldfld, fb);
+        if TryFindFieldBuilder(fCurClassName, fr.FieldName, fb) then
+        begin
+          aIL.Emit(OpCodes.Ldarg_0); // self
+          aIL.Emit(OpCodes.Ldfld, fb);
+        end
+        else
+        begin
+          var _extType:=FindExternalAncestorType(fCurClassName);
+          if _extType=nil then
+            raise new Exception('필드/속성을 찾을 수 없음: '+fCurClassName+'.'+fr.FieldName);
+          var _pi:=_extType.GetProperty(fr.FieldName);
+          if _pi<>nil then
+          begin
+            var _getter:=_pi.GetGetMethod;
+            if _getter=nil then
+              raise new Exception('속성 "'+_extType.FullName+'.'+fr.FieldName+'"에 getter가 없습니다 (쓰기 전용).');
+            aIL.Emit(OpCodes.Ldarg_0);
+            aIL.Emit(OpCodes.Callvirt, _getter);
+          end
+          else
+          begin
+            var _fi:=_extType.GetField(fr.FieldName);
+            if _fi=nil then
+              raise new Exception('외부 타입 "'+_extType.FullName+'"에 필드/속성 "'+fr.FieldName+'"가 없습니다.');
+            aIL.Emit(OpCodes.Ldarg_0);
+            aIL.Emit(OpCodes.Ldfld, _fi);
+          end;
+        end;
       end
 
       else if e is TNewObjectExprNode then

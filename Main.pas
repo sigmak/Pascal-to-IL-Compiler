@@ -15,11 +15,12 @@ uses
 
 const
   TestSource =
-    'program StaticCallTest;' + #10 +
+    'program ExternalReadTest;' + #10 +
     'type' + #10 +
     '  TMyForm = class(System.Windows.Forms.Form)' + #10 +
     '  public' + #10 +
     '    procedure Setup;' + #10 +
+    '    function GetTitle: string;' + #10 +
     '  end;' + #10 +
     '' + #10 +
     'procedure TMyForm.Setup;' + #10 +
@@ -27,13 +28,17 @@ const
     '  Text := ''Hello from Pascal-to-IL compiler'';' + #10 +
     'end;' + #10 +
     '' + #10 +
+    'function TMyForm.GetTitle: string;' + #10 +
+    'begin' + #10 +
+    '  Result := Text;' + #10 +
+    'end;' + #10 +
+    '' + #10 +
     'var' + #10 +
     '  f : TMyForm;' + #10 +
     'begin' + #10 +
     '  f := TMyForm.Create;' + #10 +
     '  f.Setup;' + #10 +
-    '  writeln(''폼 준비 완료, Application.Run 호출 직전'');' + #10 +
-    '  System.Windows.Forms.Application.Run(f);' + #10 +
+    '  writeln(f.GetTitle);' + #10 +
     'end.';
 
 var
@@ -42,7 +47,7 @@ var
   codegen: TCodeGenerator; outputName: string;
 
 begin
-  Writeln('=== Stage 16: 외부 타입의 정적(static) 멤버 호출 (Application.Run) ===');
+  Writeln('=== Stage 17: 외부 상속 타입의 속성 읽기 ===');
   Writeln('--- 입력 소스 ---'); Writeln(TestSource); Writeln;
 
   try
@@ -55,7 +60,7 @@ begin
     Writeln('[2/3] 구문분석 완료: 클래스 '+prog.ClassDecls.Count.ToString
       +'개, 메서드구현 '+prog.MethodImpls.Count.ToString+'개');
 
-    outputName:='StaticCall_Test_Stage16.exe';
+    outputName:='ExternalRead_Test_Stage17.exe';
     codegen:=new TCodeGenerator(prog);
     codegen.AddReferenceAssembly('System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089');
     codegen.GenerateExe(outputName);
@@ -63,10 +68,9 @@ begin
 
     Writeln;
     Writeln('=====================================================');
-    Writeln('성공! "'+outputName+'" 을 실행하면:');
-    Writeln('  1) 콘솔에 "폼 준비 완료, Application.Run 호출 직전" 출력');
-    Writeln('  2) "Hello from Pascal-to-IL compiler" 제목의 빈 윈도우 창이 실제로 뜸');
-    Writeln('  (창을 닫아야 프로세스가 종료됩니다)');
+    Writeln('성공! "'+outputName+'" 을 실행하면 다음이 출력되어야 합니다:');
+    Writeln('  Hello from Pascal-to-IL compiler');
+    Writeln('(Setup에서 쓴 Text 속성을 GetTitle에서 다시 읽어온 값입니다)');
     Writeln('=====================================================');
   except
     on E: Exception do
