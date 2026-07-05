@@ -61,6 +61,34 @@ type
       else raise new Exception('줄 '+Cur.Line.ToString+': 타입이 와야 합니다 ("'+Cur.Text+'")');
     end;
 
+    // 매개변수/필드 타입 하나를 파싱한다 (기본타입/지역클래스/인터페이스/외부타입 모두 지원).
+    // isExt(출력)가 true면 cn(출력)이 외부 .NET 타입 이름 (예: System.EventArgs).
+    function ParseParamTypeExt(var isExt: boolean; var cn: string): TVarType;
+    begin
+      isExt:=false; cn:='';
+      if (Cur.Kind=tkIdent) and fClassNames.Contains(Cur.Text) then
+      begin cn:=Cur.Text; fPos:=fPos+1; Result:=vtObject; end
+      else if (Cur.Kind=tkIdent) and fInterfaceNames.Contains(Cur.Text) then
+      begin cn:=Cur.Text; fPos:=fPos+1; Result:=vtInterface; end
+      else if Cur.Kind=tkIdent then
+      begin
+        var savedPos4:=fPos;
+        var qn4:=Expect(tkIdent).Text;
+        if Cur.Kind=tkDot then
+        begin
+          while Cur.Kind=tkDot do begin fPos:=fPos+1; qn4:=qn4+'.'+Expect(tkIdent).Text; end;
+          cn:=qn4; isExt:=true; Result:=vtObject;
+        end
+        else
+        begin
+          fPos:=savedPos4;
+          Result:=ParseVarType; // 기본 타입도 지역클래스도 아니면 여기서 명확한 에러
+        end;
+      end
+      else
+        Result:=ParseVarType;
+    end;
+
     // ---- 식 파싱 (ParsePrimary 안에서는 ParseAddSub만 호출) ----
 
     function ParsePrimary: TExprNode;
@@ -314,6 +342,14 @@ type
             fas2.Qualifier:=qualifier;
             Result:=fas2;
           end
+          else if Cur.Kind=tkPlusAssign then
+          begin
+            // Button1.Click += Button1_Click;  이벤트 구독.
+            // 오른쪽은 항상 "현재 클래스의 메서드 이름" 하나만 온다 (괄호 없음).
+            fPos:=fPos+1;
+            var handlerName:=Expect(tkIdent).Text;
+            Result:=new TEventSubscribeStmtNode(qualifier, mname, handlerName);
+          end
           else
           begin
             mcs:=new TMethodCallStmtNode(qualifier, mname);
@@ -518,9 +554,14 @@ type
           begin
             var pn:=Expect(tkIdent).Text; pnames.Add(pn);
             while Cur.Kind=tkComma do begin fPos:=fPos+1; pnames.Add(Expect(tkIdent).Text); end;
-            Expect(tkColon); pt:=ParseVarType;
+            Expect(tkColon);
+            var pIsExt:=false; var pCn:='';
+            pt:=ParseParamTypeExt(pIsExt, pCn);
             foreach var pnm in pnames do
-            begin sig.ParamNames.Add(pnm); sig.ParamTypes.Add(pt); end;
+            begin
+              sig.ParamNames.Add(pnm); sig.ParamTypes.Add(pt);
+              sig.ParamClassNames.Add(pCn); sig.ParamIsExternal.Add(pIsExt);
+            end;
             pnames.Clear;
             if Cur.Kind=tkSemicolon then fPos:=fPos+1 else break;
           end;
@@ -637,9 +678,14 @@ type
                   begin
                     var pn:=Expect(tkIdent).Text; pnames.Add(pn);
                     while Cur.Kind=tkComma do begin fPos:=fPos+1; pnames.Add(Expect(tkIdent).Text); end;
-                    Expect(tkColon); pt:=ParseVarType;
+                    Expect(tkColon);
+                    var pIsExt2:=false; var pCn2:='';
+                    pt:=ParseParamTypeExt(pIsExt2, pCn2);
                     foreach var pnm in pnames do
-                    begin sig.ParamNames.Add(pnm); sig.ParamTypes.Add(pt); end;
+                    begin
+                      sig.ParamNames.Add(pnm); sig.ParamTypes.Add(pt);
+                      sig.ParamClassNames.Add(pCn2); sig.ParamIsExternal.Add(pIsExt2);
+                    end;
                     pnames.Clear;
                     if Cur.Kind=tkSemicolon then fPos:=fPos+1 else break;
                   end;
@@ -727,7 +773,9 @@ type
           begin
             var pn:=Expect(tkIdent).Text; impl.ParamNames.Add(pn);
             while Cur.Kind=tkComma do begin fPos:=fPos+1; impl.ParamNames.Add(Expect(tkIdent).Text); end;
-            Expect(tkColon); pt:=ParseVarType;
+            Expect(tkColon);
+            var pIsExt3:=false; var pCn3:='';
+            pt:=ParseParamTypeExt(pIsExt3, pCn3);
             for var i:=impl.ParamTypes.Count to impl.ParamNames.Count-1 do
               impl.ParamTypes.Add(pt);
             if Cur.Kind=tkSemicolon then fPos:=fPos+1 else break;

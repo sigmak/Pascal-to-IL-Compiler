@@ -186,6 +186,14 @@ type
     begin FieldName:=f; ValueExpr:=v; Qualifier:=''; end;
   end;
 
+  // Qualifier.EventName += HandlerName;  (예: Button1.Click += Button1_Click;)
+  // HandlerName은 현재 클래스의 인스턴스 메서드 이름이어야 한다 (델리게이트로 감싸짐).
+  TEventSubscribeStmtNode = class(TStmtNode)
+  public Qualifier: string; EventName: string; HandlerName: string;
+    constructor Create(q, ev, h: string);
+    begin Qualifier:=q; EventName:=ev; HandlerName:=h; end;
+  end;
+
   // try ... except on E: ExType do <stmt> end
   // ExVarName='' 이면 except (on 없이) 또는 finally
   TTryStmtNode = class(TStmtNode)
@@ -234,10 +242,13 @@ type
     ReturnType: TVarType;
     ParamNames: List<string>;
     ParamTypes: List<TVarType>;
+    ParamClassNames: List<string>;   // ParamTypes[i]=vtObject일 때만 의미 있음
+    ParamIsExternal: List<boolean>;  // true면 ParamClassNames[i]가 외부 .NET 타입
     constructor Create(n: string; isFunc: boolean; ret: TVarType);
     begin
       Name:=n; IsFunction:=isFunc; ReturnType:=ret;
       ParamNames:=new List<string>; ParamTypes:=new List<TVarType>;
+      ParamClassNames:=new List<string>; ParamIsExternal:=new List<boolean>;
     end;
   end;
 

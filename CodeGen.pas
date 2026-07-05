@@ -39,6 +39,7 @@ type
     fInstanceMethods: Dictionary<string, Dictionary<string, MethodBuilder>>; // 클래스명 → 메서드명 → MB
     fClassParents: Dictionary<string, string>; // 클래스명 → 부모 클래스명 ('' 이면 없음)
     fMethodReturnTypes: Dictionary<string, Dictionary<string, TVarType>>; // 클래스명/인터페이스명 → 메서드명 → 반환타입
+    fMethodParamClrTypes: Dictionary<string, Dictionary<string, array of System.Type>>; // 클래스명 → 메서드명 → 매개변수 CLR 타입 배열
     fCtorBuilders: Dictionary<string, ConstructorBuilder>; // 클래스명 → 기본 생성자 (CreateType 전에도 참조 가능하도록 보관)
 
     // 외부 .NET 어셈블리 (WPF/WinForm/Avalonia 등) — GenerateExe 전에 AddReferenceAssembly로 채워짐
@@ -494,6 +495,7 @@ type
       eL, endL, ckL, bdL: &Label;
       extType: System.Type; propInfo: PropertyInfo; extFld: System.Reflection.FieldInfo;
       setter, emi: MethodInfo; qfb: FieldBuilder; qTargetType: System.Type;
+      evs: TEventSubscribeStmtNode; evInfo: EventInfo; delCtor: ConstructorInfo;
     begin
       if s is TWritelnStringStmtNode then
       begin
@@ -685,6 +687,56 @@ type
         end;
       end
 
+      else if s is TEventSubscribeStmtNode then
+      begin
+        // Button1.Click += Button1_Click;
+        evs:=TEventSubscribeStmtNode(s);
+
+        // 1) 리시버(Button1) 로드 — 필드 우선, 그다음 로컬/전역 변수
+        if TryFindFieldBuilder(fCurClassName, evs.Qualifier, qfb) then
+        begin
+          aIL.Emit(OpCodes.Ldarg_0); aIL.Emit(OpCodes.Ldfld, qfb);
+          qTargetType:=qfb.FieldType;
+        end
+        else if fLocals.ContainsKey(evs.Qualifier) or fGlobals.ContainsKey(evs.Qualifier) then
+        begin
+          cn:=GetVarClassName(evs.Qualifier);
+          if fLocals.ContainsKey(evs.Qualifier) then aIL.Emit(OpCodes.Ldloc, fLocals[evs.Qualifier])
+          else aIL.Emit(OpCodes.Ldloc, fGlobals[evs.Qualifier]);
+          if fBuiltTypes.ContainsKey(cn) then qTargetType:=fBuiltTypes[cn]
+          else if fTypeBuilders.ContainsKey(cn) then qTargetType:=fTypeBuilders[cn]
+          else raise new Exception('알 수 없는 타입 "'+cn+'" (변수 "'+evs.Qualifier+'")');
+        end
+        else
+          raise new Exception('알 수 없는 대상 "'+evs.Qualifier+'" — 필드/지역변수/전역변수가 아닙니다.');
+
+        // 2) 이벤트 정보 조회 (예: Click → EventHandler 델리게이트 타입)
+        evInfo:=qTargetType.GetEvent(evs.EventName);
+        if evInfo=nil then
+          raise new Exception('타입 "'+qTargetType.FullName+'"에 이벤트 "'+evs.EventName+'"가 없습니다.');
+        delCtor:=evInfo.EventHandlerType.GetConstructor([typeof(System.Object), typeof(System.IntPtr)]);
+        if delCtor=nil then
+          raise new Exception('델리게이트 "'+evInfo.EventHandlerType.FullName+'"의 생성자를 찾을 수 없습니다.');
+
+        // 3) 델리게이트 생성: self(핸들러의 target) + 핸들러 메서드 포인터 → Newobj
+        // 핸들러 메서드는 (다른 모든 메서드와 마찬가지로) virtual로 정의되어 있으므로
+        // Ldftn이 아니라 Ldvirtftn을 써야 한다 — 이때는 대상 참조를 두 번 로드해야
+        // 한다: 하나는 델리게이트의 target 인자로 남고, 하나는 Ldvirtftn이 소비해서
+        // 가상 디스패치로 실제 메서드 포인터를 구한다.
+        if not TryFindInstanceMethod(fCurClassName, evs.HandlerName, imb) then
+          raise new Exception('핸들러 메서드를 찾을 수 없음: '+fCurClassName+'.'+evs.HandlerName);
+        aIL.Emit(OpCodes.Ldarg_0); // target (newobj용, 남겨둠)
+        aIL.Emit(OpCodes.Ldarg_0); // ldvirtftn이 소비할 참조
+        aIL.Emit(OpCodes.Ldvirtftn, imb);
+        aIL.Emit(OpCodes.Newobj, delCtor);
+
+        // 4) add_XXX(delegate) 호출 — 스택: [리시버, 델리게이트]
+        emi:=evInfo.GetAddMethod;
+        if emi=nil then
+          raise new Exception('이벤트 "'+evs.EventName+'"의 add 메서드를 찾을 수 없습니다.');
+        aIL.Emit(OpCodes.Callvirt, emi);
+      end
+
       else if s is TSetLengthStmtNode then
       begin
         sl:=TSetLengthStmtNode(s); at2:=vtIntArray;
@@ -842,6 +894,17 @@ type
       else raise new Exception('알 수 없는 문장 노드: '+s.GetType.Name);
     end;
 
+    // 메서드 시그니처의 i번째 매개변수의 실제 CLR 타입을 결정한다 (기본/지역클래스/외부타입 모두 포함)
+    function ResolveParamClrType(sig: TMethodSignature; i: integer): System.Type;
+    begin
+      if (sig.ParamTypes[i]=vtObject) and (i<sig.ParamIsExternal.Count) and sig.ParamIsExternal[i] then
+        Result:=ResolveExternalType(sig.ParamClassNames[i])
+      else if sig.ParamTypes[i]=vtObject then
+        Result:=VTC(vtObject, sig.ParamClassNames[i])
+      else
+        Result:=VTC(sig.ParamTypes[i], '');
+    end;
+
     // 인터페이스 TypeBuilder 생성 + 즉시 완성(CreateType)
     // 인터페이스는 클래스처럼 나중에 몸체를 채울 필요가 없으므로(메서드 시그니처뿐)
     // 클래스들보다 먼저 완전히 빌드해둔다. 클래스가 AddInterfaceImplementation을
@@ -865,7 +928,7 @@ type
       begin
         paramTypes:=new System.Type[sig.ParamNames.Count];
         for i:=0 to sig.ParamNames.Count-1 do
-          paramTypes[i]:=typeof(integer); // 단순화: 매개변수는 정수
+          paramTypes[i]:=ResolveParamClrType(sig, i);
 
         if sig.IsFunction then
           mb:=tb.DefineMethod(sig.Name, methAttrs, VTC(sig.ReturnType, ''), paramTypes)
@@ -1001,7 +1064,7 @@ type
       begin
         paramTypes:=new System.Type[sig.ParamNames.Count];
         for i:=0 to sig.ParamNames.Count-1 do
-          paramTypes[i]:=typeof(integer); // 단순화: 매개변수는 정수
+          paramTypes[i]:=ResolveParamClrType(sig, i);
         if sig.IsFunction then
           mb:=tb.DefineMethod(sig.Name, methAttrs, VTC(sig.ReturnType, ''), paramTypes)
         else
@@ -1010,6 +1073,9 @@ type
         if not fMethodReturnTypes.ContainsKey(cd.Name) then
           fMethodReturnTypes[cd.Name]:=new Dictionary<string, TVarType>;
         fMethodReturnTypes[cd.Name][sig.Name]:=sig.ReturnType;
+        if not fMethodParamClrTypes.ContainsKey(cd.Name) then
+          fMethodParamClrTypes[cd.Name]:=new Dictionary<string, array of System.Type>;
+        fMethodParamClrTypes[cd.Name][sig.Name]:=paramTypes;
       end;
 
       // 기본 생성자 추가 (부모 생성자 호출로 체이닝)
@@ -1077,7 +1143,12 @@ type
       for i:=0 to impl.ParamNames.Count-1 do
       begin
         p:=impl.ParamNames[i];
-        var loc:=il.DeclareLocal(typeof(integer));
+        var pClrType:=typeof(integer);
+        if fMethodParamClrTypes.ContainsKey(impl.ClassName)
+           and fMethodParamClrTypes[impl.ClassName].ContainsKey(impl.MethodName)
+           and (i<fMethodParamClrTypes[impl.ClassName][impl.MethodName].Length) then
+          pClrType:=fMethodParamClrTypes[impl.ClassName][impl.MethodName][i];
+        var loc:=il.DeclareLocal(pClrType);
         fLocals[p]:=loc; fLocalTypes[p]:=vtInteger;
         // self=Ldarg_0 이므로 매개변수는 Ldarg_1부터
         if i=0 then il.Emit(OpCodes.Ldarg_1)
@@ -1172,6 +1243,7 @@ type
       fInstanceMethods:=new Dictionary<string, Dictionary<string, MethodBuilder>>;
       fClassParents:=new Dictionary<string, string>;
       fMethodReturnTypes:=new Dictionary<string, Dictionary<string, TVarType>>;
+      fMethodParamClrTypes:=new Dictionary<string, Dictionary<string, array of System.Type>>;
       fCtorBuilders:=new Dictionary<string, ConstructorBuilder>;
       fInterfaceBuilders:=new Dictionary<string, TypeBuilder>;
       fBuiltInterfaces:=new Dictionary<string, System.Type>;

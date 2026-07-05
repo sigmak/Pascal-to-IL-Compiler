@@ -24,7 +24,7 @@ type
     tkIntToStr, tkSetLength, tkLength,
     tkIdent, tkString, tkIntLiteral,
     tkSemicolon, tkColon, tkComma, tkAssign,
-    tkPlus, tkMinus, tkStar, tkSlash,
+    tkPlus, tkMinus, tkStar, tkSlash, tkPlusAssign,
     tkEq, tkNeq, tkLt, tkGt, tkLe, tkGe,
     tkLParen, tkRParen, tkLBracket, tkRBracket,
     tkDot, tkEOF
@@ -151,6 +151,8 @@ type
         else if ch='<' then begin toks.Add(new TToken(tkLt,'<',fLine)); Adv; end
         else if ch='>' then begin toks.Add(new TToken(tkGt,'>',fLine)); Adv; end
         else if ch='=' then begin toks.Add(new TToken(tkEq,'=',fLine)); Adv; end
+        else if (ch='+') and (PC='=') then
+          begin toks.Add(new TToken(tkPlusAssign,'+=',fLine)); Adv; Adv; end
         else if ch='+' then begin toks.Add(new TToken(tkPlus,'+',fLine)); Adv; end
         else if ch='-' then begin toks.Add(new TToken(tkMinus,'-',fLine)); Adv; end
         else if ch='*' then begin toks.Add(new TToken(tkStar,'*',fLine)); Adv; end
