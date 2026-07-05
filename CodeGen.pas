@@ -309,12 +309,23 @@ type
 
       else if e is TNewObjectExprNode then
       begin
-        // TCounter.Create → Newobj
+        // TCounter.Create → Newobj (지역 클래스 또는 외부 타입 모두 지원)
         neo:=TNewObjectExprNode(e);
-        if not fCtorBuilders.ContainsKey(neo.ClassName) then
-          raise new Exception('알 수 없는 클래스 "'+neo.ClassName+'"');
-        ctor:=fCtorBuilders[neo.ClassName];
-        aIL.Emit(OpCodes.Newobj, ctor);
+        if neo.IsExternalType then
+        begin
+          var _extCtorType:=ResolveExternalType(neo.ClassName);
+          var _extCtor:=_extCtorType.GetConstructor(System.Type.EmptyTypes);
+          if _extCtor=nil then
+            raise new Exception('외부 타입 "'+_extCtorType.FullName+'"에 매개변수 없는 public 생성자가 없습니다.');
+          aIL.Emit(OpCodes.Newobj, _extCtor);
+        end
+        else
+        begin
+          if not fCtorBuilders.ContainsKey(neo.ClassName) then
+            raise new Exception('알 수 없는 클래스 "'+neo.ClassName+'"');
+          ctor:=fCtorBuilders[neo.ClassName];
+          aIL.Emit(OpCodes.Newobj, ctor);
+        end;
       end
 
       else if e is TMethodCallExprNode then
@@ -826,6 +837,15 @@ type
         begin Result:=mi; exit; end;
     end;
 
+    // 필드 선언의 실제 CLR 타입을 결정한다 (기본 타입/지역 클래스/외부 타입 모두 포함)
+    function ResolveFieldClrType(fd: TFieldDeclNode): System.Type;
+    begin
+      if (fd.FieldType=vtObject) and fd.IsExternalType then
+        Result:=ResolveExternalType(fd.ClassName)
+      else
+        Result:=VTC(fd.FieldType, fd.ClassName);
+    end;
+
     // 클래스 TypeBuilder 생성 (필드 + 메서드 정의만, 본문은 아직)
     procedure BuildClassShell(modBuilder: ModuleBuilder; cd: TClassDeclNode);
     var
@@ -867,7 +887,7 @@ type
       // 필드
       foreach fd in cd.Fields do
       begin
-        fb:=tb.DefineField(fd.Name, typeof(integer), FieldAttributes.Public);
+        fb:=tb.DefineField(fd.Name, ResolveFieldClrType(fd), FieldAttributes.Public);
         fFieldBuilders[cd.Name][fd.Name]:=fb;
       end;
 

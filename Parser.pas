@@ -105,7 +105,7 @@ type
       begin
         fPos:=fPos+1;
 
-        // 클래스명.Create → TNewObjectExprNode
+        // 클래스명.Create → TNewObjectExprNode (지역 클래스 또는 점(.)으로 연결된 외부 타입)
         if (Cur.Kind=tkDot) and fClassNames.Contains(t.Text) then
         begin
           fPos:=fPos+1; // '.' 소비
@@ -132,30 +132,42 @@ type
           end;
         end
 
-        // 변수.메서드 (인스턴스 메서드 호출) 또는 변수.Message (예외 프로퍼티)
-        else if Cur.Kind=tkDot then
+        // 점(.)으로 연결된 외부 타입의 .Create (예: System.Windows.Forms.Button.Create)
+        // fClassNames에 없는 식별자로 시작하고, 점이 여러 번 이어지다 마지막이 Create인 경우.
+        else if (Cur.Kind=tkDot) then
         begin
-          fPos:=fPos+1; // '.' 소비
-          var mname:=Expect(tkIdent);
-          // E.Message 패턴 → TExceptionMsgExprNode
-          if mname.Text.ToLower='message' then
+          var savedPos3:=fPos; var segs2:=new List<string>; segs2.Add(t.Text);
+          while Cur.Kind=tkDot do
+          begin fPos:=fPos+1; segs2.Add(Expect(tkIdent).Text); end;
+          if segs2[segs2.Count-1].ToLower='create' then
           begin
-            Result:=new TExceptionMsgExprNode(t.Text);
+            var neo2:=new TNewObjectExprNode(string.Join('.', segs2.GetRange(0, segs2.Count-1)));
+            neo2.IsExternalType:=true;
+            Result:=neo2;
           end
           else
           begin
-            mc:=new TMethodCallExprNode(t.Text, mname.Text);
-            if Cur.Kind=tkLParen then
+            // Create가 아니면 기존처럼 obj.Method 식으로 되돌린다 (한 단계만 지원)
+            fPos:=savedPos3;
+            fPos:=fPos+1; // '.' 소비
+            var mname2:=Expect(tkIdent);
+            if mname2.Text.ToLower='message' then
+              Result:=new TExceptionMsgExprNode(t.Text)
+            else
             begin
-              fPos:=fPos+1;
-              if Cur.Kind<>tkRParen then
+              mc:=new TMethodCallExprNode(t.Text, mname2.Text);
+              if Cur.Kind=tkLParen then
               begin
-                mc.Args.Add(ParseAddSub);
-                while Cur.Kind=tkComma do begin fPos:=fPos+1; mc.Args.Add(ParseAddSub); end;
+                fPos:=fPos+1;
+                if Cur.Kind<>tkRParen then
+                begin
+                  mc.Args.Add(ParseAddSub);
+                  while Cur.Kind=tkComma do begin fPos:=fPos+1; mc.Args.Add(ParseAddSub); end;
+                end;
+                Expect(tkRParen);
               end;
-              Expect(tkRParen);
+              Result:=mc;
             end;
-            Result:=mc;
           end;
         end
 
@@ -631,13 +643,42 @@ type
               fClassMethods[cn][mname]:=isFunc;
             end
 
-            // 필드 선언: fname : type;
+            // 필드 선언: fname : type;  (기본 타입, 지역 클래스, 또는 외부 타입 System.Windows.Forms.Button)
             else if Cur.Kind=tkIdent then
             begin
               fname:=Cur.Text; fPos:=fPos+1;
-              Expect(tkColon); ftype:=ParseVarType;
+              Expect(tkColon);
+              var fld:=new TFieldDeclNode(fname, vtInteger);
+              if (Cur.Kind=tkIdent) and fClassNames.Contains(Cur.Text) then
+              begin
+                fld.FieldType:=vtObject; fld.ClassName:=Cur.Text; fPos:=fPos+1;
+              end
+              else if (Cur.Kind=tkIdent) and fInterfaceNames.Contains(Cur.Text) then
+              begin
+                fld.FieldType:=vtInterface; fld.ClassName:=Cur.Text; fPos:=fPos+1;
+              end
+              else if Cur.Kind=tkIdent then
+              begin
+                // fClassNames/fInterfaceNames에 없는 식별자로 시작 → 점(.)으로 연결된
+                // 외부 .NET 타입일 가능성 확인 (예: System.Windows.Forms.Button)
+                var savedPos2:=fPos;
+                var qn:=Expect(tkIdent).Text;
+                if Cur.Kind=tkDot then
+                begin
+                  while Cur.Kind=tkDot do
+                  begin fPos:=fPos+1; qn:=qn+'.'+Expect(tkIdent).Text; end;
+                  fld.FieldType:=vtObject; fld.ClassName:=qn; fld.IsExternalType:=true;
+                end
+                else
+                begin
+                  fPos:=savedPos2; // 점이 없으면 기본 타입 파서로 위임 (integer/string 등의 별칭이 아니므로 오류 처리됨)
+                  fld.FieldType:=ParseVarType;
+                end;
+              end
+              else
+                fld.FieldType:=ParseVarType;
               Expect(tkSemicolon);
-              cd.Fields.Add(new TFieldDeclNode(fname, ftype));
+              cd.Fields.Add(fld);
               fClassFields[cn].Add(fname);
             end
 

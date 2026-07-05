@@ -15,22 +15,18 @@ uses
 
 const
   TestSource =
-    'program ExternalReadTest;' + #10 +
+    'program FieldExternalTypeTest;' + #10 +
     'type' + #10 +
     '  TMyForm = class(System.Windows.Forms.Form)' + #10 +
     '  public' + #10 +
+    '    Button1: System.Windows.Forms.Button;' + #10 +
     '    procedure Setup;' + #10 +
-    '    function GetTitle: string;' + #10 +
     '  end;' + #10 +
     '' + #10 +
     'procedure TMyForm.Setup;' + #10 +
     'begin' + #10 +
-    '  Text := ''Hello from Pascal-to-IL compiler'';' + #10 +
-    'end;' + #10 +
-    '' + #10 +
-    'function TMyForm.GetTitle: string;' + #10 +
-    'begin' + #10 +
-    '  Result := Text;' + #10 +
+    '  Button1 := System.Windows.Forms.Button.Create;' + #10 +
+    '  writeln(''완료: 외부 타입 필드 선언 + 생성 성공 (예외 없음)'');' + #10 +
     'end;' + #10 +
     '' + #10 +
     'var' + #10 +
@@ -38,7 +34,6 @@ const
     'begin' + #10 +
     '  f := TMyForm.Create;' + #10 +
     '  f.Setup;' + #10 +
-    '  writeln(f.GetTitle);' + #10 +
     'end.';
 
 var
@@ -47,7 +42,7 @@ var
   codegen: TCodeGenerator; outputName: string;
 
 begin
-  Writeln('=== Stage 17: 외부 상속 타입의 속성 읽기 ===');
+  Writeln('=== Stage 18: 필드가 외부 타입을 가질 수 있도록 (Button1: System.Windows.Forms.Button) ===');
   Writeln('--- 입력 소스 ---'); Writeln(TestSource); Writeln;
 
   try
@@ -60,7 +55,7 @@ begin
     Writeln('[2/3] 구문분석 완료: 클래스 '+prog.ClassDecls.Count.ToString
       +'개, 메서드구현 '+prog.MethodImpls.Count.ToString+'개');
 
-    outputName:='ExternalRead_Test_Stage17.exe';
+    outputName:='FieldExternalType_Test_Stage18.exe';
     codegen:=new TCodeGenerator(prog);
     codegen.AddReferenceAssembly('System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089');
     codegen.GenerateExe(outputName);
@@ -69,9 +64,12 @@ begin
     Writeln;
     Writeln('=====================================================');
     Writeln('성공! "'+outputName+'" 을 실행하면 다음이 출력되어야 합니다:');
-    Writeln('  Hello from Pascal-to-IL compiler');
-    Writeln('(Setup에서 쓴 Text 속성을 GetTitle에서 다시 읽어온 값입니다)');
+    Writeln('  완료: 외부 타입 필드 선언 + 생성 성공 (예외 없음)');
     Writeln('=====================================================');
+    Writeln;
+    Writeln('참고: 아직 "Button1.Text := ...", "Button1.Click += ..." 처럼');
+    Writeln('필드를 통한 한정(qualified) 멤버 접근은 지원하지 않습니다.');
+    Writeln('(implicit self 접근만 지원 — 이건 Stage19에서 다룰 예정)');
   except
     on E: Exception do
     begin

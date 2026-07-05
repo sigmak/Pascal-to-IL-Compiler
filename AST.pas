@@ -57,8 +57,8 @@ type
 
   // TCounter.Create → Newobj
   TNewObjectExprNode = class(TExprNode)
-  public ClassName: string;
-    constructor Create(cn: string); begin ClassName:=cn; end;
+  public ClassName: string; IsExternalType: boolean;
+    constructor Create(cn: string); begin ClassName:=cn; IsExternalType:=false; end;
   end;
 
   // c.GetValue, c.Init(10) → 인스턴스 메서드 호출 (반환값 있음 → 식)
@@ -217,8 +217,12 @@ type
   // AST — 클래스 선언 관련
   // ----------------------------------------------------------
   TFieldDeclNode = class
-  public Name: string; FieldType: TVarType;
-    constructor Create(n: string; t: TVarType); begin Name:=n; FieldType:=t; end;
+  public
+    Name: string; FieldType: TVarType;
+    ClassName: string;      // FieldType=vtObject일 때만 의미 있음 (지역 클래스 또는 외부 타입 이름)
+    IsExternalType: boolean; // true면 ClassName이 외부 .NET 어셈블리의 타입 (예: System.Windows.Forms.Button)
+    constructor Create(n: string; t: TVarType);
+    begin Name:=n; FieldType:=t; ClassName:=''; IsExternalType:=false; end;
   end;
 
   TMethodSignature = class
