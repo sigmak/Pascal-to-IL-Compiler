@@ -178,10 +178,12 @@ type
   end;
 
   // self.fValue := 식  (메서드 본문 안에서 필드 쓰기)
+  // Qualifier=''  이면 self의 필드/속성. Qualifier<>'' 이면 그 이름의 필드를 통해
+  // 접근하는 대상의 속성/필드 (예: Button1.Text := '...' → Qualifier='Button1', FieldName='Text')
   TFieldAssignStmtNode = class(TStmtNode)
-  public FieldName: string; ValueExpr: TExprNode;
+  public FieldName: string; ValueExpr: TExprNode; Qualifier: string;
     constructor Create(f: string; v: TExprNode);
-    begin FieldName:=f; ValueExpr:=v; end;
+    begin FieldName:=f; ValueExpr:=v; Qualifier:=''; end;
   end;
 
   // try ... except on E: ExType do <stmt> end

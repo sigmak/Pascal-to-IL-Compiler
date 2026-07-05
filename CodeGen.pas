@@ -221,8 +221,18 @@ type
         end;
       end
       else if e is TMethodCallExprNode then
-        Result:=FindMethodReturnType(GetVarClassName(TMethodCallExprNode(e).ObjName),
-                                      TMethodCallExprNode(e).MethodName)
+      begin
+        var _mc4:=TMethodCallExprNode(e); var _qfb4: FieldBuilder;
+        if GetVarClassName(_mc4.ObjName)<>'' then
+          Result:=FindMethodReturnType(GetVarClassName(_mc4.ObjName), _mc4.MethodName)
+        else if TryFindFieldBuilder(fCurClassName, _mc4.ObjName, _qfb4) then
+        begin
+          var _pi4:=_qfb4.FieldType.GetProperty(_mc4.MethodName);
+          if (_pi4<>nil) and (_pi4.PropertyType=typeof(string)) then Result:=vtString
+          else Result:=vtInteger;
+        end
+        else Result:=vtInteger;
+      end
       else if e is TArrayIndexExprNode then Result:=vtInteger
       else if e is TVarRefNode then Result:=GetVarType(TVarRefNode(e).VarName)
       else if e is TBinOpNode then
@@ -332,25 +342,46 @@ type
       begin
         // c.GetValue → Ldloc c + Call TCounter::GetValue
         mc:=TMethodCallExprNode(e);
-        cn:=GetVarClassName(mc.ObjName);
-        vtVar:=GetVarType(mc.ObjName);
-        if fLocals.ContainsKey(mc.ObjName) then aIL.Emit(OpCodes.Ldloc, fLocals[mc.ObjName])
-        else if fGlobals.ContainsKey(mc.ObjName) then aIL.Emit(OpCodes.Ldloc, fGlobals[mc.ObjName])
-        else raise new Exception('알 수 없는 변수 "'+mc.ObjName+'"');
-        foreach ae in mc.Args do EmitExpr(aIL, ae);
-        if cn='' then raise new Exception('알 수 없는 메서드 "'+cn+'.'+mc.MethodName+'"');
-        // 인터페이스 타입 변수면 인터페이스 메서드로, 아니면 클래스 상속 체인에서 탐색
-        if vtVar=vtInterface then
+        if fLocals.ContainsKey(mc.ObjName) or fGlobals.ContainsKey(mc.ObjName) then
         begin
-          var imi:=FindInterfaceMethod(cn, mc.MethodName);
-          aIL.Emit(OpCodes.Callvirt, imi);
+          cn:=GetVarClassName(mc.ObjName);
+          vtVar:=GetVarType(mc.ObjName);
+          if fLocals.ContainsKey(mc.ObjName) then aIL.Emit(OpCodes.Ldloc, fLocals[mc.ObjName])
+          else aIL.Emit(OpCodes.Ldloc, fGlobals[mc.ObjName]);
+          foreach ae in mc.Args do EmitExpr(aIL, ae);
+          if cn='' then raise new Exception('알 수 없는 메서드 "'+cn+'.'+mc.MethodName+'"');
+          // 인터페이스 타입 변수면 인터페이스 메서드로, 아니면 클래스 상속 체인에서 탐색
+          if vtVar=vtInterface then
+          begin
+            var imi:=FindInterfaceMethod(cn, mc.MethodName);
+            aIL.Emit(OpCodes.Callvirt, imi);
+          end
+          else
+          begin
+            imb:=FindInstanceMethod(cn, mc.MethodName);
+            // virtual 메서드이므로 Callvirt 사용 (다형성 대비)
+            aIL.Emit(OpCodes.Callvirt, imb);
+          end;
         end
-        else
+        else if TryFindFieldBuilder(fCurClassName, mc.ObjName, fb) then
         begin
-          imb:=FindInstanceMethod(cn, mc.MethodName);
-          // virtual 메서드이므로 Callvirt 사용 (다형성 대비)
-          aIL.Emit(OpCodes.Callvirt, imb);
-        end;
+          // Button1.Text (필드를 통한 속성 읽기) 또는 Button1.SomeMethod() (필드를 통한 메서드 호출)
+          aIL.Emit(OpCodes.Ldarg_0);
+          aIL.Emit(OpCodes.Ldfld, fb);
+          foreach ae in mc.Args do EmitExpr(aIL, ae);
+          var _qType:=fb.FieldType;
+          var _pi5:=_qType.GetProperty(mc.MethodName);
+          if (mc.Args.Count=0) and (_pi5<>nil) and (_pi5.GetGetMethod<>nil) then
+            aIL.Emit(OpCodes.Callvirt, _pi5.GetGetMethod)
+          else
+          begin
+            var _emi5:=ResolveMethodByArity(_qType, mc.MethodName, mc.Args.Count, false);
+            if _emi5=nil then
+              raise new Exception('타입 "'+_qType.FullName+'"에 메서드 "'+mc.MethodName+'"가 없습니다 (인자 '+mc.Args.Count.ToString+'개).');
+            aIL.Emit(OpCodes.Callvirt, _emi5);
+          end;
+        end
+        else raise new Exception('알 수 없는 변수 "'+mc.ObjName+'"');
       end
 
       else if e is TArrayIndexExprNode then
@@ -462,7 +493,7 @@ type
       et, at2: TVarType; fb: FieldBuilder; cn: string; vtVar: TVarType;
       eL, endL, ckL, bdL: &Label;
       extType: System.Type; propInfo: PropertyInfo; extFld: System.Reflection.FieldInfo;
-      setter, emi: MethodInfo;
+      setter, emi: MethodInfo; qfb: FieldBuilder; qTargetType: System.Type;
     begin
       if s is TWritelnStringStmtNode then
       begin
@@ -495,8 +526,32 @@ type
 
       else if s is TFieldAssignStmtNode then
       begin
-        // self.fieldName := 식  (지역 필드) 또는 외부 상속 타입의 속성/필드 설정
         fas:=TFieldAssignStmtNode(s);
+        if fas.Qualifier<>'' then
+        begin
+          // Qualifier.FieldName := 식  (예: Button1.Text := '...')
+          // Qualifier는 현재 클래스의 필드인 경우가 가장 흔하다 (지역/전역 변수도 지원).
+          if TryFindFieldBuilder(fCurClassName, fas.Qualifier, qfb) then
+          begin
+            aIL.Emit(OpCodes.Ldarg_0);
+            aIL.Emit(OpCodes.Ldfld, qfb);
+            EmitPropertyOrFieldSet(aIL, qfb.FieldType, fas.FieldName, fas.ValueExpr);
+          end
+          else if fLocals.ContainsKey(fas.Qualifier) or fGlobals.ContainsKey(fas.Qualifier) then
+          begin
+            cn:=GetVarClassName(fas.Qualifier);
+            if fLocals.ContainsKey(fas.Qualifier) then aIL.Emit(OpCodes.Ldloc, fLocals[fas.Qualifier])
+            else aIL.Emit(OpCodes.Ldloc, fGlobals[fas.Qualifier]);
+            if fBuiltTypes.ContainsKey(cn) then qTargetType:=fBuiltTypes[cn]
+            else if fTypeBuilders.ContainsKey(cn) then qTargetType:=fTypeBuilders[cn]
+            else raise new Exception('알 수 없는 타입 "'+cn+'" (변수 "'+fas.Qualifier+'")');
+            EmitPropertyOrFieldSet(aIL, qTargetType, fas.FieldName, fas.ValueExpr);
+          end
+          else
+            raise new Exception('알 수 없는 대상 "'+fas.Qualifier+'" — 필드/지역변수/전역변수가 아닙니다 (정적 멤버 대입은 아직 미지원).');
+        end
+        else
+        // self.fieldName := 식  (지역 필드) 또는 외부 상속 타입의 속성/필드 설정
         if TryFindFieldBuilder(fCurClassName, fas.FieldName, fb) then
         begin
           aIL.Emit(OpCodes.Ldarg_0); // self
@@ -590,6 +645,29 @@ type
             // void 메서드가 아닌 경우 반환값 버리기
             if imb.ReturnType<>typeof(System.Void) then
               aIL.Emit(OpCodes.Pop);
+          end;
+        end
+        else if TryFindFieldBuilder(fCurClassName, mcs.ObjName, qfb) then
+        begin
+          // Button1.Focus(); 처럼 필드를 통한 메서드 호출. 인자 0개면 프로퍼티
+          // 게터일 가능성도 먼저 확인한다 (문장 위치에서 값은 버림).
+          aIL.Emit(OpCodes.Ldarg_0);
+          aIL.Emit(OpCodes.Ldfld, qfb);
+          foreach ae in mcs.Args do EmitExpr(aIL, ae);
+          qTargetType:=qfb.FieldType;
+          var _getP:=qTargetType.GetProperty(mcs.MethodName);
+          if (mcs.Args.Count=0) and (_getP<>nil) and (_getP.GetGetMethod<>nil) then
+          begin
+            aIL.Emit(OpCodes.Callvirt, _getP.GetGetMethod);
+            aIL.Emit(OpCodes.Pop);
+          end
+          else
+          begin
+            emi:=ResolveMethodByArity(qTargetType, mcs.MethodName, mcs.Args.Count, false);
+            if emi=nil then
+              raise new Exception('타입 "'+qTargetType.FullName+'"에 메서드 "'+mcs.MethodName+'"가 없습니다 (인자 '+mcs.Args.Count.ToString+'개).');
+            aIL.Emit(OpCodes.Callvirt, emi);
+            if emi.ReturnType<>typeof(System.Void) then aIL.Emit(OpCodes.Pop);
           end;
         end
         else
@@ -835,6 +913,30 @@ type
       foreach mi in t.GetMethods(flags) do
         if (mi.Name=mname) and (mi.GetParameters.Length=argCount) then
         begin Result:=mi; exit; end;
+    end;
+
+    // aIL 스택에 target 참조가 이미 로드되어 있다고 가정하고, 그 위에
+    // targetType의 memberName 속성(setter)이나 필드에 valueExpr 값을 설정한다.
+    procedure EmitPropertyOrFieldSet(aIL: ILGenerator; targetType: System.Type; memberName: string; valueExpr: TExprNode);
+    var pi: PropertyInfo; fi: System.Reflection.FieldInfo; setr: MethodInfo;
+    begin
+      pi:=targetType.GetProperty(memberName);
+      if pi<>nil then
+      begin
+        setr:=pi.GetSetMethod;
+        if setr=nil then
+          raise new Exception('속성 "'+targetType.FullName+'.'+memberName+'"에 setter가 없습니다 (읽기 전용).');
+        EmitExpr(aIL, valueExpr);
+        aIL.Emit(OpCodes.Callvirt, setr);
+      end
+      else
+      begin
+        fi:=targetType.GetField(memberName);
+        if fi=nil then
+          raise new Exception('타입 "'+targetType.FullName+'"에 필드/속성 "'+memberName+'"가 없습니다.');
+        EmitExpr(aIL, valueExpr);
+        aIL.Emit(OpCodes.Stfld, fi);
+      end;
     end;
 
     // 필드 선언의 실제 CLR 타입을 결정한다 (기본 타입/지역 클래스/외부 타입 모두 포함)

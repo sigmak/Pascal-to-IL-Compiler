@@ -305,18 +305,30 @@ type
           end;
           var mname:=segs[segs.Count-1];
           var qualifier:=string.Join('.', segs.GetRange(0, segs.Count-1));
-          mcs:=new TMethodCallStmtNode(qualifier, mname);
-          if Cur.Kind=tkLParen then
+          if Cur.Kind=tkAssign then
           begin
-            fPos:=fPos+1;
-            if Cur.Kind<>tkRParen then
+            // Button1.Text := '...' 처럼 필드/전역변수/외부타입을 통한
+            // 한정(qualified) 속성·필드 대입. 대상이 무엇인지는 CodeGen이 판별한다.
+            fPos:=fPos+1; rhs:=ParseExpr;
+            var fas2:=new TFieldAssignStmtNode(mname, rhs);
+            fas2.Qualifier:=qualifier;
+            Result:=fas2;
+          end
+          else
+          begin
+            mcs:=new TMethodCallStmtNode(qualifier, mname);
+            if Cur.Kind=tkLParen then
             begin
-              mcs.Args.Add(ParseExpr);
-              while Cur.Kind=tkComma do begin fPos:=fPos+1; mcs.Args.Add(ParseExpr); end;
+              fPos:=fPos+1;
+              if Cur.Kind<>tkRParen then
+              begin
+                mcs.Args.Add(ParseExpr);
+                while Cur.Kind=tkComma do begin fPos:=fPos+1; mcs.Args.Add(ParseExpr); end;
+              end;
+              Expect(tkRParen);
             end;
-            Expect(tkRParen);
+            Result:=mcs;
           end;
-          Result:=mcs;
         end
 
         // 프로시저 호출

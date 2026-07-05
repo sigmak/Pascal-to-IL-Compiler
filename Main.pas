@@ -15,7 +15,7 @@ uses
 
 const
   TestSource =
-    'program FieldExternalTypeTest;' + #10 +
+    'program QualifiedFieldAccessTest;' + #10 +
     'type' + #10 +
     '  TMyForm = class(System.Windows.Forms.Form)' + #10 +
     '  public' + #10 +
@@ -26,7 +26,8 @@ const
     'procedure TMyForm.Setup;' + #10 +
     'begin' + #10 +
     '  Button1 := System.Windows.Forms.Button.Create;' + #10 +
-    '  writeln(''완료: 외부 타입 필드 선언 + 생성 성공 (예외 없음)'');' + #10 +
+    '  Button1.Text := ''Click me'';' + #10 +
+    '  writeln(Button1.Text);' + #10 +
     'end;' + #10 +
     '' + #10 +
     'var' + #10 +
@@ -42,7 +43,7 @@ var
   codegen: TCodeGenerator; outputName: string;
 
 begin
-  Writeln('=== Stage 18: 필드가 외부 타입을 가질 수 있도록 (Button1: System.Windows.Forms.Button) ===');
+  Writeln('=== Stage 19: 필드를 통한 한정(qualified) 속성 대입 (Button1.Text := ...) ===');
   Writeln('--- 입력 소스 ---'); Writeln(TestSource); Writeln;
 
   try
@@ -55,7 +56,7 @@ begin
     Writeln('[2/3] 구문분석 완료: 클래스 '+prog.ClassDecls.Count.ToString
       +'개, 메서드구현 '+prog.MethodImpls.Count.ToString+'개');
 
-    outputName:='FieldExternalType_Test_Stage18.exe';
+    outputName:='QualifiedFieldAccess_Test_Stage19.exe';
     codegen:=new TCodeGenerator(prog);
     codegen.AddReferenceAssembly('System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089');
     codegen.GenerateExe(outputName);
@@ -64,12 +65,12 @@ begin
     Writeln;
     Writeln('=====================================================');
     Writeln('성공! "'+outputName+'" 을 실행하면 다음이 출력되어야 합니다:');
-    Writeln('  완료: 외부 타입 필드 선언 + 생성 성공 (예외 없음)');
+    Writeln('  Click me');
+    Writeln('(Button1.Text에 쓴 값을 필드를 통해 다시 읽어온 것입니다)');
     Writeln('=====================================================');
     Writeln;
-    Writeln('참고: 아직 "Button1.Text := ...", "Button1.Click += ..." 처럼');
-    Writeln('필드를 통한 한정(qualified) 멤버 접근은 지원하지 않습니다.');
-    Writeln('(implicit self 접근만 지원 — 이건 Stage19에서 다룰 예정)');
+    Writeln('참고: 이벤트 구독(Button1.Click += ...)은 아직 지원하지 않습니다.');
+    Writeln('(대입/함수호출은 되지만 델리게이트 생성은 Stage20에서 다룰 예정)');
   except
     on E: Exception do
     begin
