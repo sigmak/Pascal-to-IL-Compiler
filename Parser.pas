@@ -161,7 +161,8 @@ type
         end
 
         // 점(.)으로 연결된 외부 타입의 .Create (예: System.Windows.Forms.Button.Create)
-        // fClassNames에 없는 식별자로 시작하고, 점이 여러 번 이어지다 마지막이 Create인 경우.
+        // 또는 TypeName(expr).member 캐스트 읽기 (예: System.Windows.Forms.Button(sender).Text)
+        // fClassNames에 없는 식별자로 시작하고, 점이 여러 번 이어지는 경우.
         else if (Cur.Kind=tkDot) then
         begin
           var savedPos3:=fPos; var segs2:=new List<string>; segs2.Add(t.Text);
@@ -173,9 +174,48 @@ type
             neo2.IsExternalType:=true;
             Result:=neo2;
           end
+          else if (Cur.Kind=tkLParen) and (segs2.Count>1) then
+          begin
+            // TypeName(expr).member 캐스트 읽기 패턴인지 확인해본다.
+            // segs2 전체가 사실 타입 이름이고, 괄호 안 인자(정확히 1개)가 캐스트 대상.
+            var savedPos5:=fPos;
+            fPos:=fPos+1; // '(' 소비
+            var castArgs2:=new List<TExprNode>;
+            if Cur.Kind<>tkRParen then
+            begin
+              castArgs2.Add(ParseExpr);
+              while Cur.Kind=tkComma do begin fPos:=fPos+1; castArgs2.Add(ParseExpr); end;
+            end;
+            Expect(tkRParen);
+            if (castArgs2.Count=1) and (Cur.Kind=tkDot) then
+            begin
+              var castType2:=string.Join('.', segs2);
+              var innerName2:='';
+              if castArgs2[0] is TVarRefNode then innerName2:=TVarRefNode(castArgs2[0]).VarName
+              else if castArgs2[0] is TFieldReadExprNode then innerName2:=TFieldReadExprNode(castArgs2[0]).FieldName
+              else raise new Exception('줄 '+Cur.Line.ToString+': 캐스트 대상은 단순 변수/필드 이름이어야 합니다');
+              fPos:=fPos+1; // '.' 소비
+              var member3:=Expect(tkIdent).Text;
+              var mc3:=new TMethodCallExprNode(innerName2, member3);
+              mc3.ObjCastType:=castType2;
+              if Cur.Kind=tkLParen then
+              begin
+                fPos:=fPos+1;
+                if Cur.Kind<>tkRParen then
+                begin
+                  mc3.Args.Add(ParseAddSub);
+                  while Cur.Kind=tkComma do begin fPos:=fPos+1; mc3.Args.Add(ParseAddSub); end;
+                end;
+                Expect(tkRParen);
+              end;
+              Result:=mc3;
+            end
+            else
+              raise new Exception('줄 '+Cur.Line.ToString+': "'+string.Join('.', segs2)+'(...)" 형태를 해석할 수 없습니다 (캐스트나 .Create가 아님)');
+          end
           else
           begin
-            // Create가 아니면 기존처럼 obj.Method 식으로 되돌린다 (한 단계만 지원)
+            // Create도 캐스트도 아니면 기존처럼 obj.Method 식으로 되돌린다 (한 단계만 지원)
             fPos:=savedPos3;
             fPos:=fPos+1; // '.' 소비
             var mname2:=Expect(tkIdent);

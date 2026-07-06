@@ -227,26 +227,30 @@ type
         var _mc4:=TMethodCallExprNode(e); var _qfb4: FieldBuilder;
         if fLocalClrTypes.ContainsKey(_mc4.ObjName) then
         begin
-          var _pi4b:=fLocalClrTypes[_mc4.ObjName].GetProperty(_mc4.MethodName);
+          var _effType4:=fLocalClrTypes[_mc4.ObjName];
+          if _mc4.ObjCastType<>'' then _effType4:=ResolveExternalType(_mc4.ObjCastType);
+          var _pi4b:=_effType4.GetProperty(_mc4.MethodName);
           if (_pi4b<>nil) and (_pi4b.PropertyType=typeof(string)) then Result:=vtString
           else
           begin
             // 프로퍼티가 아니면 메서드일 수 있으므로 실제 반환 타입을 확인한다.
             // (예: sender.ToString() → GetProperty는 nil이지만 메서드 반환타입은 string)
-            var _mi4b:=ResolveMethodByArity(fLocalClrTypes[_mc4.ObjName], _mc4.MethodName, _mc4.Args.Count, false);
+            var _mi4b:=ResolveMethodByArity(_effType4, _mc4.MethodName, _mc4.Args.Count, false);
             if (_mi4b<>nil) and (_mi4b.ReturnType=typeof(string)) then Result:=vtString
             else Result:=vtInteger;
           end;
         end
-        else if GetVarClassName(_mc4.ObjName)<>'' then
+        else if (_mc4.ObjCastType='') and (GetVarClassName(_mc4.ObjName)<>'') then
           Result:=FindMethodReturnType(GetVarClassName(_mc4.ObjName), _mc4.MethodName)
         else if TryFindFieldBuilder(fCurClassName, _mc4.ObjName, _qfb4) then
         begin
-          var _pi4:=_qfb4.FieldType.GetProperty(_mc4.MethodName);
+          var _effType4b:=_qfb4.FieldType;
+          if _mc4.ObjCastType<>'' then _effType4b:=ResolveExternalType(_mc4.ObjCastType);
+          var _pi4:=_effType4b.GetProperty(_mc4.MethodName);
           if (_pi4<>nil) and (_pi4.PropertyType=typeof(string)) then Result:=vtString
           else
           begin
-            var _mi4:=ResolveMethodByArity(_qfb4.FieldType, _mc4.MethodName, _mc4.Args.Count, false);
+            var _mi4:=ResolveMethodByArity(_effType4b, _mc4.MethodName, _mc4.Args.Count, false);
             if (_mi4<>nil) and (_mi4.ReturnType=typeof(string)) then Result:=vtString
             else Result:=vtInteger;
           end;
@@ -368,8 +372,13 @@ type
           // sender/e 같은, 외부(또는 객체) 타입 매개변수/지역변수를 통한 접근.
           // 우리가 만든 클래스가 아니라 Reflection으로 속성/메서드를 찾는다.
           aIL.Emit(OpCodes.Ldloc, fLocals[mc.ObjName]);
-          foreach ae in mc.Args do EmitExpr(aIL, ae);
           var _qType2:=fLocalClrTypes[mc.ObjName];
+          if mc.ObjCastType<>'' then
+          begin
+            _qType2:=ResolveExternalType(mc.ObjCastType);
+            aIL.Emit(OpCodes.Castclass, _qType2);
+          end;
+          foreach ae in mc.Args do EmitExpr(aIL, ae);
           var _pi6:=_qType2.GetProperty(mc.MethodName);
           if (mc.Args.Count=0) and (_pi6<>nil) and (_pi6.GetGetMethod<>nil) then
             aIL.Emit(OpCodes.Callvirt, _pi6.GetGetMethod)
@@ -407,8 +416,13 @@ type
           // Button1.Text (필드를 통한 속성 읽기) 또는 Button1.SomeMethod() (필드를 통한 메서드 호출)
           aIL.Emit(OpCodes.Ldarg_0);
           aIL.Emit(OpCodes.Ldfld, fb);
-          foreach ae in mc.Args do EmitExpr(aIL, ae);
           var _qType:=fb.FieldType;
+          if mc.ObjCastType<>'' then
+          begin
+            _qType:=ResolveExternalType(mc.ObjCastType);
+            aIL.Emit(OpCodes.Castclass, _qType);
+          end;
+          foreach ae in mc.Args do EmitExpr(aIL, ae);
           var _pi5:=_qType.GetProperty(mc.MethodName);
           if (mc.Args.Count=0) and (_pi5<>nil) and (_pi5.GetGetMethod<>nil) then
             aIL.Emit(OpCodes.Callvirt, _pi5.GetGetMethod)

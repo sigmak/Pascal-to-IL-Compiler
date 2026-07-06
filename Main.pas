@@ -15,7 +15,7 @@ uses
 
 const
   TestSource =
-    'program CastTest;' + #10 +
+    'program ExprCastTest;' + #10 +
     'type' + #10 +
     '  TMyForm = class(System.Windows.Forms.Form)' + #10 +
     '  public' + #10 +
@@ -27,7 +27,7 @@ const
     'procedure TMyForm.Button1_Click(sender: System.Object; e: System.EventArgs);' + #10 +
     'begin' + #10 +
     '  System.Windows.Forms.Button(sender).Text := ''클릭됨!'';' + #10 +
-    '  writeln(''완료: 캐스트 통한 Text 설정 성공 (예외 없음)'');' + #10 +
+    '  writeln(''식 문맥 캐스트 읽기: '' + System.Windows.Forms.Button(sender).Text);' + #10 +
     'end;' + #10 +
     '' + #10 +
     'procedure TMyForm.Setup;' + #10 +
@@ -35,7 +35,6 @@ const
     '  Button1 := System.Windows.Forms.Button.Create;' + #10 +
     '  Button1.Click += Button1_Click;' + #10 +
     '  Button1_Click(Button1, System.EventArgs.Create);' + #10 +
-    '  writeln(''Button1.Text (필드로 재확인) = '' + Button1.Text);' + #10 +
     'end;' + #10 +
     '' + #10 +
     'var' + #10 +
@@ -51,7 +50,7 @@ var
   codegen: TCodeGenerator; outputName: string;
 
 begin
-  Writeln('=== Stage 22: 캐스팅 — System.Windows.Forms.Button(sender).Text := ... ===');
+  Writeln('=== Stage 23: 식(expression) 문맥에서의 캐스팅 읽기 ===');
   Writeln('--- 입력 소스 ---'); Writeln(TestSource); Writeln;
 
   try
@@ -64,7 +63,7 @@ begin
     Writeln('[2/3] 구문분석 완료: 클래스 '+prog.ClassDecls.Count.ToString
       +'개, 메서드구현 '+prog.MethodImpls.Count.ToString+'개');
 
-    outputName:='Cast_Test_Stage22.exe';
+    outputName:='ExprCast_Test_Stage23.exe';
     codegen:=new TCodeGenerator(prog);
     codegen.AddReferenceAssembly('System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089');
     codegen.GenerateExe(outputName);
@@ -73,13 +72,8 @@ begin
     Writeln;
     Writeln('=====================================================');
     Writeln('성공! "'+outputName+'" 을 실행하면 다음이 출력되어야 합니다:');
-    Writeln('  완료: 캐스트 통한 Text 설정 성공 (예외 없음)');
-    Writeln('  Button1.Text (필드로 재확인) = 클릭됨!');
+    Writeln('  식 문맥 캐스트 읽기: 클릭됨!');
     Writeln('=====================================================');
-    Writeln;
-    Writeln('참고: 캐스트는 지금 "쓰기/메서드 호출/이벤트 구독" 문장에서만');
-    Writeln('지원됩니다. writeln(TButton(sender).Text) 처럼 식(expression)');
-    Writeln('문맥에서 캐스트를 바로 쓰는 것은 아직 미지원입니다.');
   except
     on E: Exception do
     begin
