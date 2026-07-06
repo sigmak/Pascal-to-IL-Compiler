@@ -28,6 +28,7 @@ type
     // 현재 함수/메서드 로컬 변수
     fLocals:      Dictionary<string, LocalBuilder>;
     fLocalTypes:  Dictionary<string, TVarType>;
+    fLocalClrTypes: Dictionary<string, System.Type>; // object/외부타입 지역변수·매개변수의 실제 CLR 타입
 
     // 일반 static 함수/프로시저
     fMethods:     Dictionary<string, MethodBuilder>;
@@ -224,13 +225,31 @@ type
       else if e is TMethodCallExprNode then
       begin
         var _mc4:=TMethodCallExprNode(e); var _qfb4: FieldBuilder;
-        if GetVarClassName(_mc4.ObjName)<>'' then
+        if fLocalClrTypes.ContainsKey(_mc4.ObjName) then
+        begin
+          var _pi4b:=fLocalClrTypes[_mc4.ObjName].GetProperty(_mc4.MethodName);
+          if (_pi4b<>nil) and (_pi4b.PropertyType=typeof(string)) then Result:=vtString
+          else
+          begin
+            // 프로퍼티가 아니면 메서드일 수 있으므로 실제 반환 타입을 확인한다.
+            // (예: sender.ToString() → GetProperty는 nil이지만 메서드 반환타입은 string)
+            var _mi4b:=ResolveMethodByArity(fLocalClrTypes[_mc4.ObjName], _mc4.MethodName, _mc4.Args.Count, false);
+            if (_mi4b<>nil) and (_mi4b.ReturnType=typeof(string)) then Result:=vtString
+            else Result:=vtInteger;
+          end;
+        end
+        else if GetVarClassName(_mc4.ObjName)<>'' then
           Result:=FindMethodReturnType(GetVarClassName(_mc4.ObjName), _mc4.MethodName)
         else if TryFindFieldBuilder(fCurClassName, _mc4.ObjName, _qfb4) then
         begin
           var _pi4:=_qfb4.FieldType.GetProperty(_mc4.MethodName);
           if (_pi4<>nil) and (_pi4.PropertyType=typeof(string)) then Result:=vtString
-          else Result:=vtInteger;
+          else
+          begin
+            var _mi4:=ResolveMethodByArity(_qfb4.FieldType, _mc4.MethodName, _mc4.Args.Count, false);
+            if (_mi4<>nil) and (_mi4.ReturnType=typeof(string)) then Result:=vtString
+            else Result:=vtInteger;
+          end;
         end
         else Result:=vtInteger;
       end
@@ -343,7 +362,26 @@ type
       begin
         // c.GetValue → Ldloc c + Call TCounter::GetValue
         mc:=TMethodCallExprNode(e);
-        if fLocals.ContainsKey(mc.ObjName) or fGlobals.ContainsKey(mc.ObjName) then
+        if (fLocals.ContainsKey(mc.ObjName) or fGlobals.ContainsKey(mc.ObjName))
+           and fLocalClrTypes.ContainsKey(mc.ObjName) then
+        begin
+          // sender/e 같은, 외부(또는 객체) 타입 매개변수/지역변수를 통한 접근.
+          // 우리가 만든 클래스가 아니라 Reflection으로 속성/메서드를 찾는다.
+          aIL.Emit(OpCodes.Ldloc, fLocals[mc.ObjName]);
+          foreach ae in mc.Args do EmitExpr(aIL, ae);
+          var _qType2:=fLocalClrTypes[mc.ObjName];
+          var _pi6:=_qType2.GetProperty(mc.MethodName);
+          if (mc.Args.Count=0) and (_pi6<>nil) and (_pi6.GetGetMethod<>nil) then
+            aIL.Emit(OpCodes.Callvirt, _pi6.GetGetMethod)
+          else
+          begin
+            var _emi6:=ResolveMethodByArity(_qType2, mc.MethodName, mc.Args.Count, false);
+            if _emi6=nil then
+              raise new Exception('타입 "'+_qType2.FullName+'"에 메서드 "'+mc.MethodName+'"가 없습니다 (인자 '+mc.Args.Count.ToString+'개).');
+            aIL.Emit(OpCodes.Callvirt, _emi6);
+          end;
+        end
+        else if fLocals.ContainsKey(mc.ObjName) or fGlobals.ContainsKey(mc.ObjName) then
         begin
           cn:=GetVarClassName(mc.ObjName);
           vtVar:=GetVarType(mc.ObjName);
@@ -539,6 +577,13 @@ type
             aIL.Emit(OpCodes.Ldfld, qfb);
             EmitPropertyOrFieldSet(aIL, qfb.FieldType, fas.FieldName, fas.ValueExpr);
           end
+          else if (fLocals.ContainsKey(fas.Qualifier) or fGlobals.ContainsKey(fas.Qualifier))
+                  and fLocalClrTypes.ContainsKey(fas.Qualifier) then
+          begin
+            // 매개변수/지역변수가 외부(객체) 타입인 경우 — Reflection 기반 처리
+            aIL.Emit(OpCodes.Ldloc, fLocals[fas.Qualifier]);
+            EmitPropertyOrFieldSet(aIL, fLocalClrTypes[fas.Qualifier], fas.FieldName, fas.ValueExpr);
+          end
           else if fLocals.ContainsKey(fas.Qualifier) or fGlobals.ContainsKey(fas.Qualifier) then
           begin
             cn:=GetVarClassName(fas.Qualifier);
@@ -618,6 +663,28 @@ type
             emi:=ResolveMethodByArity(extType, mcs.MethodName, mcs.Args.Count, false);
             if emi=nil then
               raise new Exception('외부 타입 "'+extType.FullName+'"에 메서드 "'+mcs.MethodName+'"가 없습니다 (인자 '+mcs.Args.Count.ToString+'개).');
+            aIL.Emit(OpCodes.Callvirt, emi);
+            if emi.ReturnType<>typeof(System.Void) then aIL.Emit(OpCodes.Pop);
+          end;
+        end
+        else if (fLocals.ContainsKey(mcs.ObjName) or fGlobals.ContainsKey(mcs.ObjName))
+                and fLocalClrTypes.ContainsKey(mcs.ObjName) then
+        begin
+          // sender.Focus(); 같은, 외부(객체) 타입 매개변수/지역변수를 통한 호출.
+          aIL.Emit(OpCodes.Ldloc, fLocals[mcs.ObjName]);
+          foreach ae in mcs.Args do EmitExpr(aIL, ae);
+          qTargetType:=fLocalClrTypes[mcs.ObjName];
+          var _getP2:=qTargetType.GetProperty(mcs.MethodName);
+          if (mcs.Args.Count=0) and (_getP2<>nil) and (_getP2.GetGetMethod<>nil) then
+          begin
+            aIL.Emit(OpCodes.Callvirt, _getP2.GetGetMethod);
+            aIL.Emit(OpCodes.Pop);
+          end
+          else
+          begin
+            emi:=ResolveMethodByArity(qTargetType, mcs.MethodName, mcs.Args.Count, false);
+            if emi=nil then
+              raise new Exception('타입 "'+qTargetType.FullName+'"에 메서드 "'+mcs.MethodName+'"가 없습니다 (인자 '+mcs.Args.Count.ToString+'개).');
             aIL.Emit(OpCodes.Callvirt, emi);
             if emi.ReturnType<>typeof(System.Void) then aIL.Emit(OpCodes.Pop);
           end;
@@ -1110,6 +1177,7 @@ type
       i: integer; p: string;
       svLocals: Dictionary<string, LocalBuilder>;
       svLocalTypes: Dictionary<string, TVarType>;
+      svLocalClrTypes: Dictionary<string, System.Type>;
       svResult: LocalBuilder; svResultType: TVarType;
       svCurClass: string; st: TStmtNode;
     begin
@@ -1120,12 +1188,13 @@ type
       mb:=fInstanceMethods[impl.ClassName][impl.MethodName];
       il:=mb.GetILGenerator;
 
-      svLocals:=fLocals; svLocalTypes:=fLocalTypes;
+      svLocals:=fLocals; svLocalTypes:=fLocalTypes; svLocalClrTypes:=fLocalClrTypes;
       svResult:=fResultLocal; svResultType:=fResultType;
       svCurClass:=fCurClassName;
 
       fLocals:=new Dictionary<string, LocalBuilder>;
       fLocalTypes:=new Dictionary<string, TVarType>;
+      fLocalClrTypes:=new Dictionary<string, System.Type>;
       fCurClassName:=impl.ClassName;
 
       if impl.IsFunction then
@@ -1150,6 +1219,7 @@ type
           pClrType:=fMethodParamClrTypes[impl.ClassName][impl.MethodName][i];
         var loc:=il.DeclareLocal(pClrType);
         fLocals[p]:=loc; fLocalTypes[p]:=vtInteger;
+        if pClrType<>typeof(integer) then fLocalClrTypes[p]:=pClrType;
         // self=Ldarg_0 이므로 매개변수는 Ldarg_1부터
         if i=0 then il.Emit(OpCodes.Ldarg_1)
         else if i=1 then il.Emit(OpCodes.Ldarg_2)
@@ -1166,7 +1236,7 @@ type
       end;
       il.Emit(OpCodes.Ret);
 
-      fLocals:=svLocals; fLocalTypes:=svLocalTypes;
+      fLocals:=svLocals; fLocalTypes:=svLocalTypes; fLocalClrTypes:=svLocalClrTypes;
       fResultLocal:=svResult; fResultType:=svResultType;
       fCurClassName:=svCurClass;
     end;
@@ -1236,6 +1306,7 @@ type
       fGlobalClass:=new Dictionary<string, string>;
       fLocals:=new Dictionary<string, LocalBuilder>;
       fLocalTypes:=new Dictionary<string, TVarType>;
+      fLocalClrTypes:=new Dictionary<string, System.Type>;
       fMethods:=new Dictionary<string, MethodBuilder>;
       fTypeBuilders:=new Dictionary<string, TypeBuilder>;
       fBuiltTypes:=new Dictionary<string, System.Type>;
