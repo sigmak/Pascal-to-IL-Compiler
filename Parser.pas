@@ -352,18 +352,71 @@ type
           end
           else
           begin
-            mcs:=new TMethodCallStmtNode(qualifier, mname);
+            // 괄호를 먼저 파싱해본다 — 정적 호출의 인자일 수도, 캐스트 대상(단일 인자)일 수도 있다.
+            var callArgs:=new List<TExprNode>; var hadParen:=false;
             if Cur.Kind=tkLParen then
             begin
-              fPos:=fPos+1;
+              hadParen:=true; fPos:=fPos+1;
               if Cur.Kind<>tkRParen then
               begin
-                mcs.Args.Add(ParseExpr);
-                while Cur.Kind=tkComma do begin fPos:=fPos+1; mcs.Args.Add(ParseExpr); end;
+                callArgs.Add(ParseExpr);
+                while Cur.Kind=tkComma do begin fPos:=fPos+1; callArgs.Add(ParseExpr); end;
               end;
               Expect(tkRParen);
             end;
-            Result:=mcs;
+
+            if hadParen and (callArgs.Count=1) and (Cur.Kind=tkDot) then
+            begin
+              // TypeName(expr).member ...  캐스트 패턴으로 재해석.
+              // qualifier+'.'+mname 전체가 사실 타입 이름이었고, callArgs[0]이 캐스트 대상.
+              var castType:=qualifier+'.'+mname;
+              var innerName:='';
+              if callArgs[0] is TVarRefNode then innerName:=TVarRefNode(callArgs[0]).VarName
+              else if callArgs[0] is TFieldReadExprNode then innerName:=TFieldReadExprNode(callArgs[0]).FieldName
+              else raise new Exception('줄 '+Cur.Line.ToString+': 캐스트 대상은 단순 변수/필드 이름이어야 합니다');
+
+              fPos:=fPos+1; // '.' 소비
+              var member2:=Expect(tkIdent).Text;
+
+              if Cur.Kind=tkAssign then
+              begin
+                fPos:=fPos+1; rhs:=ParseExpr;
+                var fas3:=new TFieldAssignStmtNode(member2, rhs);
+                fas3.Qualifier:=innerName; fas3.QualifierCastType:=castType;
+                Result:=fas3;
+              end
+              else if Cur.Kind=tkPlusAssign then
+              begin
+                fPos:=fPos+1;
+                var handlerName2:=Expect(tkIdent).Text;
+                var evs2:=new TEventSubscribeStmtNode(innerName, member2, handlerName2);
+                evs2.QualifierCastType:=castType;
+                Result:=evs2;
+              end
+              else
+              begin
+                var mcs2:=new TMethodCallStmtNode(innerName, member2);
+                mcs2.ObjCastType:=castType;
+                if Cur.Kind=tkLParen then
+                begin
+                  fPos:=fPos+1;
+                  if Cur.Kind<>tkRParen then
+                  begin
+                    mcs2.Args.Add(ParseExpr);
+                    while Cur.Kind=tkComma do begin fPos:=fPos+1; mcs2.Args.Add(ParseExpr); end;
+                  end;
+                  Expect(tkRParen);
+                end;
+                Result:=mcs2;
+              end;
+            end
+            else
+            begin
+              // 기존처럼: 정적 호출 또는 필드/변수 경유 메서드 호출
+              mcs:=new TMethodCallStmtNode(qualifier, mname);
+              foreach var a5 in callArgs do mcs.Args.Add(a5);
+              Result:=mcs;
+            end;
           end;
         end
 

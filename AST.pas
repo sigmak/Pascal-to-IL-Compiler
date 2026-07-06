@@ -64,8 +64,9 @@ type
   // c.GetValue, c.Init(10) → 인스턴스 메서드 호출 (반환값 있음 → 식)
   TMethodCallExprNode = class(TExprNode)
   public ObjName: string; MethodName: string; Args: List<TExprNode>;
+    ObjCastType: string; // ''이 아니면 ObjName을 이 타입으로 캐스트한 뒤 멤버에 접근
     constructor Create(obj, mth: string);
-    begin ObjName:=obj; MethodName:=mth; Args:=new List<TExprNode>; end;
+    begin ObjName:=obj; MethodName:=mth; Args:=new List<TExprNode>; ObjCastType:=''; end;
   end;
 
   // self.fValue 읽기 (메서드 본문 안에서 필드 참조)
@@ -173,8 +174,9 @@ type
   // c.Init(10); 인스턴스 메서드 호출 (반환값 없는 프로시저)
   TMethodCallStmtNode = class(TStmtNode)
   public ObjName: string; MethodName: string; Args: List<TExprNode>;
+    ObjCastType: string; // ''이 아니면 ObjName을 이 타입으로 캐스트한 뒤 멤버에 접근 (예: TButton(sender).Focus)
     constructor Create(obj, mth: string);
-    begin ObjName:=obj; MethodName:=mth; Args:=new List<TExprNode>; end;
+    begin ObjName:=obj; MethodName:=mth; Args:=new List<TExprNode>; ObjCastType:=''; end;
   end;
 
   // self.fValue := 식  (메서드 본문 안에서 필드 쓰기)
@@ -182,16 +184,18 @@ type
   // 접근하는 대상의 속성/필드 (예: Button1.Text := '...' → Qualifier='Button1', FieldName='Text')
   TFieldAssignStmtNode = class(TStmtNode)
   public FieldName: string; ValueExpr: TExprNode; Qualifier: string;
+    QualifierCastType: string; // ''이 아니면 Qualifier를 이 타입으로 캐스트 (예: TButton(sender).Text := ...)
     constructor Create(f: string; v: TExprNode);
-    begin FieldName:=f; ValueExpr:=v; Qualifier:=''; end;
+    begin FieldName:=f; ValueExpr:=v; Qualifier:=''; QualifierCastType:=''; end;
   end;
 
   // Qualifier.EventName += HandlerName;  (예: Button1.Click += Button1_Click;)
   // HandlerName은 현재 클래스의 인스턴스 메서드 이름이어야 한다 (델리게이트로 감싸짐).
   TEventSubscribeStmtNode = class(TStmtNode)
   public Qualifier: string; EventName: string; HandlerName: string;
+    QualifierCastType: string; // ''이 아니면 Qualifier를 이 타입으로 캐스트
     constructor Create(q, ev, h: string);
-    begin Qualifier:=q; EventName:=ev; HandlerName:=h; end;
+    begin Qualifier:=q; EventName:=ev; HandlerName:=h; QualifierCastType:=''; end;
   end;
 
   // try ... except on E: ExType do <stmt> end

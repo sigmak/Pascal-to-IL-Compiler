@@ -575,14 +575,26 @@ type
           begin
             aIL.Emit(OpCodes.Ldarg_0);
             aIL.Emit(OpCodes.Ldfld, qfb);
-            EmitPropertyOrFieldSet(aIL, qfb.FieldType, fas.FieldName, fas.ValueExpr);
+            qTargetType:=qfb.FieldType;
+            if fas.QualifierCastType<>'' then
+            begin
+              qTargetType:=ResolveExternalType(fas.QualifierCastType);
+              aIL.Emit(OpCodes.Castclass, qTargetType);
+            end;
+            EmitPropertyOrFieldSet(aIL, qTargetType, fas.FieldName, fas.ValueExpr);
           end
           else if (fLocals.ContainsKey(fas.Qualifier) or fGlobals.ContainsKey(fas.Qualifier))
                   and fLocalClrTypes.ContainsKey(fas.Qualifier) then
           begin
             // 매개변수/지역변수가 외부(객체) 타입인 경우 — Reflection 기반 처리
             aIL.Emit(OpCodes.Ldloc, fLocals[fas.Qualifier]);
-            EmitPropertyOrFieldSet(aIL, fLocalClrTypes[fas.Qualifier], fas.FieldName, fas.ValueExpr);
+            qTargetType:=fLocalClrTypes[fas.Qualifier];
+            if fas.QualifierCastType<>'' then
+            begin
+              qTargetType:=ResolveExternalType(fas.QualifierCastType);
+              aIL.Emit(OpCodes.Castclass, qTargetType);
+            end;
+            EmitPropertyOrFieldSet(aIL, qTargetType, fas.FieldName, fas.ValueExpr);
           end
           else if fLocals.ContainsKey(fas.Qualifier) or fGlobals.ContainsKey(fas.Qualifier) then
           begin
@@ -592,6 +604,11 @@ type
             if fBuiltTypes.ContainsKey(cn) then qTargetType:=fBuiltTypes[cn]
             else if fTypeBuilders.ContainsKey(cn) then qTargetType:=fTypeBuilders[cn]
             else raise new Exception('알 수 없는 타입 "'+cn+'" (변수 "'+fas.Qualifier+'")');
+            if fas.QualifierCastType<>'' then
+            begin
+              qTargetType:=ResolveExternalType(fas.QualifierCastType);
+              aIL.Emit(OpCodes.Castclass, qTargetType);
+            end;
             EmitPropertyOrFieldSet(aIL, qTargetType, fas.FieldName, fas.ValueExpr);
           end
           else
@@ -672,8 +689,13 @@ type
         begin
           // sender.Focus(); 같은, 외부(객체) 타입 매개변수/지역변수를 통한 호출.
           aIL.Emit(OpCodes.Ldloc, fLocals[mcs.ObjName]);
-          foreach ae in mcs.Args do EmitExpr(aIL, ae);
           qTargetType:=fLocalClrTypes[mcs.ObjName];
+          if mcs.ObjCastType<>'' then
+          begin
+            qTargetType:=ResolveExternalType(mcs.ObjCastType);
+            aIL.Emit(OpCodes.Castclass, qTargetType);
+          end;
+          foreach ae in mcs.Args do EmitExpr(aIL, ae);
           var _getP2:=qTargetType.GetProperty(mcs.MethodName);
           if (mcs.Args.Count=0) and (_getP2<>nil) and (_getP2.GetGetMethod<>nil) then
           begin
@@ -722,8 +744,13 @@ type
           // 게터일 가능성도 먼저 확인한다 (문장 위치에서 값은 버림).
           aIL.Emit(OpCodes.Ldarg_0);
           aIL.Emit(OpCodes.Ldfld, qfb);
-          foreach ae in mcs.Args do EmitExpr(aIL, ae);
           qTargetType:=qfb.FieldType;
+          if mcs.ObjCastType<>'' then
+          begin
+            qTargetType:=ResolveExternalType(mcs.ObjCastType);
+            aIL.Emit(OpCodes.Castclass, qTargetType);
+          end;
+          foreach ae in mcs.Args do EmitExpr(aIL, ae);
           var _getP:=qTargetType.GetProperty(mcs.MethodName);
           if (mcs.Args.Count=0) and (_getP<>nil) and (_getP.GetGetMethod<>nil) then
           begin
@@ -767,15 +794,25 @@ type
         end
         else if fLocals.ContainsKey(evs.Qualifier) or fGlobals.ContainsKey(evs.Qualifier) then
         begin
-          cn:=GetVarClassName(evs.Qualifier);
           if fLocals.ContainsKey(evs.Qualifier) then aIL.Emit(OpCodes.Ldloc, fLocals[evs.Qualifier])
           else aIL.Emit(OpCodes.Ldloc, fGlobals[evs.Qualifier]);
-          if fBuiltTypes.ContainsKey(cn) then qTargetType:=fBuiltTypes[cn]
-          else if fTypeBuilders.ContainsKey(cn) then qTargetType:=fTypeBuilders[cn]
-          else raise new Exception('알 수 없는 타입 "'+cn+'" (변수 "'+evs.Qualifier+'")');
+          if fLocalClrTypes.ContainsKey(evs.Qualifier) then qTargetType:=fLocalClrTypes[evs.Qualifier]
+          else
+          begin
+            cn:=GetVarClassName(evs.Qualifier);
+            if fBuiltTypes.ContainsKey(cn) then qTargetType:=fBuiltTypes[cn]
+            else if fTypeBuilders.ContainsKey(cn) then qTargetType:=fTypeBuilders[cn]
+            else raise new Exception('알 수 없는 타입 "'+cn+'" (변수 "'+evs.Qualifier+'")');
+          end;
         end
         else
           raise new Exception('알 수 없는 대상 "'+evs.Qualifier+'" — 필드/지역변수/전역변수가 아닙니다.');
+
+        if evs.QualifierCastType<>'' then
+        begin
+          qTargetType:=ResolveExternalType(evs.QualifierCastType);
+          aIL.Emit(OpCodes.Castclass, qTargetType);
+        end;
 
         // 2) 이벤트 정보 조회 (예: Click → EventHandler 델리게이트 타입)
         evInfo:=qTargetType.GetEvent(evs.EventName);

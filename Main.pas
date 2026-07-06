@@ -15,21 +15,19 @@ uses
 
 const
   TestSource =
-    'program HandlerParamsTest;' + #10 +
+    'program CastTest;' + #10 +
     'type' + #10 +
     '  TMyForm = class(System.Windows.Forms.Form)' + #10 +
     '  public' + #10 +
     '    Button1: System.Windows.Forms.Button;' + #10 +
-    '    ClickCount: integer;' + #10 +
     '    procedure Setup;' + #10 +
     '    procedure Button1_Click(sender: System.Object; e: System.EventArgs);' + #10 +
     '  end;' + #10 +
     '' + #10 +
     'procedure TMyForm.Button1_Click(sender: System.Object; e: System.EventArgs);' + #10 +
     'begin' + #10 +
-    '  ClickCount := ClickCount + 1;' + #10 +
-    '  writeln(''핸들러 호출됨. sender.ToString = '' + sender.ToString);' + #10 +
-    '  writeln(''ClickCount='' + IntToStr(ClickCount));' + #10 +
+    '  System.Windows.Forms.Button(sender).Text := ''클릭됨!'';' + #10 +
+    '  writeln(''완료: 캐스트 통한 Text 설정 성공 (예외 없음)'');' + #10 +
     'end;' + #10 +
     '' + #10 +
     'procedure TMyForm.Setup;' + #10 +
@@ -37,7 +35,7 @@ const
     '  Button1 := System.Windows.Forms.Button.Create;' + #10 +
     '  Button1.Click += Button1_Click;' + #10 +
     '  Button1_Click(Button1, System.EventArgs.Create);' + #10 +
-    '  writeln(''완료: 핸들러에서 sender 매개변수 사용 성공'');' + #10 +
+    '  writeln(''Button1.Text (필드로 재확인) = '' + Button1.Text);' + #10 +
     'end;' + #10 +
     '' + #10 +
     'var' + #10 +
@@ -53,7 +51,7 @@ var
   codegen: TCodeGenerator; outputName: string;
 
 begin
-  Writeln('=== Stage 21: 핸들러에서 sender/e 매개변수 실제 사용 ===');
+  Writeln('=== Stage 22: 캐스팅 — System.Windows.Forms.Button(sender).Text := ... ===');
   Writeln('--- 입력 소스 ---'); Writeln(TestSource); Writeln;
 
   try
@@ -66,7 +64,7 @@ begin
     Writeln('[2/3] 구문분석 완료: 클래스 '+prog.ClassDecls.Count.ToString
       +'개, 메서드구현 '+prog.MethodImpls.Count.ToString+'개');
 
-    outputName:='HandlerParams_Test_Stage21.exe';
+    outputName:='Cast_Test_Stage22.exe';
     codegen:=new TCodeGenerator(prog);
     codegen.AddReferenceAssembly('System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089');
     codegen.GenerateExe(outputName);
@@ -74,11 +72,14 @@ begin
 
     Writeln;
     Writeln('=====================================================');
-    Writeln('성공! "'+outputName+'" 을 실행하면 다음과 비슷하게 출력됩니다:');
-    Writeln('  핸들러 호출됨. sender.ToString = System.Windows.Forms.Button, Text:');
-    Writeln('  ClickCount=1');
-    Writeln('  완료: 핸들러에서 sender 매개변수 사용 성공');
+    Writeln('성공! "'+outputName+'" 을 실행하면 다음이 출력되어야 합니다:');
+    Writeln('  완료: 캐스트 통한 Text 설정 성공 (예외 없음)');
+    Writeln('  Button1.Text (필드로 재확인) = 클릭됨!');
     Writeln('=====================================================');
+    Writeln;
+    Writeln('참고: 캐스트는 지금 "쓰기/메서드 호출/이벤트 구독" 문장에서만');
+    Writeln('지원됩니다. writeln(TButton(sender).Text) 처럼 식(expression)');
+    Writeln('문맥에서 캐스트를 바로 쓰는 것은 아직 미지원입니다.');
   except
     on E: Exception do
     begin
