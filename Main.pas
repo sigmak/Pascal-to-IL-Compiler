@@ -15,7 +15,7 @@ uses
 
 const
   TestSource =
-    'program ExprCastTest;' + #10 +
+    'program StaticMemberTest;' + #10 +
     'type' + #10 +
     '  TMyForm = class(System.Windows.Forms.Form)' + #10 +
     '  public' + #10 +
@@ -26,15 +26,15 @@ const
     '' + #10 +
     'procedure TMyForm.Button1_Click(sender: System.Object; e: System.EventArgs);' + #10 +
     'begin' + #10 +
-    '  System.Windows.Forms.Button(sender).Text := ''클릭됨!'';' + #10 +
-    '  writeln(''식 문맥 캐스트 읽기: '' + System.Windows.Forms.Button(sender).Text);' + #10 +
+    '  writeln(''핸들러 호출됨 (정적 속성으로 만든 EventArgs 사용)'');' + #10 +
     'end;' + #10 +
     '' + #10 +
     'procedure TMyForm.Setup;' + #10 +
     'begin' + #10 +
     '  Button1 := System.Windows.Forms.Button.Create;' + #10 +
     '  Button1.Click += Button1_Click;' + #10 +
-    '  Button1_Click(Button1, System.EventArgs.Create);' + #10 +
+    '  Button1_Click(Button1, System.EventArgs.Empty);' + #10 +
+    '  writeln(''완료: 정적 필드/속성(EventArgs.Empty) 접근 성공'');' + #10 +
     'end;' + #10 +
     '' + #10 +
     'var' + #10 +
@@ -50,7 +50,7 @@ var
   codegen: TCodeGenerator; outputName: string;
 
 begin
-  Writeln('=== Stage 23: 식(expression) 문맥에서의 캐스팅 읽기 ===');
+  Writeln('=== Stage 24: 정적 필드/속성 접근 (System.EventArgs.Empty) ===');
   Writeln('--- 입력 소스 ---'); Writeln(TestSource); Writeln;
 
   try
@@ -63,7 +63,7 @@ begin
     Writeln('[2/3] 구문분석 완료: 클래스 '+prog.ClassDecls.Count.ToString
       +'개, 메서드구현 '+prog.MethodImpls.Count.ToString+'개');
 
-    outputName:='ExprCast_Test_Stage23.exe';
+    outputName:='StaticMember_Test_Stage24.exe';
     codegen:=new TCodeGenerator(prog);
     codegen.AddReferenceAssembly('System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089');
     codegen.GenerateExe(outputName);
@@ -72,8 +72,11 @@ begin
     Writeln;
     Writeln('=====================================================');
     Writeln('성공! "'+outputName+'" 을 실행하면 다음이 출력되어야 합니다:');
-    Writeln('  식 문맥 캐스트 읽기: 클릭됨!');
+    Writeln('  핸들러 호출됨 (정적 속성으로 만든 EventArgs 사용)');
+    Writeln('  완료: 정적 필드/속성(EventArgs.Empty) 접근 성공');
     Writeln('=====================================================');
+    Writeln;
+    Writeln('참고: 정적 필드/속성은 읽기만 지원합니다 (쓰기는 아직 미지원).');
   except
     on E: Exception do
     begin

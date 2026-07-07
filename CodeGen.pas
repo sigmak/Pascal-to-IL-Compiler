@@ -259,6 +259,20 @@ type
       end
       else if e is TArrayIndexExprNode then Result:=vtInteger
       else if e is TVarRefNode then Result:=GetVarType(TVarRefNode(e).VarName)
+      else if e is TExceptionMsgExprNode then Result:=vtString // E.Message는 항상 string
+      else if e is TStaticMemberExprNode then
+      begin
+        var _sm4:=TStaticMemberExprNode(e);
+        var _smType4:=ResolveExternalType(_sm4.TypeName);
+        var _smPi4:=_smType4.GetProperty(_sm4.MemberName);
+        if (_smPi4<>nil) and (_smPi4.PropertyType=typeof(string)) then Result:=vtString
+        else
+        begin
+          var _smFi4:=_smType4.GetField(_sm4.MemberName);
+          if (_smFi4<>nil) and (_smFi4.FieldType=typeof(string)) then Result:=vtString
+          else Result:=vtInteger;
+        end;
+      end
       else if e is TBinOpNode then
       begin
         b:=TBinOpNode(e);
@@ -529,6 +543,23 @@ type
         if getMsgMI=nil then
           getMsgMI:=typeof(Exception).GetProperty('Message').GetGetMethod;
         aIL.Emit(OpCodes.Callvirt, getMsgMI);
+      end
+
+      else if e is TStaticMemberExprNode then
+      begin
+        // TypeName.MemberName — 정적 필드/속성 읽기 (예: System.EventArgs.Empty)
+        var sm:=TStaticMemberExprNode(e);
+        var smType:=ResolveExternalType(sm.TypeName);
+        var smPi:=smType.GetProperty(sm.MemberName);
+        if (smPi<>nil) and (smPi.GetGetMethod<>nil) then
+          aIL.Emit(OpCodes.Call, smPi.GetGetMethod) // 정적 프로퍼티 getter는 Call(비가상)
+        else
+        begin
+          var smFi:=smType.GetField(sm.MemberName);
+          if smFi=nil then
+            raise new Exception('타입 "'+smType.FullName+'"에 정적 필드/속성 "'+sm.MemberName+'"가 없습니다.');
+          aIL.Emit(OpCodes.Ldsfld, smFi); // 정적 필드는 Ldsfld
+        end;
       end
 
       else raise new Exception('알 수 없는 식 노드: '+e.GetType.Name);

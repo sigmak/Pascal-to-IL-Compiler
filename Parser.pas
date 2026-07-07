@@ -211,7 +211,24 @@ type
               Result:=mc3;
             end
             else
-              raise new Exception('줄 '+Cur.Line.ToString+': "'+string.Join('.', segs2)+'(...)" 형태를 해석할 수 없습니다 (캐스트나 .Create가 아님)');
+            begin
+              // 캐스트 패턴이 아니면 정적(static) 메서드 호출로 간주한다
+              // (예: System.Windows.Forms.MessageBox.Show(...) 를 식으로 사용).
+              var staticQualifier:=string.Join('.', segs2.GetRange(0, segs2.Count-1));
+              var staticMname:=segs2[segs2.Count-1];
+              var mc4:=new TMethodCallExprNode(staticQualifier, staticMname);
+              foreach var a6 in castArgs2 do mc4.Args.Add(a6);
+              Result:=mc4;
+            end;
+          end
+          else if segs2.Count>2 then
+          begin
+            // 괄호 없이 3단계 이상 점(.)으로 연결된 경우 = 정적 필드/속성 읽기
+            // (예: System.EventArgs.Empty). 지역 변수/필드 이름에는 점이 없으므로
+            // 2단계(obj.Member)와 명확히 구분된다.
+            var staticType:=string.Join('.', segs2.GetRange(0, segs2.Count-1));
+            var staticMember:=segs2[segs2.Count-1];
+            Result:=new TStaticMemberExprNode(staticType, staticMember);
           end
           else
           begin

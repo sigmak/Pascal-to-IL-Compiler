@@ -227,6 +227,13 @@ type
     constructor Create(v: string); begin VarName:=v; end;
   end;
 
+  // TypeName.MemberName  (정적 필드/속성 읽기, 예: System.EventArgs.Empty)
+  // TypeName은 점(.)으로 연결된 외부 타입 전체 경로.
+  TStaticMemberExprNode = class(TExprNode)
+  public TypeName: string; MemberName: string;
+    constructor Create(t, m: string); begin TypeName:=t; MemberName:=m; end;
+  end;
+
   // ----------------------------------------------------------
   // AST — 클래스 선언 관련
   // ----------------------------------------------------------
