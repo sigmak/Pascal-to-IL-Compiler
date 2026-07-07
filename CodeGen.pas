@@ -657,7 +657,7 @@ type
             EmitPropertyOrFieldSet(aIL, qTargetType, fas.FieldName, fas.ValueExpr);
           end
           else
-            raise new Exception('알 수 없는 대상 "'+fas.Qualifier+'" — 필드/지역변수/전역변수가 아닙니다 (정적 멤버 대입은 아직 미지원).');
+            EmitStaticPropertyOrFieldSet(aIL, ResolveExternalType(fas.Qualifier), fas.FieldName, fas.ValueExpr);
         end
         else
         // self.fieldName := 식  (지역 필드) 또는 외부 상속 타입의 속성/필드 설정
@@ -1148,6 +1148,28 @@ type
           raise new Exception('타입 "'+targetType.FullName+'"에 필드/속성 "'+memberName+'"가 없습니다.');
         EmitExpr(aIL, valueExpr);
         aIL.Emit(OpCodes.Stfld, fi);
+      end;
+    end;
+
+    // 정적 필드/속성 설정 (예: System.Console.Title := '...'). 인스턴스 리시버가 없으므로
+    // Callvirt/Stfld가 아니라 Call/Stsfld를 쓴다.
+    procedure EmitStaticPropertyOrFieldSet(aIL: ILGenerator; targetType: System.Type; memberName: string; valueExpr: TExprNode);
+    var pi2: PropertyInfo; fi2: System.Reflection.FieldInfo; setr2: MethodInfo;
+    begin
+      pi2:=targetType.GetProperty(memberName);
+      if (pi2<>nil) and (pi2.GetSetMethod<>nil) then
+      begin
+        setr2:=pi2.GetSetMethod;
+        EmitExpr(aIL, valueExpr);
+        aIL.Emit(OpCodes.Call, setr2);
+      end
+      else
+      begin
+        fi2:=targetType.GetField(memberName);
+        if fi2=nil then
+          raise new Exception('타입 "'+targetType.FullName+'"에 정적 필드/속성 "'+memberName+'"가 없습니다 (또는 읽기 전용).');
+        EmitExpr(aIL, valueExpr);
+        aIL.Emit(OpCodes.Stsfld, fi2);
       end;
     end;
 

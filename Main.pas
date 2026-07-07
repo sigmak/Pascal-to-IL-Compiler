@@ -15,26 +15,17 @@ uses
 
 const
   TestSource =
-    'program StaticMemberTest;' + #10 +
+    'program StaticWriteTest;' + #10 +
     'type' + #10 +
     '  TMyForm = class(System.Windows.Forms.Form)' + #10 +
     '  public' + #10 +
-    '    Button1: System.Windows.Forms.Button;' + #10 +
     '    procedure Setup;' + #10 +
-    '    procedure Button1_Click(sender: System.Object; e: System.EventArgs);' + #10 +
     '  end;' + #10 +
-    '' + #10 +
-    'procedure TMyForm.Button1_Click(sender: System.Object; e: System.EventArgs);' + #10 +
-    'begin' + #10 +
-    '  writeln(''핸들러 호출됨 (정적 속성으로 만든 EventArgs 사용)'');' + #10 +
-    'end;' + #10 +
     '' + #10 +
     'procedure TMyForm.Setup;' + #10 +
     'begin' + #10 +
-    '  Button1 := System.Windows.Forms.Button.Create;' + #10 +
-    '  Button1.Click += Button1_Click;' + #10 +
-    '  Button1_Click(Button1, System.EventArgs.Empty);' + #10 +
-    '  writeln(''완료: 정적 필드/속성(EventArgs.Empty) 접근 성공'');' + #10 +
+    '  System.Console.Title := ''Pascal-to-IL Compiler'';' + #10 +
+    '  writeln(''설정된 제목: '' + System.Console.Title);' + #10 +
     'end;' + #10 +
     '' + #10 +
     'var' + #10 +
@@ -50,7 +41,7 @@ var
   codegen: TCodeGenerator; outputName: string;
 
 begin
-  Writeln('=== Stage 24: 정적 필드/속성 접근 (System.EventArgs.Empty) ===');
+  Writeln('=== Stage 25: 정적 필드/속성 쓰기 (System.Console.Title := ...) ===');
   Writeln('--- 입력 소스 ---'); Writeln(TestSource); Writeln;
 
   try
@@ -63,7 +54,7 @@ begin
     Writeln('[2/3] 구문분석 완료: 클래스 '+prog.ClassDecls.Count.ToString
       +'개, 메서드구현 '+prog.MethodImpls.Count.ToString+'개');
 
-    outputName:='StaticMember_Test_Stage24.exe';
+    outputName:='StaticWrite_Test_Stage25.exe';
     codegen:=new TCodeGenerator(prog);
     codegen.AddReferenceAssembly('System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089');
     codegen.GenerateExe(outputName);
@@ -72,11 +63,9 @@ begin
     Writeln;
     Writeln('=====================================================');
     Writeln('성공! "'+outputName+'" 을 실행하면 다음이 출력되어야 합니다:');
-    Writeln('  핸들러 호출됨 (정적 속성으로 만든 EventArgs 사용)');
-    Writeln('  완료: 정적 필드/속성(EventArgs.Empty) 접근 성공');
+    Writeln('  설정된 제목: Pascal-to-IL Compiler');
+    Writeln('(실행 중인 콘솔 창의 제목 표시줄도 바뀌는지 확인해보세요)');
     Writeln('=====================================================');
-    Writeln;
-    Writeln('참고: 정적 필드/속성은 읽기만 지원합니다 (쓰기는 아직 미지원).');
   except
     on E: Exception do
     begin
