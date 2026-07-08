@@ -51,7 +51,33 @@ type
     begin if CC=#10 then fLine:=fLine+1; fPos:=fPos+1; end;
 
     procedure SkipWS;
-    begin while (CC=' ') or (CC=#9) or (CC=#10) or (CC=#13) do Adv; end;
+    begin
+      while true do
+      begin
+        while (CC=' ') or (CC=#9) or (CC=#10) or (CC=#13) do Adv;
+        if (CC='/') and (PC='/') then
+        begin
+          // // 줄 주석: 줄 끝까지 건너뜀
+          while (CC<>#10) and (CC<>#0) do Adv;
+        end
+        else if CC='{' then
+        begin
+          // { } 블록 주석
+          Adv;
+          while (CC<>'}') and (CC<>#0) do Adv;
+          if CC='}' then Adv;
+        end
+        else if (CC='(') and (PC='*') then
+        begin
+          // (* *) 블록 주석
+          Adv; Adv;
+          while not(((CC='*') and (PC=')')) or (CC=#0)) do Adv;
+          if CC='*' then begin Adv; Adv; end;
+        end
+        else
+          break; // 공백도 주석도 아니면 종료
+      end;
+    end;
 
     function ReadIdent: TToken;
     var sl: integer; sb: StringBuilder; w, lw: string;
