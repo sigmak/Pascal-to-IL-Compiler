@@ -20,8 +20,9 @@ type
     fTokens: List<TToken>; fPos: integer;
     fCurFunc: string;
     fCurClass: string; // 현재 파싱 중인 메서드의 클래스 이름
+    fCurParams: List<string>; // 현재 파싱 중인 메서드의 매개변수 이름 목록 (필드보다 우선)
     fFuncNames, fProcNames, fArrayNames: List<string>;
-    fClassNames: List<string>; // 선언된 클래스 이름 목록
+    fClassNames: List<string>; // 선언된 클래스 이름 목록 (제네릭 템플릿 이름 + 단형화된 구체 이름 포함)
     fInterfaceNames: List<string>; // 선언된 인터페이스 이름 목록
     // 클래스별 필드 이름 목록 (메서드 본문에서 필드 vs 변수 구분) — 상속받은 필드 포함
     fClassFields: Dictionary<string, List<string>>;
@@ -29,6 +30,11 @@ type
     fClassMethods: Dictionary<string, Dictionary<string, boolean>>;
     // 클래스별 부모 클래스 이름 ('' 이면 없음)
     fClassParent: Dictionary<string, string>;
+    // Stage26: 제네릭(단형화) 지원
+    fProg: TProgramNode; // ParseProgram 시작 시 설정 — 깊이 상관없이 GenericInstantiations에 접근하기 위함
+    fGenericClassNames: List<string>; // 제네릭 템플릿으로 선언된 클래스 이름 (예: 'TStack')
+    fClassGenericParam: Dictionary<string, string>; // 템플릿 이름 → 타입 매개변수 이름 (예: 'TStack'→'T')
+    fCurGenericParam: string; // 현재 파싱 중인 제네릭 클래스 본문/메서드구현의 타입 매개변수 이름 ('' 이면 제네릭 문맥 아님)
 
     function Cur: TToken; begin Result:=fTokens[fPos]; end;
 
@@ -44,7 +50,9 @@ type
 
     function ParseVarType: TVarType;
     begin
-      if Cur.Kind=tkInteger then begin fPos:=fPos+1; Result:=vtInteger; end
+      if (Cur.Kind=tkIdent) and (fCurGenericParam<>'') and (Cur.Text=fCurGenericParam) then
+        begin fPos:=fPos+1; Result:=vtGeneric; end
+      else if Cur.Kind=tkInteger then begin fPos:=fPos+1; Result:=vtInteger; end
       else if Cur.Kind=tkStringType then begin fPos:=fPos+1; Result:=vtString; end
       else if Cur.Kind=tkBoolean then begin fPos:=fPos+1; Result:=vtBoolean; end
       else if Cur.Kind=tkArray then
@@ -67,7 +75,10 @@ type
     begin
       isExt:=false; cn:='';
       if (Cur.Kind=tkIdent) and fClassNames.Contains(Cur.Text) then
-      begin cn:=Cur.Text; fPos:=fPos+1; Result:=vtObject; end
+      begin
+        cn:=Cur.Text; fPos:=fPos+1; Result:=vtObject;
+        if (Cur.Kind=tkLt) and fGenericClassNames.Contains(cn) then cn:=ResolveGenericInstantiation(cn);
+      end
       else if (Cur.Kind=tkIdent) and fInterfaceNames.Contains(Cur.Text) then
       begin cn:=Cur.Text; fPos:=fPos+1; Result:=vtInterface; end
       else if Cur.Kind=tkIdent then
@@ -87,6 +98,41 @@ type
       end
       else
         Result:=ParseVarType;
+    end;
+
+    // Stage26: 제네릭 인스턴스화 (예: TStack<integer>) 해석.
+    // 호출 시점에 templateName은 이미 소비된 상태이고 Cur='<' 이어야 한다.
+    // '<' TypeArg '>' 를 소비하고, 아직 등록되지 않은 조합이면 fProg.GenericInstantiations에
+    // 요청을 등록한 뒤, 실제로 CodeGen이 다루게 될 구체 클래스 이름을 돌려준다.
+    function ResolveGenericInstantiation(templateName: string): string;
+    var argType: TVarType; argClassName, argTag, concreteName: string;
+    begin
+      Expect(tkLt);
+
+      argClassName:='';
+      if Cur.Kind=tkInteger then begin fPos:=fPos+1; argType:=vtInteger; argTag:='integer'; end
+      else if Cur.Kind=tkStringType then begin fPos:=fPos+1; argType:=vtString; argTag:='string'; end
+      else if Cur.Kind=tkBoolean then begin fPos:=fPos+1; argType:=vtBoolean; argTag:='boolean'; end
+      else if (Cur.Kind=tkIdent) and fClassNames.Contains(Cur.Text) and (not fGenericClassNames.Contains(Cur.Text)) then
+        begin argClassName:=Cur.Text; argType:=vtObject; argTag:=Cur.Text; fPos:=fPos+1; end
+      else
+        raise new Exception('줄 '+Cur.Line.ToString+': 제네릭 타입 인자로 지원되지 않는 타입 ("'+Cur.Text
+          +'") — integer/string/boolean 또는 일반 클래스만 가능합니다 (중첩 제네릭은 아직 미지원)');
+
+      Expect(tkGt);
+
+      concreteName:=templateName+'_'+argTag;
+
+      if not fClassNames.Contains(concreteName) then
+      begin
+        fClassNames.Add(concreteName);
+        fClassFields[concreteName]:=new List<string>(fClassFields[templateName]);
+        fClassMethods[concreteName]:=new Dictionary<string, boolean>(fClassMethods[templateName]);
+        fClassParent[concreteName]:='';
+        fProg.GenericInstantiations.Add(new TGenericInstantiation(templateName, concreteName, argType, argClassName));
+      end;
+
+      Result:=concreteName;
     end;
 
     // ---- 식 파싱 (ParsePrimary 안에서는 ParseAddSub만 호출) ----
@@ -133,19 +179,25 @@ type
       begin
         fPos:=fPos+1;
 
+        // Stage26: TStack<integer> 처럼 제네릭 클래스 이름 뒤에 '<' 가 이어지면
+        // 그 자리에서 단형화 요청을 등록하고, 이후 로직은 구체 클래스 이름(gcn)으로 진행한다.
+        var gcn:=t.Text;
+        if (Cur.Kind=tkLt) and fGenericClassNames.Contains(gcn) then
+          gcn:=ResolveGenericInstantiation(gcn);
+
         // 클래스명.Create → TNewObjectExprNode (지역 클래스 또는 점(.)으로 연결된 외부 타입)
-        if (Cur.Kind=tkDot) and fClassNames.Contains(t.Text) then
+        if (Cur.Kind=tkDot) and fClassNames.Contains(gcn) then
         begin
           fPos:=fPos+1; // '.' 소비
           var mname:=Expect(tkIdent);
           if mname.Text.ToLower='create' then
           begin
-            Result:=new TNewObjectExprNode(t.Text);
+            Result:=new TNewObjectExprNode(gcn);
           end
           else
           begin
             // 클래스명.메서드 (함수 호출로서 식)
-            mc:=new TMethodCallExprNode(t.Text, mname.Text);
+            mc:=new TMethodCallExprNode(gcn, mname.Text);
             if Cur.Kind=tkLParen then
             begin
               fPos:=fPos+1;
@@ -277,11 +329,12 @@ type
 
         else
         begin
-          // 메서드 본문 안에서의 식별자 읽기는 항상 필드/속성 읽기로 취급한다.
-          // (대입문과 동일한 이유 — var 섹션보다 메서드가 먼저 파싱되어 전역변수
-          //  이름을 알 수 없고, 이 경로로 전역변수를 읽는 기존 코드도 없었음.
-          //  지역 필드든 외부 상속 타입의 속성이든 CodeGen 단계에서 최종 판별한다.)
-          if fCurClass<>'' then
+          // 메서드 본문 안에서의 식별자 읽기: 매개변수 이름이면 지역 변수 참조,
+          // 그렇지 않으면 필드/속성 읽기로 취급한다.
+          // (var 섹션보다 메서드가 먼저 파싱되어 전역변수 이름을 알 수 없고,
+          //  이 경로로 전역변수를 읽는 기존 코드도 없었음. 지역 필드든 외부
+          //  상속 타입의 속성이든 CodeGen 단계에서 최종 판별한다.)
+          if (fCurClass<>'') and not fCurParams.Contains(t.Text) then
             Result:=new TFieldReadExprNode(t.Text)
           else
             Result:=new TVarRefNode(t.Text);
@@ -519,11 +572,12 @@ type
         else
         begin
           Expect(tkAssign); rhs:=ParseExpr;
-          // 메서드 본문 안에서의 대입은 항상 필드/속성 쓰기로 취급한다.
+          // 메서드 본문 안에서의 대입: 매개변수 이름이면 지역 변수 대입으로,
+          // 그렇지 않으면 필드/속성 쓰기로 취급한다.
           // (메서드는 var 섹션보다 먼저 파싱되므로 전역변수 이름 목록을 알 수 없고,
           //  실제로 이 경로로 전역변수에 대입하는 기존 코드도 없었음 — 지역 필드든
           //  외부 상속 타입의 속성이든 CodeGen 단계에서 최종 판별한다.)
-          if fCurClass<>'' then
+          if (fCurClass<>'') and not fCurParams.Contains(nt.Text) then
             Result:=new TFieldAssignStmtNode(nt.Text, rhs)
           else
             Result:=new TAssignStmtNode(nt.Text, rhs);
@@ -697,11 +751,23 @@ type
       while Cur.Kind=tkIdent do
       begin
         cn:=Cur.Text; fPos:=fPos+1;
+
+        // 선택적 제네릭 타입 매개변수: TStack<T> = class ... end;
+        var genParamName:='';
+        if Cur.Kind=tkLt then
+        begin
+          fPos:=fPos+1;
+          genParamName:=Expect(tkIdent).Text;
+          Expect(tkGt);
+        end;
+
         Expect(tkEq);
 
         // ---- 인터페이스 선언 ----
         if Cur.Kind=tkInterface then
         begin
+          if genParamName<>'' then
+            raise new Exception('줄 '+Cur.Line.ToString+': 제네릭 인터페이스는 아직 지원되지 않습니다');
           fPos:=fPos+1; // 'interface' 소비
           idecl:=new TInterfaceDeclNode(cn);
           fInterfaceNames.Add(cn);
@@ -718,6 +784,12 @@ type
         begin
           Expect(tkClass);
           cd:=new TClassDeclNode(cn);
+          cd.IsGeneric:=(genParamName<>''); cd.GenericParamName:=genParamName;
+          if cd.IsGeneric then
+          begin
+            fGenericClassNames.Add(cn);
+            fClassGenericParam[cn]:=genParamName;
+          end;
 
           // 선택적 상속/인터페이스 구현: class(TParentName) 또는 class(IInterfaceName)
           // 또는 class(System.Windows.Window) 처럼 점(.)으로 연결된 외부 .NET 타입
@@ -762,6 +834,8 @@ type
           end;
 
           // private/public 섹션 안의 필드와 메서드 시그니처 읽기
+          // (본문 파싱 동안 fCurGenericParam을 설정해 T 참조를 vtGeneric으로 인식시킨다)
+          var savedGP1:=fCurGenericParam; fCurGenericParam:=genParamName;
           while Cur.Kind<>tkEnd do
           begin
             // private / public 키워드는 건너뜀
@@ -817,9 +891,15 @@ type
               fname:=Cur.Text; fPos:=fPos+1;
               Expect(tkColon);
               var fld:=new TFieldDeclNode(fname, vtInteger);
-              if (Cur.Kind=tkIdent) and fClassNames.Contains(Cur.Text) then
+              if (Cur.Kind=tkIdent) and (fCurGenericParam<>'') and (Cur.Text=fCurGenericParam) then
+              begin
+                fld.FieldType:=vtGeneric; fPos:=fPos+1;
+              end
+              else if (Cur.Kind=tkIdent) and fClassNames.Contains(Cur.Text) then
               begin
                 fld.FieldType:=vtObject; fld.ClassName:=Cur.Text; fPos:=fPos+1;
+                if (Cur.Kind=tkLt) and fGenericClassNames.Contains(fld.ClassName) then
+                  fld.ClassName:=ResolveGenericInstantiation(fld.ClassName);
               end
               else if (Cur.Kind=tkIdent) and fInterfaceNames.Contains(Cur.Text) then
               begin
@@ -854,6 +934,7 @@ type
               raise new Exception('줄 '+Cur.Line.ToString+': 클래스 선언 안에서 알 수 없는 토큰 "'+Cur.Text+'"');
           end;
 
+          fCurGenericParam:=savedGP1;
           Expect(tkEnd); Expect(tkSemicolon);
           aProg.ClassDecls.Add(cd);
         end;
@@ -872,6 +953,12 @@ type
       mn:=Expect(tkIdent).Text;
       retType:=vtInteger;
       impl:=new TMethodImplNode(cn, mn, isFunc, retType);
+
+      // 제네릭 클래스(TStack<T>)의 메서드 구현이면, 본문의 매개변수/반환 타입에서
+      // T를 인식할 수 있도록 fCurGenericParam을 설정해 둔다.
+      var savedGP3:=fCurGenericParam;
+      if fClassGenericParam.ContainsKey(cn) then fCurGenericParam:=fClassGenericParam[cn]
+      else fCurGenericParam:='';
 
       // 매개변수
       if Cur.Kind=tkLParen then
@@ -900,14 +987,18 @@ type
 
       // 본문 파싱 (fCurClass 설정으로 필드 참조 가능)
       var savedClass:=fCurClass; var savedFunc:=fCurFunc;
+      var savedParams:=fCurParams;
       fCurClass:=cn; fCurFunc:=mn;
+      fCurParams:=new List<string>;
+      foreach var pnCp in impl.ParamNames do fCurParams.Add(pnCp);
 
       Expect(tkBegin); comp:=new TCompoundStmtNode;
       while Cur.Kind<>tkEnd do
       begin comp.Statements.Add(ParseStatement); if Cur.Kind=tkSemicolon then fPos:=fPos+1; end;
       Expect(tkEnd); Expect(tkSemicolon);
 
-      fCurClass:=savedClass; fCurFunc:=savedFunc;
+      fCurClass:=savedClass; fCurFunc:=savedFunc; fCurGenericParam:=savedGP3;
+      fCurParams:=savedParams;
       impl.Body:=comp;
       Result:=impl;
     end;
@@ -973,6 +1064,7 @@ type
         if (Cur.Kind=tkIdent) and fClassNames.Contains(Cur.Text) then
         begin
           cn:=Cur.Text; fPos:=fPos+1; vt:=vtObject;
+          if (Cur.Kind=tkLt) and fGenericClassNames.Contains(cn) then cn:=ResolveGenericInstantiation(cn);
         end
         // 인터페이스 타입 변수 처리
         else if (Cur.Kind=tkIdent) and fInterfaceNames.Contains(Cur.Text) then
@@ -992,7 +1084,7 @@ type
   public
     constructor Create(aTokens: List<TToken>);
     begin
-      fTokens:=aTokens; fPos:=0; fCurFunc:=''; fCurClass:='';
+      fTokens:=aTokens; fPos:=0; fCurFunc:=''; fCurClass:=''; fCurParams:=new List<string>;
       fFuncNames:=new List<string>;
       fProcNames:=new List<string>;
       fArrayNames:=new List<string>;
@@ -1001,12 +1093,16 @@ type
       fClassFields:=new Dictionary<string, List<string>>;
       fClassMethods:=new Dictionary<string, Dictionary<string, boolean>>;
       fClassParent:=new Dictionary<string, string>;
+      fGenericClassNames:=new List<string>;
+      fClassGenericParam:=new Dictionary<string, string>;
+      fCurGenericParam:='';
     end;
 
     function ParseProgram: TProgramNode;
     var prog: TProgramNode; t: TToken;
     begin
       Expect(tkProgram); prog:=new TProgramNode(Expect(tkIdent).Text); Expect(tkSemicolon);
+      fProg:=prog; // 깊이 상관없이(식/타입 파싱 도중) GenericInstantiations에 접근하기 위함
 
       // type 섹션
       if Cur.Kind=tkType then ParseTypeSection(prog);

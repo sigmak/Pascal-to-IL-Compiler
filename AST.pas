@@ -10,10 +10,12 @@ type
   // ----------------------------------------------------------
   // 변수/식 타입
   // ----------------------------------------------------------
-  TVarType = (vtInteger, vtString, vtIntArray, vtStrArray, vtObject, vtInterface, vtBoolean);
+  TVarType = (vtInteger, vtString, vtIntArray, vtStrArray, vtObject, vtInterface, vtBoolean, vtGeneric);
   // vtObject: 클래스 인스턴스 (TCounter 등)
   // vtInterface: 인터페이스 타입 변수 (ISpeaker 등)
   // vtBoolean: boolean 타입 (true/false)
+  // vtGeneric: 제네릭 클래스 선언 본문 안에서만 등장하는 "타입 매개변수 자리" (예: T).
+  //   Monomorphize 단계에서 실제 타입 인자로 치환되어 사라지므로 CodeGen은 이 값을 절대 보지 않는다.
 
   // ----------------------------------------------------------
   // Lexer
@@ -271,11 +273,27 @@ type
     InterfaceName: string; // 구현하는 인터페이스 이름 ('' 이면 없음). ParentName과 양자택일.
     Fields: List<TFieldDeclNode>;
     Methods: List<TMethodSignature>;
+    IsGeneric: boolean;       // true면 "TStack<T> = class" 형태의 제네릭 템플릿 선언
+    GenericParamName: string; // 제네릭 타입 매개변수 이름 (예: 'T'). IsGeneric=false면 ''
     constructor Create(n: string);
     begin
       Name:=n; ParentName:=''; IsExternalParent:=false; InterfaceName:='';
       Fields:=new List<TFieldDeclNode>; Methods:=new List<TMethodSignature>;
+      IsGeneric:=false; GenericParamName:='';
     end;
+  end;
+
+  // Monomorphize 단계가 처리해야 할 "제네릭 인스턴스화 요청" 하나.
+  // Parser가 소스에서 TStack<integer> 같은 사용을 만날 때마다 등록하고,
+  // Monomorphize.TMonomorphizer가 이를 소비해 실제 구체 클래스를 합성한다.
+  TGenericInstantiation = class
+  public
+    TemplateName: string;  // 제네릭 템플릿 이름 (예: 'TStack')
+    ConcreteName: string;  // 합성될 구체 클래스 이름 (예: 'TStack_integer')
+    ArgType: TVarType;     // 타입 인자가 기본형이면 vtInteger/vtString/vtBoolean, 클래스면 vtObject
+    ArgClassName: string;  // 타입 인자가 클래스(vtObject)일 때 그 클래스 이름, 아니면 ''
+    constructor Create(tn, cnm: string; at: TVarType; acn: string);
+    begin TemplateName:=tn; ConcreteName:=cnm; ArgType:=at; ArgClassName:=acn; end;
   end;
 
   // 인터페이스 선언 (메서드 시그니처만, 본문 없음)
@@ -338,6 +356,7 @@ type
     ProcDecls:   List<TProcDeclNode>;
     VarDecls:    List<TVarDecl>;
     Statements:  List<TStmtNode>;
+    GenericInstantiations: List<TGenericInstantiation>; // Parser가 채우고 Monomorphize가 소비
     constructor Create(n: string);
     begin
       Name:=n;
@@ -348,6 +367,7 @@ type
       ProcDecls:=new List<TProcDeclNode>;
       VarDecls:=new List<TVarDecl>;
       Statements:=new List<TStmtNode>;
+      GenericInstantiations:=new List<TGenericInstantiation>;
     end;
   end;
 

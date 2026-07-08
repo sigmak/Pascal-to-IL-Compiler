@@ -11,60 +11,79 @@ uses
   AST,
   Lexer,
   Parser,
+  Monomorphize,
   CodeGen;
 
 const
   TestSource =
-    'program StaticWriteTest;' + #10 +
+    'program GenericBoxTest;' + #10 +
     'type' + #10 +
-    '  TMyForm = class(System.Windows.Forms.Form)' + #10 +
+    '  TBox<T> = class' + #10 +
+    '  private' + #10 +
+    '    fValue: T;' + #10 +
     '  public' + #10 +
-    '    procedure Setup;' + #10 +
+    '    procedure SetValue(v: T);' + #10 +
+    '    function GetValue: T;' + #10 +
     '  end;' + #10 +
     '' + #10 +
-    'procedure TMyForm.Setup;' + #10 +
+    'procedure TBox.SetValue(v: T);' + #10 +
     'begin' + #10 +
-    '  System.Console.Title := ''Pascal-to-IL Compiler'';' + #10 +
-    '  writeln(''설정된 제목: '' + System.Console.Title);' + #10 +
+    '  fValue := v;' + #10 +
+    'end;' + #10 +
+    '' + #10 +
+    'function TBox.GetValue: T;' + #10 +
+    'begin' + #10 +
+    '  Result := fValue;' + #10 +
     'end;' + #10 +
     '' + #10 +
     'var' + #10 +
-    '  f : TMyForm;' + #10 +
+    '  intBox : TBox<integer>;' + #10 +
+    '  strBox : TBox<string>;' + #10 +
     'begin' + #10 +
-    '  f := TMyForm.Create;' + #10 +
-    '  f.Setup;' + #10 +
+    '  intBox := TBox<integer>.Create;' + #10 +
+    '  intBox.SetValue(42);' + #10 +
+    '  writeln(''intBox = '' + IntToStr(intBox.GetValue));' + #10 +
+    '' + #10 +
+    '  strBox := TBox<string>.Create;' + #10 +
+    '  strBox.SetValue(''hello generics'');' + #10 +
+    '  writeln(''strBox = '' + strBox.GetValue);' + #10 +
     'end.';
 
 var
   lexer: TLexer; tokens: List<TToken>;
   parser: TParser; prog: TProgramNode;
+  mono: TMonomorphizer;
   codegen: TCodeGenerator; outputName: string;
 
 begin
-  Writeln('=== Stage 25: 정적 필드/속성 쓰기 (System.Console.Title := ...) ===');
+  Writeln('=== Stage 26: 제네릭 (단형화) — TBox<T> → TBox_integer / TBox_string ===');
   Writeln('--- 입력 소스 ---'); Writeln(TestSource); Writeln;
 
   try
     lexer:=new TLexer(TestSource);
     tokens:=lexer.Tokenize;
-    Writeln('[1/3] 토큰화 완료: '+tokens.Count.ToString+'개 토큰');
+    Writeln('[1/4] 토큰화 완료: '+tokens.Count.ToString+'개 토큰');
 
     parser:=new TParser(tokens);
     prog:=parser.ParseProgram;
-    Writeln('[2/3] 구문분석 완료: 클래스 '+prog.ClassDecls.Count.ToString
-      +'개, 메서드구현 '+prog.MethodImpls.Count.ToString+'개');
+    Writeln('[2/4] 구문분석 완료: 클래스 '+prog.ClassDecls.Count.ToString
+      +'개(제네릭 템플릿 포함), 인스턴스화 요청 '+prog.GenericInstantiations.Count.ToString+'건');
 
-    outputName:='StaticWrite_Test_Stage25.exe';
+    mono:=new TMonomorphizer(prog);
+    mono.Run;
+    Writeln('[3/4] 단형화 완료: 클래스 '+prog.ClassDecls.Count.ToString
+      +'개(구체화됨), 메서드구현 '+prog.MethodImpls.Count.ToString+'개');
+
+    outputName:='GenericBox_Test_Stage26.exe';
     codegen:=new TCodeGenerator(prog);
-    codegen.AddReferenceAssembly('System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089');
     codegen.GenerateExe(outputName);
-    Writeln('[3/3] 코드생성 완료: '+outputName+' 생성됨');
+    Writeln('[4/4] 코드생성 완료: '+outputName+' 생성됨');
 
     Writeln;
     Writeln('=====================================================');
     Writeln('성공! "'+outputName+'" 을 실행하면 다음이 출력되어야 합니다:');
-    Writeln('  설정된 제목: Pascal-to-IL Compiler');
-    Writeln('(실행 중인 콘솔 창의 제목 표시줄도 바뀌는지 확인해보세요)');
+    Writeln('  intBox = 42');
+    Writeln('  strBox = hello generics');
     Writeln('=====================================================');
   except
     on E: Exception do

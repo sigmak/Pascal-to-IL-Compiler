@@ -6,6 +6,7 @@
     <Item Type="SourceFile" Name="Lexer.pas" Path="Lexer.pas" />
     <Item Type="SourceFile" Name="Parser.pas" Path="Parser.pas" />
     <Item Type="SourceFile" Name="CodeGen.pas" Path="CodeGen.pas" />
+    <Item Type="SourceFile" Name="Monomorphize.pas" Path="Monomorphize.pas" />
     <Item Type="Reference" AssemblyName="System" FullAssemblyName="System.dll" />
   </Items>
 </Project>
