@@ -80,15 +80,20 @@ type
   TBinOpKind = (boAdd, boSub, boMul, boDiv, boMod, boAnd, boOr);
   TBinOpNode = class(TExprNode)
   public Op: TBinOpKind; Left, Right: TExprNode;
-    constructor Create(op: TBinOpKind; l, r: TExprNode);
-    begin Op:=op; Left:=l; Right:=r; end;
+    // 주의: 매개변수 이름을 필드명 Op와 대소문자만 다르게 두면 안 됨.
+    // Pascal은 대소문자를 구분하지 않으므로 'op'와 'Op'가 같은 식별자로 처리되어
+    // 매개변수가 필드를 가려버리고(Op:=op가 사실상 op:=op가 됨),
+    // Op 필드가 항상 기본값(boAdd)으로 남는 버그가 생긴다.
+    constructor Create(aOp: TBinOpKind; l, r: TExprNode);
+    begin Op:=aOp; Left:=l; Right:=r; end;
   end;
 
   TCompareKind = (cmpEq, cmpNeq, cmpLt, cmpGt, cmpLe, cmpGe);
   TCompareNode = class(TExprNode)
   public Op: TCompareKind; Left, Right: TExprNode;
-    constructor Create(op: TCompareKind; l, r: TExprNode);
-    begin Op:=op; Left:=l; Right:=r; end;
+    // 위와 동일한 이유로 매개변수명을 aOp로 사용 (Op와 대소문자만 다른 이름 금지).
+    constructor Create(aOp: TCompareKind; l, r: TExprNode);
+    begin Op:=aOp; Left:=l; Right:=r; end;
   end;
 
   // true / false 리터럴
