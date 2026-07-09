@@ -53,7 +53,7 @@ type
     begin
       t:=Cur;
       if t.Kind<>k then
-        raise new Exception('줄 '+t.Line.ToString+': 예상 '+k.ToString
+        raise new Exception('줄 '+t.Line.ToString+', 열 '+t.Column.ToString+': 예상 '+k.ToString
           +' 실제 '+t.Kind.ToString+' ("'+t.Text+'")');
       fPos:=fPos+1; Result:=t;
     end;
@@ -71,13 +71,13 @@ type
         fPos:=fPos+1; Expect(tkOf);
         if Cur.Kind=tkInteger then begin fPos:=fPos+1; Result:=vtIntArray; end
         else if Cur.Kind=tkStringType then begin fPos:=fPos+1; Result:=vtStrArray; end
-        else raise new Exception('줄 '+Cur.Line.ToString+': array of integer/string만 지원');
+        else raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': array of integer/string만 지원');
       end
       else if (Cur.Kind=tkIdent) and fClassNames.Contains(Cur.Text) then
       begin
         fPos:=fPos+1; Result:=vtObject;
       end
-      else raise new Exception('줄 '+Cur.Line.ToString+': 타입이 와야 합니다 ("'+Cur.Text+'")');
+      else raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': 타입이 와야 합니다 ("'+Cur.Text+'")');
     end;
 
     // 매개변수/필드 타입 하나를 파싱한다 (기본타입/지역클래스/인터페이스/외부타입 모두 지원).
@@ -120,10 +120,10 @@ type
       fPos:=fPos+1; // ':' 소비
       if Cur.Kind=tkClass then begin fPos:=fPos+1; Result:='class'; exit; end; // T: class (임의의 참조 타입)
       if Cur.Kind<>tkIdent then
-        raise new Exception('줄 '+Cur.Line.ToString+': 제네릭 제약조건에는 클래스/인터페이스 이름 또는 "class"가 와야 합니다');
+        raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': 제네릭 제약조건에는 클래스/인터페이스 이름 또는 "class"가 와야 합니다');
       constraintName:=Cur.Text; fPos:=fPos+1;
       if (not fClassNames.Contains(constraintName)) and (not fInterfaceNames.Contains(constraintName)) then
-        raise new Exception('줄 '+Cur.Line.ToString+': 제약조건 "'+constraintName+'"는 알 수 없는 클래스/인터페이스입니다');
+        raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': 제약조건 "'+constraintName+'"는 알 수 없는 클래스/인터페이스입니다');
       Result:=constraintName;
     end;
 
@@ -170,7 +170,7 @@ type
           // [Stage 32] 중첩 제네릭: 타입 인자 자체가 TStack<...> 형태
           var nestedTemplate:=Cur.Text; fPos:=fPos+1;
           if Cur.Kind<>tkLt then
-            raise new Exception('줄 '+Cur.Line.ToString+': 제네릭 클래스 "'+nestedTemplate
+            raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': 제네릭 클래스 "'+nestedTemplate
               +'"는 타입 인자 없이 쓸 수 없습니다 (예: '+nestedTemplate+'<integer>)');
           var nestedConcrete:=ResolveGenericInstantiation(nestedTemplate);
           oneType:=vtObject; oneClassName:=nestedConcrete; oneTag:=nestedConcrete;
@@ -178,7 +178,7 @@ type
         else if (Cur.Kind=tkIdent) and fClassNames.Contains(Cur.Text) then
           begin oneClassName:=Cur.Text; oneType:=vtObject; oneTag:=Cur.Text; fPos:=fPos+1; end
         else
-          raise new Exception('줄 '+Cur.Line.ToString+': 제네릭 타입 인자로 지원되지 않는 타입 ("'+Cur.Text
+          raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': 제네릭 타입 인자로 지원되지 않는 타입 ("'+Cur.Text
             +'") — integer/string/boolean, 일반 클래스, 또는 다른 제네릭 인스턴스만 가능합니다');
 
         argTypes.Add(oneType); argClassNames.Add(oneClassName); argTags.Add(oneTag);
@@ -191,7 +191,7 @@ type
       // [Stage 32] 타입 매개변수 개수 검증 (예: TPair는 2개인데 1개만 준 경우)
       if fClassGenericParam.ContainsKey(templateName)
          and (fClassGenericParam[templateName].Count<>argTypes.Count) then
-        raise new Exception('줄 '+Cur.Line.ToString+': 제네릭 클래스 "'+templateName+'"는 타입 매개변수 '
+        raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': 제네릭 클래스 "'+templateName+'"는 타입 매개변수 '
           +fClassGenericParam[templateName].Count.ToString+'개가 필요한데 '+argTypes.Count.ToString+'개가 주어졌습니다');
 
       // [Stage 34] 제약조건 검증 (T: TAnimal, T: IComparable, T: class 등)
@@ -203,7 +203,7 @@ type
           if constraints[ci]<>'' then
           begin
             if (argTypes[ci]<>vtObject) or (not SatisfiesConstraint(argClassNames[ci], constraints[ci])) then
-              raise new Exception('줄 '+Cur.Line.ToString+': 제네릭 타입 인자 "'+argTags[ci]
+              raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': 제네릭 타입 인자 "'+argTags[ci]
                 +'"는 제약조건 "'+constraints[ci]+'"을(를) 만족하지 않습니다 (타입 매개변수 "'
                 +fClassGenericParam[templateName][ci]+'")');
           end;
@@ -383,7 +383,7 @@ type
               var innerName2:='';
               if castArgs2[0] is TVarRefNode then innerName2:=TVarRefNode(castArgs2[0]).VarName
               else if castArgs2[0] is TFieldReadExprNode then innerName2:=TFieldReadExprNode(castArgs2[0]).FieldName
-              else raise new Exception('줄 '+Cur.Line.ToString+': 캐스트 대상은 단순 변수/필드 이름이어야 합니다');
+              else raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': 캐스트 대상은 단순 변수/필드 이름이어야 합니다');
               fPos:=fPos+1; // '.' 소비
               var member3:=Expect(tkIdent).Text;
               var mc3:=new TMethodCallExprNode(innerName2, member3);
@@ -485,7 +485,7 @@ type
       end
 
       else
-        raise new Exception('줄 '+t.Line.ToString+': 식이 와야 하는데 "'+t.Text+'"');
+        raise new Exception('줄 '+t.Line.ToString+', 열 '+t.Column.ToString+': 식이 와야 하는데 "'+t.Text+'"');
     end;
 
     // [Stage 30] <식> as <TypeName> — Delphi에서 as는 *,/,mod와 같은 우선순위이므로
@@ -639,7 +639,7 @@ type
               var innerName:='';
               if callArgs[0] is TVarRefNode then innerName:=TVarRefNode(callArgs[0]).VarName
               else if callArgs[0] is TFieldReadExprNode then innerName:=TFieldReadExprNode(callArgs[0]).FieldName
-              else raise new Exception('줄 '+Cur.Line.ToString+': 캐스트 대상은 단순 변수/필드 이름이어야 합니다');
+              else raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': 캐스트 대상은 단순 변수/필드 이름이어야 합니다');
 
               fPos:=fPos+1; // '.' 소비
               var member2:=Expect(tkIdent).Text;
@@ -806,7 +806,7 @@ type
         var isDown:=false;
         if Cur.Kind=tkTo then fPos:=fPos+1
         else if Cur.Kind=tkDownto then begin isDown:=true; fPos:=fPos+1; end
-        else raise new Exception('줄 '+Cur.Line.ToString+': for문에는 to 또는 downto가 와야 합니다');
+        else raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': for문에는 to 또는 downto가 와야 합니다');
         var eeE:=ParseExpr;
         Expect(tkDo);
         var forBody:=ParseStatement;
@@ -915,7 +915,7 @@ type
       end
 
       else
-        raise new Exception('줄 '+Cur.Line.ToString+': 알 수 없는 문장 ("'+Cur.Text+'")');
+        raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': 알 수 없는 문장 ("'+Cur.Text+'")');
     end;
 
     // 인터페이스 안의 메서드 시그니처 하나 파싱 (본문 없음)
@@ -924,7 +924,7 @@ type
     begin
       isFunc:=(Cur.Kind=tkFunction);
       if not ((Cur.Kind=tkFunction) or (Cur.Kind=tkProcedure)) then
-        raise new Exception('줄 '+Cur.Line.ToString+': 인터페이스 안에는 메서드 시그니처만 올 수 있습니다 ("'+Cur.Text+'")');
+        raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': 인터페이스 안에는 메서드 시그니처만 올 수 있습니다 ("'+Cur.Text+'")');
       fPos:=fPos+1;
       var mname:=Expect(tkIdent).Text;
       retType:=vtInteger;
@@ -997,7 +997,7 @@ type
         if Cur.Kind=tkInterface then
         begin
           if genParamNames.Count>0 then
-            raise new Exception('줄 '+Cur.Line.ToString+': 제네릭 인터페이스는 아직 지원되지 않습니다');
+            raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': 제네릭 인터페이스는 아직 지원되지 않습니다');
           fPos:=fPos+1; // 'interface' 소비
           idecl:=new TInterfaceDeclNode(cn);
           fInterfaceNames.Add(cn);
@@ -1166,7 +1166,7 @@ type
             end
 
             else
-              raise new Exception('줄 '+Cur.Line.ToString+': 클래스 선언 안에서 알 수 없는 토큰 "'+Cur.Text+'"');
+              raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': 클래스 선언 안에서 알 수 없는 토큰 "'+Cur.Text+'"');
           end;
 
           fCurGenericParams:=savedGP1;

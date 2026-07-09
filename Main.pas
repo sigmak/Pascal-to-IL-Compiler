@@ -21,7 +21,9 @@ uses
 
 const
   DefaultExampleDir = 'Examples';
-  DefaultExampleFile = 'test_stage34.pas';
+  DefaultExampleFile = 'Test_stage35_parse_errors.pas';
+  //DefaultExampleFile = 'Test_stage35_lex_errors.pas';
+  //DefaultExampleFile = 'test_stage34.pas';
   //DefaultExampleFile = 'test_stage32.pas';
   //DefaultExampleFile = 'test_stage31.pas';
   //DefaultExampleFile = 'test_stage30.pas';
@@ -58,22 +60,26 @@ end;
 // 줄 번호를 알 수 없는 예외(예: CodeGen 단계의 CLR 런타임 예외)는 메시지만 그대로 보여준다.
 procedure PrintCompileError(phase: string; sourceCode: string; ex: Exception);
 var
-  m: System.Text.RegularExpressions.Match; lineNo, i, startLn, endLn: integer; srcLines: array of string; marker: string;
+  m: System.Text.RegularExpressions.Match;
+  lineNo, colNo, i, startLn, endLn: integer;
+  srcLines: array of string; marker, caretLine: string;
 begin
   Writeln;
   Writeln('=====================================================');
   Writeln('컴파일 실패 — [' + phase + '] 단계');
   Writeln('=====================================================');
 
-  m := System.Text.RegularExpressions.Regex.Match(ex.Message, '^줄 (\d+):\s*(.*)$', System.Text.RegularExpressions.RegexOptions.Singleline);
+  // [Stage 35] '줄 N, 열 C: ...' 형식이면 줄 번호와 열 번호를 모두 뽑아 캐럿(^)으로 정확한 위치를 가리킨다.
+  // 예전 메시지('줄 N: ...', 열 번호 없음)나 줄 정보가 아예 없는 예외도 각각 처리한다.
+  m := System.Text.RegularExpressions.Regex.Match(ex.Message, '^줄 (\d+), 열 (\d+):\s*(.*)$', System.Text.RegularExpressions.RegexOptions.Singleline);
   if m.Success then
   begin
     lineNo := integer.Parse(m.Groups[1].Value);
-    Writeln('오류 (줄 ' + lineNo.ToString + '): ' + m.Groups[2].Value);
+    colNo := integer.Parse(m.Groups[2].Value);
+    Writeln('오류 (줄 ' + lineNo.ToString + ', 열 ' + colNo.ToString + '): ' + m.Groups[3].Value);
     Writeln;
 
     srcLines := sourceCode.Replace(#13, '').Split(#10);
-
     startLn := lineNo - 2; if startLn < 1 then startLn := 1;
     endLn := lineNo + 2; if endLn > srcLines.Length then endLn := srcLines.Length;
 
@@ -81,13 +87,64 @@ begin
     begin
       if i = lineNo then marker := '  >> ' else marker := '     ';
       Writeln(marker + i.ToString.PadLeft(4) + ' | ' + srcLines[i - 1]);
+      if i = lineNo then
+      begin
+        caretLine := ''.PadLeft(colNo - 1, ' ');
+        Writeln('            ' + caretLine + '^');
+      end;
     end;
   end
   else
   begin
-    // 줄 번호가 없는 예외 (CLR 런타임 예외 등) — 메시지와 타입만 표시
-    Writeln('오류 유형: ' + ex.GetType.FullName);
-    Writeln('메시지: ' + ex.Message);
+    m := System.Text.RegularExpressions.Regex.Match(ex.Message, '^줄 (\d+):\s*(.*)$', System.Text.RegularExpressions.RegexOptions.Singleline);
+    if m.Success then
+    begin
+      lineNo := integer.Parse(m.Groups[1].Value);
+      Writeln('오류 (줄 ' + lineNo.ToString + '): ' + m.Groups[2].Value);
+      Writeln;
+
+      srcLines := sourceCode.Replace(#13, '').Split(#10);
+      startLn := lineNo - 2; if startLn < 1 then startLn := 1;
+      endLn := lineNo + 2; if endLn > srcLines.Length then endLn := srcLines.Length;
+
+      for i := startLn to endLn do
+      begin
+        if i = lineNo then marker := '  >> ' else marker := '     ';
+        Writeln(marker + i.ToString.PadLeft(4) + ' | ' + srcLines[i - 1]);
+      end;
+    end
+    else
+    begin
+      // [Stage 35] Lexer가 여러 개의 '알 수 없는 문자' 오류를 한 번에 모아 던진 경우:
+      // 각 줄이 '줄 N, 열 C: ...' 형식이므로, 하나씩 나눠 각자의 소스 컨텍스트를 보여준다.
+      var subLines := ex.Message.Split(#10);
+      var anyMatched := false;
+      foreach var subLine in subLines do
+      begin
+        var sm := System.Text.RegularExpressions.Regex.Match(subLine, '^줄 (\d+), 열 (\d+):\s*(.*)$');
+        if sm.Success then
+        begin
+          anyMatched := true;
+          lineNo := integer.Parse(sm.Groups[1].Value);
+          colNo := integer.Parse(sm.Groups[2].Value);
+          Writeln('오류 (줄 ' + lineNo.ToString + ', 열 ' + colNo.ToString + '): ' + sm.Groups[3].Value);
+          srcLines := sourceCode.Replace(#13, '').Split(#10);
+          if (lineNo >= 1) and (lineNo <= srcLines.Length) then
+          begin
+            Writeln('  >> ' + lineNo.ToString.PadLeft(4) + ' | ' + srcLines[lineNo - 1]);
+            caretLine := ''.PadLeft(colNo - 1, ' ');
+            Writeln('            ' + caretLine + '^');
+          end;
+          Writeln;
+        end;
+      end;
+      if not anyMatched then
+      begin
+        // 줄 번호가 없는 예외 (CLR 런타임 예외, Monomorphize의 구조적 오류 등) — 메시지와 타입만 표시
+        Writeln('오류 유형: ' + ex.GetType.FullName);
+        Writeln('메시지: ' + ex.Message);
+      end;
+    end;
   end;
 
   Writeln;
