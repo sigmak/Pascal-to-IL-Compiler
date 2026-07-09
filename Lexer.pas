@@ -23,6 +23,7 @@ type
     tkFunction, tkProcedure, tkResult,
     tkIntToStr, tkSetLength, tkLength,
     tkUses, tkNil, // [Stage 29] uses 절, nil 리터럴
+    tkSelf, tkAs, tkInherited, // [Stage 30] self 키워드, as 캐스트, inherited 호출
     tkIdent, tkString, tkIntLiteral,
     tkSemicolon, tkColon, tkComma, tkAssign,
     tkPlus, tkMinus, tkStar, tkSlash, tkPlusAssign,
@@ -128,6 +129,9 @@ type
       else if lw='length'    then Result:=new TToken(tkLength,    w,sl)
       else if lw='uses'      then Result:=new TToken(tkUses,      w,sl)
       else if lw='nil'       then Result:=new TToken(tkNil,       w,sl)
+      else if lw='self'      then Result:=new TToken(tkSelf,      w,sl) // [Stage 30]
+      else if lw='as'        then Result:=new TToken(tkAs,        w,sl) // [Stage 30]
+      else if lw='inherited' then Result:=new TToken(tkInherited, w,sl) // [Stage 30]
       else                        Result:=new TToken(tkIdent,     w,sl);
     end;
 

@@ -20,7 +20,8 @@ type
     fTokens: List<TToken>; fPos: integer;
     fCurFunc: string;
     fCurClass: string; // 현재 파싱 중인 메서드의 클래스 이름
-    fCurParams: List<string>; // 현재 파싱 중인 메서드의 매개변수 이름 목록 (필드보다 우선)
+    fCurParams: List<string>; // 현재 파싱 중인 메서드의 매개변수 이름 목록 (필드보다 우선) — 지역변수도 나중에 추가됨
+    fCurMethodParamNames: List<string>; // [Stage 30] 순수 매개변수 이름만(지역변수 제외) — bare 'inherited;' 인자 전달용
     fFuncNames, fProcNames, fArrayNames: List<string>;
     fClassNames: List<string>; // 선언된 클래스 이름 목록 (제네릭 템플릿 이름 + 단형화된 구체 이름 포함)
     fInterfaceNames: List<string>; // 선언된 인터페이스 이름 목록
@@ -160,6 +161,51 @@ type
 
       else if t.Kind=tkNil then
         begin fPos:=fPos+1; Result:=new TNilLiteralNode; end // [Stage 29]
+
+      else if t.Kind=tkSelf then // [Stage 30]
+      begin
+        fPos:=fPos+1;
+        if Cur.Kind=tkDot then
+        begin
+          // self.Xxx / self.Xxx(...) → 기존 암시적 self 필드읽기/메서드호출(ObjName='')로 환원.
+          // (self가 필드/외부 상속 타입 어느 쪽이든 CodeGen이 이미 판별해준다.)
+          fPos:=fPos+1;
+          var selfMname:=Expect(tkIdent).Text;
+          if Cur.Kind=tkLParen then
+          begin
+            mc:=new TMethodCallExprNode('', selfMname); fPos:=fPos+1;
+            if Cur.Kind<>tkRParen then
+            begin
+              mc.Args.Add(ParseAddSub);
+              while Cur.Kind=tkComma do begin fPos:=fPos+1; mc.Args.Add(ParseAddSub); end;
+            end;
+            Expect(tkRParen);
+            Result:=mc;
+          end
+          else
+            Result:=new TFieldReadExprNode(selfMname);
+        end
+        else
+          Result:=new TSelfExprNode; // self 자체를 값으로 사용 (예: 인자로 전달, as 캐스트 대상)
+      end
+
+      else if t.Kind=tkInherited then // [Stage 30] 식으로 쓰이는 inherited (예: Result := inherited GetValue();)
+      begin
+        fPos:=fPos+1;
+        var imnE:=Expect(tkIdent).Text;
+        var iceN:=new TInheritedCallExprNode(imnE);
+        if Cur.Kind=tkLParen then
+        begin
+          fPos:=fPos+1;
+          if Cur.Kind<>tkRParen then
+          begin
+            iceN.Args.Add(ParseAddSub);
+            while Cur.Kind=tkComma do begin fPos:=fPos+1; iceN.Args.Add(ParseAddSub); end;
+          end;
+          Expect(tkRParen);
+        end;
+        Result:=iceN;
+      end
 
       else if t.Kind=tkNot then
         begin fPos:=fPos+1; Result:=new TNotExprNode(ParsePrimary); end
@@ -353,17 +399,35 @@ type
         raise new Exception('줄 '+t.Line.ToString+': 식이 와야 하는데 "'+t.Text+'"');
     end;
 
+    // [Stage 30] <식> as <TypeName> — Delphi에서 as는 *,/,mod와 같은 우선순위이므로
+    // ParsePrimary 바로 위, ParseMulDivMod가 사용하는 자리에 끼워 넣는다.
+    function ParseAsCast: TExprNode;
+    var e: TExprNode; tn: string; isExt: boolean; asN: TAsCastExprNode;
+    begin
+      e:=ParsePrimary;
+      while Cur.Kind=tkAs do
+      begin
+        fPos:=fPos+1;
+        tn:=Expect(tkIdent).Text; isExt:=false;
+        while Cur.Kind=tkDot do begin fPos:=fPos+1; tn:=tn+'.'+Expect(tkIdent).Text; end;
+        if not (fClassNames.Contains(tn) or fInterfaceNames.Contains(tn)) then isExt:=true;
+        asN:=new TAsCastExprNode(e, tn); asN.IsExternalType:=isExt;
+        e:=asN;
+      end;
+      Result:=e;
+    end;
+
     function ParseMulDivMod: TExprNode;
     var left: TExprNode; op: TBinOpKind;
     begin
-      left:=ParsePrimary;
+      left:=ParseAsCast;
       while (Cur.Kind=tkStar) or (Cur.Kind=tkSlash) or (Cur.Kind=tkMod) or (Cur.Kind=tkAnd) do
       begin
         if Cur.Kind=tkStar then op:=boMul
         else if Cur.Kind=tkSlash then op:=boDiv
         else if Cur.Kind=tkMod then op:=boMod
         else op:=boAnd; // tkAnd — 표준 Pascal에서 and는 *,/,mod와 같은 우선순위
-        fPos:=fPos+1; left:=new TBinOpNode(op, left, ParsePrimary);
+        fPos:=fPos+1; left:=new TBinOpNode(op, left, ParseAsCast);
       end;
       Result:=left;
     end;
@@ -587,6 +651,41 @@ type
         end;
       end
 
+      // [Stage 30] self.Xxx := ...; / self.Xxx(...); / self.Event += Handler; 문장.
+      // ParsePrimary의 self.Xxx 식 처리와 마찬가지로 기존 암시적 self 경로(Qualifier/ObjName='')
+      // 로 환원해 재사용한다.
+      else if Cur.Kind=tkSelf then
+      begin
+        fPos:=fPos+1; Expect(tkDot);
+        var selfMname2:=Expect(tkIdent).Text;
+        if Cur.Kind=tkAssign then
+        begin
+          fPos:=fPos+1; rhs:=ParseExpr;
+          Result:=new TFieldAssignStmtNode(selfMname2, rhs); // Qualifier='' → self 필드/속성 대입
+        end
+        else if Cur.Kind=tkPlusAssign then
+        begin
+          fPos:=fPos+1;
+          var handlerName3:=Expect(tkIdent).Text;
+          Result:=new TEventSubscribeStmtNode('', selfMname2, handlerName3); // Qualifier='' → self가 이벤트 소유자
+        end
+        else
+        begin
+          mcs:=new TMethodCallStmtNode('', selfMname2);
+          if Cur.Kind=tkLParen then
+          begin
+            fPos:=fPos+1;
+            if Cur.Kind<>tkRParen then
+            begin
+              mcs.Args.Add(ParseExpr);
+              while Cur.Kind=tkComma do begin fPos:=fPos+1; mcs.Args.Add(ParseExpr); end;
+            end;
+            Expect(tkRParen);
+          end;
+          Result:=mcs;
+        end;
+      end
+
       else if Cur.Kind=tkBegin then
       begin
         fPos:=fPos+1; comp:=new TCompoundStmtNode;
@@ -694,6 +793,36 @@ type
           Result:=new TRaiseStmtNode(nil)
         else
           Result:=new TRaiseStmtNode(ParseExpr);
+      end
+
+      // [Stage 30] inherited MethodName(args); / inherited MethodName; / inherited;
+      // bare 'inherited;'는 현재 메서드와 같은 이름 + 같은 매개변수를 그대로 부모에게 전달한다
+      // (오버라이드 관용구: procedure TDerived.Init(x: integer); begin inherited; ... end;).
+      else if Cur.Kind=tkInherited then
+      begin
+        fPos:=fPos+1;
+        if (Cur.Kind=tkSemicolon) or (Cur.Kind=tkEnd) then
+        begin
+          var ihs:=new TInheritedCallStmtNode(fCurFunc);
+          foreach var pnm2 in fCurMethodParamNames do ihs.Args.Add(new TVarRefNode(pnm2));
+          Result:=ihs;
+        end
+        else
+        begin
+          var imn:=Expect(tkIdent).Text;
+          var ihs2:=new TInheritedCallStmtNode(imn);
+          if Cur.Kind=tkLParen then
+          begin
+            fPos:=fPos+1;
+            if Cur.Kind<>tkRParen then
+            begin
+              ihs2.Args.Add(ParseExpr);
+              while Cur.Kind=tkComma do begin fPos:=fPos+1; ihs2.Args.Add(ParseExpr); end;
+            end;
+            Expect(tkRParen);
+          end;
+          Result:=ihs2;
+        end;
       end
 
       else
@@ -1035,9 +1164,12 @@ type
       // 본문 파싱 (fCurClass 설정으로 필드 참조 가능)
       var savedClass:=fCurClass; var savedFunc:=fCurFunc;
       var savedParams:=fCurParams;
+      var savedMethodParamNames:=fCurMethodParamNames; // [Stage 30]
       fCurClass:=cn; fCurFunc:=mn;
       fCurParams:=new List<string>;
       foreach var pnCp in impl.ParamNames do fCurParams.Add(pnCp);
+      fCurMethodParamNames:=new List<string>; // [Stage 30] 지역변수 섞이기 전, 순수 매개변수 이름만 스냅샷
+      foreach var pnCp2 in impl.ParamNames do fCurMethodParamNames.Add(pnCp2);
 
       // [Stage 28] 지역 변수도 매개변수와 마찬가지로 "필드가 아님"으로 표시해야
       // ParsePrimary/ParseStatement의 필드 vs 지역변수 분기가 올바르게 동작한다.
@@ -1054,6 +1186,7 @@ type
 
       fCurClass:=savedClass; fCurFunc:=savedFunc; fCurGenericParam:=savedGP3;
       fCurParams:=savedParams;
+      fCurMethodParamNames:=savedMethodParamNames; // [Stage 30]
       impl.Body:=comp;
       Result:=impl;
     end;
@@ -1149,6 +1282,7 @@ type
     constructor Create(aTokens: List<TToken>);
     begin
       fTokens:=aTokens; fPos:=0; fCurFunc:=''; fCurClass:=''; fCurParams:=new List<string>;
+      fCurMethodParamNames:=new List<string>; // [Stage 30]
       fFuncNames:=new List<string>;
       fProcNames:=new List<string>;
       fArrayNames:=new List<string>;

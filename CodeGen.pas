@@ -29,6 +29,12 @@ type
     fLocals:      Dictionary<string, LocalBuilder>;
     fLocalTypes:  Dictionary<string, TVarType>;
     fLocalClrTypes: Dictionary<string, System.Type>; // object/외부타입 지역변수·매개변수의 실제 CLR 타입
+    fLocalClass: Dictionary<string, string>; // [Stage 30 fix] 로컬(우리 컴파일러가 만든) 클래스 타입 지역변수명 → 클래스명.
+      // fLocalClrTypes와 분리하는 이유: fLocalClrTypes에 담긴 타입은 이미 완성된 CLR 타입이라 가정하고
+      // GetProperty/GetMethod 같은 Reflection API를 직접 호출한다. 하지만 아직 CreateType()이 호출되지
+      // 않은 우리 클래스의 TypeBuilder에 Reflection을 걸면 "The invoked member is not supported in a
+      // dynamic module" 예외가 난다. 그래서 로컬 클래스 타입 변수는 이 딕셔너리로 분리해 GetVarClassName
+      // 경유 → FindMethodReturnType/FindInstanceMethod 같은 메타데이터 기반 조회로 처리한다.
 
     // 일반 static 함수/프로시저
     fMethods:     Dictionary<string, MethodBuilder>;
@@ -88,7 +94,8 @@ type
 
     function GetVarClassName(name: string): string;
     begin
-      if fGlobalClass.ContainsKey(name) then Result:=fGlobalClass[name]
+      if fLocalClass.ContainsKey(name) then Result:=fLocalClass[name]
+      else if fGlobalClass.ContainsKey(name) then Result:=fGlobalClass[name]
       else Result:='';
     end;
 
@@ -206,7 +213,15 @@ type
         // (Writeln 등에서 string/정수 분기가 정확해야 하므로).
         var _fr:=TFieldReadExprNode(e); var _fb: FieldBuilder;
         if TryFindFieldBuilder(fCurClassName, _fr.FieldName, _fb) then
-          Result:=vtInteger
+        begin
+          // [Stage 30 fix] 이전에는 로컬 필드를 무조건 vtInteger로 간주했다.
+          // fName: string 같은 문자열 필드가 문자열 연결식(TBinOpNode boAdd)에 쓰이면
+          // lt=vtInteger로 오판되어 Convert.ToString(int32)가 문자열 참조에 호출되고,
+          // 그 결과 객체 참조값이 정수로 해석되어 엉뚱한 숫자가 출력되는 버그가 있었다.
+          // FieldBuilder.FieldType을 실제로 확인해 string이면 vtString으로 판정한다.
+          if _fb.FieldType=typeof(string) then Result:=vtString
+          else Result:=vtInteger;
+        end
         else
         begin
           var _extType:=FindExternalAncestorType(fCurClassName);
@@ -227,7 +242,28 @@ type
       else if e is TMethodCallExprNode then
       begin
         var _mc4:=TMethodCallExprNode(e); var _qfb4: FieldBuilder;
-        if fLocalClrTypes.ContainsKey(_mc4.ObjName) then
+        if _mc4.ObjName='' then // [Stage 30] Self.Method(...) / 암시적 self 호출 — 지역 메서드 우선, 없으면 외부 조상 타입
+        begin
+          if fMethodReturnTypes.ContainsKey(fCurClassName) and fMethodReturnTypes[fCurClassName].ContainsKey(_mc4.MethodName) then
+            Result:=FindMethodReturnType(fCurClassName, _mc4.MethodName)
+          else
+          begin
+            var _extSelf:=FindExternalAncestorType(fCurClassName);
+            if _extSelf<>nil then
+            begin
+              var _pi4c:=_extSelf.GetProperty(_mc4.MethodName);
+              if (_pi4c<>nil) and (_pi4c.PropertyType=typeof(string)) then Result:=vtString
+              else
+              begin
+                var _mi4c:=ResolveMethodByArity(_extSelf, _mc4.MethodName, _mc4.Args.Count, false);
+                if (_mi4c<>nil) and (_mi4c.ReturnType=typeof(string)) then Result:=vtString
+                else Result:=vtInteger;
+              end;
+            end
+            else Result:=vtInteger;
+          end;
+        end
+        else if fLocalClrTypes.ContainsKey(_mc4.ObjName) then
         begin
           var _effType4:=fLocalClrTypes[_mc4.ObjName];
           if _mc4.ObjCastType<>'' then _effType4:=ResolveExternalType(_mc4.ObjCastType);
@@ -291,7 +327,68 @@ type
           Result:=vtString
         else Result:=vtInteger;
       end
+      else if e is TSelfExprNode then Result:=vtObject // [Stage 30]
+      else if e is TAsCastExprNode then // [Stage 30]
+      begin
+        var _ac:=TAsCastExprNode(e);
+        if fBuiltInterfaces.ContainsKey(_ac.TargetType) then Result:=vtInterface
+        else Result:=vtObject;
+      end
+      else if e is TInheritedCallExprNode then // [Stage 30]
+      begin
+        var _ih:=TInheritedCallExprNode(e);
+        var _pc:='';
+        if fClassParents.ContainsKey(fCurClassName) then _pc:=fClassParents[fCurClassName];
+        if _pc<>'' then Result:=FindMethodReturnType(_pc, _ih.MethodName)
+        else Result:=vtInteger;
+      end
       else Result:=vtInteger;
+    end;
+
+    // [Stage 30] inherited MethodName(args) 공통 구현. 식/문장 양쪽에서 재사용.
+    // 1) 지역 부모 클래스 체인에서 먼저 찾는다 — 찾으면 Call(비가상)로 그 MethodBuilder를
+    //    직접 호출해 가상 디스패치(자기 자신의 override)를 우회한다.
+    // 2) 없으면(지역 부모가 없거나, 부모 체인에 그 메서드가 없으면) 외부 조상 타입
+    //    (WPF Window 등)에서 이름+인자개수로 찾아 마찬가지로 Call(비가상)로 호출한다.
+    // keepReturnValue=true(식으로 쓰임)면 반환값을 스택에 남기고, false(문장)면 버린다.
+    procedure EmitInheritedCall(aIL: ILGenerator; mname: string; args: List<TExprNode>; keepReturnValue: boolean);
+    var startCls: string; imb2: MethodBuilder; extType2: System.Type; emi2: MethodInfo;
+        ae2: TExprNode; found: boolean;
+    begin
+      startCls:='';
+      if fClassParents.ContainsKey(fCurClassName) then startCls:=fClassParents[fCurClassName];
+      found:=false;
+      if startCls<>'' then found:=TryFindInstanceMethod(startCls, mname, imb2);
+
+      aIL.Emit(OpCodes.Ldarg_0); // self
+      foreach ae2 in args do EmitExpr(aIL, ae2);
+
+      if found then
+      begin
+        aIL.Emit(OpCodes.Call, imb2); // 비가상 호출 — 부모의 실제 구현을 직접 호출
+        if keepReturnValue then
+        begin
+          if imb2.ReturnType=typeof(System.Void) then
+            raise new Exception('inherited '+mname+'는 값을 반환하지 않습니다(procedure) — 식으로 사용할 수 없습니다.');
+        end
+        else if imb2.ReturnType<>typeof(System.Void) then aIL.Emit(OpCodes.Pop);
+      end
+      else
+      begin
+        extType2:=FindExternalAncestorType(fCurClassName);
+        if extType2=nil then
+          raise new Exception('inherited '+mname+': 클래스 "'+fCurClassName+'"에서 부모/외부 조상 타입을 찾을 수 없습니다.');
+        emi2:=ResolveMethodByArity(extType2, mname, args.Count, false);
+        if emi2=nil then
+          raise new Exception('외부 조상 타입 "'+extType2.FullName+'"에 메서드 "'+mname+'"가 없습니다 (인자 '+args.Count.ToString+'개).');
+        aIL.Emit(OpCodes.Call, emi2); // 비가상 호출
+        if keepReturnValue then
+        begin
+          if emi2.ReturnType=typeof(System.Void) then
+            raise new Exception('inherited '+mname+'는 값을 반환하지 않습니다(procedure) — 식으로 사용할 수 없습니다.');
+        end
+        else if emi2.ReturnType<>typeof(System.Void) then aIL.Emit(OpCodes.Pop);
+      end;
     end;
 
     procedure EmitExpr(aIL: ILGenerator; e: TExprNode);
@@ -576,6 +673,32 @@ type
         end;
       end
 
+      else if e is TSelfExprNode then
+        aIL.Emit(OpCodes.Ldarg_0) // [Stage 30] self 값 자체 (인자 전달, as 캐스트 대상 등)
+
+      else if e is TAsCastExprNode then
+      begin
+        // [Stage 30] <식> as <TypeName> — Castclass로 구현 (실패 시 InvalidCastException,
+        // Delphi as의 "실패하면 예외" 의미론과 일치. TypeName(expr) 캐스트와 IL은 같지만
+        // '식 전체'에 적용 가능하다는 점이 다르다 — TypeName(expr) 캐스트는 바로 뒤 멤버
+        // 접근 패턴에서만 파서가 인식한다).
+        var asc:=TAsCastExprNode(e);
+        EmitExpr(aIL, asc.Expr);
+        var targetT: System.Type;
+        if asc.IsExternalType then targetT:=ResolveExternalType(asc.TargetType)
+        else if fBuiltInterfaces.ContainsKey(asc.TargetType) then targetT:=fBuiltInterfaces[asc.TargetType]
+        else if fBuiltTypes.ContainsKey(asc.TargetType) then targetT:=fBuiltTypes[asc.TargetType]
+        else if fTypeBuilders.ContainsKey(asc.TargetType) then targetT:=fTypeBuilders[asc.TargetType]
+        else raise new Exception('as 캐스트 대상 타입을 찾을 수 없음: "'+asc.TargetType+'"');
+        aIL.Emit(OpCodes.Castclass, targetT);
+      end
+
+      else if e is TInheritedCallExprNode then
+      begin
+        var ihe:=TInheritedCallExprNode(e);
+        EmitInheritedCall(aIL, ihe.MethodName, ihe.Args, true);
+      end
+
       else raise new Exception('알 수 없는 식 노드: '+e.GetType.Name);
     end;
 
@@ -846,7 +969,16 @@ type
         evs:=TEventSubscribeStmtNode(s);
 
         // 1) 리시버(Button1) 로드 — 필드 우선, 그다음 로컬/전역 변수
-        if TryFindFieldBuilder(fCurClassName, evs.Qualifier, qfb) then
+        // [Stage 30] Qualifier=''  → self.Event += Handler; (예: WPF Window 자신의 Loaded 이벤트).
+        // 로컬 클래스에는 직접 정의한 이벤트가 없으므로 언제나 외부 조상 타입에서 찾는다.
+        if evs.Qualifier='' then
+        begin
+          aIL.Emit(OpCodes.Ldarg_0); // self
+          qTargetType:=FindExternalAncestorType(fCurClassName);
+          if qTargetType=nil then
+            raise new Exception('self 이벤트 구독 실패: 클래스 "'+fCurClassName+'"에 외부 조상 타입이 없습니다.');
+        end
+        else if TryFindFieldBuilder(fCurClassName, evs.Qualifier, qfb) then
         begin
           aIL.Emit(OpCodes.Ldarg_0); aIL.Emit(OpCodes.Ldfld, qfb);
           qTargetType:=qfb.FieldType;
@@ -1052,6 +1184,12 @@ type
           EmitExpr(aIL, rs.Expr);
           aIL.Emit(OpCodes.Throw);
         end;
+      end
+
+      else if s is TInheritedCallStmtNode then // [Stage 30]
+      begin
+        var ihs3:=TInheritedCallStmtNode(s);
+        EmitInheritedCall(aIL, ihs3.MethodName, ihs3.Args, false);
       end
 
       else raise new Exception('알 수 없는 문장 노드: '+s.GetType.Name);
@@ -1296,6 +1434,7 @@ type
       svLocals: Dictionary<string, LocalBuilder>;
       svLocalTypes: Dictionary<string, TVarType>;
       svLocalClrTypes: Dictionary<string, System.Type>;
+      svLocalClass: Dictionary<string, string>;
       svResult: LocalBuilder; svResultType: TVarType;
       svCurClass: string; st: TStmtNode;
     begin
@@ -1306,13 +1445,14 @@ type
       mb:=fInstanceMethods[impl.ClassName][impl.MethodName];
       il:=mb.GetILGenerator;
 
-      svLocals:=fLocals; svLocalTypes:=fLocalTypes; svLocalClrTypes:=fLocalClrTypes;
+      svLocals:=fLocals; svLocalTypes:=fLocalTypes; svLocalClrTypes:=fLocalClrTypes; svLocalClass:=fLocalClass;
       svResult:=fResultLocal; svResultType:=fResultType;
       svCurClass:=fCurClassName;
 
       fLocals:=new Dictionary<string, LocalBuilder>;
       fLocalTypes:=new Dictionary<string, TVarType>;
       fLocalClrTypes:=new Dictionary<string, System.Type>;
+      fLocalClass:=new Dictionary<string, string>;
       fCurClassName:=impl.ClassName;
 
       if impl.IsFunction then
@@ -1355,7 +1495,16 @@ type
         var lvClrType:=VTC(lv.VarType, lv.ClassName);
         var lvLoc:=il.DeclareLocal(lvClrType);
         fLocals[lv.Name]:=lvLoc; fLocalTypes[lv.Name]:=lv.VarType;
-        if (lv.VarType=vtObject) or (lv.VarType=vtInterface) then fLocalClrTypes[lv.Name]:=lvClrType;
+        if (lv.VarType=vtObject) or (lv.VarType=vtInterface) then
+        begin
+          // [Stage 30 fix] 우리 컴파일러가 만든 로컬 클래스면(TypeBuilder/완성타입이 이미 등록돼 있으면)
+          // 아직 CreateType() 전일 수 있으므로 Reflection 경로(fLocalClrTypes) 대신
+          // 메타데이터 기반 경로(fLocalClass → GetVarClassName)로 보낸다.
+          if fTypeBuilders.ContainsKey(lv.ClassName) or fBuiltTypes.ContainsKey(lv.ClassName) then
+            fLocalClass[lv.Name]:=lv.ClassName
+          else
+            fLocalClrTypes[lv.Name]:=lvClrType;
+        end;
       end;
 
       foreach st in impl.Body.Statements do EmitStatement(il, st);
@@ -1366,7 +1515,7 @@ type
       end;
       il.Emit(OpCodes.Ret);
 
-      fLocals:=svLocals; fLocalTypes:=svLocalTypes; fLocalClrTypes:=svLocalClrTypes;
+      fLocals:=svLocals; fLocalTypes:=svLocalTypes; fLocalClrTypes:=svLocalClrTypes; fLocalClass:=svLocalClass;
       fResultLocal:=svResult; fResultType:=svResultType;
       fCurClassName:=svCurClass;
     end;
@@ -1382,7 +1531,7 @@ type
     var
       pt: array of System.Type; i: integer; mb: MethodBuilder; il: ILGenerator;
       svL: Dictionary<string, LocalBuilder>; svLT: Dictionary<string, TVarType>;
-      svLC: Dictionary<string, System.Type>;
+      svLC: Dictionary<string, System.Type>; svLClass: Dictionary<string, string>;
       svR: LocalBuilder; svRT: TVarType; st: TStmtNode; retClrType: System.Type;
     begin
       pt:=new System.Type[d.Parameters.Count];
@@ -1391,9 +1540,9 @@ type
       mb:=tb.DefineMethod(d.Name, MethodAttributes.Public or MethodAttributes.Static,
         retClrType, pt);
       fMethods[d.Name]:=mb; fFuncReturnTypes[d.Name]:=d.ReturnType; il:=mb.GetILGenerator;
-      svL:=fLocals; svLT:=fLocalTypes; svLC:=fLocalClrTypes; svR:=fResultLocal; svRT:=fResultType;
+      svL:=fLocals; svLT:=fLocalTypes; svLC:=fLocalClrTypes; svLClass:=fLocalClass; svR:=fResultLocal; svRT:=fResultType;
       fLocals:=new Dictionary<string,LocalBuilder>; fLocalTypes:=new Dictionary<string,TVarType>;
-      fLocalClrTypes:=new Dictionary<string,System.Type>;
+      fLocalClrTypes:=new Dictionary<string,System.Type>; fLocalClass:=new Dictionary<string,string>;
       fResultType:=d.ReturnType; fResultLocal:=il.DeclareLocal(retClrType);
       for i:=0 to d.Parameters.Count-1 do
       begin
@@ -1410,18 +1559,27 @@ type
         var lvClrType:=VTC(lv.VarType, lv.ClassName);
         var lvLoc:=il.DeclareLocal(lvClrType);
         fLocals[lv.Name]:=lvLoc; fLocalTypes[lv.Name]:=lv.VarType;
-        if (lv.VarType=vtObject) or (lv.VarType=vtInterface) then fLocalClrTypes[lv.Name]:=lvClrType;
+        if (lv.VarType=vtObject) or (lv.VarType=vtInterface) then
+        begin
+          // [Stage 30 fix] 우리 컴파일러가 만든 로컬 클래스면(TypeBuilder/완성타입이 이미 등록돼 있으면)
+          // 아직 CreateType() 전일 수 있으므로 Reflection 경로(fLocalClrTypes) 대신
+          // 메타데이터 기반 경로(fLocalClass → GetVarClassName)로 보낸다.
+          if fTypeBuilders.ContainsKey(lv.ClassName) or fBuiltTypes.ContainsKey(lv.ClassName) then
+            fLocalClass[lv.Name]:=lv.ClassName
+          else
+            fLocalClrTypes[lv.Name]:=lvClrType;
+        end;
       end;
       foreach st in d.Body.Statements do EmitStatement(il, st);
       il.Emit(OpCodes.Ldloc, fResultLocal); il.Emit(OpCodes.Ret);
-      fLocals:=svL; fLocalTypes:=svLT; fLocalClrTypes:=svLC; fResultLocal:=svR; fResultType:=svRT;
+      fLocals:=svL; fLocalTypes:=svLT; fLocalClrTypes:=svLC; fLocalClass:=svLClass; fResultLocal:=svR; fResultType:=svRT;
     end;
 
     procedure BuildStaticProc(tb: TypeBuilder; d: TProcDeclNode);
     var
       pt: array of System.Type; i: integer; mb: MethodBuilder; il: ILGenerator;
       svL: Dictionary<string, LocalBuilder>; svLT: Dictionary<string, TVarType>;
-      svLC: Dictionary<string, System.Type>;
+      svLC: Dictionary<string, System.Type>; svLClass: Dictionary<string, string>;
       svR: LocalBuilder; svRT: TVarType; st: TStmtNode;
     begin
       pt:=new System.Type[d.Parameters.Count];
@@ -1429,9 +1587,9 @@ type
       mb:=tb.DefineMethod(d.Name, MethodAttributes.Public or MethodAttributes.Static,
         typeof(System.Void), pt);
       fMethods[d.Name]:=mb; il:=mb.GetILGenerator;
-      svL:=fLocals; svLT:=fLocalTypes; svLC:=fLocalClrTypes; svR:=fResultLocal; svRT:=fResultType;
+      svL:=fLocals; svLT:=fLocalTypes; svLC:=fLocalClrTypes; svLClass:=fLocalClass; svR:=fResultLocal; svRT:=fResultType;
       fLocals:=new Dictionary<string,LocalBuilder>; fLocalTypes:=new Dictionary<string,TVarType>;
-      fLocalClrTypes:=new Dictionary<string,System.Type>;
+      fLocalClrTypes:=new Dictionary<string,System.Type>; fLocalClass:=new Dictionary<string,string>;
       fResultLocal:=nil;
       for i:=0 to d.Parameters.Count-1 do
       begin
@@ -1448,11 +1606,20 @@ type
         var lvClrType:=VTC(lv.VarType, lv.ClassName);
         var lvLoc:=il.DeclareLocal(lvClrType);
         fLocals[lv.Name]:=lvLoc; fLocalTypes[lv.Name]:=lv.VarType;
-        if (lv.VarType=vtObject) or (lv.VarType=vtInterface) then fLocalClrTypes[lv.Name]:=lvClrType;
+        if (lv.VarType=vtObject) or (lv.VarType=vtInterface) then
+        begin
+          // [Stage 30 fix] 우리 컴파일러가 만든 로컬 클래스면(TypeBuilder/완성타입이 이미 등록돼 있으면)
+          // 아직 CreateType() 전일 수 있으므로 Reflection 경로(fLocalClrTypes) 대신
+          // 메타데이터 기반 경로(fLocalClass → GetVarClassName)로 보낸다.
+          if fTypeBuilders.ContainsKey(lv.ClassName) or fBuiltTypes.ContainsKey(lv.ClassName) then
+            fLocalClass[lv.Name]:=lv.ClassName
+          else
+            fLocalClrTypes[lv.Name]:=lvClrType;
+        end;
       end;
       foreach st in d.Body.Statements do EmitStatement(il, st);
       il.Emit(OpCodes.Ret);
-      fLocals:=svL; fLocalTypes:=svLT; fLocalClrTypes:=svLC; fResultLocal:=svR; fResultType:=svRT;
+      fLocals:=svL; fLocalTypes:=svLT; fLocalClrTypes:=svLC; fLocalClass:=svLClass; fResultLocal:=svR; fResultType:=svRT;
     end;
 
   public
@@ -1465,6 +1632,7 @@ type
       fLocals:=new Dictionary<string, LocalBuilder>;
       fLocalTypes:=new Dictionary<string, TVarType>;
       fLocalClrTypes:=new Dictionary<string, System.Type>;
+      fLocalClass:=new Dictionary<string, string>;
       fMethods:=new Dictionary<string, MethodBuilder>;
       fFuncReturnTypes:=new Dictionary<string, TVarType>;
       fTypeBuilders:=new Dictionary<string, TypeBuilder>;

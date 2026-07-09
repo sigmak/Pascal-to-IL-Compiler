@@ -45,6 +45,27 @@ type
   // [Stage 29] nil 리터럴 (참조 타입 변수/필드와의 비교, 대입에 사용)
   TNilLiteralNode = class(TExprNode) end;
 
+  // [Stage 30] self 값 자체를 식으로 참조 (예: 델리게이트 target, 다른 메서드/함수의
+  // 인자로 self를 넘길 때). 'self.fValue' 처럼 뒤에 점(.)이 붙는 형태는 파서 단계에서
+  // 기존 암시적 self 필드읽기/메서드호출(ObjName='')로 즉시 환원되므로 이 노드가 쓰이지 않는다.
+  TSelfExprNode = class(TExprNode) end;
+
+  // [Stage 30] <식> as <TypeName>  — Delphi식 체크 캐스트. 실패 시 InvalidCastException.
+  // TargetType은 지역 클래스/인터페이스 이름이거나(IsExternalType=false),
+  // 점(.)으로 연결된 외부 .NET 타입 전체 경로(IsExternalType=true).
+  TAsCastExprNode = class(TExprNode)
+  public Expr: TExprNode; TargetType: string; IsExternalType: boolean;
+    constructor Create(e: TExprNode; tt: string);
+    begin Expr:=e; TargetType:=tt; IsExternalType:=false; end;
+  end;
+
+  // [Stage 30] inherited MethodName(args...)  — 식으로 쓰이는 경우 (함수: 반환값 있음).
+  // 예: Result := inherited GetValue();
+  TInheritedCallExprNode = class(TExprNode)
+  public MethodName: string; Args: List<TExprNode>;
+    constructor Create(mn: string); begin MethodName:=mn; Args:=new List<TExprNode>; end;
+  end;
+
   TIntToStrNode = class(TExprNode)
   public Arg: TExprNode;
     constructor Create(a: TExprNode); begin Arg:=a; end;
@@ -229,6 +250,14 @@ type
   TRaiseStmtNode = class(TStmtNode)
   public Expr: TExprNode; // nil이면 reraise
     constructor Create(e: TExprNode); begin Expr:=e; end;
+  end;
+
+  // [Stage 30] inherited MethodName(args...); 또는 inherited;  — 문장으로 쓰이는 경우
+  // (프로시저: 반환값 없음/버림). bare 'inherited;'는 파서 단계에서 현재 메서드와
+  // 같은 이름 + 같은 매개변수를 그대로 전달하는 형태로 즉시 확장되어 채워진다.
+  TInheritedCallStmtNode = class(TStmtNode)
+  public MethodName: string; Args: List<TExprNode>;
+    constructor Create(mn: string); begin MethodName:=mn; Args:=new List<TExprNode>; end;
   end;
 
   // E.Message (예외 변수의 Message 프로퍼티)
