@@ -318,11 +318,15 @@ type
     // [Stage 32] 제네릭 타입 매개변수 이름 목록 (예: TStack<T> → ['T'], TPair<K,V> → ['K','V']).
     // 선언 순서가 TGenericInstantiation.ArgTypes/ArgClassNames의 인덱스와 대응된다. IsGeneric=false면 빈 목록.
     GenericParamNames: List<string>;
+    // [Stage 34] GenericParamNames와 같은 인덱스로 대응하는 제약조건.
+    // ''(빈 문자열)이면 제약 없음. 'class'면 참조 타입(임의의 클래스)만 허용.
+    // 그 외 값이면 해당 이름의 클래스/인터페이스를 상속·구현해야 함 (예: 'TAnimal', 'IComparable').
+    GenericParamConstraints: List<string>;
     constructor Create(n: string);
     begin
       Name:=n; ParentName:=''; IsExternalParent:=false; InterfaceName:='';
       Fields:=new List<TFieldDeclNode>; Methods:=new List<TMethodSignature>;
-      IsGeneric:=false; GenericParamNames:=new List<string>;
+      IsGeneric:=false; GenericParamNames:=new List<string>; GenericParamConstraints:=new List<string>;
     end;
   end;
 

@@ -31,11 +31,15 @@ type
     fClassMethods: Dictionary<string, Dictionary<string, boolean>>;
     // 클래스별 부모 클래스 이름 ('' 이면 없음)
     fClassParent: Dictionary<string, string>;
+    // [Stage 34] 클래스별 구현 인터페이스 이름 ('' 이면 없음) — 제네릭 제약조건 검증에 사용
+    fClassInterface: Dictionary<string, string>;
     // Stage26: 제네릭(단형화) 지원
     fProg: TProgramNode; // ParseProgram 시작 시 설정 — 깊이 상관없이 GenericInstantiations에 접근하기 위함
     fGenericClassNames: List<string>; // 제네릭 템플릿으로 선언된 클래스 이름 (예: 'TStack')
     // [Stage 32] 템플릿 이름 → 타입 매개변수 이름 목록 (예: 'TStack'→['T'], 'TPair'→['K','V'])
     fClassGenericParam: Dictionary<string, List<string>>;
+    // [Stage 34] 템플릿 이름 → 타입 매개변수별 제약조건 목록 (fClassGenericParam과 같은 인덱스로 대응, ''=제약 없음)
+    fClassGenericConstraint: Dictionary<string, List<string>>;
     // [Stage 32] 현재 파싱 중인 제네릭 클래스 본문/메서드구현에서 유효한 타입 매개변수 이름들 (빈 목록이면 제네릭 문맥 아님)
     fCurGenericParams: List<string>;
     // [Stage 32] ParseVarType/ParseParamTypeExt가 vtGeneric을 반환했을 때, 그 자리에서 바로 리턴값에
@@ -107,6 +111,39 @@ type
         Result:=ParseVarType;
     end;
 
+    // [Stage 34] 타입 매개변수 하나 뒤에 선택적으로 붙는 제약조건을 파싱한다: <T: TAnimal>, <T: IComparable>, <T: class>
+    // 호출 시점에 매개변수 이름(T 등)은 이미 소비된 상태. 콜론이 없으면 제약 없음('')을 돌려준다.
+    function ParseOptionalGenericConstraint: string;
+    var constraintName: string;
+    begin
+      if Cur.Kind<>tkColon then begin Result:=''; exit; end;
+      fPos:=fPos+1; // ':' 소비
+      if Cur.Kind=tkClass then begin fPos:=fPos+1; Result:='class'; exit; end; // T: class (임의의 참조 타입)
+      if Cur.Kind<>tkIdent then
+        raise new Exception('줄 '+Cur.Line.ToString+': 제네릭 제약조건에는 클래스/인터페이스 이름 또는 "class"가 와야 합니다');
+      constraintName:=Cur.Text; fPos:=fPos+1;
+      if (not fClassNames.Contains(constraintName)) and (not fInterfaceNames.Contains(constraintName)) then
+        raise new Exception('줄 '+Cur.Line.ToString+': 제약조건 "'+constraintName+'"는 알 수 없는 클래스/인터페이스입니다');
+      Result:=constraintName;
+    end;
+
+    // [Stage 34] 타입 인자(클래스 이름)가 제약조건(클래스/인터페이스 이름 또는 'class')을 만족하는지 검사.
+    // 상속 체인(fClassParent)과 구현 인터페이스(fClassInterface)를 따라 올라가며 확인한다.
+    function SatisfiesConstraint(className, constraintName: string): boolean;
+    var cur: string;
+    begin
+      if constraintName='class' then begin Result:=true; exit; end; // 'class' 제약: 임의의 참조 타입 허용
+      cur:=className;
+      while cur<>'' do
+      begin
+        if cur=constraintName then begin Result:=true; exit; end;
+        if fClassInterface.ContainsKey(cur) and (fClassInterface[cur]=constraintName) then
+          begin Result:=true; exit; end;
+        if fClassParent.ContainsKey(cur) then cur:=fClassParent[cur] else cur:='';
+      end;
+      Result:=false;
+    end;
+
     // Stage26/[Stage 32] 제네릭 인스턴스화 (예: TStack<integer>, TPair<integer,string>,
     // TStack<TStack<integer>>) 해석.
     // 호출 시점에 templateName은 이미 소비된 상태이고 Cur='<' 이어야 한다.
@@ -156,6 +193,22 @@ type
          and (fClassGenericParam[templateName].Count<>argTypes.Count) then
         raise new Exception('줄 '+Cur.Line.ToString+': 제네릭 클래스 "'+templateName+'"는 타입 매개변수 '
           +fClassGenericParam[templateName].Count.ToString+'개가 필요한데 '+argTypes.Count.ToString+'개가 주어졌습니다');
+
+      // [Stage 34] 제약조건 검증 (T: TAnimal, T: IComparable, T: class 등)
+      if fClassGenericConstraint.ContainsKey(templateName) then
+      begin
+        var constraints:=fClassGenericConstraint[templateName];
+        for var ci:=0 to constraints.Count-1 do
+        begin
+          if constraints[ci]<>'' then
+          begin
+            if (argTypes[ci]<>vtObject) or (not SatisfiesConstraint(argClassNames[ci], constraints[ci])) then
+              raise new Exception('줄 '+Cur.Line.ToString+': 제네릭 타입 인자 "'+argTags[ci]
+                +'"는 제약조건 "'+constraints[ci]+'"을(를) 만족하지 않습니다 (타입 매개변수 "'
+                +fClassGenericParam[templateName][ci]+'")');
+          end;
+        end;
+      end;
 
       concreteName:=templateName;
       foreach var tag in argTags do concreteName:=concreteName+'_'+tag;
@@ -921,12 +974,20 @@ type
         cn:=Cur.Text; fPos:=fPos+1;
 
         // 선택적 제네릭 타입 매개변수: TStack<T> = class ... end; 또는 [Stage 32] TPair<K,V> = class ... end;
+        // [Stage 34] 각 매개변수는 선택적으로 제약조건을 가질 수 있다: TBox<T: TAnimal>, TBox<T: class>
         var genParamNames:=new List<string>;
+        var genParamConstraints:=new List<string>;
         if Cur.Kind=tkLt then
         begin
           fPos:=fPos+1;
           genParamNames.Add(Expect(tkIdent).Text);
-          while Cur.Kind=tkComma do begin fPos:=fPos+1; genParamNames.Add(Expect(tkIdent).Text); end;
+          genParamConstraints.Add(ParseOptionalGenericConstraint);
+          while Cur.Kind=tkComma do
+          begin
+            fPos:=fPos+1;
+            genParamNames.Add(Expect(tkIdent).Text);
+            genParamConstraints.Add(ParseOptionalGenericConstraint);
+          end;
           Expect(tkGt);
         end;
 
@@ -954,10 +1015,12 @@ type
           Expect(tkClass);
           cd:=new TClassDeclNode(cn);
           cd.IsGeneric:=(genParamNames.Count>0); cd.GenericParamNames:=genParamNames;
+          cd.GenericParamConstraints:=genParamConstraints;
           if cd.IsGeneric then
           begin
             fGenericClassNames.Add(cn);
             fClassGenericParam[cn]:=genParamNames;
+            fClassGenericConstraint[cn]:=genParamConstraints;
           end;
 
           // 선택적 상속/인터페이스 구현: class(TParentName) 또는 class(IInterfaceName)
@@ -987,6 +1050,7 @@ type
 
           fClassNames.Add(cn);
           fClassParent[cn]:=cd.ParentName;
+          fClassInterface[cn]:=cd.InterfaceName; // [Stage 34] 제네릭 제약조건 검증용
 
           // 필드/메서드 이름 목록은 부모의 것을 상속하여 시작 (필드/메서드 참조 판별용)
           // 외부 타입 상속인 경우 그 타입의 필드/메서드 목록을 알 수 없으므로 빈 목록으로 시작
@@ -1342,8 +1406,10 @@ type
       fClassFields:=new Dictionary<string, List<string>>;
       fClassMethods:=new Dictionary<string, Dictionary<string, boolean>>;
       fClassParent:=new Dictionary<string, string>;
+      fClassInterface:=new Dictionary<string, string>; // [Stage 34]
       fGenericClassNames:=new List<string>;
       fClassGenericParam:=new Dictionary<string, List<string>>;
+      fClassGenericConstraint:=new Dictionary<string, List<string>>; // [Stage 34]
       fCurGenericParams:=new List<string>;
       fLastGenericName:='';
     end;
