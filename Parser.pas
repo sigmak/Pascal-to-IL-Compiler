@@ -941,6 +941,40 @@ type
       end;
     end;
 
+    // [Stage 28] 함수/프로시저/메서드 본문 안의 지역 변수 선언(var 섹션)을 파싱한다.
+    // 최상위 var 섹션(ParseVarSection)과 로직은 같지만, 중첩 함수/프로시저 선언이
+    // 없으므로 tkBegin 하나만 만나면 끝난다.
+    procedure ParseLocalVarSection(aList: List<TVarDecl>);
+    var vt: TVarType; ns: List<string>; cn: string;
+    begin
+      Expect(tkVar);
+      while Cur.Kind<>tkBegin do
+      begin
+        ns:=new List<string>; ns.Add(Expect(tkIdent).Text);
+        while Cur.Kind=tkComma do begin fPos:=fPos+1; ns.Add(Expect(tkIdent).Text); end;
+        Expect(tkColon);
+        cn:='';
+        // 클래스 타입 지역변수 처리
+        if (Cur.Kind=tkIdent) and fClassNames.Contains(Cur.Text) then
+        begin
+          cn:=Cur.Text; fPos:=fPos+1; vt:=vtObject;
+          if (Cur.Kind=tkLt) and fGenericClassNames.Contains(cn) then cn:=ResolveGenericInstantiation(cn);
+        end
+        // 인터페이스 타입 지역변수 처리
+        else if (Cur.Kind=tkIdent) and fInterfaceNames.Contains(Cur.Text) then
+        begin
+          cn:=Cur.Text; fPos:=fPos+1; vt:=vtInterface;
+        end
+        else vt:=ParseVarType;
+        Expect(tkSemicolon);
+        foreach var nm in ns do
+        begin
+          aList.Add(new TVarDecl(nm, vt, cn));
+          if (vt=vtIntArray) or (vt=vtStrArray) then fArrayNames.Add(nm);
+        end;
+      end;
+    end;
+
     // 클래스 메서드 구현: procedure TClassName.MethodName; begin...end;
     function ParseMethodImpl: TMethodImplNode;
     var
@@ -968,13 +1002,23 @@ type
         begin
           while true do
           begin
-            var pn:=Expect(tkIdent).Text; impl.ParamNames.Add(pn);
-            while Cur.Kind=tkComma do begin fPos:=fPos+1; impl.ParamNames.Add(Expect(tkIdent).Text); end;
+            var pBatch:=new List<string>;
+            var pn:=Expect(tkIdent).Text; impl.ParamNames.Add(pn); pBatch.Add(pn);
+            while Cur.Kind=tkComma do
+            begin
+              fPos:=fPos+1; var pn2:=Expect(tkIdent).Text;
+              impl.ParamNames.Add(pn2); pBatch.Add(pn2);
+            end;
             Expect(tkColon);
             var pIsExt3:=false; var pCn3:='';
             pt:=ParseParamTypeExt(pIsExt3, pCn3);
             for var i:=impl.ParamTypes.Count to impl.ParamNames.Count-1 do
               impl.ParamTypes.Add(pt);
+            // [Stage 28] array of integer/string 매개변수를 본문에서 a[i]로 인덱싱할 수
+            // 있으려면 fArrayNames에 등록되어야 한다(별개 버그, 함께 수정).
+            if (pt=vtIntArray) or (pt=vtStrArray) then
+              foreach var pbn in pBatch do
+                if not fArrayNames.Contains(pbn) then fArrayNames.Add(pbn);
             if Cur.Kind=tkSemicolon then fPos:=fPos+1 else break;
           end;
         end;
@@ -992,6 +1036,14 @@ type
       fCurParams:=new List<string>;
       foreach var pnCp in impl.ParamNames do fCurParams.Add(pnCp);
 
+      // [Stage 28] 지역 변수도 매개변수와 마찬가지로 "필드가 아님"으로 표시해야
+      // ParsePrimary/ParseStatement의 필드 vs 지역변수 분기가 올바르게 동작한다.
+      // (fCurParams는 사실상 "이 스코프에서 필드보다 우선하는 이름" 목록으로 쓰인다.)
+      if Cur.Kind=tkVar then
+      begin
+        ParseLocalVarSection(impl.LocalVars);
+        foreach var lvcp in impl.LocalVars do fCurParams.Add(lvcp.Name);
+      end;
       Expect(tkBegin); comp:=new TCompoundStmtNode;
       while Cur.Kind<>tkEnd do
       begin comp.Statements.Add(ParseStatement); if Cur.Kind=tkSemicolon then fPos:=fPos+1; end;
@@ -1014,7 +1066,14 @@ type
           ns:=new List<string>; ns.Add(Expect(tkIdent).Text);
           while Cur.Kind=tkComma do begin fPos:=fPos+1; ns.Add(Expect(tkIdent).Text); end;
           Expect(tkColon); pt:=ParseVarType;
-          foreach var nm in ns do aP.Add(new TParamDef(nm, pt));
+          foreach var nm in ns do
+          begin
+            aP.Add(new TParamDef(nm, pt));
+            // [Stage 28] array of integer/string 매개변수도 본문에서 a[i]로 인덱싱할 수
+            // 있어야 하는데, 이전에는 매개변수 이름이 fArrayNames에 등록되지 않아
+            // 배열 인덱스 식으로 인식되지 않았다(별개 버그, 이번에 함께 수정).
+            if (pt=vtIntArray) or (pt=vtStrArray) then fArrayNames.Add(nm);
+          end;
           if Cur.Kind=tkSemicolon then fPos:=fPos+1 else break;
         end;
       end;
@@ -1028,6 +1087,7 @@ type
       fFuncNames.Add(d.Name); ParseParams(d.Parameters);
       Expect(tkColon); d.ReturnType:=ParseVarType; Expect(tkSemicolon);
       sv:=fCurFunc; fCurFunc:=d.Name;
+      if Cur.Kind=tkVar then ParseLocalVarSection(d.LocalVars);
       Expect(tkBegin); c:=new TCompoundStmtNode;
       while Cur.Kind<>tkEnd do
       begin c.Statements.Add(ParseStatement); if Cur.Kind=tkSemicolon then fPos:=fPos+1; end;
@@ -1043,6 +1103,7 @@ type
       d:=new TProcDeclNode(Expect(tkIdent).Text);
       fProcNames.Add(d.Name); ParseParams(d.Parameters); Expect(tkSemicolon);
       sv:=fCurFunc; fCurFunc:='';
+      if Cur.Kind=tkVar then ParseLocalVarSection(d.LocalVars);
       Expect(tkBegin); c:=new TCompoundStmtNode;
       while Cur.Kind<>tkEnd do
       begin c.Statements.Add(ParseStatement); if Cur.Kind=tkSemicolon then fPos:=fPos+1; end;

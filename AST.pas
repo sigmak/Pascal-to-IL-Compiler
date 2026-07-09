@@ -310,20 +310,6 @@ type
     begin Name:=n; Methods:=new List<TMethodSignature>; end;
   end;
 
-  // 클래스 메서드 구현 (ClassName.MethodName 형태)
-  TMethodImplNode = class
-  public
-    ClassName: string; MethodName: string;
-    IsFunction: boolean; ReturnType: TVarType;
-    ParamNames: List<string>; ParamTypes: List<TVarType>;
-    Body: TCompoundStmtNode;
-    constructor Create(cn, mn: string; isFunc: boolean; ret: TVarType);
-    begin
-      ClassName:=cn; MethodName:=mn; IsFunction:=isFunc; ReturnType:=ret;
-      ParamNames:=new List<string>; ParamTypes:=new List<TVarType>;
-    end;
-  end;
-
   // ----------------------------------------------------------
   // 변수/매개변수 선언
   // ----------------------------------------------------------
@@ -338,18 +324,37 @@ type
     constructor Create(n: string; t: TVarType); begin Name:=n; ParamType:=t; end;
   end;
 
+  // 클래스 메서드 구현 (ClassName.MethodName 형태)
+  TMethodImplNode = class
+  public
+    ClassName: string; MethodName: string;
+    IsFunction: boolean; ReturnType: TVarType;
+    ParamNames: List<string>; ParamTypes: List<TVarType>;
+    LocalVars: List<TVarDecl>; // [Stage 28] 메서드 본문 안의 지역 변수 선언(var 섹션)
+    Body: TCompoundStmtNode;
+    constructor Create(cn, mn: string; isFunc: boolean; ret: TVarType);
+    begin
+      ClassName:=cn; MethodName:=mn; IsFunction:=isFunc; ReturnType:=ret;
+      ParamNames:=new List<string>; ParamTypes:=new List<TVarType>;
+      LocalVars:=new List<TVarDecl>;
+    end;
+  end;
+
   TFuncDeclNode = class
   public Name: string; Parameters: List<TParamDef>;
     ReturnType: TVarType; Body: TCompoundStmtNode;
+    LocalVars: List<TVarDecl>; // [Stage 28] 함수 본문 안의 지역 변수 선언(var 섹션)
     constructor Create(n: string);
-    begin Name:=n; Parameters:=new List<TParamDef>; end;
+    begin Name:=n; Parameters:=new List<TParamDef>; LocalVars:=new List<TVarDecl>; end;
   end;
 
   TProcDeclNode = class
   public Name: string; Parameters: List<TParamDef>; Body: TCompoundStmtNode;
+    LocalVars: List<TVarDecl>; // [Stage 28] 프로시저 본문 안의 지역 변수 선언(var 섹션)
     constructor Create(n: string);
-    begin Name:=n; Parameters:=new List<TParamDef>; end;
+    begin Name:=n; Parameters:=new List<TParamDef>; LocalVars:=new List<TVarDecl>; end;
   end;
+
 
   TProgramNode = class
   public

@@ -20,7 +20,8 @@ uses
 
 const
   DefaultExampleDir = 'Examples';
-  DefaultExampleFile = 'GenericBox_Test_Stage26.pas';
+  //DefaultExampleFile = 'Staticfunctypes_test_Stage27.pas';
+  DefaultExampleFile = 'LocalVars_Test_Stage28.pas';
 
 function ResolveInputPath: string;
 var

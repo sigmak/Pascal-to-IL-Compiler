@@ -32,6 +32,7 @@ type
 
     // 일반 static 함수/프로시저
     fMethods:     Dictionary<string, MethodBuilder>;
+    fFuncReturnTypes: Dictionary<string, TVarType>; // [Stage 27] 최상위 함수명 → 반환타입 (InferType이 함수 호출식의 타입을 알 수 있도록)
 
     // 클래스 관련
     fTypeBuilders: Dictionary<string, TypeBuilder>;  // 클래스명 → TypeBuilder
@@ -259,6 +260,15 @@ type
       end
       else if e is TArrayIndexExprNode then Result:=vtInteger
       else if e is TVarRefNode then Result:=GetVarType(TVarRefNode(e).VarName)
+      else if e is TFuncCallExprNode then
+      begin
+        // [Stage 27] 이전에는 이 분기 자체가 없어 최상위 함수 호출식은 항상
+        // vtInteger로 취급됐다 — 'x: ' + Greet(name) 같은 식에서 Greet()가
+        // string을 반환해도 정수 변환 경로를 타 값이 깨졌다.
+        var _fc4:=TFuncCallExprNode(e);
+        if fFuncReturnTypes.ContainsKey(_fc4.FuncName) then Result:=fFuncReturnTypes[_fc4.FuncName]
+        else Result:=vtInteger;
+      end
       else if e is TExceptionMsgExprNode then Result:=vtString // E.Message는 항상 string
       else if e is TStaticMemberExprNode then
       begin
@@ -1332,6 +1342,18 @@ type
         il.Emit(OpCodes.Stloc, loc);
       end;
 
+      // [Stage 28] 메서드 본문의 지역 변수 선언(var 섹션) 처리.
+      // 전역 var 섹션과 같은 방식으로 VTC를 이용해 실제 CLR 타입으로 슬롯을 만들고,
+      // object/interface 타입이면 fLocalClrTypes에도 등록해 메서드 호출 대상 해석이
+      // (InferType/EmitExpr의 TMethodCallExprNode 처리와) 그대로 맞물리게 한다.
+      foreach var lv in impl.LocalVars do
+      begin
+        var lvClrType:=VTC(lv.VarType, lv.ClassName);
+        var lvLoc:=il.DeclareLocal(lvClrType);
+        fLocals[lv.Name]:=lvLoc; fLocalTypes[lv.Name]:=lv.VarType;
+        if (lv.VarType=vtObject) or (lv.VarType=vtInterface) then fLocalClrTypes[lv.Name]:=lvClrType;
+      end;
+
       foreach st in impl.Body.Statements do EmitStatement(il, st);
 
       if impl.IsFunction then
@@ -1345,60 +1367,88 @@ type
       fCurClassName:=svCurClass;
     end;
 
+    // [Stage 27] 이전에는 최상위 함수/프로시저의 모든 매개변수·반환값을 무조건
+    // typeof(integer)로 방출했다 — string/boolean/array 매개변수를 받는 함수는
+    // 인자를 올바른 CLR 타입으로 스택에 올려도 시그니처가 int32로 선언되어 있어
+    // IL 검증에서 깨지거나 값이 깨졌다. 이제 Parser가 이미 채워둔
+    // d.Parameters[i].ParamType/d.ReturnType을 VTC로 변환해 그대로 사용한다.
+    // (클래스/인터페이스 타입 매개변수는 TParamDef가 ClassName을 보관하지 않아
+    // 아직 범위 밖 — 향후 단계 과제로 남긴다.)
     procedure BuildStaticFunc(tb: TypeBuilder; d: TFuncDeclNode);
     var
       pt: array of System.Type; i: integer; mb: MethodBuilder; il: ILGenerator;
       svL: Dictionary<string, LocalBuilder>; svLT: Dictionary<string, TVarType>;
-      svR: LocalBuilder; svRT: TVarType; st: TStmtNode;
+      svLC: Dictionary<string, System.Type>;
+      svR: LocalBuilder; svRT: TVarType; st: TStmtNode; retClrType: System.Type;
     begin
       pt:=new System.Type[d.Parameters.Count];
-      for i:=0 to d.Parameters.Count-1 do pt[i]:=typeof(integer);
+      for i:=0 to d.Parameters.Count-1 do pt[i]:=VTC(d.Parameters[i].ParamType, '');
+      retClrType:=VTC(d.ReturnType, '');
       mb:=tb.DefineMethod(d.Name, MethodAttributes.Public or MethodAttributes.Static,
-        typeof(integer), pt);
-      fMethods[d.Name]:=mb; il:=mb.GetILGenerator;
-      svL:=fLocals; svLT:=fLocalTypes; svR:=fResultLocal; svRT:=fResultType;
+        retClrType, pt);
+      fMethods[d.Name]:=mb; fFuncReturnTypes[d.Name]:=d.ReturnType; il:=mb.GetILGenerator;
+      svL:=fLocals; svLT:=fLocalTypes; svLC:=fLocalClrTypes; svR:=fResultLocal; svRT:=fResultType;
       fLocals:=new Dictionary<string,LocalBuilder>; fLocalTypes:=new Dictionary<string,TVarType>;
-      fResultType:=d.ReturnType; fResultLocal:=il.DeclareLocal(typeof(integer));
+      fLocalClrTypes:=new Dictionary<string,System.Type>;
+      fResultType:=d.ReturnType; fResultLocal:=il.DeclareLocal(retClrType);
       for i:=0 to d.Parameters.Count-1 do
       begin
-        var loc:=il.DeclareLocal(typeof(integer));
-        fLocals[d.Parameters[i].Name]:=loc; fLocalTypes[d.Parameters[i].Name]:=vtInteger;
+        var loc:=il.DeclareLocal(pt[i]);
+        fLocals[d.Parameters[i].Name]:=loc; fLocalTypes[d.Parameters[i].Name]:=d.Parameters[i].ParamType;
         if i=0 then il.Emit(OpCodes.Ldarg_0) else if i=1 then il.Emit(OpCodes.Ldarg_1)
         else if i=2 then il.Emit(OpCodes.Ldarg_2) else if i=3 then il.Emit(OpCodes.Ldarg_3)
         else il.Emit(OpCodes.Ldarg_S, byte(i));
         il.Emit(OpCodes.Stloc, loc);
       end;
+      // [Stage 28] 함수 본문의 지역 변수 선언(var 섹션) 처리 — BuildMethodBody와 동일 패턴.
+      foreach var lv in d.LocalVars do
+      begin
+        var lvClrType:=VTC(lv.VarType, lv.ClassName);
+        var lvLoc:=il.DeclareLocal(lvClrType);
+        fLocals[lv.Name]:=lvLoc; fLocalTypes[lv.Name]:=lv.VarType;
+        if (lv.VarType=vtObject) or (lv.VarType=vtInterface) then fLocalClrTypes[lv.Name]:=lvClrType;
+      end;
       foreach st in d.Body.Statements do EmitStatement(il, st);
       il.Emit(OpCodes.Ldloc, fResultLocal); il.Emit(OpCodes.Ret);
-      fLocals:=svL; fLocalTypes:=svLT; fResultLocal:=svR; fResultType:=svRT;
+      fLocals:=svL; fLocalTypes:=svLT; fLocalClrTypes:=svLC; fResultLocal:=svR; fResultType:=svRT;
     end;
 
     procedure BuildStaticProc(tb: TypeBuilder; d: TProcDeclNode);
     var
       pt: array of System.Type; i: integer; mb: MethodBuilder; il: ILGenerator;
       svL: Dictionary<string, LocalBuilder>; svLT: Dictionary<string, TVarType>;
+      svLC: Dictionary<string, System.Type>;
       svR: LocalBuilder; svRT: TVarType; st: TStmtNode;
     begin
       pt:=new System.Type[d.Parameters.Count];
-      for i:=0 to d.Parameters.Count-1 do pt[i]:=typeof(integer);
+      for i:=0 to d.Parameters.Count-1 do pt[i]:=VTC(d.Parameters[i].ParamType, '');
       mb:=tb.DefineMethod(d.Name, MethodAttributes.Public or MethodAttributes.Static,
         typeof(System.Void), pt);
       fMethods[d.Name]:=mb; il:=mb.GetILGenerator;
-      svL:=fLocals; svLT:=fLocalTypes; svR:=fResultLocal; svRT:=fResultType;
+      svL:=fLocals; svLT:=fLocalTypes; svLC:=fLocalClrTypes; svR:=fResultLocal; svRT:=fResultType;
       fLocals:=new Dictionary<string,LocalBuilder>; fLocalTypes:=new Dictionary<string,TVarType>;
+      fLocalClrTypes:=new Dictionary<string,System.Type>;
       fResultLocal:=nil;
       for i:=0 to d.Parameters.Count-1 do
       begin
-        var loc:=il.DeclareLocal(typeof(integer));
-        fLocals[d.Parameters[i].Name]:=loc; fLocalTypes[d.Parameters[i].Name]:=vtInteger;
+        var loc:=il.DeclareLocal(pt[i]);
+        fLocals[d.Parameters[i].Name]:=loc; fLocalTypes[d.Parameters[i].Name]:=d.Parameters[i].ParamType;
         if i=0 then il.Emit(OpCodes.Ldarg_0) else if i=1 then il.Emit(OpCodes.Ldarg_1)
         else if i=2 then il.Emit(OpCodes.Ldarg_2) else if i=3 then il.Emit(OpCodes.Ldarg_3)
         else il.Emit(OpCodes.Ldarg_S, byte(i));
         il.Emit(OpCodes.Stloc, loc);
       end;
+      // [Stage 28] 프로시저 본문의 지역 변수 선언(var 섹션) 처리.
+      foreach var lv in d.LocalVars do
+      begin
+        var lvClrType:=VTC(lv.VarType, lv.ClassName);
+        var lvLoc:=il.DeclareLocal(lvClrType);
+        fLocals[lv.Name]:=lvLoc; fLocalTypes[lv.Name]:=lv.VarType;
+        if (lv.VarType=vtObject) or (lv.VarType=vtInterface) then fLocalClrTypes[lv.Name]:=lvClrType;
+      end;
       foreach st in d.Body.Statements do EmitStatement(il, st);
       il.Emit(OpCodes.Ret);
-      fLocals:=svL; fLocalTypes:=svLT; fResultLocal:=svR; fResultType:=svRT;
+      fLocals:=svL; fLocalTypes:=svLT; fLocalClrTypes:=svLC; fResultLocal:=svR; fResultType:=svRT;
     end;
 
   public
@@ -1412,6 +1462,7 @@ type
       fLocalTypes:=new Dictionary<string, TVarType>;
       fLocalClrTypes:=new Dictionary<string, System.Type>;
       fMethods:=new Dictionary<string, MethodBuilder>;
+      fFuncReturnTypes:=new Dictionary<string, TVarType>;
       fTypeBuilders:=new Dictionary<string, TypeBuilder>;
       fBuiltTypes:=new Dictionary<string, System.Type>;
       fFieldBuilders:=new Dictionary<string, Dictionary<string, FieldBuilder>>;
@@ -1523,7 +1574,10 @@ type
             clrType:=typeof(System.Object);
           fGlobalClass[vd.Name]:=vd.ClassName;
         end
-        else clrType:=typeof(integer);
+        // [Stage 27] string/boolean/array 전역 변수도 예전에는 무조건 typeof(integer)로
+        // 선언되어 있었다 — fGlobalTypes만 올바르고 실제 LocalBuilder 슬롯 타입은 틀려서
+        // 대입 시 IL 검증에서 깨졌다. object/interface가 아닌 나머지는 VTC로 위임한다.
+        else clrType:=VTC(vd.VarType, '');
         fGlobals[vd.Name]:=il.DeclareLocal(clrType);
         fGlobalTypes[vd.Name]:=vd.VarType;
       end;
