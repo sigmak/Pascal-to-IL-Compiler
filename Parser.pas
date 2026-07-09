@@ -1201,10 +1201,15 @@ type
         begin
           ns:=new List<string>; ns.Add(Expect(tkIdent).Text);
           while Cur.Kind=tkComma do begin fPos:=fPos+1; ns.Add(Expect(tkIdent).Text); end;
-          Expect(tkColon); pt:=ParseVarType;
+          Expect(tkColon);
+          // [Stage 31] 이전에는 ParseVarType만 써서 최상위 함수/프로시저가
+          // 클래스/인터페이스/외부 .NET 타입 매개변수를 받을 수 없었다.
+          // (클래스 메서드 시그니처는 이미 ParseParamTypeExt를 쓰고 있었음 — 동일하게 맞춘다.)
+          var pIsExt5:=false; var pCn5:='';
+          pt:=ParseParamTypeExt(pIsExt5, pCn5);
           foreach var nm in ns do
           begin
-            aP.Add(new TParamDef(nm, pt));
+            aP.Add(new TParamDef(nm, pt, pCn5, pIsExt5));
             // [Stage 28] array of integer/string 매개변수도 본문에서 a[i]로 인덱싱할 수
             // 있어야 하는데, 이전에는 매개변수 이름이 fArrayNames에 등록되지 않아
             // 배열 인덱스 식으로 인식되지 않았다(별개 버그, 이번에 함께 수정).

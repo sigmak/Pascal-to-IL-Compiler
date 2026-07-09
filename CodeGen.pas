@@ -1206,6 +1206,16 @@ type
         Result:=VTC(sig.ParamTypes[i], '');
     end;
 
+    // [Stage 31] 최상위 함수/프로시저(TParamDef)의 매개변수 실제 CLR 타입을 결정한다.
+    // ResolveParamClrType(TMethodSignature용)과 동일한 패턴이지만 TParamDef를 입력으로 받는다.
+    function ResolveTopParamClrType(p: TParamDef): System.Type;
+    begin
+      if (p.ParamType=vtObject) and p.IsExternal then Result:=ResolveExternalType(p.ClassName)
+      else if p.ParamType=vtObject then Result:=VTC(vtObject, p.ClassName)
+      else if p.ParamType=vtInterface then Result:=VTC(vtInterface, p.ClassName)
+      else Result:=VTC(p.ParamType, '');
+    end;
+
     // 인터페이스 TypeBuilder 생성 + 즉시 완성(CreateType)
     // 인터페이스는 클래스처럼 나중에 몸체를 채울 필요가 없으므로(메서드 시그니처뿐)
     // 클래스들보다 먼저 완전히 빌드해둔다. 클래스가 AddInterfaceImplementation을
@@ -1525,8 +1535,8 @@ type
     // 인자를 올바른 CLR 타입으로 스택에 올려도 시그니처가 int32로 선언되어 있어
     // IL 검증에서 깨지거나 값이 깨졌다. 이제 Parser가 이미 채워둔
     // d.Parameters[i].ParamType/d.ReturnType을 VTC로 변환해 그대로 사용한다.
-    // (클래스/인터페이스 타입 매개변수는 TParamDef가 ClassName을 보관하지 않아
-    // 아직 범위 밖 — 향후 단계 과제로 남긴다.)
+    // [Stage 31] TParamDef에 ClassName/IsExternal을 추가해 클래스/인터페이스/외부 .NET
+    // 타입 매개변수도 지원한다 (ResolveTopParamClrType 사용).
     procedure BuildStaticFunc(tb: TypeBuilder; d: TFuncDeclNode);
     var
       pt: array of System.Type; i: integer; mb: MethodBuilder; il: ILGenerator;
@@ -1535,7 +1545,7 @@ type
       svR: LocalBuilder; svRT: TVarType; st: TStmtNode; retClrType: System.Type;
     begin
       pt:=new System.Type[d.Parameters.Count];
-      for i:=0 to d.Parameters.Count-1 do pt[i]:=VTC(d.Parameters[i].ParamType, '');
+      for i:=0 to d.Parameters.Count-1 do pt[i]:=ResolveTopParamClrType(d.Parameters[i]);
       retClrType:=VTC(d.ReturnType, '');
       mb:=tb.DefineMethod(d.Name, MethodAttributes.Public or MethodAttributes.Static,
         retClrType, pt);
@@ -1547,13 +1557,23 @@ type
       for i:=0 to d.Parameters.Count-1 do
       begin
         var loc:=il.DeclareLocal(pt[i]);
-        fLocals[d.Parameters[i].Name]:=loc; fLocalTypes[d.Parameters[i].Name]:=d.Parameters[i].ParamType;
+        var pdef:=d.Parameters[i];
+        fLocals[pdef.Name]:=loc; fLocalTypes[pdef.Name]:=pdef.ParamType;
+        // [Stage 31] 지역 변수(var 섹션)와 동일한 원칙: 우리 컴파일러가 만든 로컬 클래스면
+        // 아직 CreateType() 전일 수 있으므로 fLocalClass(메타데이터 기반 조회)로,
+        // 외부 .NET 타입이면 기존처럼 fLocalClrTypes(Reflection 기반 조회)로 보낸다.
+        if (pdef.ParamType=vtObject) or (pdef.ParamType=vtInterface) then
+        begin
+          if fTypeBuilders.ContainsKey(pdef.ClassName) or fBuiltTypes.ContainsKey(pdef.ClassName) then
+            fLocalClass[pdef.Name]:=pdef.ClassName
+          else
+            fLocalClrTypes[pdef.Name]:=pt[i];
+        end;
         if i=0 then il.Emit(OpCodes.Ldarg_0) else if i=1 then il.Emit(OpCodes.Ldarg_1)
         else if i=2 then il.Emit(OpCodes.Ldarg_2) else if i=3 then il.Emit(OpCodes.Ldarg_3)
         else il.Emit(OpCodes.Ldarg_S, byte(i));
         il.Emit(OpCodes.Stloc, loc);
       end;
-      // [Stage 28] 함수 본문의 지역 변수 선언(var 섹션) 처리 — BuildMethodBody와 동일 패턴.
       foreach var lv in d.LocalVars do
       begin
         var lvClrType:=VTC(lv.VarType, lv.ClassName);
@@ -1583,7 +1603,7 @@ type
       svR: LocalBuilder; svRT: TVarType; st: TStmtNode;
     begin
       pt:=new System.Type[d.Parameters.Count];
-      for i:=0 to d.Parameters.Count-1 do pt[i]:=VTC(d.Parameters[i].ParamType, '');
+      for i:=0 to d.Parameters.Count-1 do pt[i]:=ResolveTopParamClrType(d.Parameters[i]);
       mb:=tb.DefineMethod(d.Name, MethodAttributes.Public or MethodAttributes.Static,
         typeof(System.Void), pt);
       fMethods[d.Name]:=mb; il:=mb.GetILGenerator;
@@ -1594,7 +1614,15 @@ type
       for i:=0 to d.Parameters.Count-1 do
       begin
         var loc:=il.DeclareLocal(pt[i]);
-        fLocals[d.Parameters[i].Name]:=loc; fLocalTypes[d.Parameters[i].Name]:=d.Parameters[i].ParamType;
+        var pdef:=d.Parameters[i];
+        fLocals[pdef.Name]:=loc; fLocalTypes[pdef.Name]:=pdef.ParamType;
+        if (pdef.ParamType=vtObject) or (pdef.ParamType=vtInterface) then
+        begin
+          if fTypeBuilders.ContainsKey(pdef.ClassName) or fBuiltTypes.ContainsKey(pdef.ClassName) then
+            fLocalClass[pdef.Name]:=pdef.ClassName
+          else
+            fLocalClrTypes[pdef.Name]:=pt[i];
+        end;
         if i=0 then il.Emit(OpCodes.Ldarg_0) else if i=1 then il.Emit(OpCodes.Ldarg_1)
         else if i=2 then il.Emit(OpCodes.Ldarg_2) else if i=3 then il.Emit(OpCodes.Ldarg_3)
         else il.Emit(OpCodes.Ldarg_S, byte(i));

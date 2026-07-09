@@ -353,7 +353,12 @@ type
 
   TParamDef = class
   public Name: string; ParamType: TVarType;
-    constructor Create(n: string; t: TVarType); begin Name:=n; ParamType:=t; end;
+    ClassName: string;   // [Stage 31] ParamType=vtObject/vtInterface일 때만 의미 있음 (지역 클래스/인터페이스 또는 외부 타입 이름)
+    IsExternal: boolean; // [Stage 31] true면 ClassName이 외부 .NET 타입 이름
+    constructor Create(n: string; t: TVarType); overload;
+    begin Name:=n; ParamType:=t; ClassName:=''; IsExternal:=false; end;
+    constructor Create(n: string; t: TVarType; cn: string; isExt: boolean); overload;
+    begin Name:=n; ParamType:=t; ClassName:=cn; IsExternal:=isExt; end;
   end;
 
   // 클래스 메서드 구현 (ClassName.MethodName 형태)
