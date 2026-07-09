@@ -22,6 +22,7 @@ type
     tkTry, tkExcept, tkFinally, tkRaise, tkOn,
     tkFunction, tkProcedure, tkResult,
     tkIntToStr, tkSetLength, tkLength,
+    tkUses, tkNil, // [Stage 29] uses 절, nil 리터럴
     tkIdent, tkString, tkIntLiteral,
     tkSemicolon, tkColon, tkComma, tkAssign,
     tkPlus, tkMinus, tkStar, tkSlash, tkPlusAssign,
@@ -125,6 +126,8 @@ type
       else if lw='inttostr'  then Result:=new TToken(tkIntToStr,  w,sl)
       else if lw='setlength' then Result:=new TToken(tkSetLength, w,sl)
       else if lw='length'    then Result:=new TToken(tkLength,    w,sl)
+      else if lw='uses'      then Result:=new TToken(tkUses,      w,sl)
+      else if lw='nil'       then Result:=new TToken(tkNil,       w,sl)
       else                        Result:=new TToken(tkIdent,     w,sl);
     end;
 

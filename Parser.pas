@@ -158,6 +158,9 @@ type
       else if t.Kind=tkFalse then
         begin fPos:=fPos+1; Result:=new TBoolLiteralNode(false); end
 
+      else if t.Kind=tkNil then
+        begin fPos:=fPos+1; Result:=new TNilLiteralNode; end // [Stage 29]
+
       else if t.Kind=tkNot then
         begin fPos:=fPos+1; Result:=new TNotExprNode(ParsePrimary); end
 
@@ -1164,6 +1167,24 @@ type
     begin
       Expect(tkProgram); prog:=new TProgramNode(Expect(tkIdent).Text); Expect(tkSemicolon);
       fProg:=prog; // 깊이 상관없이(식/타입 파싱 도중) GenericInstantiations에 접근하기 위함
+
+      // [Stage 29] uses 절: uses UnitA, UnitB.SubUnit, ...;
+      // 지금은 이름을 소비만 하고 버린다 — 외부 타입은 이미 완전한 점(.) 경로 이름으로
+      // 참조되므로(예: System.Windows.Forms.Button) uses 목록 자체가 CodeGen에 영향을 주지 않는다.
+      // WPF 디자이너가 생성하는 파일 헤더를 그대로 통과시키는 것이 목적.
+      if Cur.Kind=tkUses then
+      begin
+        fPos:=fPos+1; // 'uses' 소비
+        Expect(tkIdent);
+        while Cur.Kind=tkDot do begin fPos:=fPos+1; Expect(tkIdent); end;
+        while Cur.Kind=tkComma do
+        begin
+          fPos:=fPos+1;
+          Expect(tkIdent);
+          while Cur.Kind=tkDot do begin fPos:=fPos+1; Expect(tkIdent); end;
+        end;
+        Expect(tkSemicolon);
+      end;
 
       // type 섹션
       if Cur.Kind=tkType then ParseTypeSection(prog);

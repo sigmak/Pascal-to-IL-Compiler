@@ -20,8 +20,10 @@ uses
 
 const
   DefaultExampleDir = 'Examples';
+  DefaultExampleFile = 'test_stage29.pas';
+  //DefaultExampleFile = 'LocalVars_Test_Stage28.pas';
   //DefaultExampleFile = 'Staticfunctypes_test_Stage27.pas';
-  DefaultExampleFile = 'LocalVars_Test_Stage28.pas';
+  
 
 function ResolveInputPath: string;
 var

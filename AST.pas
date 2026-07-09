@@ -42,6 +42,9 @@ type
 
   TResultRefNode = class(TExprNode) end;
 
+  // [Stage 29] nil 리터럴 (참조 타입 변수/필드와의 비교, 대입에 사용)
+  TNilLiteralNode = class(TExprNode) end;
+
   TIntToStrNode = class(TExprNode)
   public Arg: TExprNode;
     constructor Create(a: TExprNode); begin Arg:=a; end;

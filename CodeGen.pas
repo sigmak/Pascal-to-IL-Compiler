@@ -193,6 +193,7 @@ type
     var b: TBinOpNode;
     begin
       if e is TIntLiteralNode then Result:=vtInteger
+      else if e is TNilLiteralNode then Result:=vtObject // [Stage 29]
       else if e is TStrLiteralNode then Result:=vtString
       else if e is TIntToStrNode then Result:=vtString
       else if e is TLengthExprNode then Result:=vtInteger
@@ -306,6 +307,9 @@ type
     begin
       if e is TIntLiteralNode then
       begin lit:=TIntLiteralNode(e); aIL.Emit(OpCodes.Ldc_I4, lit.Value); end
+
+      else if e is TNilLiteralNode then
+        aIL.Emit(OpCodes.Ldnull) // [Stage 29] — 참조 타입 지역/필드 변수와만 비교·대입에 사용
 
       else if e is TStrLiteralNode then
       begin slit:=TStrLiteralNode(e); aIL.Emit(OpCodes.Ldstr, slit.Value); end
