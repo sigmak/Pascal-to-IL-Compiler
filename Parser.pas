@@ -34,8 +34,13 @@ type
     // Stage26: 제네릭(단형화) 지원
     fProg: TProgramNode; // ParseProgram 시작 시 설정 — 깊이 상관없이 GenericInstantiations에 접근하기 위함
     fGenericClassNames: List<string>; // 제네릭 템플릿으로 선언된 클래스 이름 (예: 'TStack')
-    fClassGenericParam: Dictionary<string, string>; // 템플릿 이름 → 타입 매개변수 이름 (예: 'TStack'→'T')
-    fCurGenericParam: string; // 현재 파싱 중인 제네릭 클래스 본문/메서드구현의 타입 매개변수 이름 ('' 이면 제네릭 문맥 아님)
+    // [Stage 32] 템플릿 이름 → 타입 매개변수 이름 목록 (예: 'TStack'→['T'], 'TPair'→['K','V'])
+    fClassGenericParam: Dictionary<string, List<string>>;
+    // [Stage 32] 현재 파싱 중인 제네릭 클래스 본문/메서드구현에서 유효한 타입 매개변수 이름들 (빈 목록이면 제네릭 문맥 아님)
+    fCurGenericParams: List<string>;
+    // [Stage 32] ParseVarType/ParseParamTypeExt가 vtGeneric을 반환했을 때, 그 자리에서 바로 리턴값에
+    // 담을 수 없는 "어느 타입 매개변수였는지" 이름을 넘겨주는 보조 채널. 호출 직후 곧바로 읽어야 한다.
+    fLastGenericName: string;
 
     function Cur: TToken; begin Result:=fTokens[fPos]; end;
 
@@ -51,8 +56,9 @@ type
 
     function ParseVarType: TVarType;
     begin
-      if (Cur.Kind=tkIdent) and (fCurGenericParam<>'') and (Cur.Text=fCurGenericParam) then
-        begin fPos:=fPos+1; Result:=vtGeneric; end
+      fLastGenericName:='';
+      if (Cur.Kind=tkIdent) and fCurGenericParams.Contains(Cur.Text) then
+        begin fLastGenericName:=Cur.Text; fPos:=fPos+1; Result:=vtGeneric; end
       else if Cur.Kind=tkInteger then begin fPos:=fPos+1; Result:=vtInteger; end
       else if Cur.Kind=tkStringType then begin fPos:=fPos+1; Result:=vtString; end
       else if Cur.Kind=tkBoolean then begin fPos:=fPos+1; Result:=vtBoolean; end
@@ -74,7 +80,7 @@ type
     // isExt(출력)가 true면 cn(출력)이 외부 .NET 타입 이름 (예: System.EventArgs).
     function ParseParamTypeExt(var isExt: boolean; var cn: string): TVarType;
     begin
-      isExt:=false; cn:='';
+      isExt:=false; cn:=''; fLastGenericName:='';
       if (Cur.Kind=tkIdent) and fClassNames.Contains(Cur.Text) then
       begin
         cn:=Cur.Text; fPos:=fPos+1; Result:=vtObject;
@@ -101,28 +107,58 @@ type
         Result:=ParseVarType;
     end;
 
-    // Stage26: 제네릭 인스턴스화 (예: TStack<integer>) 해석.
+    // Stage26/[Stage 32] 제네릭 인스턴스화 (예: TStack<integer>, TPair<integer,string>,
+    // TStack<TStack<integer>>) 해석.
     // 호출 시점에 templateName은 이미 소비된 상태이고 Cur='<' 이어야 한다.
-    // '<' TypeArg '>' 를 소비하고, 아직 등록되지 않은 조합이면 fProg.GenericInstantiations에
-    // 요청을 등록한 뒤, 실제로 CodeGen이 다루게 될 구체 클래스 이름을 돌려준다.
+    // '<' TypeArg (',' TypeArg)* '>' 를 소비하고, 아직 등록되지 않은 조합이면
+    // fProg.GenericInstantiations에 요청을 등록한 뒤, 실제로 CodeGen이 다루게 될 구체 클래스 이름을 돌려준다.
+    // [Stage 32] 타입 인자 자신이 다른 제네릭 인스턴스(TStack<integer> 등)이면 재귀적으로
+    // 먼저 해석해 그 구체 클래스 이름을 인자로 사용한다(중첩 제네릭).
     function ResolveGenericInstantiation(templateName: string): string;
-    var argType: TVarType; argClassName, argTag, concreteName: string;
+    var
+      argTypes: List<TVarType>; argClassNames, argTags: List<string>;
+      concreteName: string; oneType: TVarType; oneClassName, oneTag: string;
     begin
       Expect(tkLt);
 
-      argClassName:='';
-      if Cur.Kind=tkInteger then begin fPos:=fPos+1; argType:=vtInteger; argTag:='integer'; end
-      else if Cur.Kind=tkStringType then begin fPos:=fPos+1; argType:=vtString; argTag:='string'; end
-      else if Cur.Kind=tkBoolean then begin fPos:=fPos+1; argType:=vtBoolean; argTag:='boolean'; end
-      else if (Cur.Kind=tkIdent) and fClassNames.Contains(Cur.Text) and (not fGenericClassNames.Contains(Cur.Text)) then
-        begin argClassName:=Cur.Text; argType:=vtObject; argTag:=Cur.Text; fPos:=fPos+1; end
-      else
-        raise new Exception('줄 '+Cur.Line.ToString+': 제네릭 타입 인자로 지원되지 않는 타입 ("'+Cur.Text
-          +'") — integer/string/boolean 또는 일반 클래스만 가능합니다 (중첩 제네릭은 아직 미지원)');
+      argTypes:=new List<TVarType>; argClassNames:=new List<string>; argTags:=new List<string>;
+      while true do
+      begin
+        oneClassName:='';
+        if Cur.Kind=tkInteger then begin fPos:=fPos+1; oneType:=vtInteger; oneTag:='integer'; end
+        else if Cur.Kind=tkStringType then begin fPos:=fPos+1; oneType:=vtString; oneTag:='string'; end
+        else if Cur.Kind=tkBoolean then begin fPos:=fPos+1; oneType:=vtBoolean; oneTag:='boolean'; end
+        else if (Cur.Kind=tkIdent) and fGenericClassNames.Contains(Cur.Text) then
+        begin
+          // [Stage 32] 중첩 제네릭: 타입 인자 자체가 TStack<...> 형태
+          var nestedTemplate:=Cur.Text; fPos:=fPos+1;
+          if Cur.Kind<>tkLt then
+            raise new Exception('줄 '+Cur.Line.ToString+': 제네릭 클래스 "'+nestedTemplate
+              +'"는 타입 인자 없이 쓸 수 없습니다 (예: '+nestedTemplate+'<integer>)');
+          var nestedConcrete:=ResolveGenericInstantiation(nestedTemplate);
+          oneType:=vtObject; oneClassName:=nestedConcrete; oneTag:=nestedConcrete;
+        end
+        else if (Cur.Kind=tkIdent) and fClassNames.Contains(Cur.Text) then
+          begin oneClassName:=Cur.Text; oneType:=vtObject; oneTag:=Cur.Text; fPos:=fPos+1; end
+        else
+          raise new Exception('줄 '+Cur.Line.ToString+': 제네릭 타입 인자로 지원되지 않는 타입 ("'+Cur.Text
+            +'") — integer/string/boolean, 일반 클래스, 또는 다른 제네릭 인스턴스만 가능합니다');
+
+        argTypes.Add(oneType); argClassNames.Add(oneClassName); argTags.Add(oneTag);
+
+        if Cur.Kind=tkComma then fPos:=fPos+1 else break;
+      end;
 
       Expect(tkGt);
 
-      concreteName:=templateName+'_'+argTag;
+      // [Stage 32] 타입 매개변수 개수 검증 (예: TPair는 2개인데 1개만 준 경우)
+      if fClassGenericParam.ContainsKey(templateName)
+         and (fClassGenericParam[templateName].Count<>argTypes.Count) then
+        raise new Exception('줄 '+Cur.Line.ToString+': 제네릭 클래스 "'+templateName+'"는 타입 매개변수 '
+          +fClassGenericParam[templateName].Count.ToString+'개가 필요한데 '+argTypes.Count.ToString+'개가 주어졌습니다');
+
+      concreteName:=templateName;
+      foreach var tag in argTags do concreteName:=concreteName+'_'+tag;
 
       if not fClassNames.Contains(concreteName) then
       begin
@@ -130,7 +166,7 @@ type
         fClassFields[concreteName]:=new List<string>(fClassFields[templateName]);
         fClassMethods[concreteName]:=new Dictionary<string, boolean>(fClassMethods[templateName]);
         fClassParent[concreteName]:='';
-        fProg.GenericInstantiations.Add(new TGenericInstantiation(templateName, concreteName, argType, argClassName));
+        fProg.GenericInstantiations.Add(new TGenericInstantiation(templateName, concreteName, argTypes, argClassNames));
       end;
 
       Result:=concreteName;
@@ -884,12 +920,13 @@ type
       begin
         cn:=Cur.Text; fPos:=fPos+1;
 
-        // 선택적 제네릭 타입 매개변수: TStack<T> = class ... end;
-        var genParamName:='';
+        // 선택적 제네릭 타입 매개변수: TStack<T> = class ... end; 또는 [Stage 32] TPair<K,V> = class ... end;
+        var genParamNames:=new List<string>;
         if Cur.Kind=tkLt then
         begin
           fPos:=fPos+1;
-          genParamName:=Expect(tkIdent).Text;
+          genParamNames.Add(Expect(tkIdent).Text);
+          while Cur.Kind=tkComma do begin fPos:=fPos+1; genParamNames.Add(Expect(tkIdent).Text); end;
           Expect(tkGt);
         end;
 
@@ -898,7 +935,7 @@ type
         // ---- 인터페이스 선언 ----
         if Cur.Kind=tkInterface then
         begin
-          if genParamName<>'' then
+          if genParamNames.Count>0 then
             raise new Exception('줄 '+Cur.Line.ToString+': 제네릭 인터페이스는 아직 지원되지 않습니다');
           fPos:=fPos+1; // 'interface' 소비
           idecl:=new TInterfaceDeclNode(cn);
@@ -916,11 +953,11 @@ type
         begin
           Expect(tkClass);
           cd:=new TClassDeclNode(cn);
-          cd.IsGeneric:=(genParamName<>''); cd.GenericParamName:=genParamName;
+          cd.IsGeneric:=(genParamNames.Count>0); cd.GenericParamNames:=genParamNames;
           if cd.IsGeneric then
           begin
             fGenericClassNames.Add(cn);
-            fClassGenericParam[cn]:=genParamName;
+            fClassGenericParam[cn]:=genParamNames;
           end;
 
           // 선택적 상속/인터페이스 구현: class(TParentName) 또는 class(IInterfaceName)
@@ -966,8 +1003,8 @@ type
           end;
 
           // private/public 섹션 안의 필드와 메서드 시그니처 읽기
-          // (본문 파싱 동안 fCurGenericParam을 설정해 T 참조를 vtGeneric으로 인식시킨다)
-          var savedGP1:=fCurGenericParam; fCurGenericParam:=genParamName;
+          // (본문 파싱 동안 fCurGenericParams를 설정해 T/K/V 등의 참조를 vtGeneric으로 인식시킨다)
+          var savedGP1:=fCurGenericParams; fCurGenericParams:=genParamNames;
           while Cur.Kind<>tkEnd do
           begin
             // private / public 키워드는 건너뜀
@@ -997,6 +1034,7 @@ type
                     Expect(tkColon);
                     var pIsExt2:=false; var pCn2:='';
                     pt:=ParseParamTypeExt(pIsExt2, pCn2);
+                    if pt=vtGeneric then pCn2:=fLastGenericName; // [Stage 32] 어느 타입 매개변수(K/V 등)인지 기록
                     foreach var pnm in pnames do
                     begin
                       sig.ParamNames.Add(pnm); sig.ParamTypes.Add(pt);
@@ -1011,6 +1049,7 @@ type
               if isFunc then
               begin
                 Expect(tkColon); sig.ReturnType:=ParseVarType;
+                if sig.ReturnType=vtGeneric then sig.ReturnGenericName:=fLastGenericName; // [Stage 32]
               end;
               Expect(tkSemicolon);
               cd.Methods.Add(sig);
@@ -1023,9 +1062,9 @@ type
               fname:=Cur.Text; fPos:=fPos+1;
               Expect(tkColon);
               var fld:=new TFieldDeclNode(fname, vtInteger);
-              if (Cur.Kind=tkIdent) and (fCurGenericParam<>'') and (Cur.Text=fCurGenericParam) then
+              if (Cur.Kind=tkIdent) and fCurGenericParams.Contains(Cur.Text) then
               begin
-                fld.FieldType:=vtGeneric; fPos:=fPos+1;
+                fld.FieldType:=vtGeneric; fld.ClassName:=Cur.Text; fPos:=fPos+1; // [Stage 32] 어느 타입 매개변수인지 기록
               end
               else if (Cur.Kind=tkIdent) and fClassNames.Contains(Cur.Text) then
               begin
@@ -1066,7 +1105,7 @@ type
               raise new Exception('줄 '+Cur.Line.ToString+': 클래스 선언 안에서 알 수 없는 토큰 "'+Cur.Text+'"');
           end;
 
-          fCurGenericParam:=savedGP1;
+          fCurGenericParams:=savedGP1;
           Expect(tkEnd); Expect(tkSemicolon);
           aProg.ClassDecls.Add(cd);
         end;
@@ -1120,11 +1159,11 @@ type
       retType:=vtInteger;
       impl:=new TMethodImplNode(cn, mn, isFunc, retType);
 
-      // 제네릭 클래스(TStack<T>)의 메서드 구현이면, 본문의 매개변수/반환 타입에서
-      // T를 인식할 수 있도록 fCurGenericParam을 설정해 둔다.
-      var savedGP3:=fCurGenericParam;
-      if fClassGenericParam.ContainsKey(cn) then fCurGenericParam:=fClassGenericParam[cn]
-      else fCurGenericParam:='';
+      // 제네릭 클래스(TStack<T>, [Stage 32] TPair<K,V> 등)의 메서드 구현이면, 본문의 매개변수/반환
+      // 타입에서 T/K/V 등을 인식할 수 있도록 fCurGenericParams를 설정해 둔다.
+      var savedGP3:=fCurGenericParams;
+      if fClassGenericParam.ContainsKey(cn) then fCurGenericParams:=fClassGenericParam[cn]
+      else fCurGenericParams:=new List<string>;
 
       // 매개변수
       if Cur.Kind=tkLParen then
@@ -1144,8 +1183,12 @@ type
             Expect(tkColon);
             var pIsExt3:=false; var pCn3:='';
             pt:=ParseParamTypeExt(pIsExt3, pCn3);
+            var pGenName3:=''; if pt=vtGeneric then pGenName3:=fLastGenericName; // [Stage 32]
             for var i:=impl.ParamTypes.Count to impl.ParamNames.Count-1 do
+            begin
               impl.ParamTypes.Add(pt);
+              impl.ParamGenericNames.Add(pGenName3);
+            end;
             // [Stage 28] array of integer/string 매개변수를 본문에서 a[i]로 인덱싱할 수
             // 있으려면 fArrayNames에 등록되어야 한다(별개 버그, 함께 수정).
             if (pt=vtIntArray) or (pt=vtStrArray) then
@@ -1158,7 +1201,10 @@ type
       end;
 
       if isFunc then
-      begin Expect(tkColon); impl.ReturnType:=ParseVarType; end;
+      begin
+        Expect(tkColon); impl.ReturnType:=ParseVarType;
+        if impl.ReturnType=vtGeneric then impl.ReturnGenericName:=fLastGenericName; // [Stage 32]
+      end;
       Expect(tkSemicolon);
 
       // 본문 파싱 (fCurClass 설정으로 필드 참조 가능)
@@ -1184,7 +1230,7 @@ type
       begin comp.Statements.Add(ParseStatement); if Cur.Kind=tkSemicolon then fPos:=fPos+1; end;
       Expect(tkEnd); Expect(tkSemicolon);
 
-      fCurClass:=savedClass; fCurFunc:=savedFunc; fCurGenericParam:=savedGP3;
+      fCurClass:=savedClass; fCurFunc:=savedFunc; fCurGenericParams:=savedGP3;
       fCurParams:=savedParams;
       fCurMethodParamNames:=savedMethodParamNames; // [Stage 30]
       impl.Body:=comp;
@@ -1297,8 +1343,9 @@ type
       fClassMethods:=new Dictionary<string, Dictionary<string, boolean>>;
       fClassParent:=new Dictionary<string, string>;
       fGenericClassNames:=new List<string>;
-      fClassGenericParam:=new Dictionary<string, string>;
-      fCurGenericParam:='';
+      fClassGenericParam:=new Dictionary<string, List<string>>;
+      fCurGenericParams:=new List<string>;
+      fLastGenericName:='';
     end;
 
     function ParseProgram: TProgramNode;

@@ -279,7 +279,9 @@ type
   TFieldDeclNode = class
   public
     Name: string; FieldType: TVarType;
-    ClassName: string;      // FieldType=vtObject일 때만 의미 있음 (지역 클래스 또는 외부 타입 이름)
+    // FieldType=vtObject일 때: 지역 클래스 또는 외부 타입 이름.
+    // FieldType=vtGeneric일 때: [Stage 32] 이 필드가 참조하는 타입 매개변수 이름 (예: 'K'/'V').
+    ClassName: string;
     IsExternalType: boolean; // true면 ClassName이 외부 .NET 어셈블리의 타입 (예: System.Windows.Forms.Button)
     constructor Create(n: string; t: TVarType);
     begin Name:=n; FieldType:=t; ClassName:=''; IsExternalType:=false; end;
@@ -290,13 +292,15 @@ type
     Name: string;
     IsFunction: boolean;
     ReturnType: TVarType;
+    ReturnGenericName: string;       // [Stage 32] ReturnType=vtGeneric일 때 어느 타입 매개변수(예: 'T'/'K'/'V')인지
     ParamNames: List<string>;
     ParamTypes: List<TVarType>;
-    ParamClassNames: List<string>;   // ParamTypes[i]=vtObject일 때만 의미 있음
+    // ParamTypes[i]=vtObject일 때는 클래스/외부타입 이름, vtGeneric일 때는 [Stage 32] 타입 매개변수 이름(예: 'K')
+    ParamClassNames: List<string>;
     ParamIsExternal: List<boolean>;  // true면 ParamClassNames[i]가 외부 .NET 타입
     constructor Create(n: string; isFunc: boolean; ret: TVarType);
     begin
-      Name:=n; IsFunction:=isFunc; ReturnType:=ret;
+      Name:=n; IsFunction:=isFunc; ReturnType:=ret; ReturnGenericName:='';
       ParamNames:=new List<string>; ParamTypes:=new List<TVarType>;
       ParamClassNames:=new List<string>; ParamIsExternal:=new List<boolean>;
     end;
@@ -310,27 +314,31 @@ type
     InterfaceName: string; // 구현하는 인터페이스 이름 ('' 이면 없음). ParentName과 양자택일.
     Fields: List<TFieldDeclNode>;
     Methods: List<TMethodSignature>;
-    IsGeneric: boolean;       // true면 "TStack<T> = class" 형태의 제네릭 템플릿 선언
-    GenericParamName: string; // 제네릭 타입 매개변수 이름 (예: 'T'). IsGeneric=false면 ''
+    IsGeneric: boolean;       // true면 "TStack<T> = class" / "TPair<K,V> = class" 형태의 제네릭 템플릿 선언
+    // [Stage 32] 제네릭 타입 매개변수 이름 목록 (예: TStack<T> → ['T'], TPair<K,V> → ['K','V']).
+    // 선언 순서가 TGenericInstantiation.ArgTypes/ArgClassNames의 인덱스와 대응된다. IsGeneric=false면 빈 목록.
+    GenericParamNames: List<string>;
     constructor Create(n: string);
     begin
       Name:=n; ParentName:=''; IsExternalParent:=false; InterfaceName:='';
       Fields:=new List<TFieldDeclNode>; Methods:=new List<TMethodSignature>;
-      IsGeneric:=false; GenericParamName:='';
+      IsGeneric:=false; GenericParamNames:=new List<string>;
     end;
   end;
 
   // Monomorphize 단계가 처리해야 할 "제네릭 인스턴스화 요청" 하나.
-  // Parser가 소스에서 TStack<integer> 같은 사용을 만날 때마다 등록하고,
+  // Parser가 소스에서 TStack<integer> 또는 TPair<integer,string> 같은 사용을 만날 때마다 등록하고,
   // Monomorphize.TMonomorphizer가 이를 소비해 실제 구체 클래스를 합성한다.
+  // [Stage 32] 타입 인자가 하나 이상일 수 있으므로 ArgType/ArgClassName 단일 필드 대신 목록으로 관리하며,
+  // 인덱스는 템플릿의 GenericParamNames 순서와 대응된다 (0번째 인자 → 0번째 타입 매개변수).
   TGenericInstantiation = class
   public
-    TemplateName: string;  // 제네릭 템플릿 이름 (예: 'TStack')
-    ConcreteName: string;  // 합성될 구체 클래스 이름 (예: 'TStack_integer')
-    ArgType: TVarType;     // 타입 인자가 기본형이면 vtInteger/vtString/vtBoolean, 클래스면 vtObject
-    ArgClassName: string;  // 타입 인자가 클래스(vtObject)일 때 그 클래스 이름, 아니면 ''
-    constructor Create(tn, cnm: string; at: TVarType; acn: string);
-    begin TemplateName:=tn; ConcreteName:=cnm; ArgType:=at; ArgClassName:=acn; end;
+    TemplateName: string;  // 제네릭 템플릿 이름 (예: 'TStack', 'TPair')
+    ConcreteName: string;  // 합성될 구체 클래스 이름 (예: 'TStack_integer', 'TPair_integer_string')
+    ArgTypes: List<TVarType>;    // 타입 인자별로 기본형이면 vtInteger/vtString/vtBoolean, 클래스(중첩 제네릭 포함)면 vtObject
+    ArgClassNames: List<string>; // ArgTypes[i]=vtObject일 때 그 클래스 이름(단형화된 이름 포함), 아니면 ''
+    constructor Create(tn, cnm: string; ats: List<TVarType>; acns: List<string>);
+    begin TemplateName:=tn; ConcreteName:=cnm; ArgTypes:=ats; ArgClassNames:=acns; end;
   end;
 
   // 인터페이스 선언 (메서드 시그니처만, 본문 없음)
@@ -366,13 +374,16 @@ type
   public
     ClassName: string; MethodName: string;
     IsFunction: boolean; ReturnType: TVarType;
+    ReturnGenericName: string; // [Stage 32] ReturnType=vtGeneric일 때 어느 타입 매개변수인지 (예: 'T'/'K'/'V')
     ParamNames: List<string>; ParamTypes: List<TVarType>;
+    ParamGenericNames: List<string>; // [Stage 32] ParamTypes[i]=vtGeneric일 때 그 타입 매개변수 이름, 아니면 ''
     LocalVars: List<TVarDecl>; // [Stage 28] 메서드 본문 안의 지역 변수 선언(var 섹션)
     Body: TCompoundStmtNode;
     constructor Create(cn, mn: string; isFunc: boolean; ret: TVarType);
     begin
-      ClassName:=cn; MethodName:=mn; IsFunction:=isFunc; ReturnType:=ret;
+      ClassName:=cn; MethodName:=mn; IsFunction:=isFunc; ReturnType:=ret; ReturnGenericName:='';
       ParamNames:=new List<string>; ParamTypes:=new List<TVarType>;
+      ParamGenericNames:=new List<string>;
       LocalVars:=new List<TVarDecl>;
     end;
   end;
