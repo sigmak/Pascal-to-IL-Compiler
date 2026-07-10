@@ -474,20 +474,37 @@ type
 
       else if e is TNewObjectExprNode then
       begin
-        // TCounter.Create → Newobj (지역 클래스 또는 외부 타입 모두 지원)
+        // TCounter.Create / new TCounter / new System.IO.FileStream(a,b,c) → Newobj
+        // (지역 클래스 또는 외부 타입 모두 지원. [Stage 40] 인자 있는 외부 생성자 추가)
         neo:=TNewObjectExprNode(e);
         if neo.IsExternalType then
         begin
           var _extCtorType:=ResolveExternalType(neo.ClassName);
-          var _extCtor:=_extCtorType.GetConstructor(System.Type.EmptyTypes);
-          if _extCtor=nil then
-            raise new Exception('외부 타입 "'+_extCtorType.FullName+'"에 매개변수 없는 public 생성자가 없습니다.');
-          aIL.Emit(OpCodes.Newobj, _extCtor);
+          if neo.Args.Count=0 then
+          begin
+            var _extCtor:=_extCtorType.GetConstructor(System.Type.EmptyTypes);
+            if _extCtor=nil then
+              raise new Exception('외부 타입 "'+_extCtorType.FullName+'"에 매개변수 없는 public 생성자가 없습니다.');
+            aIL.Emit(OpCodes.Newobj, _extCtor);
+          end
+          else
+          begin
+            var _extCtorN:=ResolveConstructorByArity(_extCtorType, neo.Args.Count);
+            if _extCtorN=nil then
+              raise new Exception('외부 타입 "'+_extCtorType.FullName+'"에 인자 '+neo.Args.Count.ToString+'개짜리 public 생성자가 없습니다.');
+            foreach ae in neo.Args do EmitExpr(aIL, ae);
+            aIL.Emit(OpCodes.Newobj, _extCtorN);
+          end;
         end
         else
         begin
           if not fCtorBuilders.ContainsKey(neo.ClassName) then
             raise new Exception('알 수 없는 클래스 "'+neo.ClassName+'"');
+          // [Stage 40] 로컬(우리 컴파일러가 만든) 클래스는 아직 항상 매개변수 없는 기본 생성자만
+          // 갖는다 — 사용자 정의 생성자(constructor 키워드)는 다음 단계 과제.
+          if neo.Args.Count>0 then
+            raise new Exception('클래스 "'+neo.ClassName+'"는 아직 매개변수 있는 생성자를 지원하지 않습니다 '
+              +'(constructor 키워드는 다음 단계에서 지원 예정입니다).');
           ctor:=fCtorBuilders[neo.ClassName];
           aIL.Emit(OpCodes.Newobj, ctor);
         end;
@@ -1298,6 +1315,17 @@ type
       foreach mi in t.GetMethods(flags) do
         if (mi.Name=mname) and (mi.GetParameters.Length=argCount) then
         begin Result:=mi; exit; end;
+    end;
+
+    // [Stage 40] 외부 타입에서 인자 개수로 생성자를 찾는다 (ResolveMethodByArity와 동일한 패턴 —
+    // 엄격한 타입 일치 대신 개수만 맞춰서 찾는다). 오버로드가 여러 개면 개수가 맞는 첫 번째를 사용.
+    function ResolveConstructorByArity(t: System.Type; argCount: integer): ConstructorInfo;
+    var ci: ConstructorInfo;
+    begin
+      Result:=nil;
+      foreach ci in t.GetConstructors(BindingFlags.Public or BindingFlags.Instance) do
+        if ci.GetParameters.Length=argCount then
+        begin Result:=ci; exit; end;
     end;
 
     // aIL 스택에 target 참조가 이미 로드되어 있다고 가정하고, 그 위에

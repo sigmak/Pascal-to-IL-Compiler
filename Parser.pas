@@ -421,6 +421,31 @@ type
         Result:=iceN;
       end
 
+      // [Stage 40] new TypeName(args) — PascalABC.NET 스타일 객체 생성 구문.
+      // 기존 "TypeName.Create" 관용구와 별개로, 인자 있는 생성자 호출을 지원하기 위해 추가.
+      // TypeName은 로컬 클래스(제네릭 인스턴스화 포함)이거나 점(.)으로 연결된 외부 .NET 타입.
+      else if t.Kind=tkNew then
+      begin
+        fPos:=fPos+1; // 'new' 소비
+        var newTn:=Expect(tkIdent).Text;
+        if (Cur.Kind=tkLt) and fGenericClassNames.Contains(newTn) then
+          newTn:=ResolveGenericInstantiation(newTn);
+        while Cur.Kind=tkDot do begin fPos:=fPos+1; newTn:=newTn+'.'+Expect(tkIdent).Text; end;
+        var neoN:=new TNewObjectExprNode(newTn);
+        neoN.IsExternalType:=not fClassNames.Contains(newTn);
+        if Cur.Kind=tkLParen then
+        begin
+          fPos:=fPos+1;
+          if Cur.Kind<>tkRParen then
+          begin
+            neoN.Args.Add(ParseExpr);
+            while Cur.Kind=tkComma do begin fPos:=fPos+1; neoN.Args.Add(ParseExpr); end;
+          end;
+          Expect(tkRParen);
+        end;
+        Result:=neoN;
+      end
+
       else if t.Kind=tkNot then
         begin fPos:=fPos+1; Result:=new TNotExprNode(ParsePrimary); end
 

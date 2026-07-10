@@ -25,6 +25,7 @@ type
     tkIntToStr, tkSetLength, tkLength,
     tkUses, tkNil, // [Stage 29] uses 절, nil 리터럴
     tkSelf, tkAs, tkInherited, // [Stage 30] self 키워드, as 캐스트, inherited 호출
+    tkNew, // [Stage 40] new TypeName(args) 객체 생성 구문
     tkIdent, tkString, tkIntLiteral,
     tkSemicolon, tkColon, tkComma, tkAssign,
     tkPlus, tkMinus, tkStar, tkSlash, tkPlusAssign,
@@ -148,6 +149,7 @@ type
       else if lw='self'      then Result:=new TToken(tkSelf,      w,sl,sc) // [Stage 30]
       else if lw='as'        then Result:=new TToken(tkAs,        w,sl,sc) // [Stage 30]
       else if lw='inherited' then Result:=new TToken(tkInherited, w,sl,sc) // [Stage 30]
+      else if lw='new'       then Result:=new TToken(tkNew,       w,sl,sc) // [Stage 40]
       else                        Result:=new TToken(tkIdent,     w,sl,sc);
     end;
 

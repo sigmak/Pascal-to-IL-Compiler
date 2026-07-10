@@ -89,7 +89,8 @@ type
   // TCounter.Create → Newobj
   TNewObjectExprNode = class(TExprNode)
   public ClassName: string; IsExternalType: boolean;
-    constructor Create(cn: string); begin ClassName:=cn; IsExternalType:=false; end;
+    Args: List<TExprNode>; // [Stage 40] new TypeName(args) — 생성자 인자 (없으면 빈 목록)
+    constructor Create(cn: string); begin ClassName:=cn; IsExternalType:=false; Args:=new List<TExprNode>; end;
   end;
 
   // c.GetValue, c.Init(10) → 인스턴스 메서드 호출 (반환값 있음 → 식)
