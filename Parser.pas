@@ -1034,6 +1034,10 @@ type
             tryNode.ExVarName:=Expect(tkIdent).Text;
             Expect(tkColon);
             tryNode.ExTypeName:=Expect(tkIdent).Text;
+            // [Stage 43] on ex: System.Exception do — 점(.)으로 연결된 외부 예외 타입 이름도 허용.
+            // (실제로는 ExTypeName을 CodeGen이 쓰지 않고 항상 typeof(System.Exception)으로 잡지만,
+            // 파싱 자체가 dotted 이름에서 막히면 디자이너가 내는 코드를 아예 받을 수 없다.)
+            while Cur.Kind=tkDot do begin fPos:=fPos+1; tryNode.ExTypeName:=tryNode.ExTypeName+'.'+Expect(tkIdent).Text; end;
             Expect(tkDo);
             tryNode.ExceptStmts.Add(ParseStatement);
             if Cur.Kind=tkSemicolon then fPos:=fPos+1;

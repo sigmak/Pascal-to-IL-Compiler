@@ -279,7 +279,21 @@ type
           end;
         end
         else if (_mc4.ObjCastType='') and (GetVarClassName(_mc4.ObjName)<>'') then
-          Result:=FindMethodReturnType(GetVarClassName(_mc4.ObjName), _mc4.MethodName)
+        begin
+          // [버그 수정] EmitExpr에서 고친 것과 같은 문제 — obj.FieldName(괄호 없음, 인자 없음)은
+          // 메서드가 아니라 필드일 수 있다. 여기서 먼저 확인하지 않으면 FindMethodReturnType이
+          // "메서드 아님"으로 판단해 기본값 vtInteger를 돌려주고, 문자열 필드가 Writeln 등에서
+          // 정수로 오인되어 참조값이 숫자로 찍히는 버그가 생긴다.
+          var _cn4c:=GetVarClassName(_mc4.ObjName);
+          var _fb4c: FieldBuilder;
+          if (_mc4.Args.Count=0) and TryFindFieldBuilder(_cn4c, _mc4.MethodName, _fb4c) then
+          begin
+            if _fb4c.FieldType=typeof(string) then Result:=vtString
+            else Result:=vtInteger;
+          end
+          else
+            Result:=FindMethodReturnType(_cn4c, _mc4.MethodName);
+        end
         else if TryFindFieldBuilder(fCurClassName, _mc4.ObjName, _qfb4) then
         begin
           var _effType4b:=_qfb4.FieldType;
@@ -596,19 +610,27 @@ type
           vtVar:=GetVarType(mc.ObjName);
           if fLocals.ContainsKey(mc.ObjName) then aIL.Emit(OpCodes.Ldloc, fLocals[mc.ObjName])
           else aIL.Emit(OpCodes.Ldloc, fGlobals[mc.ObjName]);
-          foreach ae in mc.Args do EmitExpr(aIL, ae);
           if cn='' then raise new Exception('알 수 없는 메서드 "'+cn+'.'+mc.MethodName+'"');
-          // 인터페이스 타입 변수면 인터페이스 메서드로, 아니면 클래스 상속 체인에서 탐색
-          if vtVar=vtInterface then
-          begin
-            var imi:=FindInterfaceMethod(cn, mc.MethodName);
-            aIL.Emit(OpCodes.Callvirt, imi);
-          end
+          // [버그 수정] obj.FieldName(괄호 없음, 인자 없음)은 메서드가 아니라 필드/속성 읽기일
+          // 수도 있다 — 이전에는 무조건 FindInstanceMethod로 보내서 실제로는 필드인데
+          // "알 수 없는 메서드"로 오인했다 (예: Writeln(app.Label1) — app이 전역/지역 변수인 경우).
+          if (mc.Args.Count=0) and TryFindFieldBuilder(cn, mc.MethodName, fb) then
+            aIL.Emit(OpCodes.Ldfld, fb)
           else
           begin
-            imb:=FindInstanceMethod(cn, mc.MethodName);
-            // virtual 메서드이므로 Callvirt 사용 (다형성 대비)
-            aIL.Emit(OpCodes.Callvirt, imb);
+            foreach ae in mc.Args do EmitExpr(aIL, ae);
+            // 인터페이스 타입 변수면 인터페이스 메서드로, 아니면 클래스 상속 체인에서 탐색
+            if vtVar=vtInterface then
+            begin
+              var imi:=FindInterfaceMethod(cn, mc.MethodName);
+              aIL.Emit(OpCodes.Callvirt, imi);
+            end
+            else
+            begin
+              imb:=FindInstanceMethod(cn, mc.MethodName);
+              // virtual 메서드이므로 Callvirt 사용 (다형성 대비)
+              aIL.Emit(OpCodes.Callvirt, imb);
+            end;
           end;
         end
         else if TryFindFieldBuilder(fCurClassName, mc.ObjName, fb) then
