@@ -365,8 +365,13 @@ type
   // ----------------------------------------------------------
   TVarDecl = class
   public Name: string; VarType: TVarType; ClassName: string;
-    constructor Create(n: string; t: TVarType; cn: string);
-    begin Name:=n; VarType:=t; ClassName:=cn; end;
+    // [Stage 41] VarType=vtObject일 때만 의미 있음. true면 ClassName이 점(.)으로 연결된
+    // 외부 .NET 타입 이름(예: System.Text.StringBuilder) — TParamDef.IsExternal과 동일한 역할.
+    IsExternal: boolean;
+    constructor Create(n: string; t: TVarType; cn: string); overload;
+    begin Name:=n; VarType:=t; ClassName:=cn; IsExternal:=false; end;
+    constructor Create(n: string; t: TVarType; cn: string; isExt: boolean); overload;
+    begin Name:=n; VarType:=t; ClassName:=cn; IsExternal:=isExt; end;
   end;
 
   TParamDef = class

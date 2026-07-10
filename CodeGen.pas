@@ -326,6 +326,8 @@ type
           else Result:=vtInteger;
         end;
       end
+      else if e is TCompareNode then // [Stage 41 수정 2026.07.11]
+        Result:=vtBoolean
       else if e is TBinOpNode then
       begin
         b:=TBinOpNode(e);
@@ -759,6 +761,12 @@ type
         begin
           wlS:=typeof(Console).GetMethod('WriteLine',[typeof(string)]);
           EmitExpr(aIL, we.Arg); aIL.Emit(OpCodes.Call, wlS);
+        end
+        else if et=vtBoolean then // [Stage 41 수정 2026.07.11]
+        begin
+          wlS:=typeof(Console).GetMethod('WriteLine',[typeof(boolean)]);
+          EmitExpr(aIL, we.Arg);
+          aIL.Emit(OpCodes.Call, wlS);
         end
         else
         begin
@@ -1244,6 +1252,17 @@ type
       else Result:=VTC(p.ParamType, '');
     end;
 
+    // [Stage 41] 지역 변수(TVarDecl)의 실제 CLR 타입을 결정한다. ResolveTopParamClrType과 동일한 패턴 —
+    // VarType=vtObject이고 IsExternal이면(예: var sb: System.Text.StringBuilder;) 점(.)으로 연결된
+    // 외부 .NET 타입 이름을 ResolveExternalType으로 실제 로드된 Type으로 바꾼다. 이전에는 VTC가
+    // 로컬 클래스(fBuiltTypes/fTypeBuilders)만 알아서, 외부 타입 지역변수는 전부 System.Object로
+    // 선언되어 그 위에서 멤버 호출/속성 접근을 할 수 없었다.
+    function ResolveLocalVarClrType(lv: TVarDecl): System.Type;
+    begin
+      if (lv.VarType=vtObject) and lv.IsExternal then Result:=ResolveExternalType(lv.ClassName)
+      else Result:=VTC(lv.VarType, lv.ClassName);
+    end;
+
     // 인터페이스 TypeBuilder 생성 + 즉시 완성(CreateType)
     // 인터페이스는 클래스처럼 나중에 몸체를 채울 필요가 없으므로(메서드 시그니처뿐)
     // 클래스들보다 먼저 완전히 빌드해둔다. 클래스가 AddInterfaceImplementation을
@@ -1548,7 +1567,7 @@ type
       // (InferType/EmitExpr의 TMethodCallExprNode 처리와) 그대로 맞물리게 한다.
       foreach var lv in impl.LocalVars do
       begin
-        var lvClrType:=VTC(lv.VarType, lv.ClassName);
+        var lvClrType:=ResolveLocalVarClrType(lv); // [Stage 41]
         var lvLoc:=il.DeclareLocal(lvClrType);
         fLocals[lv.Name]:=lvLoc; fLocalTypes[lv.Name]:=lv.VarType;
         if (lv.VarType=vtObject) or (lv.VarType=vtInterface) then
@@ -1622,7 +1641,7 @@ type
       end;
       foreach var lv in d.LocalVars do
       begin
-        var lvClrType:=VTC(lv.VarType, lv.ClassName);
+        var lvClrType:=ResolveLocalVarClrType(lv); // [Stage 41]
         var lvLoc:=il.DeclareLocal(lvClrType);
         fLocals[lv.Name]:=lvLoc; fLocalTypes[lv.Name]:=lv.VarType;
         if (lv.VarType=vtObject) or (lv.VarType=vtInterface) then
@@ -1677,7 +1696,7 @@ type
       // [Stage 28] 프로시저 본문의 지역 변수 선언(var 섹션) 처리.
       foreach var lv in d.LocalVars do
       begin
-        var lvClrType:=VTC(lv.VarType, lv.ClassName);
+        var lvClrType:=ResolveLocalVarClrType(lv); // [Stage 41]
         var lvLoc:=il.DeclareLocal(lvClrType);
         fLocals[lv.Name]:=lvLoc; fLocalTypes[lv.Name]:=lv.VarType;
         if (lv.VarType=vtObject) or (lv.VarType=vtInterface) then

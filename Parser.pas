@@ -62,6 +62,22 @@ type
       fPos:=fPos+1; Result:=t;
     end;
 
+    // [Stage 41] 점(.) 뒤 멤버 이름 소비 헬퍼.
+    // .Length, .Count 등 Lexer가 키워드 토큰으로 분류하는 이름도
+    // 속성/메서드 이름으로 허용한다. tkIdent이거나 알려진 키워드이면 통과.
+    function ExpectMemberName: string;
+    var t: TToken;
+    begin
+      t:=Cur;
+      if (t.Kind=tkIdent) or (t.Kind=tkLength) then
+      begin
+        fPos:=fPos+1; Result:=t.Text;
+      end
+      else
+        raise new Exception('줄 '+t.Line.ToString+', 열 '+t.Column.ToString
+          +': 멤버 이름이 와야 합니다 ("'+t.Text+'")');
+    end;
+
     function ParseVarType: TVarType;
     begin
       fLastGenericName:='';
@@ -384,7 +400,7 @@ type
           // self.Xxx / self.Xxx(...) → 기존 암시적 self 필드읽기/메서드호출(ObjName='')로 환원.
           // (self가 필드/외부 상속 타입 어느 쪽이든 CodeGen이 이미 판별해준다.)
           fPos:=fPos+1;
-          var selfMname:=Expect(tkIdent).Text;
+          var selfMname:=ExpectMemberName; // [Stage 41] 키워드 속성명(Length 등) 허용
           if Cur.Kind=tkLParen then
           begin
             mc:=new TMethodCallExprNode('', selfMname); fPos:=fPos+1;
@@ -456,12 +472,8 @@ type
         Result:=new TIntToStrNode(argE);
       end
 
-      else if t.Kind=tkLength then
-      begin
-        fPos:=fPos+1; Expect(tkLParen);
-        var nt:=Expect(tkIdent); Expect(tkRParen);
-        Result:=new TLengthExprNode(nt.Text);
-      end
+      // [Stage 41] tkLength 단독 분기 제거 — 'length'는 이제 tkIdent로 내려오므로
+      // tkIdent 분기 안에서 텍스트로 구분한다 (아래 참조).
 
       else if t.Kind=tkIdent then
       begin
@@ -507,7 +519,7 @@ type
         begin
           var savedPos3:=fPos; var segs2:=new List<string>; segs2.Add(t.Text);
           while Cur.Kind=tkDot do
-          begin fPos:=fPos+1; segs2.Add(Expect(tkIdent).Text); end;
+          begin fPos:=fPos+1; segs2.Add(ExpectMemberName); end; // [Stage 41] 키워드 속성명(Length 등) 허용
           if segs2[segs2.Count-1].ToLower='create' then
           begin
             var neo2:=new TNewObjectExprNode(string.Join('.', segs2.GetRange(0, segs2.Count-1)));
@@ -535,7 +547,7 @@ type
               else if castArgs2[0] is TFieldReadExprNode then innerName2:=TFieldReadExprNode(castArgs2[0]).FieldName
               else raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': 캐스트 대상은 단순 변수/필드 이름이어야 합니다');
               fPos:=fPos+1; // '.' 소비
-              var member3:=Expect(tkIdent).Text;
+              var member3:=ExpectMemberName; // [Stage 41] 키워드 속성명(Length 등) 허용
               var mc3:=new TMethodCallExprNode(innerName2, member3);
               mc3.ObjCastType:=castType2;
               if Cur.Kind=tkLParen then
@@ -575,12 +587,12 @@ type
             // Create도 캐스트도 아니면 기존처럼 obj.Method 식으로 되돌린다 (한 단계만 지원)
             fPos:=savedPos3;
             fPos:=fPos+1; // '.' 소비
-            var mname2:=Expect(tkIdent);
-            if mname2.Text.ToLower='message' then
+            var mname2:=ExpectMemberName; // [Stage 41] 키워드 속성명(Length 등) 허용
+            if mname2.ToLower='message' then
               Result:=new TExceptionMsgExprNode(t.Text)
             else
             begin
-              mc:=new TMethodCallExprNode(t.Text, mname2.Text);
+              mc:=new TMethodCallExprNode(t.Text, mname2);
               if Cur.Kind=tkLParen then
               begin
                 fPos:=fPos+1;
@@ -627,6 +639,15 @@ type
             while Cur.Kind=tkComma do begin fPos:=fPos+1; cn.Args.Add(ParseAddSub); end;
           end;
           Expect(tkRParen); Result:=cn;
+        end
+
+        // [Stage 41] 'length'가 tkIdent로 들어오는 경우: Length(arr) 단독 함수 호출.
+        // Lexer에서 tkLength 키워드로 분류하던 것을 tkIdent로 내리면서 이 분기로 이동.
+        else if (t.Text.ToLower='length') and (Cur.Kind=tkLParen) then
+        begin
+          fPos:=fPos+1; // '(' 소비 (t는 이미 소비됨)
+          var ntL:=Expect(tkIdent); Expect(tkRParen);
+          Result:=new TLengthExprNode(ntL.Text);
         end
 
         else
@@ -759,7 +780,7 @@ type
           while Cur.Kind=tkDot do
           begin
             fPos:=fPos+1;
-            segs.Add(Expect(tkIdent).Text);
+            segs.Add(ExpectMemberName); // [Stage 41] 키워드 속성명(Length 등) 허용
           end;
           var mname:=segs[segs.Count-1];
           var qualifier:=string.Join('.', segs.GetRange(0, segs.Count-1));
@@ -1362,7 +1383,7 @@ type
     // 최상위 var 섹션(ParseVarSection)과 로직은 같지만, 중첩 함수/프로시저 선언이
     // 없으므로 tkBegin 하나만 만나면 끝난다.
     procedure ParseLocalVarSection(aList: List<TVarDecl>);
-    var vt: TVarType; ns: List<string>; cn: string;
+    var vt: TVarType; ns: List<string>; cn: string; isExt: boolean;
     begin
       Expect(tkVar);
       while Cur.Kind<>tkBegin do
@@ -1370,24 +1391,15 @@ type
         ns:=new List<string>; ns.Add(Expect(tkIdent).Text);
         while Cur.Kind=tkComma do begin fPos:=fPos+1; ns.Add(Expect(tkIdent).Text); end;
         Expect(tkColon);
-        cn:='';
-        // 클래스 타입 지역변수 처리
-        if (Cur.Kind=tkIdent) and fClassNames.Contains(Cur.Text) then
-        begin
-          cn:=Cur.Text; fPos:=fPos+1; vt:=vtObject;
-          if (Cur.Kind=tkLt) and fGenericClassNames.Contains(cn) then cn:=ResolveGenericInstantiation(cn);
-        end
-        // 인터페이스 타입 지역변수 처리
-        else if (Cur.Kind=tkIdent) and fInterfaceNames.Contains(Cur.Text) then
-        begin
-          cn:=Cur.Text; fPos:=fPos+1; vt:=vtInterface;
-        end
-        else vt:=ParseVarType;
+        // [Stage 41] 기존에는 여기서 클래스/인터페이스/기본타입만 직접 처리하고 점(.)으로 연결된
+        // 외부 .NET 타입(예: var sb: System.Text.StringBuilder;)은 지원하지 않았다. 매개변수/필드에서
+        // 이미 쓰던 ParseParamTypeExt(지역클래스/인터페이스/외부타입/제네릭 모두 처리)로 통일한다.
+        vt:=ParseParamTypeExt(isExt, cn);
         if (vt=vtGeneric) or (vt=vtGenericArray) then cn:=fLastGenericName; // [Stage 36/37] 제네릭 지역변수(예: var temp: T; var arr: array of T;)의 타입 매개변수 이름 보존
         Expect(tkSemicolon);
         foreach var nm in ns do
         begin
-          aList.Add(new TVarDecl(nm, vt, cn));
+          aList.Add(new TVarDecl(nm, vt, cn, isExt));
           if (vt=vtIntArray) or (vt=vtStrArray) or (vt=vtGenericArray) then fArrayNames.Add(nm); // [Stage 37]
         end;
       end;
@@ -1487,6 +1499,10 @@ type
     procedure ParseParams(aP: List<TParamDef>);
     var pt: TVarType; ns: List<string>;
     begin
+      // [Stage 41] 매개변수가 없는 함수/프로시저는 괄호 자체를 생략할 수 있다.
+      // '(' 가 없으면 빈 매개변수 목록으로 처리하고 바로 리턴.
+      if Cur.Kind <> tkLParen then exit;   // ← 이 한 줄 추가 
+      
       Expect(tkLParen);
       if Cur.Kind<>tkRParen then
       begin

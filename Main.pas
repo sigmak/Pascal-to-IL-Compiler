@@ -22,7 +22,8 @@ uses
 const
   DefaultExampleDir = 'Examples';
   
-  DefaultExampleFile = 'Test_stage40.pas';
+  DefaultExampleFile = 'Test_stage41.pas';
+  //DefaultExampleFile = 'Test_stage40.pas';
   // 38~39는 문서 작업이라 소스코드및 예제 소스코드가 없음.
   //DefaultExampleFile = 'Test_stage37.pas';
   //DefaultExampleFile = 'Test_stage36.pas';

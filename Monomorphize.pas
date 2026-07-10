@@ -210,8 +210,9 @@ begin
     foreach var lv in srcImpl.LocalVars do
     begin
       var lot: TVarType; var locn: string; var loext: boolean;
-      ResolveType(subst, lv.VarType, lv.ClassName, lv.ClassName, false, lot, locn, loext);
-      impl.LocalVars.Add(new TVarDecl(lv.Name, lot, locn));
+      // [Stage 41] lv.IsExternal(외부 .NET 타입 여부)을 입력으로 넘기고, 소거 결과 loext를 그대로 보존한다.
+      ResolveType(subst, lv.VarType, lv.ClassName, lv.ClassName, lv.IsExternal, lot, locn, loext);
+      impl.LocalVars.Add(new TVarDecl(lv.Name, lot, locn, loext));
     end;
     impl.Body:=srcImpl.Body;
     fProg.MethodImpls.Add(impl);
@@ -240,8 +241,9 @@ begin
   foreach var lv in tmpl.LocalVars do
   begin
     var lot: TVarType; var locn: string; var loext: boolean;
-    ResolveType(subst, lv.VarType, lv.ClassName, lv.ClassName, false, lot, locn, loext);
-    fn.LocalVars.Add(new TVarDecl(lv.Name, lot, locn));
+    // [Stage 41] lv.IsExternal을 입력으로 넘기고, 소거 결과 loext를 그대로 보존한다.
+    ResolveType(subst, lv.VarType, lv.ClassName, lv.ClassName, lv.IsExternal, lot, locn, loext);
+    fn.LocalVars.Add(new TVarDecl(lv.Name, lot, locn, loext));
   end;
 
   // 본문은 타입 소거되어 있으므로(매개변수/지역변수는 이름으로만 참조) 그대로 공유해도 안전하다.
@@ -267,8 +269,9 @@ begin
   foreach var lv in tmpl.LocalVars do
   begin
     var lot: TVarType; var locn: string; var loext: boolean;
-    ResolveType(subst, lv.VarType, lv.ClassName, lv.ClassName, false, lot, locn, loext);
-    pr.LocalVars.Add(new TVarDecl(lv.Name, lot, locn));
+    // [Stage 41] lv.IsExternal을 입력으로 넘기고, 소거 결과 loext를 그대로 보존한다.
+    ResolveType(subst, lv.VarType, lv.ClassName, lv.ClassName, lv.IsExternal, lot, locn, loext);
+    pr.LocalVars.Add(new TVarDecl(lv.Name, lot, locn, loext));
   end;
 
   pr.Body:=tmpl.Body;
