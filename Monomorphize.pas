@@ -34,9 +34,14 @@ type
     fProg: TProgramNode;
     fTemplates: Dictionary<string, TClassDeclNode>;       // 템플릿 이름 → 선언
     fTemplateImpls: Dictionary<string, List<TMethodImplNode>>; // 템플릿 이름 → 메서드 구현 목록
+    // [Stage 36] 최상위 제네릭 함수/프로시저 템플릿 (클래스와 동일한 패턴)
+    fFuncTemplates: Dictionary<string, TFuncDeclNode>;
+    fProcTemplates: Dictionary<string, TProcDeclNode>;
 
     // [Stage 32] 인스턴스화 요청 하나에 대해 "타입 매개변수 이름(T/K/V...) → 실제 타입 인자" 맵을 만든다.
     function BuildSubstMap(inst: TGenericInstantiation; tmpl: TClassDeclNode): Dictionary<string, TArgSlot>;
+    // [Stage 36] 함수/프로시저용 버전. 클래스처럼 tmpl 노드 전체가 아니라 GenericParamNames만 필요하다.
+    function BuildFuncSubstMap(paramNames: List<string>; argTypes: List<TVarType>; argClassNames: List<string>): Dictionary<string, TArgSlot>;
 
     // FieldType/ParamTypes[i]/ReturnType이 vtGeneric이면 그 자리에 적힌 타입 매개변수 이름(srcGenericName)을
     // subst에서 찾아 실제 타입 인자로 치환한다.
@@ -47,12 +52,17 @@ type
     function BuildConcreteClass(inst: TGenericInstantiation; tmpl: TClassDeclNode): TClassDeclNode;
     procedure BuildConcreteImpls(inst: TGenericInstantiation; subst: Dictionary<string, TArgSlot>);
 
+    // [Stage 36] 최상위 제네릭 함수/프로시저를 구체화한다. 본문은 클래스 메서드와 마찬가지로
+    // 타입 소거되어 있으므로(매개변수/지역변수는 이름으로만 참조) 그대로 공유해도 안전하다.
+    function BuildConcreteFunc(inst: TGenericFuncInstantiation; tmpl: TFuncDeclNode): TFuncDeclNode;
+    function BuildConcreteProc(inst: TGenericFuncInstantiation; tmpl: TProcDeclNode): TProcDeclNode;
+
   public
     constructor Create(aProg: TProgramNode);
 
     // aProg를 제자리에서 확장·정리한다:
-    //   1) 각 GenericInstantiation 요청마다 구체 클래스/메서드구현을 합성해 추가
-    //   2) 원본 제네릭 템플릿 선언 및 그 메서드구현을 목록에서 제거
+    //   1) 각 GenericInstantiation/[Stage 36]GenericFuncInstantiation 요청마다 구체 선언을 합성해 추가
+    //   2) 원본 제네릭 템플릿 선언(클래스/메서드구현/함수/프로시저)을 목록에서 제거
     procedure Run;
   end;
 
@@ -63,6 +73,8 @@ begin
   fProg:=aProg;
   fTemplates:=new Dictionary<string, TClassDeclNode>;
   fTemplateImpls:=new Dictionary<string, List<TMethodImplNode>>;
+  fFuncTemplates:=new Dictionary<string, TFuncDeclNode>; // [Stage 36]
+  fProcTemplates:=new Dictionary<string, TProcDeclNode>; // [Stage 36]
 end;
 
 function TMonomorphizer.BuildSubstMap(inst: TGenericInstantiation; tmpl: TClassDeclNode): Dictionary<string, TArgSlot>;
@@ -78,6 +90,24 @@ begin
     slot.ArgType:=inst.ArgTypes[i];
     slot.ArgClassName:=inst.ArgClassNames[i];
     m[tmpl.GenericParamNames[i]]:=slot;
+  end;
+  Result:=m;
+end;
+
+// [Stage 36] 함수/프로시저용 BuildSubstMap. 클래스 쪽과 로직은 동일하지만 tmpl 노드 대신
+// GenericParamNames 목록을 직접 받는다(TFuncDeclNode/TProcDeclNode를 공통 타입으로 묶지 않았기 때문).
+function TMonomorphizer.BuildFuncSubstMap(paramNames: List<string>; argTypes: List<TVarType>; argClassNames: List<string>): Dictionary<string, TArgSlot>;
+var m: Dictionary<string, TArgSlot>; slot: TArgSlot;
+begin
+  m:=new Dictionary<string, TArgSlot>;
+  if paramNames.Count<>argTypes.Count then
+    raise new Exception('단형화 실패: 제네릭 함수/프로시저의 타입 매개변수 수('
+      +paramNames.Count.ToString+')와 인스턴스화 인자 수('+argTypes.Count.ToString+')가 일치하지 않습니다');
+  for var i:=0 to paramNames.Count-1 do
+  begin
+    slot.ArgType:=argTypes[i];
+    slot.ArgClassName:=argClassNames[i];
+    m[paramNames[i]]:=slot;
   end;
   Result:=m;
 end;
@@ -165,50 +195,155 @@ begin
   end;
 end;
 
+// [Stage 36] 최상위 제네릭 함수 하나를 구체화한다 (예: Identity<T> + integer → Identity_integer).
+function TMonomorphizer.BuildConcreteFunc(inst: TGenericFuncInstantiation; tmpl: TFuncDeclNode): TFuncDeclNode;
+var fn: TFuncDeclNode; subst: Dictionary<string, TArgSlot>; ot: TVarType; ocn: string; oext: boolean;
+begin
+  subst:=BuildFuncSubstMap(tmpl.GenericParamNames, inst.ArgTypes, inst.ArgClassNames);
+
+  fn:=new TFuncDeclNode(inst.ConcreteName);
+  // 합성된 구체 함수 자신은 더 이상 제네릭이 아니다 (IsGeneric 기본값 false 그대로 둠).
+  ResolveType(subst, tmpl.ReturnType, tmpl.ReturnGenericName, '', false, ot, ocn, oext);
+  fn.ReturnType:=ot;
+
+  foreach var p in tmpl.Parameters do
+  begin
+    var pot: TVarType; var pocn: string; var poext: boolean;
+    // p.ParamType=vtGeneric일 때 p.ClassName에는 [Stage 36] 타입 매개변수 이름(예: 'T')이 들어있다.
+    ResolveType(subst, p.ParamType, p.ClassName, p.ClassName, p.IsExternal, pot, pocn, poext);
+    fn.Parameters.Add(new TParamDef(p.Name, pot, pocn, poext));
+  end;
+
+  foreach var lv in tmpl.LocalVars do
+  begin
+    var lot: TVarType; var locn: string; var loext: boolean;
+    ResolveType(subst, lv.VarType, lv.ClassName, lv.ClassName, false, lot, locn, loext);
+    fn.LocalVars.Add(new TVarDecl(lv.Name, lot, locn));
+  end;
+
+  // 본문은 타입 소거되어 있으므로(매개변수/지역변수는 이름으로만 참조) 그대로 공유해도 안전하다.
+  fn.Body:=tmpl.Body;
+  Result:=fn;
+end;
+
+// [Stage 36] 최상위 제네릭 프로시저 하나를 구체화한다. BuildConcreteFunc와 동일하나 반환값이 없다.
+function TMonomorphizer.BuildConcreteProc(inst: TGenericFuncInstantiation; tmpl: TProcDeclNode): TProcDeclNode;
+var pr: TProcDeclNode; subst: Dictionary<string, TArgSlot>;
+begin
+  subst:=BuildFuncSubstMap(tmpl.GenericParamNames, inst.ArgTypes, inst.ArgClassNames);
+
+  pr:=new TProcDeclNode(inst.ConcreteName);
+
+  foreach var p in tmpl.Parameters do
+  begin
+    var pot: TVarType; var pocn: string; var poext: boolean;
+    ResolveType(subst, p.ParamType, p.ClassName, p.ClassName, p.IsExternal, pot, pocn, poext);
+    pr.Parameters.Add(new TParamDef(p.Name, pot, pocn, poext));
+  end;
+
+  foreach var lv in tmpl.LocalVars do
+  begin
+    var lot: TVarType; var locn: string; var loext: boolean;
+    ResolveType(subst, lv.VarType, lv.ClassName, lv.ClassName, false, lot, locn, loext);
+    pr.LocalVars.Add(new TVarDecl(lv.Name, lot, locn));
+  end;
+
+  pr.Body:=tmpl.Body;
+  Result:=pr;
+end;
+
 procedure TMonomorphizer.Run;
 var processed: List<string>; keptClasses: List<TClassDeclNode>; keptImpls: List<TMethodImplNode>;
+    processedFuncs: List<string>; keptFuncs: List<TFuncDeclNode>; keptProcs: List<TProcDeclNode>;
 begin
-  // 1) 템플릿 선언과 그 메서드구현들을 이름으로 색인
+  // ---- 1) 클래스 제네릭 처리 ----
+  // 1-1) 템플릿 선언과 그 메서드구현들을 이름으로 색인
   foreach var cd in fProg.ClassDecls do
     if cd.IsGeneric then fTemplates[cd.Name]:=cd;
 
-  if fTemplates.Count=0 then exit; // 제네릭을 전혀 쓰지 않는 프로그램이면 손댈 것 없음
-
-  foreach var impl in fProg.MethodImpls do
-    if fTemplates.ContainsKey(impl.ClassName) then
-    begin
-      if not fTemplateImpls.ContainsKey(impl.ClassName) then
-        fTemplateImpls[impl.ClassName]:=new List<TMethodImplNode>;
-      fTemplateImpls[impl.ClassName].Add(impl);
-    end;
-
-  // 2) 요청된 인스턴스화마다 구체 클래스 + 메서드구현을 합성
-  processed:=new List<string>;
-  foreach var inst in fProg.GenericInstantiations do
+  // 주의: 예전에는 여기서 "제네릭 클래스가 하나도 없으면 Run 전체를 종료"했는데, 그러면
+  // [Stage 36] 클래스 제네릭 없이 최상위 제네릭 함수/프로시저만 쓰는 프로그램에서 아래 2)단계가
+  // 통째로 건너뛰어지는 버그가 생긴다. 그래서 1)과 2)를 각각 독립적으로 감싼다.
+  if fTemplates.Count>0 then
   begin
-    if not processed.Contains(inst.ConcreteName) then // 중복 요청 방지(이론상 Parser가 이미 걸러줌)
+    foreach var impl in fProg.MethodImpls do
+      if fTemplates.ContainsKey(impl.ClassName) then
+      begin
+        if not fTemplateImpls.ContainsKey(impl.ClassName) then
+          fTemplateImpls[impl.ClassName]:=new List<TMethodImplNode>;
+        fTemplateImpls[impl.ClassName].Add(impl);
+      end;
+
+    // 1-2) 요청된 인스턴스화마다 구체 클래스 + 메서드구현을 합성
+    processed:=new List<string>;
+    foreach var inst in fProg.GenericInstantiations do
     begin
-      processed.Add(inst.ConcreteName);
+      if not processed.Contains(inst.ConcreteName) then // 중복 요청 방지(이론상 Parser가 이미 걸러줌)
+      begin
+        processed.Add(inst.ConcreteName);
 
-      if not fTemplates.ContainsKey(inst.TemplateName) then
-        raise new Exception('단형화 실패: 알 수 없는 제네릭 클래스 "'+inst.TemplateName+'"');
+        if not fTemplates.ContainsKey(inst.TemplateName) then
+          raise new Exception('단형화 실패: 알 수 없는 제네릭 클래스 "'+inst.TemplateName+'"');
 
-      var tmpl:=fTemplates[inst.TemplateName];
-      fProg.ClassDecls.Add(BuildConcreteClass(inst, tmpl));
-      BuildConcreteImpls(inst, BuildSubstMap(inst, tmpl));
+        var tmpl:=fTemplates[inst.TemplateName];
+        fProg.ClassDecls.Add(BuildConcreteClass(inst, tmpl));
+        BuildConcreteImpls(inst, BuildSubstMap(inst, tmpl));
+      end;
     end;
+
+    // 1-3) CodeGen이 이해할 수 없는 원본 제네릭 템플릿(및 그 메서드구현)을 제거
+    keptClasses:=new List<TClassDeclNode>;
+    foreach var cd2 in fProg.ClassDecls do
+      if not fTemplates.ContainsKey(cd2.Name) then keptClasses.Add(cd2);
+    fProg.ClassDecls:=keptClasses;
+
+    keptImpls:=new List<TMethodImplNode>;
+    foreach var impl2 in fProg.MethodImpls do
+      if not fTemplates.ContainsKey(impl2.ClassName) then keptImpls.Add(impl2);
+    fProg.MethodImpls:=keptImpls;
   end;
 
-  // 3) CodeGen이 이해할 수 없는 원본 제네릭 템플릿(및 그 메서드구현)을 제거
-  keptClasses:=new List<TClassDeclNode>;
-  foreach var cd2 in fProg.ClassDecls do
-    if not fTemplates.ContainsKey(cd2.Name) then keptClasses.Add(cd2);
-  fProg.ClassDecls:=keptClasses;
+  // ---- 2) [Stage 36] 최상위 제네릭 함수/프로시저 처리 (클래스와 완전히 독립적으로 동작) ----
+  foreach var fd in fProg.FuncDecls do
+    if fd.IsGeneric then fFuncTemplates[fd.Name]:=fd;
+  foreach var pd in fProg.ProcDecls do
+    if pd.IsGeneric then fProcTemplates[pd.Name]:=pd;
 
-  keptImpls:=new List<TMethodImplNode>;
-  foreach var impl2 in fProg.MethodImpls do
-    if not fTemplates.ContainsKey(impl2.ClassName) then keptImpls.Add(impl2);
-  fProg.MethodImpls:=keptImpls;
+  if (fFuncTemplates.Count>0) or (fProcTemplates.Count>0) then
+  begin
+    processedFuncs:=new List<string>;
+    foreach var finst in fProg.GenericFuncInstantiations do
+    begin
+      if not processedFuncs.Contains(finst.ConcreteName) then // 중복 요청 방지(이론상 Parser가 이미 걸러줌)
+      begin
+        processedFuncs.Add(finst.ConcreteName);
+
+        if finst.IsProc then
+        begin
+          if not fProcTemplates.ContainsKey(finst.TemplateName) then
+            raise new Exception('단형화 실패: 알 수 없는 제네릭 프로시저 "'+finst.TemplateName+'"');
+          fProg.ProcDecls.Add(BuildConcreteProc(finst, fProcTemplates[finst.TemplateName]));
+        end
+        else
+        begin
+          if not fFuncTemplates.ContainsKey(finst.TemplateName) then
+            raise new Exception('단형화 실패: 알 수 없는 제네릭 함수 "'+finst.TemplateName+'"');
+          fProg.FuncDecls.Add(BuildConcreteFunc(finst, fFuncTemplates[finst.TemplateName]));
+        end;
+      end;
+    end;
+
+    // CodeGen이 이해할 수 없는 원본 제네릭 함수/프로시저 템플릿을 제거
+    keptFuncs:=new List<TFuncDeclNode>;
+    foreach var fd2 in fProg.FuncDecls do
+      if not fFuncTemplates.ContainsKey(fd2.Name) then keptFuncs.Add(fd2);
+    fProg.FuncDecls:=keptFuncs;
+
+    keptProcs:=new List<TProcDeclNode>;
+    foreach var pd2 in fProg.ProcDecls do
+      if not fProcTemplates.ContainsKey(pd2.Name) then keptProcs.Add(pd2);
+    fProg.ProcDecls:=keptProcs;
+  end;
 end;
 
 end.

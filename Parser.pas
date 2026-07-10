@@ -40,6 +40,10 @@ type
     fClassGenericParam: Dictionary<string, List<string>>;
     // [Stage 34] 템플릿 이름 → 타입 매개변수별 제약조건 목록 (fClassGenericParam과 같은 인덱스로 대응, ''=제약 없음)
     fClassGenericConstraint: Dictionary<string, List<string>>;
+    // [Stage 36] 최상위 제네릭 함수/프로시저 지원 (클래스 제네릭과 동일한 패턴).
+    fGenericFuncNames, fGenericProcNames: List<string>; // 제네릭 템플릿으로 선언된 함수/프로시저 이름
+    fFuncGenericParam, fProcGenericParam: Dictionary<string, List<string>>;      // 템플릿 이름 → 타입 매개변수 이름 목록
+    fFuncGenericConstraint, fProcGenericConstraint: Dictionary<string, List<string>>; // 템플릿 이름 → 제약조건 목록(같은 인덱스)
     // [Stage 32] 현재 파싱 중인 제네릭 클래스 본문/메서드구현에서 유효한 타입 매개변수 이름들 (빈 목록이면 제네릭 문맥 아님)
     fCurGenericParams: List<string>;
     // [Stage 32] ParseVarType/ParseParamTypeExt가 vtGeneric을 반환했을 때, 그 자리에서 바로 리턴값에
@@ -219,7 +223,124 @@ type
         fClassFields[concreteName]:=new List<string>(fClassFields[templateName]);
         fClassMethods[concreteName]:=new Dictionary<string, boolean>(fClassMethods[templateName]);
         fClassParent[concreteName]:='';
+        fClassInterface[concreteName]:=''; // [Stage 36] SatisfiesConstraint가 안전하게 조회할 수 있도록 기본값 등록
         fProg.GenericInstantiations.Add(new TGenericInstantiation(templateName, concreteName, argTypes, argClassNames));
+      end;
+
+      Result:=concreteName;
+    end;
+
+    // [Stage 36] 함수/프로시저 이름 뒤의 선택적 제네릭 타입 매개변수 목록을 파싱한다:
+    //   function Identity<T>(x: T): T;         procedure Swap<T: class>(a, b: T);
+    // '<'가 없으면 빈 목록 두 개를 돌려준다(제네릭 아님). 클래스 쪽 파싱 로직과 동일한 패턴이며
+    // ParseOptionalGenericConstraint(위 [Stage 34])를 그대로 재사용한다.
+    procedure ParseCallableGenericParams(var names, constraints: List<string>);
+    begin
+      names:=new List<string>; constraints:=new List<string>;
+      if Cur.Kind=tkLt then
+      begin
+        fPos:=fPos+1;
+        names.Add(Expect(tkIdent).Text);
+        constraints.Add(ParseOptionalGenericConstraint);
+        while Cur.Kind=tkComma do
+        begin
+          fPos:=fPos+1;
+          names.Add(Expect(tkIdent).Text);
+          constraints.Add(ParseOptionalGenericConstraint);
+        end;
+        Expect(tkGt);
+      end;
+    end;
+
+    // [Stage 36] 제네릭 함수/프로시저 호출 인스턴스화 (예: Identity<integer>(5), Swap<TUser>(a, b)) 해석.
+    // ResolveGenericInstantiation(클래스용)과 동일한 구조이며, 호출 시점에 templateName은 이미
+    // 소비된 상태이고 Cur='<' 이어야 한다. isProc으로 함수/프로시저 어느 쪽 템플릿인지 구분한다.
+    // 주의: 현재는 명시적 타입 인자만 지원한다 — Identity(5) 같은 타입 추론 호출은 지원하지 않으며,
+    // 타입 인자로 바깥 스코프의 제네릭 매개변수(T 자신)를 넘기는 것도 아직 지원하지 않는다.
+    function ResolveGenericFuncInstantiation(templateName: string; isProc: boolean): string;
+    var
+      argTypes: List<TVarType>; argClassNames, argTags: List<string>;
+      concreteName: string; oneType: TVarType; oneClassName, oneTag: string;
+      paramNames, constraintList: List<string>; kindLabel: string;
+    begin
+      Expect(tkLt);
+
+      if isProc then kindLabel:='프로시저' else kindLabel:='함수';
+
+      paramNames:=nil; constraintList:=nil;
+      if isProc then
+      begin
+        if fProcGenericParam.ContainsKey(templateName) then paramNames:=fProcGenericParam[templateName];
+        if fProcGenericConstraint.ContainsKey(templateName) then constraintList:=fProcGenericConstraint[templateName];
+      end
+      else
+      begin
+        if fFuncGenericParam.ContainsKey(templateName) then paramNames:=fFuncGenericParam[templateName];
+        if fFuncGenericConstraint.ContainsKey(templateName) then constraintList:=fFuncGenericConstraint[templateName];
+      end;
+
+      argTypes:=new List<TVarType>; argClassNames:=new List<string>; argTags:=new List<string>;
+      while true do
+      begin
+        oneClassName:='';
+        if Cur.Kind=tkInteger then begin fPos:=fPos+1; oneType:=vtInteger; oneTag:='integer'; end
+        else if Cur.Kind=tkStringType then begin fPos:=fPos+1; oneType:=vtString; oneTag:='string'; end
+        else if Cur.Kind=tkBoolean then begin fPos:=fPos+1; oneType:=vtBoolean; oneTag:='boolean'; end
+        else if (Cur.Kind=tkIdent) and fGenericClassNames.Contains(Cur.Text) then
+        begin
+          // 중첩 제네릭: 타입 인자 자체가 TBox<...> 형태
+          var nestedTemplate:=Cur.Text; fPos:=fPos+1;
+          if Cur.Kind<>tkLt then
+            raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': 제네릭 클래스 "'+nestedTemplate
+              +'"는 타입 인자 없이 쓸 수 없습니다 (예: '+nestedTemplate+'<integer>)');
+          var nestedConcrete:=ResolveGenericInstantiation(nestedTemplate);
+          oneType:=vtObject; oneClassName:=nestedConcrete; oneTag:=nestedConcrete;
+        end
+        else if (Cur.Kind=tkIdent) and fClassNames.Contains(Cur.Text) then
+          begin oneClassName:=Cur.Text; oneType:=vtObject; oneTag:=Cur.Text; fPos:=fPos+1; end
+        else
+          raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': 제네릭 '+kindLabel+' 타입 인자로 지원되지 않는 타입 ("'+Cur.Text
+            +'") — integer/string/boolean, 일반 클래스, 또는 다른 제네릭 인스턴스만 가능합니다');
+
+        // [Stage 36] 제약조건 검증 (T: TAnimal, T: IComparable, T: class 등)
+        if (constraintList<>nil) and (argTypes.Count<constraintList.Count) and (constraintList[argTypes.Count]<>'') then
+        begin
+          if (oneType<>vtObject) or (not SatisfiesConstraint(oneClassName, constraintList[argTypes.Count])) then
+            raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': 제네릭 '+kindLabel+' "'+templateName
+              +'"의 타입 인자 "'+oneTag+'"는 제약조건 "'+constraintList[argTypes.Count]+'"을(를) 만족하지 않습니다 (타입 매개변수 "'
+              +paramNames[argTypes.Count]+'")');
+        end;
+
+        argTypes.Add(oneType); argClassNames.Add(oneClassName); argTags.Add(oneTag);
+
+        if Cur.Kind=tkComma then fPos:=fPos+1 else break;
+      end;
+
+      Expect(tkGt);
+
+      // [Stage 36] 타입 매개변수 개수 검증
+      if (paramNames<>nil) and (paramNames.Count<>argTypes.Count) then
+        raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': 제네릭 '+kindLabel+' "'+templateName+'"는 타입 매개변수 '
+          +paramNames.Count.ToString+'개가 필요한데 '+argTypes.Count.ToString+'개가 주어졌습니다');
+
+      concreteName:=templateName;
+      foreach var tag in argTags do concreteName:=concreteName+'_'+tag;
+
+      if isProc then
+      begin
+        if not fProcNames.Contains(concreteName) then
+        begin
+          fProcNames.Add(concreteName);
+          fProg.GenericFuncInstantiations.Add(new TGenericFuncInstantiation(templateName, concreteName, true, argTypes, argClassNames));
+        end;
+      end
+      else
+      begin
+        if not fFuncNames.Contains(concreteName) then
+        begin
+          fFuncNames.Add(concreteName);
+          fProg.GenericFuncInstantiations.Add(new TGenericFuncInstantiation(templateName, concreteName, false, argTypes, argClassNames));
+        end;
       end;
 
       Result:=concreteName;
@@ -453,6 +574,20 @@ type
           Result:=new TArrayIndexExprNode(t.Text, idxE);
         end
 
+        // [Stage 36] 제네릭 함수 호출: Identity<integer>(5) — 명시적 타입 인자 필요
+        else if (Cur.Kind=tkLt) and fGenericFuncNames.Contains(t.Text) then
+        begin
+          var concreteFuncName:=ResolveGenericFuncInstantiation(t.Text, false);
+          cn:=new TFuncCallExprNode(concreteFuncName);
+          Expect(tkLParen);
+          if Cur.Kind<>tkRParen then
+          begin
+            cn.Args.Add(ParseAddSub);
+            while Cur.Kind=tkComma do begin fPos:=fPos+1; cn.Args.Add(ParseAddSub); end;
+          end;
+          Expect(tkRParen); Result:=cn;
+        end
+
         // 일반 함수 호출
         else if (Cur.Kind=tkLParen) and fFuncNames.Contains(t.Text) then
         begin
@@ -684,6 +819,20 @@ type
               Result:=mcs;
             end;
           end;
+        end
+
+        // [Stage 36] 제네릭 프로시저 호출: Swap<TUser>(a, b) — 명시적 타입 인자 필요
+        else if (Cur.Kind=tkLt) and fGenericProcNames.Contains(nt.Text) then
+        begin
+          var concreteProcName:=ResolveGenericFuncInstantiation(nt.Text, true);
+          pcn:=new TProcCallStmtNode(concreteProcName);
+          Expect(tkLParen);
+          if Cur.Kind<>tkRParen then
+          begin
+            pcn.Args.Add(ParseExpr);
+            while Cur.Kind=tkComma do begin fPos:=fPos+1; pcn.Args.Add(ParseExpr); end;
+          end;
+          Expect(tkRParen); Result:=pcn;
         end
 
         // 프로시저 호출
@@ -1201,6 +1350,7 @@ type
           cn:=Cur.Text; fPos:=fPos+1; vt:=vtInterface;
         end
         else vt:=ParseVarType;
+        if vt=vtGeneric then cn:=fLastGenericName; // [Stage 36] 제네릭 지역변수(예: var temp: T;)의 타입 매개변수 이름 보존
         Expect(tkSemicolon);
         foreach var nm in ns do
         begin
@@ -1317,6 +1467,7 @@ type
           // (클래스 메서드 시그니처는 이미 ParseParamTypeExt를 쓰고 있었음 — 동일하게 맞춘다.)
           var pIsExt5:=false; var pCn5:='';
           pt:=ParseParamTypeExt(pIsExt5, pCn5);
+          if pt=vtGeneric then pCn5:=fLastGenericName; // [Stage 36] 제네릭 매개변수(예: x: T)의 타입 매개변수 이름 보존
           foreach var nm in ns do
           begin
             aP.Add(new TParamDef(nm, pt, pCn5, pIsExt5));
@@ -1333,32 +1484,77 @@ type
 
     function ParseFuncDecl: TFuncDeclNode;
     var d: TFuncDeclNode; c: TCompoundStmtNode; sv: string;
+        genNames, genConstraints, savedGP4: List<string>;
     begin
       Expect(tkFunction); d:=new TFuncDeclNode(Expect(tkIdent).Text);
-      fFuncNames.Add(d.Name); ParseParams(d.Parameters);
-      Expect(tkColon); d.ReturnType:=ParseVarType; Expect(tkSemicolon);
+
+      // [Stage 36] 최상위 제네릭 함수: function Identity<T>(x: T): T;
+      ParseCallableGenericParams(genNames, genConstraints);
+      d.IsGeneric:=(genNames.Count>0);
+      d.GenericParamNames:=genNames;
+      d.GenericParamConstraints:=genConstraints;
+      if d.IsGeneric then
+      begin
+        fGenericFuncNames.Add(d.Name);
+        fFuncGenericParam[d.Name]:=genNames;
+        fFuncGenericConstraint[d.Name]:=genConstraints;
+      end
+      else
+        fFuncNames.Add(d.Name);
+
+      // (본문/매개변수/반환타입 파싱 동안 fCurGenericParams를 설정해 T 등의 참조를 vtGeneric으로 인식시킨다)
+      savedGP4:=fCurGenericParams;
+      if d.IsGeneric then fCurGenericParams:=genNames;
+
+      ParseParams(d.Parameters);
+      Expect(tkColon); d.ReturnType:=ParseVarType;
+      if d.ReturnType=vtGeneric then d.ReturnGenericName:=fLastGenericName; // [Stage 36]
+      Expect(tkSemicolon);
       sv:=fCurFunc; fCurFunc:=d.Name;
       if Cur.Kind=tkVar then ParseLocalVarSection(d.LocalVars);
       Expect(tkBegin); c:=new TCompoundStmtNode;
       while Cur.Kind<>tkEnd do
       begin c.Statements.Add(ParseStatement); if Cur.Kind=tkSemicolon then fPos:=fPos+1; end;
-      Expect(tkEnd); Expect(tkSemicolon); fCurFunc:=sv; d.Body:=c; Result:=d;
+      Expect(tkEnd); Expect(tkSemicolon); fCurFunc:=sv; d.Body:=c;
+      fCurGenericParams:=savedGP4;
+      Result:=d;
     end;
 
     function ParseProcDecl: TProcDeclNode;
     var d: TProcDeclNode; c: TCompoundStmtNode; sv: string;
+        genNames, genConstraints, savedGP5: List<string>;
     begin
       Expect(tkProcedure);
       // ClassName.MethodName 형태이면 메서드 구현으로 처리
       // (이미 Cur.Kind=tkIdent인지 확인)
       d:=new TProcDeclNode(Expect(tkIdent).Text);
-      fProcNames.Add(d.Name); ParseParams(d.Parameters); Expect(tkSemicolon);
+
+      // [Stage 36] 최상위 제네릭 프로시저: procedure PrintTwice<T>(x: T);
+      ParseCallableGenericParams(genNames, genConstraints);
+      d.IsGeneric:=(genNames.Count>0);
+      d.GenericParamNames:=genNames;
+      d.GenericParamConstraints:=genConstraints;
+      if d.IsGeneric then
+      begin
+        fGenericProcNames.Add(d.Name);
+        fProcGenericParam[d.Name]:=genNames;
+        fProcGenericConstraint[d.Name]:=genConstraints;
+      end
+      else
+        fProcNames.Add(d.Name);
+
+      savedGP5:=fCurGenericParams;
+      if d.IsGeneric then fCurGenericParams:=genNames;
+
+      ParseParams(d.Parameters); Expect(tkSemicolon);
       sv:=fCurFunc; fCurFunc:='';
       if Cur.Kind=tkVar then ParseLocalVarSection(d.LocalVars);
       Expect(tkBegin); c:=new TCompoundStmtNode;
       while Cur.Kind<>tkEnd do
       begin c.Statements.Add(ParseStatement); if Cur.Kind=tkSemicolon then fPos:=fPos+1; end;
-      Expect(tkEnd); Expect(tkSemicolon); fCurFunc:=sv; d.Body:=c; Result:=d;
+      Expect(tkEnd); Expect(tkSemicolon); fCurFunc:=sv; d.Body:=c;
+      fCurGenericParams:=savedGP5;
+      Result:=d;
     end;
 
     procedure ParseVarSection(aProg: TProgramNode);
@@ -1410,6 +1606,12 @@ type
       fGenericClassNames:=new List<string>;
       fClassGenericParam:=new Dictionary<string, List<string>>;
       fClassGenericConstraint:=new Dictionary<string, List<string>>; // [Stage 34]
+      fGenericFuncNames:=new List<string>; // [Stage 36]
+      fGenericProcNames:=new List<string>; // [Stage 36]
+      fFuncGenericParam:=new Dictionary<string, List<string>>; // [Stage 36]
+      fProcGenericParam:=new Dictionary<string, List<string>>; // [Stage 36]
+      fFuncGenericConstraint:=new Dictionary<string, List<string>>; // [Stage 36]
+      fProcGenericConstraint:=new Dictionary<string, List<string>>; // [Stage 36]
       fCurGenericParams:=new List<string>;
       fLastGenericName:='';
     end;

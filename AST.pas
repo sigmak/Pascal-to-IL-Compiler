@@ -365,7 +365,9 @@ type
 
   TParamDef = class
   public Name: string; ParamType: TVarType;
-    ClassName: string;   // [Stage 31] ParamType=vtObject/vtInterface일 때만 의미 있음 (지역 클래스/인터페이스 또는 외부 타입 이름)
+    // [Stage 31] ParamType=vtObject/vtInterface일 때만 의미 있음 (지역 클래스/인터페이스 또는 외부 타입 이름).
+    // [Stage 36] ParamType=vtGeneric일 때는 이 매개변수가 참조하는 타입 매개변수 이름(예: 'T')을 담는다.
+    ClassName: string;
     IsExternal: boolean; // [Stage 31] true면 ClassName이 외부 .NET 타입 이름
     constructor Create(n: string; t: TVarType); overload;
     begin Name:=n; ParamType:=t; ClassName:=''; IsExternal:=false; end;
@@ -396,15 +398,46 @@ type
   public Name: string; Parameters: List<TParamDef>;
     ReturnType: TVarType; Body: TCompoundStmtNode;
     LocalVars: List<TVarDecl>; // [Stage 28] 함수 본문 안의 지역 변수 선언(var 섹션)
+    // [Stage 36] 최상위 제네릭 함수: function Identity<T>(x: T): T;
+    IsGeneric: boolean;
+    GenericParamNames: List<string>;       // 예: ['T'] 또는 ['K','V']. IsGeneric=false면 빈 목록.
+    GenericParamConstraints: List<string>; // GenericParamNames와 인덱스 대응. ''=제약없음, 'class'=참조타입, 그 외=클래스/인터페이스 이름
+    ReturnGenericName: string;             // ReturnType=vtGeneric일 때 어느 타입 매개변수인지 (예: 'T')
     constructor Create(n: string);
-    begin Name:=n; Parameters:=new List<TParamDef>; LocalVars:=new List<TVarDecl>; end;
+    begin
+      Name:=n; Parameters:=new List<TParamDef>; LocalVars:=new List<TVarDecl>;
+      IsGeneric:=false; GenericParamNames:=new List<string>; GenericParamConstraints:=new List<string>;
+      ReturnGenericName:='';
+    end;
   end;
 
   TProcDeclNode = class
   public Name: string; Parameters: List<TParamDef>; Body: TCompoundStmtNode;
     LocalVars: List<TVarDecl>; // [Stage 28] 프로시저 본문 안의 지역 변수 선언(var 섹션)
+    // [Stage 36] 최상위 제네릭 프로시저: procedure PrintBoth<T>(a, b: T);
+    IsGeneric: boolean;
+    GenericParamNames: List<string>;
+    GenericParamConstraints: List<string>;
     constructor Create(n: string);
-    begin Name:=n; Parameters:=new List<TParamDef>; LocalVars:=new List<TVarDecl>; end;
+    begin
+      Name:=n; Parameters:=new List<TParamDef>; LocalVars:=new List<TVarDecl>;
+      IsGeneric:=false; GenericParamNames:=new List<string>; GenericParamConstraints:=new List<string>;
+    end;
+  end;
+
+  // [Stage 36] Monomorphize 단계가 처리해야 할 "제네릭 함수/프로시저 인스턴스화 요청" 하나.
+  // Parser가 소스에서 Identity<integer>(5) 같은 명시적 타입 인자 호출을 만날 때마다 등록하고,
+  // Monomorphize.TMonomorphizer가 이를 소비해 실제 구체 TFuncDeclNode/TProcDeclNode를 합성한다.
+  // 구조는 TGenericInstantiation(클래스용)과 동일하며 IsProc으로 함수/프로시저를 구분한다.
+  TGenericFuncInstantiation = class
+  public
+    TemplateName: string;  // 제네릭 템플릿 이름 (예: 'Identity', 'Swap')
+    ConcreteName: string;  // 합성될 구체 함수/프로시저 이름 (예: 'Identity_integer')
+    IsProc: boolean;       // true면 프로시저, false면 함수
+    ArgTypes: List<TVarType>;
+    ArgClassNames: List<string>;
+    constructor Create(tn, cnm: string; isP: boolean; ats: List<TVarType>; acns: List<string>);
+    begin TemplateName:=tn; ConcreteName:=cnm; IsProc:=isP; ArgTypes:=ats; ArgClassNames:=acns; end;
   end;
 
 
@@ -419,6 +452,7 @@ type
     VarDecls:    List<TVarDecl>;
     Statements:  List<TStmtNode>;
     GenericInstantiations: List<TGenericInstantiation>; // Parser가 채우고 Monomorphize가 소비
+    GenericFuncInstantiations: List<TGenericFuncInstantiation>; // [Stage 36] 함수/프로시저용, 동일한 방식
     constructor Create(n: string);
     begin
       Name:=n;
@@ -430,6 +464,7 @@ type
       VarDecls:=new List<TVarDecl>;
       Statements:=new List<TStmtNode>;
       GenericInstantiations:=new List<TGenericInstantiation>;
+      GenericFuncInstantiations:=new List<TGenericFuncInstantiation>;
     end;
   end;
 
