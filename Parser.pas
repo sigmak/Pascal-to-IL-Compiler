@@ -1276,6 +1276,26 @@ type
               fPos:=fPos+1;
             end
 
+            // [Stage 42] 생성자 시그니처: constructor Create; (매개변수 없는 "Create"만 지원)
+            else if Cur.Kind=tkConstructor then
+            begin
+              fPos:=fPos+1;
+              var ctorName:=Expect(tkIdent).Text;
+              if ctorName<>'Create' then
+                raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString
+                  +': 생성자 이름은 "Create"만 지원합니다 (Stage 42)');
+              if Cur.Kind=tkLParen then
+              begin
+                fPos:=fPos+1;
+                if Cur.Kind<>tkRParen then
+                  raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString
+                    +': 생성자는 아직 매개변수를 지원하지 않습니다 (Stage 42)');
+                Expect(tkRParen);
+              end;
+              Expect(tkSemicolon);
+              cd.HasUserConstructor:=true;
+            end
+
             // 메서드 시그니처: procedure/function
             else if (Cur.Kind=tkProcedure) or (Cur.Kind=tkFunction) then
             begin
@@ -1496,6 +1516,57 @@ type
       Result:=impl;
     end;
 
+    // [Stage 42] 생성자 구현: constructor ClassName.Create; begin ... end;
+    // 매개변수가 없다는 점만 빼면 ParseMethodImpl과 완전히 같은 패턴 — 본문 안에서
+    // "inherited Create(...)"(부모 생성자 호출)와 암시적 self 메서드 호출을 그대로 쓸 수 있어야
+    // 하므로 fCurClass/fCurFunc/fCurParams/fCurMethodParamNames를 동일하게 맞춰준다.
+    function ParseConstructorImpl: TConstructorImplNode;
+    var cn: string; impl: TConstructorImplNode; comp: TCompoundStmtNode;
+    begin
+      Expect(tkConstructor);
+      cn:=Expect(tkIdent).Text; Expect(tkDot);
+      var mn:=Expect(tkIdent).Text;
+      if mn<>'Create' then
+        raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString
+          +': 생성자 이름은 "Create"만 지원합니다 (Stage 42)');
+      if Cur.Kind=tkLParen then
+      begin
+        fPos:=fPos+1;
+        if Cur.Kind<>tkRParen then
+          raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString
+            +': 생성자는 아직 매개변수를 지원하지 않습니다 (Stage 42)');
+        Expect(tkRParen);
+      end;
+      Expect(tkSemicolon);
+      impl:=new TConstructorImplNode(cn);
+
+      var savedGP4:=fCurGenericParams;
+      if fClassGenericParam.ContainsKey(cn) then fCurGenericParams:=fClassGenericParam[cn]
+      else fCurGenericParams:=new List<string>;
+
+      var savedClass2:=fCurClass; var savedFunc2:=fCurFunc;
+      var savedParams2:=fCurParams;
+      var savedMethodParamNames2:=fCurMethodParamNames;
+      fCurClass:=cn; fCurFunc:='Create';
+      fCurParams:=new List<string>; // 생성자는 매개변수 없음
+      fCurMethodParamNames:=new List<string>;
+
+      if Cur.Kind=tkVar then
+      begin
+        ParseLocalVarSection(impl.LocalVars);
+        foreach var lvcp2 in impl.LocalVars do fCurParams.Add(lvcp2.Name);
+      end;
+      Expect(tkBegin); comp:=new TCompoundStmtNode;
+      while Cur.Kind<>tkEnd do
+      begin comp.Statements.Add(ParseStatement); if Cur.Kind=tkSemicolon then fPos:=fPos+1; end;
+      Expect(tkEnd); Expect(tkSemicolon);
+
+      fCurClass:=savedClass2; fCurFunc:=savedFunc2; fCurGenericParams:=savedGP4;
+      fCurParams:=savedParams2; fCurMethodParamNames:=savedMethodParamNames2;
+      impl.Body:=comp;
+      Result:=impl;
+    end;
+
     procedure ParseParams(aP: List<TParamDef>);
     var pt: TVarType; ns: List<string>;
     begin
@@ -1693,8 +1764,15 @@ type
       if Cur.Kind=tkType then ParseTypeSection(prog);
 
       // 클래스 메서드 구현 또는 일반 함수/프로시저
-      while (Cur.Kind=tkFunction) or (Cur.Kind=tkProcedure) do
+      while (Cur.Kind=tkFunction) or (Cur.Kind=tkProcedure) or (Cur.Kind=tkConstructor) do
       begin
+        // [Stage 42] 생성자 구현은 항상 "constructor ClassName.Create;" 형태 (top-level 생성자는 없음)
+        if Cur.Kind=tkConstructor then
+        begin
+          prog.ConstructorImpls.Add(ParseConstructorImpl);
+        end
+        else
+        begin
         // ClassName.MethodName 형태인지 미리 보기
         var savedPos:=fPos;
         fPos:=fPos+1; // function/procedure 소비
@@ -1722,6 +1800,7 @@ type
           t:=Cur;
           if t.Kind=tkFunction then prog.FuncDecls.Add(ParseFuncDecl)
           else prog.ProcDecls.Add(ParseProcDecl);
+        end;
         end;
       end;
 

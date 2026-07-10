@@ -359,10 +359,60 @@ type
     // 2) 없으면(지역 부모가 없거나, 부모 체인에 그 메서드가 없으면) 외부 조상 타입
     //    (WPF Window 등)에서 이름+인자개수로 찾아 마찬가지로 Call(비가상)로 호출한다.
     // keepReturnValue=true(식으로 쓰임)면 반환값을 스택에 남기고, false(문장)면 버린다.
+    // [Stage 42] inherited Create(...) 처리 — 현재 클래스의 부모 생성자를 호출한다.
+    // 부모가 로컬 클래스면 fCtorBuilders에 이미 만들어 둔 ConstructorBuilder를 그대로 쓰고
+    // (아직 CreateType 전이라 GetConstructor를 쓸 수 없음), 외부 타입이면 인자 개수로 찾는다.
+    procedure EmitInheritedCtorCall(aIL: ILGenerator; args: List<TExprNode>);
+    var startCls3: string; parentCtor3: ConstructorInfo; extType3: System.Type; ae3: TExprNode;
+    begin
+      startCls3:='';
+      if fClassParents.ContainsKey(fCurClassName) then startCls3:=fClassParents[fCurClassName];
+
+      aIL.Emit(OpCodes.Ldarg_0); // self
+      foreach ae3 in args do EmitExpr(aIL, ae3);
+
+      if (startCls3<>'') and fCtorBuilders.ContainsKey(startCls3) then
+      begin
+        // [Stage 42] 로컬 부모 클래스는 지금은 항상 매개변수 없는 생성자 하나뿐이다.
+        if args.Count>0 then
+          raise new Exception('inherited Create('+args.Count.ToString+'개 인자): 부모 클래스 "'+startCls3
+            +'"는 아직 매개변수 없는 생성자만 지원합니다.');
+        aIL.Emit(OpCodes.Call, fCtorBuilders[startCls3]);
+      end
+      else
+      begin
+        extType3:=FindExternalAncestorType(fCurClassName);
+        if extType3=nil then
+          raise new Exception('inherited Create: 클래스 "'+fCurClassName+'"에서 부모/외부 조상 타입을 찾을 수 없습니다.');
+        if args.Count=0 then
+        begin
+          parentCtor3:=extType3.GetConstructor(System.Type.EmptyTypes);
+          if parentCtor3=nil then
+            raise new Exception('외부 조상 타입 "'+extType3.FullName+'"에 매개변수 없는 public 생성자가 없습니다.');
+        end
+        else
+        begin
+          parentCtor3:=ResolveConstructorByArity(extType3, args.Count);
+          if parentCtor3=nil then
+            raise new Exception('외부 조상 타입 "'+extType3.FullName+'"에 인자 '+args.Count.ToString+'개짜리 public 생성자가 없습니다.');
+        end;
+        aIL.Emit(OpCodes.Call, parentCtor3);
+      end;
+    end;
+
     procedure EmitInheritedCall(aIL: ILGenerator; mname: string; args: List<TExprNode>; keepReturnValue: boolean);
     var startCls: string; imb2: MethodBuilder; extType2: System.Type; emi2: MethodInfo;
         ae2: TExprNode; found: boolean;
     begin
+      // [Stage 42] inherited Create(...) — 일반 메서드 호출이 아니라 부모 생성자 호출.
+      // 부모에는 "Create"라는 이름의 인스턴스 메서드가 없으므로(생성자는 fCtorBuilders/
+      // 리플렉션 생성자 조회로 별도 관리됨) 여기서 갈라서 처리한다.
+      if mname='Create' then
+      begin
+        EmitInheritedCtorCall(aIL, args);
+        exit;
+      end;
+
       startCls:='';
       if fClassParents.ContainsKey(fCurClassName) then startCls:=fClassParents[fCurClassName];
       found:=false;
@@ -1475,23 +1525,85 @@ type
         CallingConventions.Standard,
         System.Type.EmptyTypes);
       fCtorBuilders[cd.Name]:=ctorBuilder;
-      var ctorIL:=ctorBuilder.GetILGenerator;
-      ctorIL.Emit(OpCodes.Ldarg_0);
-      if (cd.ParentName<>'') and fCtorBuilders.ContainsKey(cd.ParentName) then
-        // 부모가 아직 CreateType되지 않았으므로 GetConstructor 대신
-        // 만들어둔 ConstructorBuilder를 그대로 재사용 (.NET Core는 미완성
-        // TypeBuilder에 대한 GetConstructor 호출을 지원하지 않음)
-        parentCtor:=fCtorBuilders[cd.ParentName]
-      else
+      // [Stage 42] 사용자가 "constructor Create;"를 직접 선언한 클래스는 본문을 여기서 채우지
+      // 않는다 — 이후 BuildConstructorBody가 ConstructorImpls에서 실제로 작성된 본문을
+      // 컴파일해 넣는다 (inherited Create(...) 호출을 그 본문 안에서 원하는 위치에 직접
+      // 쓸 수 있어야 하므로, 여기서 미리 "부모 호출 + Ret"를 넣어버리면 안 된다).
+      if not cd.HasUserConstructor then
       begin
-        // 로컬에서 만든 클래스가 아니면(System.Object 또는 외부 어셈블리 타입)
-        // parentType에서 직접 매개변수 없는 public 생성자를 찾는다.
-        parentCtor:=parentType.GetConstructor(System.Type.EmptyTypes);
-        if parentCtor=nil then
-          raise new Exception('부모 타입 "'+parentType.FullName+'"에 매개변수 없는 public 생성자가 없습니다.');
+        var ctorIL:=ctorBuilder.GetILGenerator;
+        ctorIL.Emit(OpCodes.Ldarg_0);
+        if (cd.ParentName<>'') and fCtorBuilders.ContainsKey(cd.ParentName) then
+          // 부모가 아직 CreateType되지 않았으므로 GetConstructor 대신
+          // 만들어둔 ConstructorBuilder를 그대로 재사용 (.NET Core는 미완성
+          // TypeBuilder에 대한 GetConstructor 호출을 지원하지 않음)
+          parentCtor:=fCtorBuilders[cd.ParentName]
+        else
+        begin
+          // 로컬에서 만든 클래스가 아니면(System.Object 또는 외부 어셈블리 타입)
+          // parentType에서 직접 매개변수 없는 public 생성자를 찾는다.
+          parentCtor:=parentType.GetConstructor(System.Type.EmptyTypes);
+          if parentCtor=nil then
+            raise new Exception('부모 타입 "'+parentType.FullName+'"에 매개변수 없는 public 생성자가 없습니다.');
+        end;
+        ctorIL.Emit(OpCodes.Call, parentCtor);
+        ctorIL.Emit(OpCodes.Ret);
       end;
-      ctorIL.Emit(OpCodes.Call, parentCtor);
-      ctorIL.Emit(OpCodes.Ret);
+    end;
+
+    // [Stage 42] 사용자가 작성한 생성자 본문(constructor ClassName.Create; begin...end;)을
+    // BuildClassShell이 미리 만들어 둔 ConstructorBuilder에 채워 넣는다. BuildMethodBody와
+    // 거의 같은 구조이지만 매개변수/Result가 없고, 몸체 끝에 항상 Ret로 마무리한다.
+    procedure BuildConstructorBody(impl: TConstructorImplNode);
+    var
+      il: ILGenerator; st: TStmtNode;
+      svLocals: Dictionary<string, LocalBuilder>;
+      svLocalTypes: Dictionary<string, TVarType>;
+      svLocalClrTypes: Dictionary<string, System.Type>;
+      svLocalClass: Dictionary<string, string>;
+      svResult: LocalBuilder; svResultType: TVarType;
+      svCurClass: string;
+    begin
+      if not fCtorBuilders.ContainsKey(impl.ClassName) then
+        raise new Exception('생성자를 찾을 수 없음: '+impl.ClassName+'.Create');
+
+      il:=fCtorBuilders[impl.ClassName].GetILGenerator;
+
+      svLocals:=fLocals; svLocalTypes:=fLocalTypes; svLocalClrTypes:=fLocalClrTypes; svLocalClass:=fLocalClass;
+      svResult:=fResultLocal; svResultType:=fResultType;
+      svCurClass:=fCurClassName;
+
+      fLocals:=new Dictionary<string, LocalBuilder>;
+      fLocalTypes:=new Dictionary<string, TVarType>;
+      fLocalClrTypes:=new Dictionary<string, System.Type>;
+      fLocalClass:=new Dictionary<string, string>;
+      fResultLocal:=nil; // 생성자는 반환값이 없음
+      fCurClassName:=impl.ClassName;
+
+      foreach var lv in impl.LocalVars do
+      begin
+        var lvClrType: System.Type;
+        if lv.IsExternal then lvClrType:=ResolveExternalType(lv.ClassName)
+        else lvClrType:=VTC(lv.VarType, lv.ClassName);
+        var lvLoc:=il.DeclareLocal(lvClrType);
+        fLocals[lv.Name]:=lvLoc; fLocalTypes[lv.Name]:=lv.VarType;
+        if (lv.VarType=vtObject) or (lv.VarType=vtInterface) then
+        begin
+          if lv.IsExternal then
+            fLocalClrTypes[lv.Name]:=lvClrType
+          else if fTypeBuilders.ContainsKey(lv.ClassName) or fBuiltTypes.ContainsKey(lv.ClassName) then
+            fLocalClass[lv.Name]:=lv.ClassName
+          else
+            fLocalClrTypes[lv.Name]:=lvClrType;
+        end;
+      end;
+
+      foreach st in impl.Body.Statements do EmitStatement(il, st);
+      il.Emit(OpCodes.Ret);
+
+      fLocals:=svLocals; fLocalTypes:=svLocalTypes; fLocalClrTypes:=svLocalClrTypes; fLocalClass:=svLocalClass;
+      fResultLocal:=svResult; fResultType:=svResultType;
+      fCurClassName:=svCurClass;
     end;
 
     // 클래스 메서드 본문 IL 생성
@@ -1773,7 +1885,7 @@ type
       mm: MethodBuilder; il: ILGenerator;
       rk: MethodInfo; vd: TVarDecl; st: TStmtNode;
       cd: TClassDeclNode; impl: TMethodImplNode; id: TInterfaceDeclNode;
-      fd: TFuncDeclNode; pd: TProcDeclNode;
+      fd: TFuncDeclNode; pd: TProcDeclNode; ctorImpl: TConstructorImplNode; // [Stage 42]
     begin
       an:=new AssemblyName(fProg.Name);
       ab:=AssemblyBuilder.DefineDynamicAssembly(an, AssemblyBuilderAccess.RunAndSave);
@@ -1803,6 +1915,21 @@ type
 
       // 4. 클래스 메서드 본문 IL 생성
       foreach impl in fProg.MethodImpls do BuildMethodBody(impl);
+
+      // 4-1. [Stage 42] 사용자 정의 생성자 본문 IL 생성 (constructor Create; ... end;)
+      foreach ctorImpl in fProg.ConstructorImpls do BuildConstructorBody(ctorImpl);
+      // constructor Create;를 선언해 놓고 실제 구현(constructor ClassName.Create; begin...end;)을
+      // 빠뜨리면 그 생성자의 IL에 Ret가 없는 채로 남는다 — CreateType 전에 미리 잡아준다.
+      foreach cd in fProg.ClassDecls do
+        if cd.HasUserConstructor then
+        begin
+          var hasImpl:=false;
+          foreach ctorImpl in fProg.ConstructorImpls do
+            if ctorImpl.ClassName=cd.Name then begin hasImpl:=true; break; end;
+          if not hasImpl then
+            raise new Exception('클래스 "'+cd.Name+'"에 "constructor Create;" 선언은 있지만 구현'
+              +'("constructor '+cd.Name+'.Create; begin...end;")이 없습니다.');
+        end;
 
       // 5. 클래스 타입 완성 (CreateType)
       foreach cd in fProg.ClassDecls do

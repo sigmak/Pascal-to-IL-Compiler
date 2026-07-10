@@ -328,11 +328,16 @@ type
     // ''(빈 문자열)이면 제약 없음. 'class'면 참조 타입(임의의 클래스)만 허용.
     // 그 외 값이면 해당 이름의 클래스/인터페이스를 상속·구현해야 함 (예: 'TAnimal', 'IComparable').
     GenericParamConstraints: List<string>;
+    // [Stage 42] 클래스 선언부에 "constructor Create;"가 있었으면 true.
+    // true면 BuildClassShell이 기본(부모 생성자만 호출하는) 생성자 본문을 즉시 채우지 않고,
+    // 이후 ConstructorImpls에서 사용자가 작성한 본문을 채워 넣을 때까지 비워 둔다.
+    HasUserConstructor: boolean;
     constructor Create(n: string);
     begin
       Name:=n; ParentName:=''; IsExternalParent:=false; InterfaceName:='';
       Fields:=new List<TFieldDeclNode>; Methods:=new List<TMethodSignature>;
       IsGeneric:=false; GenericParamNames:=new List<string>; GenericParamConstraints:=new List<string>;
+      HasUserConstructor:=false;
     end;
   end;
 
@@ -405,6 +410,18 @@ type
     end;
   end;
 
+  // [Stage 42] 클래스 생성자 구현: constructor ClassName.Create; begin ... end;
+  // 지금은 매개변수 없는 "Create"만 지원 (WPF 디자이너 템플릿의 constructor Create; 패턴과 일치).
+  // 본문 안에서 "inherited Create;"(부모 생성자 호출)와 암시적 self 메서드 호출(예: InitializeComponent;)을 쓸 수 있다.
+  TConstructorImplNode = class
+  public
+    ClassName: string;
+    LocalVars: List<TVarDecl>;
+    Body: TCompoundStmtNode;
+    constructor Create(cn: string);
+    begin ClassName:=cn; LocalVars:=new List<TVarDecl>; end;
+  end;
+
   TFuncDeclNode = class
   public Name: string; Parameters: List<TParamDef>;
     ReturnType: TVarType; Body: TCompoundStmtNode;
@@ -458,6 +475,7 @@ type
     InterfaceDecls: List<TInterfaceDeclNode>;
     ClassDecls:  List<TClassDeclNode>;
     MethodImpls: List<TMethodImplNode>;
+    ConstructorImpls: List<TConstructorImplNode>; // [Stage 42]
     FuncDecls:   List<TFuncDeclNode>;
     ProcDecls:   List<TProcDeclNode>;
     VarDecls:    List<TVarDecl>;
@@ -470,6 +488,7 @@ type
       InterfaceDecls:=new List<TInterfaceDeclNode>;
       ClassDecls:=new List<TClassDeclNode>;
       MethodImpls:=new List<TMethodImplNode>;
+      ConstructorImpls:=new List<TConstructorImplNode>; // [Stage 42]
       FuncDecls:=new List<TFuncDeclNode>;
       ProcDecls:=new List<TProcDeclNode>;
       VarDecls:=new List<TVarDecl>;
