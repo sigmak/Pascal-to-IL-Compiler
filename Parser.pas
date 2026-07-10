@@ -75,7 +75,11 @@ type
         fPos:=fPos+1; Expect(tkOf);
         if Cur.Kind=tkInteger then begin fPos:=fPos+1; Result:=vtIntArray; end
         else if Cur.Kind=tkStringType then begin fPos:=fPos+1; Result:=vtStrArray; end
-        else raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': array of integer/string만 지원');
+        // [Stage 37] array of T — 제네릭 템플릿 본문에서만 등장. 실제 타입은 Monomorphize가 채운다.
+        else if (Cur.Kind=tkIdent) and fCurGenericParams.Contains(Cur.Text) then
+          begin fLastGenericName:=Cur.Text; fPos:=fPos+1; Result:=vtGenericArray; end
+        else raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': array of integer/string'
+          +'(또는 제네릭 문맥에서는 array of T)만 지원');
       end
       else if (Cur.Kind=tkIdent) and fClassNames.Contains(Cur.Text) then
       begin
@@ -1247,7 +1251,7 @@ type
                     Expect(tkColon);
                     var pIsExt2:=false; var pCn2:='';
                     pt:=ParseParamTypeExt(pIsExt2, pCn2);
-                    if pt=vtGeneric then pCn2:=fLastGenericName; // [Stage 32] 어느 타입 매개변수(K/V 등)인지 기록
+                    if (pt=vtGeneric) or (pt=vtGenericArray) then pCn2:=fLastGenericName; // [Stage 32/37] 어느 타입 매개변수(K/V 등)인지 기록
                     foreach var pnm in pnames do
                     begin
                       sig.ParamNames.Add(pnm); sig.ParamTypes.Add(pt);
@@ -1262,7 +1266,7 @@ type
               if isFunc then
               begin
                 Expect(tkColon); sig.ReturnType:=ParseVarType;
-                if sig.ReturnType=vtGeneric then sig.ReturnGenericName:=fLastGenericName; // [Stage 32]
+                if (sig.ReturnType=vtGeneric) or (sig.ReturnType=vtGenericArray) then sig.ReturnGenericName:=fLastGenericName; // [Stage 32/37]
               end;
               Expect(tkSemicolon);
               cd.Methods.Add(sig);
@@ -1305,10 +1309,14 @@ type
                 begin
                   fPos:=savedPos2; // 점이 없으면 기본 타입 파서로 위임 (integer/string 등의 별칭이 아니므로 오류 처리됨)
                   fld.FieldType:=ParseVarType;
+                  if fld.FieldType=vtGenericArray then fld.ClassName:=fLastGenericName; // [Stage 37]
                 end;
               end
               else
+              begin
                 fld.FieldType:=ParseVarType;
+                if fld.FieldType=vtGenericArray then fld.ClassName:=fLastGenericName; // [Stage 37] 필드가 array of T인 경우
+              end;
               Expect(tkSemicolon);
               cd.Fields.Add(fld);
               fClassFields[cn].Add(fname);
@@ -1350,12 +1358,12 @@ type
           cn:=Cur.Text; fPos:=fPos+1; vt:=vtInterface;
         end
         else vt:=ParseVarType;
-        if vt=vtGeneric then cn:=fLastGenericName; // [Stage 36] 제네릭 지역변수(예: var temp: T;)의 타입 매개변수 이름 보존
+        if (vt=vtGeneric) or (vt=vtGenericArray) then cn:=fLastGenericName; // [Stage 36/37] 제네릭 지역변수(예: var temp: T; var arr: array of T;)의 타입 매개변수 이름 보존
         Expect(tkSemicolon);
         foreach var nm in ns do
         begin
           aList.Add(new TVarDecl(nm, vt, cn));
-          if (vt=vtIntArray) or (vt=vtStrArray) then fArrayNames.Add(nm);
+          if (vt=vtIntArray) or (vt=vtStrArray) or (vt=vtGenericArray) then fArrayNames.Add(nm); // [Stage 37]
         end;
       end;
     end;
@@ -1397,7 +1405,7 @@ type
             Expect(tkColon);
             var pIsExt3:=false; var pCn3:='';
             pt:=ParseParamTypeExt(pIsExt3, pCn3);
-            var pGenName3:=''; if pt=vtGeneric then pGenName3:=fLastGenericName; // [Stage 32]
+            var pGenName3:=''; if (pt=vtGeneric) or (pt=vtGenericArray) then pGenName3:=fLastGenericName; // [Stage 32/37]
             for var i:=impl.ParamTypes.Count to impl.ParamNames.Count-1 do
             begin
               impl.ParamTypes.Add(pt);
@@ -1405,7 +1413,7 @@ type
             end;
             // [Stage 28] array of integer/string 매개변수를 본문에서 a[i]로 인덱싱할 수
             // 있으려면 fArrayNames에 등록되어야 한다(별개 버그, 함께 수정).
-            if (pt=vtIntArray) or (pt=vtStrArray) then
+            if (pt=vtIntArray) or (pt=vtStrArray) or (pt=vtGenericArray) then // [Stage 37]
               foreach var pbn in pBatch do
                 if not fArrayNames.Contains(pbn) then fArrayNames.Add(pbn);
             if Cur.Kind=tkSemicolon then fPos:=fPos+1 else break;
@@ -1417,7 +1425,7 @@ type
       if isFunc then
       begin
         Expect(tkColon); impl.ReturnType:=ParseVarType;
-        if impl.ReturnType=vtGeneric then impl.ReturnGenericName:=fLastGenericName; // [Stage 32]
+        if (impl.ReturnType=vtGeneric) or (impl.ReturnType=vtGenericArray) then impl.ReturnGenericName:=fLastGenericName; // [Stage 32/37]
       end;
       Expect(tkSemicolon);
 
@@ -1467,14 +1475,14 @@ type
           // (클래스 메서드 시그니처는 이미 ParseParamTypeExt를 쓰고 있었음 — 동일하게 맞춘다.)
           var pIsExt5:=false; var pCn5:='';
           pt:=ParseParamTypeExt(pIsExt5, pCn5);
-          if pt=vtGeneric then pCn5:=fLastGenericName; // [Stage 36] 제네릭 매개변수(예: x: T)의 타입 매개변수 이름 보존
+          if (pt=vtGeneric) or (pt=vtGenericArray) then pCn5:=fLastGenericName; // [Stage 36/37] 제네릭 매개변수(예: x: T, a: array of T)의 타입 매개변수 이름 보존
           foreach var nm in ns do
           begin
             aP.Add(new TParamDef(nm, pt, pCn5, pIsExt5));
             // [Stage 28] array of integer/string 매개변수도 본문에서 a[i]로 인덱싱할 수
             // 있어야 하는데, 이전에는 매개변수 이름이 fArrayNames에 등록되지 않아
             // 배열 인덱스 식으로 인식되지 않았다(별개 버그, 이번에 함께 수정).
-            if (pt=vtIntArray) or (pt=vtStrArray) then fArrayNames.Add(nm);
+            if (pt=vtIntArray) or (pt=vtStrArray) or (pt=vtGenericArray) then fArrayNames.Add(nm); // [Stage 37]
           end;
           if Cur.Kind=tkSemicolon then fPos:=fPos+1 else break;
         end;
@@ -1508,7 +1516,7 @@ type
 
       ParseParams(d.Parameters);
       Expect(tkColon); d.ReturnType:=ParseVarType;
-      if d.ReturnType=vtGeneric then d.ReturnGenericName:=fLastGenericName; // [Stage 36]
+      if (d.ReturnType=vtGeneric) or (d.ReturnType=vtGenericArray) then d.ReturnGenericName:=fLastGenericName; // [Stage 36/37]
       Expect(tkSemicolon);
       sv:=fCurFunc; fCurFunc:=d.Name;
       if Cur.Kind=tkVar then ParseLocalVarSection(d.LocalVars);

@@ -10,12 +10,17 @@ type
   // ----------------------------------------------------------
   // 변수/식 타입
   // ----------------------------------------------------------
-  TVarType = (vtInteger, vtString, vtIntArray, vtStrArray, vtObject, vtInterface, vtBoolean, vtGeneric);
+  TVarType = (vtInteger, vtString, vtIntArray, vtStrArray, vtObject, vtInterface, vtBoolean, vtGeneric, vtGenericArray);
   // vtObject: 클래스 인스턴스 (TCounter 등)
   // vtInterface: 인터페이스 타입 변수 (ISpeaker 등)
   // vtBoolean: boolean 타입 (true/false)
   // vtGeneric: 제네릭 클래스 선언 본문 안에서만 등장하는 "타입 매개변수 자리" (예: T).
   //   Monomorphize 단계에서 실제 타입 인자로 치환되어 사라지므로 CodeGen은 이 값을 절대 보지 않는다.
+  // [Stage 37] vtGenericArray: 제네릭 템플릿 안의 "array of T" 자리. vtGeneric과 마찬가지로
+  //   Monomorphize 단계에서 실제 타입 인자에 따라 vtIntArray/vtStrArray로 치환되어 사라진다.
+  //   (현재는 정수/문자열 타입 인자만 지원 — 클래스 타입 인자로 인스턴스화하면 단형화 단계에서
+  //   명확한 에러로 실패한다. "배열 원소가 임의의 클래스" 기능은 이 컴파일러가 아직 갖고 있지
+  //   않은 별개의 큰 기능이라 제네릭과 무관하게도 지원되지 않는다.)
 
   // ----------------------------------------------------------
   // Lexer

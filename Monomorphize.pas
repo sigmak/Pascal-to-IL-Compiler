@@ -124,6 +124,20 @@ begin
     outClassName:=subst[srcGenericName].ArgClassName;
     outIsExternal:=false; // 현재는 기본형/지역 클래스(중첩 제네릭 포함) 타입 인자만 지원
   end
+  // [Stage 37] "array of T" — 실제 타입 인자가 정수/문자열이면 그에 맞는 배열 타입으로 치환한다.
+  // 클래스 타입 인자로 인스턴스화하면 여기서 명확한 에러로 실패한다("배열 원소가 임의의 클래스"
+  // 기능은 제네릭과 무관하게 이 컴파일러가 아직 갖고 있지 않은 별개의 기능이기 때문).
+  else if srcType=vtGenericArray then
+  begin
+    if not subst.ContainsKey(srcGenericName) then
+      raise new Exception('단형화 실패: 알 수 없는 타입 매개변수 "'+srcGenericName+'"');
+    if subst[srcGenericName].ArgType=vtInteger then outType:=vtIntArray
+    else if subst[srcGenericName].ArgType=vtString then outType:=vtStrArray
+    else raise new Exception('단형화 실패: "array of '+srcGenericName+'" 자리에 정수/문자열이 아닌 타입 인자가 주어졌습니다 '
+      +'— 이 컴파일러는 아직 정수/문자열 배열만 지원하며, 클래스 원소 배열은 지원하지 않습니다');
+    outClassName:='';
+    outIsExternal:=false;
+  end
   else
   begin
     outType:=srcType; outClassName:=srcClassName; outIsExternal:=srcIsExternal;
@@ -189,7 +203,16 @@ begin
       impl.ParamTypes.Add(pot);
       impl.ParamGenericNames.Add(''); // 구체화 후에는 더 이상 제네릭이 아님
     end;
-    // 본문은 타입 소거되어 있으므로(필드/변수는 이름으로만 참조) 그대로 공유해도 안전하다.
+    // [Stage 37 버그 수정] 본문(Body)은 타입 소거되어 있어 그대로 공유해도 안전하지만,
+    // LocalVars(예: var i: integer; 같은 지역변수 선언 목록)는 별도 리스트라서 지금까지
+    // 전혀 복사되지 않고 있었다 — 그 결과 제네릭 클래스 메서드 안에 지역변수가 하나라도
+    // 있으면(for 루프 변수 등) CodeGen이 "선언 안 됨" 오류로 실패했다. 여기서 함께 고친다.
+    foreach var lv in srcImpl.LocalVars do
+    begin
+      var lot: TVarType; var locn: string; var loext: boolean;
+      ResolveType(subst, lv.VarType, lv.ClassName, lv.ClassName, false, lot, locn, loext);
+      impl.LocalVars.Add(new TVarDecl(lv.Name, lot, locn));
+    end;
     impl.Body:=srcImpl.Body;
     fProg.MethodImpls.Add(impl);
   end;

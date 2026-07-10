@@ -21,7 +21,8 @@ uses
 
 const
   DefaultExampleDir = 'Examples';
-  DefaultExampleFile = 'Test_stage36.pas';
+  DefaultExampleFile = 'Test_stage37.pas';
+  //DefaultExampleFile = 'Test_stage36.pas';
   //DefaultExampleFile = 'Test_stage35_parse_errors.pas'; // 오류 메세지 검증용
   //DefaultExampleFile = 'Test_stage35_lex_errors.pas';   // 오류 메세지 검증용
   //DefaultExampleFile = 'test_stage34.pas';

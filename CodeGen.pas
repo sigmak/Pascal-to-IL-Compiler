@@ -295,7 +295,13 @@ type
         end
         else Result:=vtInteger;
       end
-      else if e is TArrayIndexExprNode then Result:=vtInteger
+      // [Stage 37 버그 수정] 이전에는 배열이 실제로 array of string이어도 무조건 vtInteger로
+      // 추론해서, Writeln(strArr[i]) 같은 식이 Console.WriteLine(int) 오버로드로 잘못 디스패치됐다.
+      else if e is TArrayIndexExprNode then
+      begin
+        if GetVarType(TArrayIndexExprNode(e).ArrName)=vtStrArray then Result:=vtString
+        else Result:=vtInteger;
+      end
       else if e is TVarRefNode then Result:=GetVarType(TVarRefNode(e).VarName)
       else if e is TFuncCallExprNode then
       begin
@@ -568,7 +574,12 @@ type
         if fLocals.ContainsKey(ai.ArrName) then aIL.Emit(OpCodes.Ldloc, fLocals[ai.ArrName])
         else aIL.Emit(OpCodes.Ldloc, fGlobals[ai.ArrName]);
         EmitExpr(aIL, ai.Index);
-        aIL.Emit(OpCodes.Ldelem_I4);
+        // [Stage 37 버그 수정] 이전에는 배열 종류와 무관하게 항상 Ldelem_I4를 썼다 —
+        // array of integer는 우연히 맞았지만 array of string은 참조(포인터)를 4바이트
+        // 정수로 잘못 읽어 쓰레기 값이 나왔다. 원소를 쓰는 쪽(Stelem, 아래 TArrayAssignStmtNode)은
+        // 이미 배열 타입을 보고 Stelem_Ref/Stelem_I4를 갈라 쓰고 있었으므로 읽는 쪽도 맞춘다.
+        if GetVarType(ai.ArrName)=vtStrArray then aIL.Emit(OpCodes.Ldelem_Ref)
+        else aIL.Emit(OpCodes.Ldelem_I4);
       end
 
       else if e is TVarRefNode then
@@ -1486,7 +1497,14 @@ type
            and (i<fMethodParamClrTypes[impl.ClassName][impl.MethodName].Length) then
           pClrType:=fMethodParamClrTypes[impl.ClassName][impl.MethodName][i];
         var loc:=il.DeclareLocal(pClrType);
-        fLocals[p]:=loc; fLocalTypes[p]:=vtInteger;
+        fLocals[p]:=loc;
+        // [버그 수정] 예전에는 인스턴스 메서드의 매개변수 타입을 무조건 vtInteger로 기록해서,
+        // GetVarType()에 의존하는 배열 원소 접근(Ldelem_I4 vs Ldelem_Ref 선택, Writeln 오버로드
+        // 선택 등)이 array of string 매개변수에서도 항상 정수로 취급됐다 — 문자열 배열 원소를
+        // 4바이트로 잘못 읽어 포인터가 깨지고 쓰레기 값이 출력되는 원인이었다. 이제 단형화 단계가
+        // 이미 채워 둔 impl.ParamTypes[i](구체 타입)를 그대로 사용한다.
+        if i<impl.ParamTypes.Count then fLocalTypes[p]:=impl.ParamTypes[i]
+        else fLocalTypes[p]:=vtInteger;
         if pClrType<>typeof(integer) then fLocalClrTypes[p]:=pClrType;
         // self=Ldarg_0 이므로 매개변수는 Ldarg_1부터
         if i=0 then il.Emit(OpCodes.Ldarg_1)
