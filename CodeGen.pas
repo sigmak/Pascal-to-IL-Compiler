@@ -1333,6 +1333,10 @@ type
           exLoc:=aIL.DeclareLocal(typeof(Exception));
           fLocals[ts2.ExVarName]:=exLoc;
           fLocalTypes[ts2.ExVarName]:=vtString; // 내부 타입은 string으로 (Message는 string)
+          // [Stage 49] .Message는 TExceptionMsgExprNode가 전용으로 처리하지만, .ToString()
+          // 같은 다른 멤버는 이게 없으면 "외부 타입 로컬 변수" 경로를 못 타서
+          // "알 수 없는 메서드"로 막혔다 — 실제 예외 객체 타입을 등록해 리플렉션 경로를 열어준다.
+          fLocalClrTypes[ts2.ExVarName]:=typeof(Exception);
         end;
 
         aIL.BeginExceptionBlock;
@@ -1363,7 +1367,10 @@ type
 
         // 예외 변수 이름을 로컬에서 제거 (스코프 종료)
         if ts2.ExVarName<>'' then
+        begin
           fLocals.Remove(ts2.ExVarName);
+          fLocalClrTypes.Remove(ts2.ExVarName); // [Stage 49]
+        end;
       end
 
       else if s is TRaiseStmtNode then
