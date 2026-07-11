@@ -1280,7 +1280,8 @@ type
               fPos:=fPos+1;
             end
 
-            // [Stage 42] 생성자 시그니처: constructor Create; (매개변수 없는 "Create"만 지원)
+            // [Stage 42] 생성자 시그니처: constructor Create;
+            // [Stage 47] 매개변수 있는 생성자도 지원 (procedure/function 시그니처 파싱과 동일한 패턴)
             else if Cur.Kind=tkConstructor then
             begin
               fPos:=fPos+1;
@@ -1292,8 +1293,21 @@ type
               begin
                 fPos:=fPos+1;
                 if Cur.Kind<>tkRParen then
-                  raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString
-                    +': 생성자는 아직 매개변수를 지원하지 않습니다 (Stage 42)');
+                begin
+                  var ctorPNames:=new List<string>;
+                  while true do
+                  begin
+                    ctorPNames.Add(Expect(tkIdent).Text);
+                    while Cur.Kind=tkComma do begin fPos:=fPos+1; ctorPNames.Add(Expect(tkIdent).Text); end;
+                    Expect(tkColon);
+                    var ctorPIsExt:=false; var ctorPCn:='';
+                    var ctorPt:=ParseParamTypeExt(ctorPIsExt, ctorPCn);
+                    foreach var ctorPn in ctorPNames do
+                      cd.ConstructorParams.Add(new TParamDef(ctorPn, ctorPt, ctorPCn, ctorPIsExt));
+                    ctorPNames.Clear;
+                    if Cur.Kind=tkSemicolon then fPos:=fPos+1 else break;
+                  end;
+                end;
                 Expect(tkRParen);
               end;
               Expect(tkSemicolon);
@@ -1521,11 +1535,9 @@ type
     end;
 
     // [Stage 42] 생성자 구현: constructor ClassName.Create; begin ... end;
-    // 매개변수가 없다는 점만 빼면 ParseMethodImpl과 완전히 같은 패턴 — 본문 안에서
-    // "inherited Create(...)"(부모 생성자 호출)와 암시적 self 메서드 호출을 그대로 쓸 수 있어야
-    // 하므로 fCurClass/fCurFunc/fCurParams/fCurMethodParamNames를 동일하게 맞춰준다.
+    // [Stage 47] 매개변수 있는 생성자도 지원 — ParseMethodImpl과 거의 같은 패턴(제네릭은 미지원).
     function ParseConstructorImpl: TConstructorImplNode;
-    var cn: string; impl: TConstructorImplNode; comp: TCompoundStmtNode;
+    var cn: string; impl: TConstructorImplNode; comp: TCompoundStmtNode; pt: TVarType;
     begin
       Expect(tkConstructor);
       cn:=Expect(tkIdent).Text; Expect(tkDot);
@@ -1533,16 +1545,30 @@ type
       if mn<>'Create' then
         raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString
           +': 생성자 이름은 "Create"만 지원합니다 (Stage 42)');
+      impl:=new TConstructorImplNode(cn);
+
+      // [Stage 47] 매개변수 목록 파싱
       if Cur.Kind=tkLParen then
       begin
         fPos:=fPos+1;
         if Cur.Kind<>tkRParen then
-          raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString
-            +': 생성자는 아직 매개변수를 지원하지 않습니다 (Stage 42)');
+        begin
+          while true do
+          begin
+            var ctorPBatch:=new List<string>;
+            ctorPBatch.Add(Expect(tkIdent).Text);
+            while Cur.Kind=tkComma do begin fPos:=fPos+1; ctorPBatch.Add(Expect(tkIdent).Text); end;
+            Expect(tkColon);
+            var ctorPIsExt2:=false; var ctorPCn2:='';
+            pt:=ParseParamTypeExt(ctorPIsExt2, ctorPCn2);
+            foreach var ctorPn2 in ctorPBatch do
+              impl.Parameters.Add(new TParamDef(ctorPn2, pt, ctorPCn2, ctorPIsExt2));
+            if Cur.Kind=tkSemicolon then fPos:=fPos+1 else break;
+          end;
+        end;
         Expect(tkRParen);
       end;
       Expect(tkSemicolon);
-      impl:=new TConstructorImplNode(cn);
 
       var savedGP4:=fCurGenericParams;
       if fClassGenericParam.ContainsKey(cn) then fCurGenericParams:=fClassGenericParam[cn]
@@ -1552,8 +1578,10 @@ type
       var savedParams2:=fCurParams;
       var savedMethodParamNames2:=fCurMethodParamNames;
       fCurClass:=cn; fCurFunc:='Create';
-      fCurParams:=new List<string>; // 생성자는 매개변수 없음
+      fCurParams:=new List<string>;
+      foreach var ctorPn3 in impl.Parameters do fCurParams.Add(ctorPn3.Name); // [Stage 47]
       fCurMethodParamNames:=new List<string>;
+      foreach var ctorPn4 in impl.Parameters do fCurMethodParamNames.Add(ctorPn4.Name); // [Stage 47]
 
       if Cur.Kind=tkVar then
       begin

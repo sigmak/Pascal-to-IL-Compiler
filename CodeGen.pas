@@ -49,6 +49,7 @@ type
     fMethodReturnTypes: Dictionary<string, Dictionary<string, TVarType>>; // 클래스명/인터페이스명 → 메서드명 → 반환타입
     fMethodParamClrTypes: Dictionary<string, Dictionary<string, array of System.Type>>; // 클래스명 → 메서드명 → 매개변수 CLR 타입 배열
     fCtorBuilders: Dictionary<string, ConstructorBuilder>; // 클래스명 → 기본 생성자 (CreateType 전에도 참조 가능하도록 보관)
+    fCtorParamClrTypes: Dictionary<string, array of System.Type>; // [Stage 47] 클래스명 → 생성자 매개변수 CLR 타입 배열
 
     // 외부 .NET 어셈블리 (WPF/WinForm/Avalonia 등) — GenerateExe 전에 AddReferenceAssembly로 채워짐
     fLoadedAssemblies: List<Assembly>;
@@ -412,10 +413,8 @@ type
 
       if (startCls3<>'') and fCtorBuilders.ContainsKey(startCls3) then
       begin
-        // [Stage 42] 로컬 부모 클래스는 지금은 항상 매개변수 없는 생성자 하나뿐이다.
-        if args.Count>0 then
-          raise new Exception('inherited Create('+args.Count.ToString+'개 인자): 부모 클래스 "'+startCls3
-            +'"는 아직 매개변수 없는 생성자만 지원합니다.');
+        // [Stage 47] 로컬 부모 클래스도 이제 매개변수 있는 생성자를 지원한다.
+        // 인자는 위에서 이미 스택에 올려뒀으므로(EmitExpr(aIL, ae3)) 바로 Call.
         aIL.Emit(OpCodes.Call, fCtorBuilders[startCls3]);
       end
       else
@@ -591,11 +590,8 @@ type
         begin
           if not fCtorBuilders.ContainsKey(neo.ClassName) then
             raise new Exception('알 수 없는 클래스 "'+neo.ClassName+'"');
-          // [Stage 40] 로컬(우리 컴파일러가 만든) 클래스는 아직 항상 매개변수 없는 기본 생성자만
-          // 갖는다 — 사용자 정의 생성자(constructor 키워드)는 다음 단계 과제.
-          if neo.Args.Count>0 then
-            raise new Exception('클래스 "'+neo.ClassName+'"는 아직 매개변수 있는 생성자를 지원하지 않습니다 '
-              +'(constructor 키워드는 다음 단계에서 지원 예정입니다).');
+          // [Stage 47] 로컬(우리 컴파일러가 만든) 클래스도 매개변수 있는 생성자를 지원한다.
+          foreach ae in neo.Args do EmitExpr(aIL, ae);
           ctor:=fCtorBuilders[neo.ClassName];
           aIL.Emit(OpCodes.Newobj, ctor);
         end;
@@ -1590,10 +1586,16 @@ type
       end;
 
       // 기본 생성자 추가 (부모 생성자 호출로 체이닝)
+      // [Stage 47] 클래스 선언부에 "constructor Create(...)"로 매개변수가 선언돼 있으면
+      // 그 시그니처 그대로 정의한다 (선언 없으면 cd.ConstructorParams는 빈 목록 → 기존과 동일).
+      var ctorParamTypes:=new System.Type[cd.ConstructorParams.Count];
+      for i:=0 to cd.ConstructorParams.Count-1 do
+        ctorParamTypes[i]:=ResolveTopParamClrType(cd.ConstructorParams[i]);
+      fCtorParamClrTypes[cd.Name]:=ctorParamTypes;
       var ctorBuilder:=tb.DefineConstructor(
         MethodAttributes.Public,
         CallingConventions.Standard,
-        System.Type.EmptyTypes);
+        ctorParamTypes);
       fCtorBuilders[cd.Name]:=ctorBuilder;
       // [Stage 42] 사용자가 "constructor Create;"를 직접 선언한 클래스는 본문을 여기서 채우지
       // 않는다 — 이후 BuildConstructorBody가 ConstructorImpls에서 실제로 작성된 본문을
@@ -1626,7 +1628,7 @@ type
     // 거의 같은 구조이지만 매개변수/Result가 없고, 몸체 끝에 항상 Ret로 마무리한다.
     procedure BuildConstructorBody(impl: TConstructorImplNode);
     var
-      il: ILGenerator; st: TStmtNode;
+      il: ILGenerator; st: TStmtNode; i: integer; p: string;
       svLocals: Dictionary<string, LocalBuilder>;
       svLocalTypes: Dictionary<string, TVarType>;
       svLocalClrTypes: Dictionary<string, System.Type>;
@@ -1649,6 +1651,26 @@ type
       fLocalClass:=new Dictionary<string, string>;
       fResultLocal:=nil; // 생성자는 반환값이 없음
       fCurClassName:=impl.ClassName;
+
+      // [Stage 47] 생성자 매개변수를 로컬 슬롯에 복사 (Ldarg_1, Ldarg_2, ... — Ldarg_0은 self).
+      // BuildMethodBody의 매개변수 바인딩과 동일한 패턴. CLR 타입은 BuildClassShell이
+      // cd.ConstructorParams로부터 미리 계산해 둔 fCtorParamClrTypes를 사용한다(시그니처 일관성 유지).
+      for i:=0 to impl.Parameters.Count-1 do
+      begin
+        p:=impl.Parameters[i].Name;
+        var pClrType:=typeof(integer);
+        if fCtorParamClrTypes.ContainsKey(impl.ClassName) and (i<fCtorParamClrTypes[impl.ClassName].Length) then
+          pClrType:=fCtorParamClrTypes[impl.ClassName][i];
+        var loc:=il.DeclareLocal(pClrType);
+        fLocals[p]:=loc;
+        fLocalTypes[p]:=impl.Parameters[i].ParamType;
+        if pClrType<>typeof(integer) then fLocalClrTypes[p]:=pClrType;
+        if i=0 then il.Emit(OpCodes.Ldarg_1)
+        else if i=1 then il.Emit(OpCodes.Ldarg_2)
+        else if i=2 then il.Emit(OpCodes.Ldarg_3)
+        else il.Emit(OpCodes.Ldarg_S, byte(i+1));
+        il.Emit(OpCodes.Stloc, loc);
+      end;
 
       foreach var lv in impl.LocalVars do
       begin
@@ -1918,6 +1940,7 @@ type
       fMethodReturnTypes:=new Dictionary<string, Dictionary<string, TVarType>>;
       fMethodParamClrTypes:=new Dictionary<string, Dictionary<string, array of System.Type>>;
       fCtorBuilders:=new Dictionary<string, ConstructorBuilder>;
+      fCtorParamClrTypes:=new Dictionary<string, array of System.Type>; // [Stage 47]
       fInterfaceBuilders:=new Dictionary<string, TypeBuilder>;
       fBuiltInterfaces:=new Dictionary<string, System.Type>;
       fLoadedAssemblies:=new List<Assembly>;

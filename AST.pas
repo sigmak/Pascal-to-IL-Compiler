@@ -282,6 +282,18 @@ type
   // ----------------------------------------------------------
   // AST — 클래스 선언 관련
   // ----------------------------------------------------------
+  TParamDef = class
+  public Name: string; ParamType: TVarType;
+    // [Stage 31] ParamType=vtObject/vtInterface일 때만 의미 있음 (지역 클래스/인터페이스 또는 외부 타입 이름).
+    // [Stage 36] ParamType=vtGeneric일 때는 이 매개변수가 참조하는 타입 매개변수 이름(예: 'T')을 담는다.
+    ClassName: string;
+    IsExternal: boolean; // [Stage 31] true면 ClassName이 외부 .NET 타입 이름
+    constructor Create(n: string; t: TVarType); overload;
+    begin Name:=n; ParamType:=t; ClassName:=''; IsExternal:=false; end;
+    constructor Create(n: string; t: TVarType; cn: string; isExt: boolean); overload;
+    begin Name:=n; ParamType:=t; ClassName:=cn; IsExternal:=isExt; end;
+  end;
+
   TFieldDeclNode = class
   public
     Name: string; FieldType: TVarType;
@@ -332,12 +344,14 @@ type
     // true면 BuildClassShell이 기본(부모 생성자만 호출하는) 생성자 본문을 즉시 채우지 않고,
     // 이후 ConstructorImpls에서 사용자가 작성한 본문을 채워 넣을 때까지 비워 둔다.
     HasUserConstructor: boolean;
+    ConstructorParams: List<TParamDef>; // [Stage 47] constructor Create(a: integer; ...) 매개변수 목록. 없으면 빈 목록.
     constructor Create(n: string);
     begin
       Name:=n; ParentName:=''; IsExternalParent:=false; InterfaceName:='';
       Fields:=new List<TFieldDeclNode>; Methods:=new List<TMethodSignature>;
       IsGeneric:=false; GenericParamNames:=new List<string>; GenericParamConstraints:=new List<string>;
       HasUserConstructor:=false;
+      ConstructorParams:=new List<TParamDef>; // [Stage 47]
     end;
   end;
 
@@ -379,18 +393,6 @@ type
     begin Name:=n; VarType:=t; ClassName:=cn; IsExternal:=isExt; end;
   end;
 
-  TParamDef = class
-  public Name: string; ParamType: TVarType;
-    // [Stage 31] ParamType=vtObject/vtInterface일 때만 의미 있음 (지역 클래스/인터페이스 또는 외부 타입 이름).
-    // [Stage 36] ParamType=vtGeneric일 때는 이 매개변수가 참조하는 타입 매개변수 이름(예: 'T')을 담는다.
-    ClassName: string;
-    IsExternal: boolean; // [Stage 31] true면 ClassName이 외부 .NET 타입 이름
-    constructor Create(n: string; t: TVarType); overload;
-    begin Name:=n; ParamType:=t; ClassName:=''; IsExternal:=false; end;
-    constructor Create(n: string; t: TVarType; cn: string; isExt: boolean); overload;
-    begin Name:=n; ParamType:=t; ClassName:=cn; IsExternal:=isExt; end;
-  end;
-
   // 클래스 메서드 구현 (ClassName.MethodName 형태)
   TMethodImplNode = class
   public
@@ -411,15 +413,16 @@ type
   end;
 
   // [Stage 42] 클래스 생성자 구현: constructor ClassName.Create; begin ... end;
-  // 지금은 매개변수 없는 "Create"만 지원 (WPF 디자이너 템플릿의 constructor Create; 패턴과 일치).
-  // 본문 안에서 "inherited Create;"(부모 생성자 호출)와 암시적 self 메서드 호출(예: InitializeComponent;)을 쓸 수 있다.
+  // [Stage 47] 매개변수 있는 생성자도 지원 (constructor ClassName.Create(a: integer); ...).
+  // 본문 안에서 "inherited Create(...)"(부모 생성자 호출)와 암시적 self 메서드 호출(예: InitializeComponent;)을 쓸 수 있다.
   TConstructorImplNode = class
   public
     ClassName: string;
+    Parameters: List<TParamDef>; // [Stage 47]
     LocalVars: List<TVarDecl>;
     Body: TCompoundStmtNode;
     constructor Create(cn: string);
-    begin ClassName:=cn; LocalVars:=new List<TVarDecl>; end;
+    begin ClassName:=cn; Parameters:=new List<TParamDef>; LocalVars:=new List<TVarDecl>; end;
   end;
 
   TFuncDeclNode = class
