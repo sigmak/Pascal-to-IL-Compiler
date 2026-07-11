@@ -21,7 +21,8 @@ uses
 
 const
   DefaultExampleDir = 'Examples';
-  DefaultExampleFile = 'Test_stage43.pas';
+  DefaultExampleFile = 'Test_stage44.pas';
+  //DefaultExampleFile = 'Test_stage43.pas';
   //DefaultExampleFile = 'Test_stage42.pas';
   //DefaultExampleFile = 'Test_stage41.pas';
   //DefaultExampleFile = 'Test_stage40.pas';
@@ -37,6 +38,7 @@ const
   //DefaultExampleFile = 'test_stage29.pas';
   //DefaultExampleFile = 'LocalVars_Test_Stage28.pas';
   //DefaultExampleFile = 'Staticfunctypes_test_Stage27.pas';
+  
   
 
 function ResolveInputPath: string;
@@ -220,7 +222,11 @@ begin
 
     if ok then
     try
-      outputName := System.IO.Path.GetFileNameWithoutExtension(inputPath) + '.exe';
+      // [Stage 44] library는 .dll로, program은 기존처럼 .exe로 저장한다.
+      if prog.IsLibrary then
+        outputName := System.IO.Path.GetFileNameWithoutExtension(inputPath) + '.dll'
+      else
+        outputName := System.IO.Path.GetFileNameWithoutExtension(inputPath) + '.exe';
       codegen := new TCodeGenerator(prog);
       codegen.GenerateExe(outputName);
       Writeln('[4/4] 코드생성 완료: ' + outputName + ' 생성됨');

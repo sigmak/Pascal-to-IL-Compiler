@@ -27,6 +27,7 @@ type
     tkSelf, tkAs, tkInherited, // [Stage 30] self 키워드, as 캐스트, inherited 호출
     tkNew, // [Stage 40] new TypeName(args) 객체 생성 구문
     tkConstructor, // [Stage 42] constructor Create; 선언/구현
+    tkLibrary, // [Stage 44] library Name; 선언 (dll 산출물, begin...end 블록 생략 가능)
     tkIdent, tkString, tkIntLiteral,
     tkSemicolon, tkColon, tkComma, tkAssign,
     tkPlus, tkMinus, tkStar, tkSlash, tkPlusAssign,
@@ -152,6 +153,7 @@ type
       else if lw='inherited' then Result:=new TToken(tkInherited, w,sl,sc) // [Stage 30]
       else if lw='new'       then Result:=new TToken(tkNew,       w,sl,sc) // [Stage 40]
       else if lw='constructor' then Result:=new TToken(tkConstructor, w,sl,sc) // [Stage 42]
+      else if lw='library' then Result:=new TToken(tkLibrary, w,sl,sc) // [Stage 44]
       else                        Result:=new TToken(tkIdent,     w,sl,sc);
     end;
 

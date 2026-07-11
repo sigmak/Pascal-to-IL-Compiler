@@ -482,6 +482,7 @@ type
     Statements:  List<TStmtNode>;
     GenericInstantiations: List<TGenericInstantiation>; // Parser가 채우고 Monomorphize가 소비
     GenericFuncInstantiations: List<TGenericFuncInstantiation>; // [Stage 36] 함수/프로시저용, 동일한 방식
+    IsLibrary: boolean; // [Stage 44] true면 "library Name;"으로 시작 — exe 대신 dll로 생성, begin...end 블록 생략 가능
     constructor Create(n: string);
     begin
       Name:=n;
@@ -495,6 +496,7 @@ type
       Statements:=new List<TStmtNode>;
       GenericInstantiations:=new List<TGenericInstantiation>;
       GenericFuncInstantiations:=new List<TGenericFuncInstantiation>;
+      IsLibrary:=false;
     end;
   end;
 

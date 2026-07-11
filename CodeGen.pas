@@ -1960,49 +1960,65 @@ type
       end;
 
       // 6. Main 메서드
-      mm:=mainTB.DefineMethod('Main',
-        MethodAttributes.Public or MethodAttributes.Static,
-        typeof(System.Void), nil);
-      // WinForm/WPF의 Application.Run 등 STA(단일 스레드 아파트먼트)가 필요한 호출을
-      // 위해 항상 [STAThread]를 붙여둔다 (콘솔/일반 프로그램에는 영향 없음).
-      mm.SetCustomAttribute(new CustomAttributeBuilder(
-        typeof(System.STAThreadAttribute).GetConstructor(System.Type.EmptyTypes), []));
-      il:=mm.GetILGenerator;
-
-      foreach vd in fProg.VarDecls do
+      // [Stage 44] library는 진입점(Main)이 없다 — dll로 저장할 뿐 실행 파일이 아니다.
+      // 전역 var/최상위 문장은 지금 구조상 전부 Main의 IL 안에 지역변수로 얹히는 방식이라
+      // (fGlobals가 실은 "Main 메서드의 로컬 슬롯" 딕셔너리) Main 자체가 없는 library에서는
+      // 애초에 표현할 방법이 없다 — 실제 디자이너 산출물도 library에 begin...end 블록이나
+      // 전역 var를 두지 않으므로, 여기선 명확한 에러로 안내한다.
+      if fProg.IsLibrary then
       begin
-        var clrType: System.Type;
-        if vd.VarType=vtObject then
+        if fProg.VarDecls.Count>0 then
+          raise new Exception('library는 지금 전역 var 섹션을 지원하지 않습니다 (Stage 44).');
+        if fProg.Statements.Count>0 then
+          raise new Exception('library는 지금 begin...end 초기화 블록을 지원하지 않습니다 (Stage 44).');
+      end
+      else
+      begin
+        mm:=mainTB.DefineMethod('Main',
+          MethodAttributes.Public or MethodAttributes.Static,
+          typeof(System.Void), nil);
+        // WinForm/WPF의 Application.Run 등 STA(단일 스레드 아파트먼트)가 필요한 호출을
+        // 위해 항상 [STAThread]를 붙여둔다 (콘솔/일반 프로그램에는 영향 없음).
+        mm.SetCustomAttribute(new CustomAttributeBuilder(
+          typeof(System.STAThreadAttribute).GetConstructor(System.Type.EmptyTypes), []));
+        il:=mm.GetILGenerator;
+
+        foreach vd in fProg.VarDecls do
         begin
-          if fBuiltTypes.ContainsKey(vd.ClassName) then
-            clrType:=fBuiltTypes[vd.ClassName]
-          else
-            clrType:=typeof(System.Object);
-          fGlobalClass[vd.Name]:=vd.ClassName;
-        end
-        else if vd.VarType=vtInterface then
-        begin
-          if fBuiltInterfaces.ContainsKey(vd.ClassName) then
-            clrType:=fBuiltInterfaces[vd.ClassName]
-          else
-            clrType:=typeof(System.Object);
-          fGlobalClass[vd.Name]:=vd.ClassName;
-        end
-        // [Stage 27] string/boolean/array 전역 변수도 예전에는 무조건 typeof(integer)로
-        // 선언되어 있었다 — fGlobalTypes만 올바르고 실제 LocalBuilder 슬롯 타입은 틀려서
-        // 대입 시 IL 검증에서 깨졌다. object/interface가 아닌 나머지는 VTC로 위임한다.
-        else clrType:=VTC(vd.VarType, '');
-        fGlobals[vd.Name]:=il.DeclareLocal(clrType);
-        fGlobalTypes[vd.Name]:=vd.VarType;
+          var clrType: System.Type;
+          if vd.VarType=vtObject then
+          begin
+            if fBuiltTypes.ContainsKey(vd.ClassName) then
+              clrType:=fBuiltTypes[vd.ClassName]
+            else
+              clrType:=typeof(System.Object);
+            fGlobalClass[vd.Name]:=vd.ClassName;
+          end
+          else if vd.VarType=vtInterface then
+          begin
+            if fBuiltInterfaces.ContainsKey(vd.ClassName) then
+              clrType:=fBuiltInterfaces[vd.ClassName]
+            else
+              clrType:=typeof(System.Object);
+            fGlobalClass[vd.Name]:=vd.ClassName;
+          end
+          // [Stage 27] string/boolean/array 전역 변수도 예전에는 무조건 typeof(integer)로
+          // 선언되어 있었다 — fGlobalTypes만 올바르고 실제 LocalBuilder 슬롯 타입은 틀려서
+          // 대입 시 IL 검증에서 깨졌다. object/interface가 아닌 나머지는 VTC로 위임한다.
+          else clrType:=VTC(vd.VarType, '');
+          fGlobals[vd.Name]:=il.DeclareLocal(clrType);
+          fGlobalTypes[vd.Name]:=vd.VarType;
+        end;
+
+        foreach st in fProg.Statements do EmitStatement(il, st);
+
+        rk:=typeof(Console).GetMethod('ReadKey', System.Type.EmptyTypes);
+        il.Emit(OpCodes.Call, rk); il.Emit(OpCodes.Pop); il.Emit(OpCodes.Ret);
       end;
 
-      foreach st in fProg.Statements do EmitStatement(il, st);
-
-      rk:=typeof(Console).GetMethod('ReadKey', System.Type.EmptyTypes);
-      il.Emit(OpCodes.Call, rk); il.Emit(OpCodes.Pop); il.Emit(OpCodes.Ret);
-
       mainTB.CreateType;
-      ab.SetEntryPoint(mm, PEFileKinds.ConsoleApplication);
+      if not fProg.IsLibrary then
+        ab.SetEntryPoint(mm, PEFileKinds.ConsoleApplication);
       ab.Save(outName);
     end;
   end;

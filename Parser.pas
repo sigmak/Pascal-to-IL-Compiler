@@ -1743,7 +1743,15 @@ type
     function ParseProgram: TProgramNode;
     var prog: TProgramNode; t: TToken;
     begin
-      Expect(tkProgram); prog:=new TProgramNode(Expect(tkIdent).Text); Expect(tkSemicolon);
+      // [Stage 44] library Name; (dll 산출물) 또는 program Name; (exe 산출물) 둘 다 허용.
+      if Cur.Kind=tkLibrary then
+      begin
+        fPos:=fPos+1; prog:=new TProgramNode(Expect(tkIdent).Text); prog.IsLibrary:=true; Expect(tkSemicolon);
+      end
+      else
+      begin
+        Expect(tkProgram); prog:=new TProgramNode(Expect(tkIdent).Text); Expect(tkSemicolon);
+      end;
       fProg:=prog; // 깊이 상관없이(식/타입 파싱 도중) GenericInstantiations에 접근하기 위함
 
       // [Stage 29] uses 절: uses UnitA, UnitB.SubUnit, ...;
@@ -1810,10 +1818,19 @@ type
 
       if Cur.Kind=tkVar then ParseVarSection(prog);
 
-      Expect(tkBegin);
-      while Cur.Kind<>tkEnd do
-      begin prog.Statements.Add(ParseStatement); if Cur.Kind=tkSemicolon then fPos:=fPos+1; end;
-      Expect(tkEnd); Expect(tkDot); Expect(tkEOF);
+      // [Stage 44] library는 begin...end 초기화 블록이 없을 수 있다 — 디자이너가 생성하는
+      // ControlLib 코드는 타입/생성자/메서드 선언만 있고 바로 "end."으로 끝난다.
+      // program은 기존처럼 항상 begin...end가 있어야 한다.
+      if (not prog.IsLibrary) or (Cur.Kind=tkBegin) then
+      begin
+        Expect(tkBegin);
+        while Cur.Kind<>tkEnd do
+        begin prog.Statements.Add(ParseStatement); if Cur.Kind=tkSemicolon then fPos:=fPos+1; end;
+        Expect(tkEnd);
+      end
+      else
+        Expect(tkEnd); // begin 없이 바로 "end."
+      Expect(tkDot); Expect(tkEOF);
       Result:=prog;
     end;
   end;
