@@ -497,6 +497,7 @@ type
       ae: TExprNode; ts, cat: MethodInfo; lt, rt, at2: TVarType;
       fb: FieldBuilder;
       ctor: ConstructorInfo; cn: string; vtVar: TVarType;
+      _argIdx48: integer; // [Stage 48]
     begin
       if e is TIntLiteralNode then
       begin lit:=TIntLiteralNode(e); aIL.Emit(OpCodes.Ldc_I4, lit.Value); end
@@ -582,7 +583,9 @@ type
             var _extCtorN:=ResolveConstructorByArity(_extCtorType, neo.Args.Count);
             if _extCtorN=nil then
               raise new Exception('외부 타입 "'+_extCtorType.FullName+'"에 인자 '+neo.Args.Count.ToString+'개짜리 public 생성자가 없습니다.');
-            foreach ae in neo.Args do EmitExpr(aIL, ae);
+            var _ctorParams48:=_extCtorN.GetParameters();
+            for _argIdx48:=0 to neo.Args.Count-1 do
+              EmitArgForParamType(aIL, neo.Args[_argIdx48], _ctorParams48[_argIdx48].ParameterType);
             aIL.Emit(OpCodes.Newobj, _extCtorN);
           end;
         end
@@ -981,6 +984,43 @@ type
             aIL.Emit(OpCodes.Stfld, extFld);
           end;
         end;
+      end
+
+      // [Stage 48] var x := 식; — 문장 중간에서 새 지역 변수를 선언과 동시에 대입.
+      // 미리 만들어둔 "var 섹션" 루프를 거치지 않으므로, 여기서 그때그때 타입을 추론해
+      // DeclareLocal 한다 (IL에서는 메서드 어디서든 DeclareLocal을 호출해도 된다).
+      else if s is TInlineVarStmtNode then
+      begin
+        var ivs:=TInlineVarStmtNode(s);
+        var ivVt:=InferType(ivs.ValueExpr);
+        var ivClrType: System.Type;
+        var ivClassName: string; var ivIsExternal: boolean;
+        ivClassName:=''; ivIsExternal:=false;
+        if ivs.ValueExpr is TNewObjectExprNode then
+        begin
+          // new Type(...) 표현식이면 그 노드가 이미 정확한 클래스명/외부 여부를 들고 있다 —
+          // InferType은 vtObject라는 것만 알려주므로 여기서 직접 가져오는 게 가장 정확하다.
+          var ivNeo:=TNewObjectExprNode(ivs.ValueExpr);
+          ivClassName:=ivNeo.ClassName; ivIsExternal:=ivNeo.IsExternalType;
+          if ivIsExternal then ivClrType:=ResolveExternalType(ivClassName)
+          else if fBuiltTypes.ContainsKey(ivClassName) then ivClrType:=fBuiltTypes[ivClassName]
+          else if fTypeBuilders.ContainsKey(ivClassName) then ivClrType:=fTypeBuilders[ivClassName]
+          else ivClrType:=typeof(System.Object);
+        end
+        else
+          ivClrType:=VTC(ivVt, '');
+        var ivLoc:=aIL.DeclareLocal(ivClrType);
+        fLocals[ivs.VarName]:=ivLoc; fLocalTypes[ivs.VarName]:=ivVt;
+        if (ivVt=vtObject) or (ivVt=vtInterface) then
+        begin
+          if ivIsExternal then fLocalClrTypes[ivs.VarName]:=ivClrType
+          else if (ivClassName<>'') and (fTypeBuilders.ContainsKey(ivClassName) or fBuiltTypes.ContainsKey(ivClassName)) then
+            fLocalClass[ivs.VarName]:=ivClassName
+          else
+            fLocalClrTypes[ivs.VarName]:=ivClrType;
+        end;
+        EmitExpr(aIL, ivs.ValueExpr);
+        aIL.Emit(OpCodes.Stloc, ivLoc);
       end
 
       else if s is TAssignStmtNode then
@@ -1461,6 +1501,32 @@ type
       foreach ci in t.GetConstructors(BindingFlags.Public or BindingFlags.Instance) do
         if ci.GetParameters.Length=argCount then
         begin Result:=ci; exit; end;
+    end;
+
+    // [Stage 48] 외부 생성자/메서드에 인자를 하나씩 넣을 때, 기대하는 매개변수 타입이
+    // 델리게이트(예: System.Threading.ThreadStart)이고 실제 인자가 최상위 프로시저
+    // 이름 하나뿐이면(예: "new System.Threading.Thread(RunApp)") 그 이름을 호출하는 게
+    // 아니라 델리게이트 인스턴스로 변환해서 넘긴다. 그 외에는 그냥 평범하게 EmitExpr.
+    procedure EmitArgForParamType(aIL: ILGenerator; argExpr: TExprNode; paramType: System.Type);
+    var _vr48: TVarRefNode; _delCtor48: ConstructorInfo;
+    begin
+      if (argExpr is TVarRefNode) and typeof(System.Delegate).IsAssignableFrom(paramType) then
+      begin
+        _vr48:=TVarRefNode(argExpr);
+        if fMethods.ContainsKey(_vr48.VarName) and not fLocals.ContainsKey(_vr48.VarName)
+           and not fGlobals.ContainsKey(_vr48.VarName) then
+        begin
+          // static 메서드를 가리키는 델리게이트이므로 대상 인스턴스는 없다(Ldnull).
+          aIL.Emit(OpCodes.Ldnull);
+          aIL.Emit(OpCodes.Ldftn, fMethods[_vr48.VarName]);
+          _delCtor48:=paramType.GetConstructor([typeof(System.Object), typeof(System.IntPtr)]);
+          if _delCtor48=nil then
+            raise new Exception('델리게이트 타입 "'+paramType.FullName+'"의 생성자를 찾을 수 없습니다.');
+          aIL.Emit(OpCodes.Newobj, _delCtor48);
+          exit;
+        end;
+      end;
+      EmitExpr(aIL, argExpr);
     end;
 
     // aIL 스택에 target 참조가 이미 로드되어 있다고 가정하고, 그 위에

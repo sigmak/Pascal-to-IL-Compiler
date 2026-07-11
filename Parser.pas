@@ -765,6 +765,17 @@ type
         Result:=new TSetLengthStmtNode(nt.Text, sz);
       end
 
+      // [Stage 48] var x := 식; — begin...end 안에서 선언과 동시에 대입.
+      // (WPF 진입점 템플릿의 "var t := new System.Threading.Thread(RunApp);" 패턴)
+      else if Cur.Kind=tkVar then
+      begin
+        fPos:=fPos+1;
+        var ivn:=Expect(tkIdent).Text;
+        Expect(tkAssign);
+        Result:=new TInlineVarStmtNode(ivn, ParseExpr);
+        fCurParams.Add(ivn); // 이후 문장에서 이 이름을 필드로 오인하지 않도록 지역변수로 등록
+      end
+
       else if Cur.Kind=tkIdent then
       begin
         nt:=Cur; fPos:=fPos+1;

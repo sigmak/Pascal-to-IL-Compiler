@@ -235,6 +235,15 @@ type
     begin Qualifier:=q; EventName:=ev; HandlerName:=h; QualifierCastType:=''; end;
   end;
 
+  // [Stage 48] begin...end 안에서 "var x := 식;" 형태로 선언과 동시에 대입하는 문장.
+  // (앞서 있던 "var 섹션"과 달리, 임의의 문장 사이에서 바로 새 지역 변수를 만든다.)
+  // 타입은 CodeGen이 ValueExpr을 통해 그때그때 추론한다.
+  TInlineVarStmtNode = class(TStmtNode)
+  public VarName: string; ValueExpr: TExprNode;
+    constructor Create(n: string; v: TExprNode);
+    begin VarName:=n; ValueExpr:=v; end;
+  end;
+
   // try ... except on E: ExType do <stmt> end
   // ExVarName='' 이면 except (on 없이) 또는 finally
   TTryStmtNode = class(TStmtNode)

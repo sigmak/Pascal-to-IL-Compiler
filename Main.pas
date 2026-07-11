@@ -21,7 +21,8 @@ uses
 
 const
   DefaultExampleDir = 'Examples';
-  DefaultExampleFile = 'Test_stage47.pas';
+  DefaultExampleFile = 'Test_stage48.pas';
+  //DefaultExampleFile = 'Test_stage47.pas';
   //DefaultExampleFile = 'Test_stage46.pas';
   //DefaultExampleFile = 'Test_stage45.pas';
   //DefaultExampleFile = 'Test_stage44.pas'; // Test_stage44.dll 생성됨.
