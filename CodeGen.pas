@@ -24,6 +24,7 @@ type
     fGlobals:     Dictionary<string, LocalBuilder>;
     fGlobalTypes: Dictionary<string, TVarType>;
     fGlobalClass: Dictionary<string, string>; // 변수명 → 클래스명
+    fGlobalClrTypes: Dictionary<string, System.Type>; // 전역 object/외부타입 변수의 실제 CLR 타입 (fLocalClrTypes의 전역판)
 
     // 현재 함수/메서드 로컬 변수
     fLocals:      Dictionary<string, LocalBuilder>;
@@ -259,7 +260,7 @@ type
               if (_pi4c<>nil) and (_pi4c.PropertyType=typeof(string)) then Result:=vtString
               else
               begin
-                var _mi4c:=ResolveMethodByArity(_extSelf, _mc4.MethodName, _mc4.Args.Count, false);
+                var _mi4c:=ResolveMethodByArity(_extSelf, _mc4.MethodName, _mc4.Args, false);
                 if (_mi4c<>nil) and (_mi4c.ReturnType=typeof(string)) then Result:=vtString
                 else Result:=vtInteger;
               end;
@@ -267,9 +268,11 @@ type
             else Result:=vtInteger;
           end;
         end
-        else if fLocalClrTypes.ContainsKey(_mc4.ObjName) then
+        else if fLocalClrTypes.ContainsKey(_mc4.ObjName) or fGlobalClrTypes.ContainsKey(_mc4.ObjName) then
         begin
-          var _effType4:=fLocalClrTypes[_mc4.ObjName];
+          var _effType4: System.Type;
+          if fLocalClrTypes.ContainsKey(_mc4.ObjName) then _effType4:=fLocalClrTypes[_mc4.ObjName]
+          else _effType4:=fGlobalClrTypes[_mc4.ObjName];
           if _mc4.ObjCastType<>'' then _effType4:=ResolveExternalType(_mc4.ObjCastType);
           var _pi4b:=_effType4.GetProperty(_mc4.MethodName);
           if (_pi4b<>nil) and (_pi4b.PropertyType=typeof(string)) then Result:=vtString
@@ -277,7 +280,7 @@ type
           begin
             // 프로퍼티가 아니면 메서드일 수 있으므로 실제 반환 타입을 확인한다.
             // (예: sender.ToString() → GetProperty는 nil이지만 메서드 반환타입은 string)
-            var _mi4b:=ResolveMethodByArity(_effType4, _mc4.MethodName, _mc4.Args.Count, false);
+            var _mi4b:=ResolveMethodByArity(_effType4, _mc4.MethodName, _mc4.Args, false);
             if (_mi4b<>nil) and (_mi4b.ReturnType=typeof(string)) then Result:=vtString
             else Result:=vtInteger;
           end;
@@ -328,7 +331,7 @@ type
           if (_pi4<>nil) and (_pi4.PropertyType=typeof(string)) then Result:=vtString
           else
           begin
-            var _mi4:=ResolveMethodByArity(_effType4b, _mc4.MethodName, _mc4.Args.Count, false);
+            var _mi4:=ResolveMethodByArity(_effType4b, _mc4.MethodName, _mc4.Args, false);
             if (_mi4<>nil) and (_mi4.ReturnType=typeof(string)) then Result:=vtString
             else Result:=vtInteger;
           end;
@@ -430,7 +433,7 @@ type
         end
         else
         begin
-          parentCtor3:=ResolveConstructorByArity(extType3, args.Count);
+          parentCtor3:=ResolveConstructorByArity(extType3, args);
           if parentCtor3=nil then
             raise new Exception('외부 조상 타입 "'+extType3.FullName+'"에 인자 '+args.Count.ToString+'개짜리 public 생성자가 없습니다.');
         end;
@@ -474,7 +477,7 @@ type
         extType2:=FindExternalAncestorType(fCurClassName);
         if extType2=nil then
           raise new Exception('inherited '+mname+': 클래스 "'+fCurClassName+'"에서 부모/외부 조상 타입을 찾을 수 없습니다.');
-        emi2:=ResolveMethodByArity(extType2, mname, args.Count, false);
+        emi2:=ResolveMethodByArity(extType2, mname, args, false);
         if emi2=nil then
           raise new Exception('외부 조상 타입 "'+extType2.FullName+'"에 메서드 "'+mname+'"가 없습니다 (인자 '+args.Count.ToString+'개).');
         aIL.Emit(OpCodes.Call, emi2); // 비가상 호출
@@ -580,7 +583,7 @@ type
           end
           else
           begin
-            var _extCtorN:=ResolveConstructorByArity(_extCtorType, neo.Args.Count);
+            var _extCtorN:=ResolveConstructorByArity(_extCtorType, neo.Args);
             if _extCtorN=nil then
               raise new Exception('외부 타입 "'+_extCtorType.FullName+'"에 인자 '+neo.Args.Count.ToString+'개짜리 public 생성자가 없습니다.');
             var _ctorParams48:=_extCtorN.GetParameters();
@@ -605,12 +608,15 @@ type
         // c.GetValue → Ldloc c + Call TCounter::GetValue
         mc:=TMethodCallExprNode(e);
         if (fLocals.ContainsKey(mc.ObjName) or fGlobals.ContainsKey(mc.ObjName))
-           and fLocalClrTypes.ContainsKey(mc.ObjName) then
+           and (fLocalClrTypes.ContainsKey(mc.ObjName) or fGlobalClrTypes.ContainsKey(mc.ObjName)) then
         begin
           // sender/e 같은, 외부(또는 객체) 타입 매개변수/지역변수를 통한 접근.
           // 우리가 만든 클래스가 아니라 Reflection으로 속성/메서드를 찾는다.
-          aIL.Emit(OpCodes.Ldloc, fLocals[mc.ObjName]);
-          var _qType2:=fLocalClrTypes[mc.ObjName];
+          if fLocals.ContainsKey(mc.ObjName) then aIL.Emit(OpCodes.Ldloc, fLocals[mc.ObjName])
+          else aIL.Emit(OpCodes.Ldloc, fGlobals[mc.ObjName]); // [전역 var 버그 수정] 항상 fLocals만 읽던 문제
+          var _qType2: System.Type;
+          if fLocalClrTypes.ContainsKey(mc.ObjName) then _qType2:=fLocalClrTypes[mc.ObjName]
+          else _qType2:=fGlobalClrTypes[mc.ObjName];
           if mc.ObjCastType<>'' then
           begin
             _qType2:=ResolveExternalType(mc.ObjCastType);
@@ -622,7 +628,7 @@ type
             aIL.Emit(OpCodes.Callvirt, _pi6.GetGetMethod)
           else
           begin
-            var _emi6:=ResolveMethodByArity(_qType2, mc.MethodName, mc.Args.Count, false);
+            var _emi6:=ResolveMethodByArity(_qType2, mc.MethodName, mc.Args, false);
             if _emi6=nil then
               raise new Exception('타입 "'+_qType2.FullName+'"에 메서드 "'+mc.MethodName+'"가 없습니다 (인자 '+mc.Args.Count.ToString+'개).');
             aIL.Emit(OpCodes.Callvirt, _emi6);
@@ -697,7 +703,7 @@ type
             aIL.Emit(OpCodes.Callvirt, _pi5.GetGetMethod)
           else
           begin
-            var _emi5:=ResolveMethodByArity(_qType, mc.MethodName, mc.Args.Count, false);
+            var _emi5:=ResolveMethodByArity(_qType, mc.MethodName, mc.Args, false);
             if _emi5=nil then
               raise new Exception('타입 "'+_qType.FullName+'"에 메서드 "'+mc.MethodName+'"가 없습니다 (인자 '+mc.Args.Count.ToString+'개).');
             aIL.Emit(OpCodes.Callvirt, _emi5);
@@ -921,11 +927,13 @@ type
             EmitPropertyOrFieldSet(aIL, qTargetType, fas.FieldName, fas.ValueExpr);
           end
           else if (fLocals.ContainsKey(fas.Qualifier) or fGlobals.ContainsKey(fas.Qualifier))
-                  and fLocalClrTypes.ContainsKey(fas.Qualifier) then
+                  and (fLocalClrTypes.ContainsKey(fas.Qualifier) or fGlobalClrTypes.ContainsKey(fas.Qualifier)) then
           begin
             // 매개변수/지역변수가 외부(객체) 타입인 경우 — Reflection 기반 처리
-            aIL.Emit(OpCodes.Ldloc, fLocals[fas.Qualifier]);
-            qTargetType:=fLocalClrTypes[fas.Qualifier];
+            if fLocals.ContainsKey(fas.Qualifier) then aIL.Emit(OpCodes.Ldloc, fLocals[fas.Qualifier])
+            else aIL.Emit(OpCodes.Ldloc, fGlobals[fas.Qualifier]); // [전역 var 버그 수정]
+            if fLocalClrTypes.ContainsKey(fas.Qualifier) then qTargetType:=fLocalClrTypes[fas.Qualifier]
+            else qTargetType:=fGlobalClrTypes[fas.Qualifier];
             if fas.QualifierCastType<>'' then
             begin
               qTargetType:=ResolveExternalType(fas.QualifierCastType);
@@ -1051,7 +1059,7 @@ type
             extType:=FindExternalAncestorType(fCurClassName);
             if extType=nil then
               raise new Exception('알 수 없는 메서드 "'+fCurClassName+'.'+mcs.MethodName+'"');
-            emi:=ResolveMethodByArity(extType, mcs.MethodName, mcs.Args.Count, false);
+            emi:=ResolveMethodByArity(extType, mcs.MethodName, mcs.Args, false);
             if emi=nil then
               raise new Exception('외부 타입 "'+extType.FullName+'"에 메서드 "'+mcs.MethodName+'"가 없습니다 (인자 '+mcs.Args.Count.ToString+'개).');
             aIL.Emit(OpCodes.Callvirt, emi);
@@ -1059,11 +1067,13 @@ type
           end;
         end
         else if (fLocals.ContainsKey(mcs.ObjName) or fGlobals.ContainsKey(mcs.ObjName))
-                and fLocalClrTypes.ContainsKey(mcs.ObjName) then
+                and (fLocalClrTypes.ContainsKey(mcs.ObjName) or fGlobalClrTypes.ContainsKey(mcs.ObjName)) then
         begin
           // sender.Focus(); 같은, 외부(객체) 타입 매개변수/지역변수를 통한 호출.
-          aIL.Emit(OpCodes.Ldloc, fLocals[mcs.ObjName]);
-          qTargetType:=fLocalClrTypes[mcs.ObjName];
+          if fLocals.ContainsKey(mcs.ObjName) then aIL.Emit(OpCodes.Ldloc, fLocals[mcs.ObjName])
+          else aIL.Emit(OpCodes.Ldloc, fGlobals[mcs.ObjName]); // [전역 var 버그 수정]
+          if fLocalClrTypes.ContainsKey(mcs.ObjName) then qTargetType:=fLocalClrTypes[mcs.ObjName]
+          else qTargetType:=fGlobalClrTypes[mcs.ObjName];
           if mcs.ObjCastType<>'' then
           begin
             qTargetType:=ResolveExternalType(mcs.ObjCastType);
@@ -1078,7 +1088,7 @@ type
           end
           else
           begin
-            emi:=ResolveMethodByArity(qTargetType, mcs.MethodName, mcs.Args.Count, false);
+            emi:=ResolveMethodByArity(qTargetType, mcs.MethodName, mcs.Args, false);
             if emi=nil then
               raise new Exception('타입 "'+qTargetType.FullName+'"에 메서드 "'+mcs.MethodName+'"가 없습니다 (인자 '+mcs.Args.Count.ToString+'개).');
             aIL.Emit(OpCodes.Callvirt, emi);
@@ -1133,7 +1143,7 @@ type
           end
           else
           begin
-            emi:=ResolveMethodByArity(qTargetType, mcs.MethodName, mcs.Args.Count, false);
+            emi:=ResolveMethodByArity(qTargetType, mcs.MethodName, mcs.Args, false);
             if emi=nil then
               raise new Exception('타입 "'+qTargetType.FullName+'"에 메서드 "'+mcs.MethodName+'"가 없습니다 (인자 '+mcs.Args.Count.ToString+'개).');
             aIL.Emit(OpCodes.Callvirt, emi);
@@ -1147,7 +1157,7 @@ type
           // 먼저 로드하지 않고 인자만 쌓은 뒤 Call(비가상)로 호출한다.
           extType:=ResolveExternalType(mcs.ObjName);
           foreach ae in mcs.Args do EmitExpr(aIL, ae);
-          emi:=ResolveMethodByArity(extType, mcs.MethodName, mcs.Args.Count, true);
+          emi:=ResolveMethodByArity(extType, mcs.MethodName, mcs.Args, true);
           if emi=nil then
             raise new Exception('외부 타입 "'+extType.FullName+'"에 정적 메서드 "'+mcs.MethodName+'"가 없습니다 (인자 '+mcs.Args.Count.ToString+'개).');
           aIL.Emit(OpCodes.Call, emi);
@@ -1180,6 +1190,7 @@ type
           if fLocals.ContainsKey(evs.Qualifier) then aIL.Emit(OpCodes.Ldloc, fLocals[evs.Qualifier])
           else aIL.Emit(OpCodes.Ldloc, fGlobals[evs.Qualifier]);
           if fLocalClrTypes.ContainsKey(evs.Qualifier) then qTargetType:=fLocalClrTypes[evs.Qualifier]
+          else if fGlobalClrTypes.ContainsKey(evs.Qualifier) then qTargetType:=fGlobalClrTypes[evs.Qualifier]
           else
           begin
             cn:=GetVarClassName(evs.Qualifier);
@@ -1484,30 +1495,130 @@ type
         'AddReferenceAssembly로 해당 타입이 들어있는 어셈블리를 먼저 등록했는지 확인하세요.');
     end;
 
-    // 외부 타입에서 이름+인자개수로 메서드를 찾는다 (엄격한 타입 일치 대신 개수만 맞춰서
-    // 찾음 — 우리가 만든 파생 클래스 인스턴스를 부모 타입 매개변수에 넘기는 경우
-    // System.Type.GetMethod(name, exactArgTypes)로는 정확히 일치하지 않아 못 찾기 때문).
-    // 오버로드가 여러 개면 그중 인자 개수가 맞는 첫 번째를 사용한다 (단순화).
-    function ResolveMethodByArity(t: System.Type; mname: string; argCount: integer; isStatic: boolean): MethodInfo;
-    var flags: BindingFlags; mi: MethodInfo;
+    // [Stage 50] 인자 식(expr)이 런타임에 어떤 CLR 타입일지 최대한 추정한다.
+    // 확신할 수 없으면 nil을 돌려주는데, 이는 오버로드 점수 계산에서 "중립"(감점도 가점도 없음)으로 처리된다.
+    // 리터럴/지역변수(fLocalClrTypes, fLocalClass)는 정확히 알 수 있고, 그 외에는 InferType의
+    // 대략적인 TVarType(string/boolean/integer)을 대표 CLR 타입으로 환산해서 쓴다.
+    function InferArgClrType(e: TExprNode): System.Type;
+    var vt: TVarType;
+    begin
+      Result:=nil;
+      if e is TStrLiteralNode then Result:=typeof(string)
+      else if e is TIntLiteralNode then Result:=typeof(integer)
+      else if e is TBoolLiteralNode then Result:=typeof(boolean)
+      else if e is TNilLiteralNode then Result:=nil // nil은 어떤 참조 타입에도 들어갈 수 있으므로 중립
+      else if e is TVarRefNode then
+      begin
+        var vn50:=TVarRefNode(e).VarName;
+        if fLocalClrTypes.ContainsKey(vn50) then Result:=fLocalClrTypes[vn50]
+        else if fGlobalClrTypes.ContainsKey(vn50) then Result:=fGlobalClrTypes[vn50] // [전역 var 버그 수정]
+        else if fLocalClass.ContainsKey(vn50) then
+        begin
+          var cn50:=fLocalClass[vn50];
+          if fBuiltTypes.ContainsKey(cn50) then Result:=fBuiltTypes[cn50]
+          else if fTypeBuilders.ContainsKey(cn50) then Result:=fTypeBuilders[cn50];
+        end
+        else if fGlobalClass.ContainsKey(vn50) then // [전역 var 버그 수정]
+        begin
+          var cn50b:=fGlobalClass[vn50];
+          if fBuiltTypes.ContainsKey(cn50b) then Result:=fBuiltTypes[cn50b]
+          else if fTypeBuilders.ContainsKey(cn50b) then Result:=fTypeBuilders[cn50b];
+        end
+        else
+        begin
+          vt:=InferType(e);
+          case vt of
+            vtString: Result:=typeof(string);
+            vtBoolean: Result:=typeof(boolean);
+            vtInteger: Result:=typeof(integer);
+          end;
+        end;
+      end
+      else
+      begin
+        vt:=InferType(e);
+        case vt of
+          vtString: Result:=typeof(string);
+          vtBoolean: Result:=typeof(boolean);
+          vtInteger: Result:=typeof(integer);
+        end;
+      end;
+    end;
+
+    // [Stage 50] 매개변수 타입과 추정된 인자 타입의 궁합을 점수로 매긴다.
+    // 높을수록 더 잘 맞음. argType이 nil(추정 불가/신뢰 불가)이면 중립(0)을 준다.
+    function ScoreParamMatch(paramType, argType: System.Type): integer;
+    begin
+      if argType=nil then begin Result:=0; exit; end;
+      if paramType=argType then begin Result:=3; exit; end; // 정확히 일치
+      try
+        if paramType.IsAssignableFrom(argType) then begin Result:=2; exit; end; // 상속/인터페이스로 대입 가능
+      except
+        // argType이 아직 CreateType()되지 않은 TypeBuilder라 IsAssignableFrom이 지원 안 될 수 있다.
+        // 이 경우 판단을 내릴 수 없으므로 감점하지 않고 중립으로 취급한다.
+        Result:=0; exit;
+      end;
+      // 흔한 값형식 폭 넓히기 변환(int→long/double 등)은 이 컴파일러가 아직 int 하나만 다루므로
+      // 별도 처리 없이, 나머지는 전부 "명백히 안 맞음"으로 크게 감점한다(하드 실격은 아님 —
+      // 다른 후보가 전혀 없을 때를 대비해 여전히 폴백은 가능하게 둔다).
+      Result:=-100;
+    end;
+
+    // 외부 타입에서 이름+인자개수로 메서드를 찾는다. [Stage 50] 개수만 보던 것에서
+    // 나아가, 개수가 같은 후보가 여럿이면 각 인자의 추정 타입과 매개변수 타입을 비교해
+    // 가장 궁합이 좋은 오버로드를 고른다(예: Show(string)과 Show(Window) 중 문자열 인자면 전자를 선택).
+    // 타입을 전혀 추정할 수 없는 경우(예: 인자 없음, 혹은 모든 인자가 nil)에는 개수만 맞는
+    // 첫 번째 후보를 그대로 쓰는 기존 동작과 동일하게 동작한다.
+    function ResolveMethodByArity(t: System.Type; mname: string; args: List<TExprNode>; isStatic: boolean): MethodInfo;
+    var flags: BindingFlags; mi: MethodInfo; argCount: integer;
+      bestScore: integer; bestMi: MethodInfo; found: boolean;
     begin
       if isStatic then flags:=BindingFlags.Public or BindingFlags.Static
       else flags:=BindingFlags.Public or BindingFlags.Instance;
-      Result:=nil;
+      argCount:=args.Count;
+      bestScore:=System.Int32.MinValue; bestMi:=nil; found:=false;
       foreach mi in t.GetMethods(flags) do
         if (mi.Name=mname) and (mi.GetParameters.Length=argCount) then
-        begin Result:=mi; exit; end;
+        begin
+          var ps50:=mi.GetParameters;
+          var score50:=0;
+          var i50:=0;
+          while i50<argCount do
+          begin
+            var argType50:=InferArgClrType(args[i50]);
+            score50:=score50+ScoreParamMatch(ps50[i50].ParameterType, argType50);
+            i50:=i50+1;
+          end;
+          if (not found) or (score50>bestScore) then
+          begin bestScore:=score50; bestMi:=mi; found:=true; end;
+        end;
+      Result:=bestMi;
     end;
 
-    // [Stage 40] 외부 타입에서 인자 개수로 생성자를 찾는다 (ResolveMethodByArity와 동일한 패턴 —
-    // 엄격한 타입 일치 대신 개수만 맞춰서 찾는다). 오버로드가 여러 개면 개수가 맞는 첫 번째를 사용.
-    function ResolveConstructorByArity(t: System.Type; argCount: integer): ConstructorInfo;
-    var ci: ConstructorInfo;
+    // [Stage 40] 외부 타입에서 인자 개수로 생성자를 찾는다. [Stage 50] 메서드와 동일하게
+    // 인자 타입 궁합 점수까지 반영해서 여러 오버로드 중 가장 잘 맞는 것을 고른다.
+    function ResolveConstructorByArity(t: System.Type; args: List<TExprNode>): ConstructorInfo;
+    var ci: ConstructorInfo; argCount: integer;
+      bestScore: integer; bestCi: ConstructorInfo; found: boolean;
     begin
-      Result:=nil;
+      argCount:=args.Count;
+      bestScore:=System.Int32.MinValue; bestCi:=nil; found:=false;
       foreach ci in t.GetConstructors(BindingFlags.Public or BindingFlags.Instance) do
         if ci.GetParameters.Length=argCount then
-        begin Result:=ci; exit; end;
+        begin
+          var ps51:=ci.GetParameters;
+          var score51:=0;
+          var i51:=0;
+          while i51<argCount do
+          begin
+            var argType51:=InferArgClrType(args[i51]);
+            score51:=score51+ScoreParamMatch(ps51[i51].ParameterType, argType51);
+            i51:=i51+1;
+          end;
+          if (not found) or (score51>bestScore) then
+          begin bestScore:=score51; bestCi:=ci; found:=true; end;
+        end;
+      Result:=bestCi;
     end;
 
     // [Stage 48] 외부 생성자/메서드에 인자를 하나씩 넣을 때, 기대하는 매개변수 타입이
@@ -1999,6 +2110,7 @@ type
       fGlobals:=new Dictionary<string, LocalBuilder>;
       fGlobalTypes:=new Dictionary<string, TVarType>;
       fGlobalClass:=new Dictionary<string, string>;
+      fGlobalClrTypes:=new Dictionary<string, System.Type>;
       fLocals:=new Dictionary<string, LocalBuilder>;
       fLocalTypes:=new Dictionary<string, TVarType>;
       fLocalClrTypes:=new Dictionary<string, System.Type>;
@@ -2149,7 +2261,15 @@ type
         foreach vd in fProg.VarDecls do
         begin
           var clrType: System.Type;
-          if vd.VarType=vtObject then
+          if (vd.VarType=vtObject) and vd.IsExternal then
+          begin
+            // [전역 var 버그 수정] System.Text.StringBuilder 같은 외부 .NET 타입 전역변수.
+            // 로컬/매개변수의 fLocalClrTypes와 같은 역할을 하는 fGlobalClrTypes에 등록해야
+            // 메서드/속성 호출 시 Reflection 기반 조회 경로를 탈 수 있다.
+            clrType:=ResolveExternalType(vd.ClassName);
+            fGlobalClrTypes[vd.Name]:=clrType;
+          end
+          else if vd.VarType=vtObject then
           begin
             if fBuiltTypes.ContainsKey(vd.ClassName) then
               clrType:=fBuiltTypes[vd.ClassName]

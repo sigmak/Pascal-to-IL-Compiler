@@ -1721,7 +1721,7 @@ type
     end;
 
     procedure ParseVarSection(aProg: TProgramNode);
-    var vt: TVarType; ns: List<string>; cn: string;
+    var vt: TVarType; ns: List<string>; cn: string; isExt: boolean;
     begin
       Expect(tkVar);
       while (Cur.Kind<>tkBegin) and (Cur.Kind<>tkFunction)
@@ -1730,7 +1730,7 @@ type
         ns:=new List<string>; ns.Add(Expect(tkIdent).Text);
         while Cur.Kind=tkComma do begin fPos:=fPos+1; ns.Add(Expect(tkIdent).Text); end;
         Expect(tkColon);
-        cn:='';
+        cn:=''; isExt:=false;
         // 클래스 타입 변수 처리
         if (Cur.Kind=tkIdent) and fClassNames.Contains(Cur.Text) then
         begin
@@ -1742,11 +1742,28 @@ type
         begin
           cn:=Cur.Text; fPos:=fPos+1; vt:=vtInterface;
         end
+        // [전역 var 버그 수정] 점(.)으로 연결된 외부 .NET 타입 (예: System.Text.StringBuilder).
+        // ParseParamTypeExt/ParseLocalVarSection에는 이미 있었는데 전역 var 섹션에만 빠져 있었다.
+        else if Cur.Kind=tkIdent then
+        begin
+          var savedPosV:=fPos;
+          var qnV:=Expect(tkIdent).Text;
+          if Cur.Kind=tkDot then
+          begin
+            while Cur.Kind=tkDot do begin fPos:=fPos+1; qnV:=qnV+'.'+Expect(tkIdent).Text; end;
+            cn:=qnV; isExt:=true; vt:=vtObject;
+          end
+          else
+          begin
+            fPos:=savedPosV;
+            vt:=ParseVarType;
+          end;
+        end
         else vt:=ParseVarType;
         Expect(tkSemicolon);
         foreach var nm in ns do
         begin
-          aProg.VarDecls.Add(new TVarDecl(nm, vt, cn));
+          aProg.VarDecls.Add(new TVarDecl(nm, vt, cn, isExt));
           if (vt=vtIntArray) or (vt=vtStrArray) then fArrayNames.Add(nm);
         end;
       end;
