@@ -21,7 +21,8 @@ uses
 
 const
   DefaultExampleDir = 'Examples';
-  DefaultExampleFile = 'Test_stage44.pas';
+  DefaultExampleFile = 'Test_stage45.pas';
+  //DefaultExampleFile = 'Test_stage44.pas'; // Test_stage44.dll 생성됨.
   //DefaultExampleFile = 'Test_stage43.pas';
   //DefaultExampleFile = 'Test_stage42.pas';
   //DefaultExampleFile = 'Test_stage41.pas';
@@ -38,7 +39,6 @@ const
   //DefaultExampleFile = 'test_stage29.pas';
   //DefaultExampleFile = 'LocalVars_Test_Stage28.pas';
   //DefaultExampleFile = 'Staticfunctypes_test_Stage27.pas';
-  
   
 
 function ResolveInputPath: string;
@@ -228,6 +228,17 @@ begin
       else
         outputName := System.IO.Path.GetFileNameWithoutExtension(inputPath) + '.exe';
       codegen := new TCodeGenerator(prog);
+
+      // [Stage 45] 소스 안의 {$reference X.dll} 지시문에서 뽑아둔 어셈블리를 codegen에 등록.
+      // 이게 없으면 System.Windows.Window 같은 실제 WPF 타입은 참조할 수 없다
+      // (mscorlib에 없는 타입은 Type.GetType만으로는 못 찾고, 미리 로드해둔 어셈블리 목록에서 찾는다).
+      if lexer.ReferenceDirectives.Count>0 then
+      begin
+        Writeln('  참조 어셈블리 등록 중: ' + string.Join(', ', lexer.ReferenceDirectives));
+        foreach var refName in lexer.ReferenceDirectives do
+          codegen.AddReferenceAssembly(refName);
+      end;
+
       codegen.GenerateExe(outputName);
       Writeln('[4/4] 코드생성 완료: ' + outputName + ' 생성됨');
 

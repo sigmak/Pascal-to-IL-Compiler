@@ -54,6 +54,11 @@ type
     // 문자열이 닫히지 않는 경우(따옴표 짝 안 맞음)는 이후 스캔 전체가 신뢰할 수 없어지므로
     // 기존처럼 즉시 예외를 던진다.
     LexErrors: List<string>;
+    // [Stage 45] {$reference X.dll} 지시문에서 뽑아낸 어셈블리 이름/경로 목록.
+    // 예전에는 {...}를 전부 일반 주석으로 그냥 건너뛰어서 이 정보가 통째로 사라졌다 —
+    // Main.pas가 컴파일 전에 이 목록을 보고 AddReferenceAssembly를 호출해줘야
+    // System.Windows.Window 같은 실제 외부 어셈블리 타입을 쓸 수 있다.
+    ReferenceDirectives: List<string>;
   private
 
     function CC: char;
@@ -83,10 +88,23 @@ type
         end
         else if CC='{' then
         begin
-          // { } 블록 주석
+          // { } 블록 주석 — 단, {$reference X.dll} 형태는 내용을 뽑아서 ReferenceDirectives에 담는다.
+          // (다른 {$...} 지시문, 예: {$apptype windows}는 예전처럼 그냥 무시한다.)
+          var _dirSb:=new System.Text.StringBuilder();
           Adv;
-          while (CC<>'}') and (CC<>#0) do Adv;
+          while (CC<>'}') and (CC<>#0) do begin _dirSb.Append(CC); Adv; end;
           if CC='}' then Adv;
+          var _dirText:=_dirSb.ToString.Trim;
+          if _dirText.StartsWith('$') then
+          begin
+            var _dirBody:=_dirText.Substring(1).Trim; // '$' 제거
+            if _dirBody.ToLower.StartsWith('reference') then
+            begin
+              var _refName:=_dirBody.Substring('reference'.Length).Trim;
+              if _refName<>'' then ReferenceDirectives.Add(_refName);
+            end;
+            // reference가 아닌 다른 지시문(apptype 등)은 지금은 그냥 무시.
+          end;
         end
         else if (CC='(') and (PC='*') then
         begin
@@ -177,7 +195,11 @@ type
 
   public
     constructor Create(src: string);
-    begin fChars:=src.ToCharArray; fPos:=0; fLine:=1; fCol:=1; LexErrors:=new List<string>; end;
+    begin
+      fChars:=src.ToCharArray; fPos:=0; fLine:=1; fCol:=1;
+      LexErrors:=new List<string>;
+      ReferenceDirectives:=new List<string>; // [Stage 45]
+    end;
 
     function Tokenize: List<TToken>;
     var toks: List<TToken>; ch: char; sc: integer;

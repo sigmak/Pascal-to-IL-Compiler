@@ -220,6 +220,7 @@ type
           // 그 결과 객체 참조값이 정수로 해석되어 엉뚱한 숫자가 출력되는 버그가 있었다.
           // FieldBuilder.FieldType을 실제로 확인해 string이면 vtString으로 판정한다.
           if _fb.FieldType=typeof(string) then Result:=vtString
+          else if _fb.FieldType=typeof(boolean) then Result:=vtBoolean // [Stage 45 수정 2026.07.11] boolean 필드가 vtInteger로 오판되어 Writeln(w.Loaded1)이 True 대신 1로 출력되던 버그
           else Result:=vtInteger;
         end
         else
@@ -229,10 +230,12 @@ type
           begin
             var _pi:=_extType.GetProperty(_fr.FieldName);
             if (_pi<>nil) and (_pi.PropertyType=typeof(string)) then Result:=vtString
+            else if (_pi<>nil) and (_pi.PropertyType=typeof(boolean)) then Result:=vtBoolean
             else
             begin
               var _fi:=_extType.GetField(_fr.FieldName);
               if (_fi<>nil) and (_fi.FieldType=typeof(string)) then Result:=vtString
+              else if (_fi<>nil) and (_fi.FieldType=typeof(boolean)) then Result:=vtBoolean
               else Result:=vtInteger;
             end;
           end
@@ -289,6 +292,7 @@ type
           if (_mc4.Args.Count=0) and TryFindFieldBuilder(_cn4c, _mc4.MethodName, _fb4c) then
           begin
             if _fb4c.FieldType=typeof(string) then Result:=vtString
+            else if _fb4c.FieldType=typeof(boolean) then Result:=vtBoolean // [Stage 45 수정 2026.07.11] w.Loaded1 같은 obj.field(괄호 없음) 접근이 이 분기를 타는데 boolean이 누락되어 Writeln(w.Loaded1)이 1로 출력되던 버그
             else Result:=vtInteger;
           end
           else
@@ -1885,19 +1889,38 @@ type
     // 처럼 Version/Culture/PublicKeyToken까지 포함한 정식 이름으로 재시도할 것.
     // 어떤 프레임워크를 쓸지는 호출하는 쪽(디자이너)이 결정해서 이 메서드로 등록한다.
     procedure AddReferenceAssembly(nameOrPath: string);
-    var asm: Assembly;
+    var asm: Assembly; shortName: string; loadErr: string;
     begin
-      asm:=nil;
+      asm:=nil; loadErr:='';
+      if nameOrPath.ToLower.EndsWith('.dll') then
+      begin
+        // [Stage 45] {$reference PresentationFramework.dll} 처럼 디자이너가 내보내는 지시문은
+        // 실제 파일 경로가 아니라 GAC/프레임워크 어셈블리의 "짧은 이름 + .dll"인 경우가 대부분이다.
+        // 그래서 .dll을 뗀 짧은 이름으로 Assembly.Load(GAC/참조 어셈블리 경로)를 먼저 시도하고,
+        // 실패하면 (Avalonia처럼 GAC에 없는 경우를 위해) 원래 문자열을 실제 파일 경로로 보고
+        // LoadFrom을 시도한다.
+        shortName:=nameOrPath.Substring(0, nameOrPath.Length-4);
+        try
+          asm:=Assembly.Load(shortName);
+        except
+          on E1: Exception do loadErr:=loadErr+'Assembly.Load("'+shortName+'"): '+E1.Message+' | ';
+        end;
+        if asm=nil then
+        try
+          asm:=Assembly.LoadFrom(nameOrPath);
+        except
+          on E2: Exception do loadErr:=loadErr+'Assembly.LoadFrom("'+nameOrPath+'"): '+E2.Message;
+        end;
+      end
+      else
       try
-        if nameOrPath.ToLower.EndsWith('.dll') then
-          asm:=Assembly.LoadFrom(nameOrPath)
-        else
-          asm:=Assembly.Load(nameOrPath);
+        asm:=Assembly.Load(nameOrPath);
       except
-        on E: Exception do
-          raise new Exception('어셈블리 "'+nameOrPath+'" 로드 실패: '+E.Message);
+        on E3: Exception do loadErr:=loadErr+'Assembly.Load("'+nameOrPath+'"): '+E3.Message;
       end;
-      if asm<>nil then fLoadedAssemblies.Add(asm);
+      if asm=nil then
+        raise new Exception('어셈블리 "'+nameOrPath+'" 로드 실패: '+loadErr);
+      fLoadedAssemblies.Add(asm);
     end;
 
     procedure GenerateExe(outName: string);
