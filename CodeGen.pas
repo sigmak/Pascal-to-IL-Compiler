@@ -295,6 +295,27 @@ type
             else if _fb4c.FieldType=typeof(boolean) then Result:=vtBoolean // [Stage 45 수정 2026.07.11] w.Loaded1 같은 obj.field(괄호 없음) 접근이 이 분기를 타는데 boolean이 누락되어 Writeln(w.Loaded1)이 1로 출력되던 버그
             else Result:=vtInteger;
           end
+          else if (_mc4.Args.Count=0) and (not (fMethodReturnTypes.ContainsKey(_cn4c) and fMethodReturnTypes[_cn4c].ContainsKey(_mc4.MethodName))) then
+          begin
+            // [Stage 46] 로컬 필드도 로컬 메서드도 아니면 외부 상속 타입(예: WPF Window)의
+            // 프로퍼티/필드일 수 있다 (예: w.Title). FindMethodReturnType은 로컬 메서드만 뒤져서
+            // 못 찾으면 무조건 vtInteger 기본값을 돌려주므로, 여기서 외부 조상 타입을 먼저 확인한다.
+            var _extAnc4c:=FindExternalAncestorType(_cn4c);
+            if _extAnc4c<>nil then
+            begin
+              var _extPi4c:=_extAnc4c.GetProperty(_mc4.MethodName);
+              if (_extPi4c<>nil) and (_extPi4c.PropertyType=typeof(string)) then Result:=vtString
+              else if (_extPi4c<>nil) and (_extPi4c.PropertyType=typeof(boolean)) then Result:=vtBoolean
+              else
+              begin
+                var _extFi4c:=_extAnc4c.GetField(_mc4.MethodName);
+                if (_extFi4c<>nil) and (_extFi4c.FieldType=typeof(string)) then Result:=vtString
+                else if (_extFi4c<>nil) and (_extFi4c.FieldType=typeof(boolean)) then Result:=vtBoolean
+                else Result:=vtInteger;
+              end;
+            end
+            else Result:=vtInteger;
+          end
           else
             Result:=FindMethodReturnType(_cn4c, _mc4.MethodName);
         end
@@ -620,6 +641,29 @@ type
           // "알 수 없는 메서드"로 오인했다 (예: Writeln(app.Label1) — app이 전역/지역 변수인 경우).
           if (mc.Args.Count=0) and TryFindFieldBuilder(cn, mc.MethodName, fb) then
             aIL.Emit(OpCodes.Ldfld, fb)
+          else if (mc.Args.Count=0) and (vtVar<>vtInterface) and (not TryFindInstanceMethod(cn, mc.MethodName, imb)) then
+          begin
+            // [Stage 46] 로컬 필드도 로컬 메서드도 아니면 외부 상속 타입(예: WPF Window)의
+            // 프로퍼티/필드일 수 있다 (예: w.Title). 객체 참조는 이미 스택에 로드돼 있다(위 Ldloc).
+            var _extAnc:=FindExternalAncestorType(cn);
+            if _extAnc=nil then
+              raise new Exception('알 수 없는 메서드 "'+cn+'.'+mc.MethodName+'"');
+            var _extPi:=_extAnc.GetProperty(mc.MethodName);
+            if _extPi<>nil then
+            begin
+              var _extGetter:=_extPi.GetGetMethod;
+              if _extGetter=nil then
+                raise new Exception('속성 "'+_extAnc.FullName+'.'+mc.MethodName+'"에 getter가 없습니다 (쓰기 전용).');
+              aIL.Emit(OpCodes.Callvirt, _extGetter);
+            end
+            else
+            begin
+              var _extFi:=_extAnc.GetField(mc.MethodName);
+              if _extFi=nil then
+                raise new Exception('외부 타입 "'+_extAnc.FullName+'"에 필드/속성 "'+mc.MethodName+'"가 없습니다.');
+              aIL.Emit(OpCodes.Ldfld, _extFi);
+            end;
+          end
           else
           begin
             foreach ae in mc.Args do EmitExpr(aIL, ae);
