@@ -25,6 +25,11 @@ type
     fFuncNames, fProcNames, fArrayNames: List<string>;
     fClassNames: List<string>; // 선언된 클래스 이름 목록 (제네릭 템플릿 이름 + 단형화된 구체 이름 포함)
     fInterfaceNames: List<string>; // 선언된 인터페이스 이름 목록
+    fEnumNames: List<string>; // [Phase 1] 선언된 열거형 이름 목록 (타입 파싱 시 vtEnum 분류용)
+    // [Stage 51] 열거형 멤버 이름 → 소속 열거형 이름 / 서수. North → ('TDirection', 0) 처럼
+    // 식(expression) 안에서 괄호 없는 식별자로 등장하는 열거형 값을 판별하는 데 쓰인다.
+    fEnumMemberEnumName: Dictionary<string, string>;
+    fEnumMemberOrdinal: Dictionary<string, integer>;
     // 클래스별 필드 이름 목록 (메서드 본문에서 필드 vs 변수 구분) — 상속받은 필드 포함
     fClassFields: Dictionary<string, List<string>>;
     // 클래스별 메서드 이름 → isFunction — 상속받은 메서드 포함
@@ -78,6 +83,14 @@ type
           +': 멤버 이름이 와야 합니다 ("'+t.Text+'")');
     end;
 
+    // [Phase 1] ExpectMemberName처럼, read/write/property 같은 Phase 1 키워드도
+    // 멤버 이름 위치에서는 식별자로 허용해야 한다.
+    function IsKeywordAllowedAsMemberName(k: TTokenKind): boolean;
+    begin
+      Result:=(k=tkLength) or (k=tkRead) or (k=tkWrite) or (k=tkReal)
+           or (k=tkDouble) or (k=tkChar) or (k=tkInt64);
+    end;
+
     function ParseVarType: TVarType;
     begin
       fLastGenericName:='';
@@ -86,16 +99,31 @@ type
       else if Cur.Kind=tkInteger then begin fPos:=fPos+1; Result:=vtInteger; end
       else if Cur.Kind=tkStringType then begin fPos:=fPos+1; Result:=vtString; end
       else if Cur.Kind=tkBoolean then begin fPos:=fPos+1; Result:=vtBoolean; end
+      // [Phase 1] 새 기본 타입
+      else if (Cur.Kind=tkReal) or (Cur.Kind=tkDouble) then begin fPos:=fPos+1; Result:=vtReal; end
+      else if Cur.Kind=tkChar  then begin fPos:=fPos+1; Result:=vtChar; end
+      else if Cur.Kind=tkInt64 then begin fPos:=fPos+1; Result:=vtInt64; end
       else if Cur.Kind=tkArray then
       begin
         fPos:=fPos+1; Expect(tkOf);
         if Cur.Kind=tkInteger then begin fPos:=fPos+1; Result:=vtIntArray; end
         else if Cur.Kind=tkStringType then begin fPos:=fPos+1; Result:=vtStrArray; end
+        // [Phase 1] array of real/char/int64 — vtObject + ClassName으로 표현 (CLR double[]/char[]/long[])
+        else if (Cur.Kind=tkReal) or (Cur.Kind=tkDouble) then
+          begin fPos:=fPos+1; fLastGenericName:='real'; Result:=vtGenericArray; end // 임시: Monomorphize가 real[]로 처리
+        else if Cur.Kind=tkChar  then
+          begin fPos:=fPos+1; fLastGenericName:='char'; Result:=vtGenericArray; end
+        else if Cur.Kind=tkInt64 then
+          begin fPos:=fPos+1; fLastGenericName:='int64'; Result:=vtGenericArray; end
         // [Stage 37] array of T — 제네릭 템플릿 본문에서만 등장. 실제 타입은 Monomorphize가 채운다.
         else if (Cur.Kind=tkIdent) and fCurGenericParams.Contains(Cur.Text) then
           begin fLastGenericName:=Cur.Text; fPos:=fPos+1; Result:=vtGenericArray; end
-        else raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': array of integer/string'
+        else raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': array of integer/string/real/char/int64'
           +'(또는 제네릭 문맥에서는 array of T)만 지원');
+      end
+      else if (Cur.Kind=tkIdent) and fEnumNames.Contains(Cur.Text) then
+      begin
+        fLastGenericName:=Cur.Text; fPos:=fPos+1; Result:=vtEnum; // [Phase 1]
       end
       else if (Cur.Kind=tkIdent) and fClassNames.Contains(Cur.Text) then
       begin
@@ -109,6 +137,15 @@ type
     function ParseParamTypeExt(var isExt: boolean; var cn: string): TVarType;
     begin
       isExt:=false; cn:=''; fLastGenericName:='';
+      // [Phase 1] 새 기본 타입을 ParseVarType보다 먼저 처리 (tkIdent가 아닌 전용 토큰이므로 안전)
+      if (Cur.Kind=tkReal) or (Cur.Kind=tkDouble) then begin fPos:=fPos+1; Result:=vtReal; exit; end;
+      if Cur.Kind=tkChar  then begin fPos:=fPos+1; Result:=vtChar; exit; end;
+      if Cur.Kind=tkInt64 then begin fPos:=fPos+1; Result:=vtInt64; exit; end;
+      // [Phase 1] 열거형 타입
+      if (Cur.Kind=tkIdent) and fEnumNames.Contains(Cur.Text) then
+      begin
+        cn:=Cur.Text; fLastGenericName:=cn; fPos:=fPos+1; Result:=vtEnum; exit;
+      end;
       if (Cur.Kind=tkIdent) and fClassNames.Contains(Cur.Text) then
       begin
         cn:=Cur.Text; fPos:=fPos+1; Result:=vtObject;
@@ -375,7 +412,23 @@ type
       t:=Cur;
 
       if t.Kind=tkIntLiteral then
-        begin fPos:=fPos+1; Result:=new TIntLiteralNode(integer.Parse(t.Text)); end
+      begin
+        fPos:=fPos+1;
+        // [Phase 1] int32 범위(2^31-1 = 2147483647) 초과 시 int64로 자동 승격
+        var _iv: int64 := int64.Parse(t.Text);
+        if (_iv >= -2147483648) and (_iv <= 2147483647) then
+          Result:=new TIntLiteralNode(integer(_iv))
+        else
+          Result:=new TInt64LiteralNode(_iv);
+      end
+
+      // [Phase 1] 실수 리터럴
+      else if t.Kind=tkRealLiteral then
+        begin fPos:=fPos+1; Result:=new TRealLiteralNode(t.RealValue); end
+
+      // [Phase 1] 문자 리터럴 (#65 또는 'A')
+      else if t.Kind=tkCharLiteral then
+        begin fPos:=fPos+1; Result:=new TCharLiteralNode(t.CharValue); end
 
       else if t.Kind=tkString then
         begin fPos:=fPos+1; Result:=new TStrLiteralNode(t.Text); end
@@ -478,6 +531,16 @@ type
       else if t.Kind=tkIdent then
       begin
         fPos:=fPos+1;
+
+        // [Stage 51] North, South 같은 열거형 멤버 이름 — 변수/필드가 아니라 정수 서수 리터럴로 취급.
+        // (열거형 선언은 var/begin 섹션보다 항상 먼저 파싱되므로 이 시점에 이미 등록돼 있다.)
+        if fEnumMemberEnumName.ContainsKey(t.Text) then
+        begin
+          Result:=new TEnumValueExprNode(fEnumMemberEnumName[t.Text], t.Text, fEnumMemberOrdinal[t.Text]);
+        end
+
+        else
+        begin
 
         // Stage26: TStack<integer> 처럼 제네릭 클래스 이름 뒤에 '<' 가 이어지면
         // 그 자리에서 단형화 요청을 등록하고, 이후 로직은 구체 클래스 이름(gcn)으로 진행한다.
@@ -662,6 +725,8 @@ type
           else
             Result:=new TVarRefNode(t.Text);
         end;
+
+        end; // [Stage 51] else 블록(열거형 멤버가 아닌 일반 식별자 처리) 종료
       end
 
       else if t.Kind=tkLParen then
@@ -1207,8 +1272,33 @@ type
 
         Expect(tkEq);
 
+        // ---- [Phase 1] 열거형 선언: TColor = (Red, Green, Blue); ----
+        if Cur.Kind=tkLParen then
+        begin
+          if genParamNames.Count>0 then
+            raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': 열거형은 제네릭 타입 매개변수를 지원하지 않습니다');
+          fPos:=fPos+1; // '(' 소비
+          var edecl:=new TEnumDeclNode(cn);
+          edecl.Members.Add(Expect(tkIdent).Text);
+          while Cur.Kind=tkComma do
+          begin
+            fPos:=fPos+1;
+            edecl.Members.Add(Expect(tkIdent).Text);
+          end;
+          Expect(tkRParen);
+          Expect(tkSemicolon);
+          fEnumNames.Add(cn);
+          // [Stage 51] 각 멤버 이름을 (열거형명, 서수)로 등록 — North → ('TDirection', 0)
+          for var _emIdx:=0 to edecl.Members.Count-1 do
+          begin
+            fEnumMemberEnumName[edecl.Members[_emIdx]]:=cn;
+            fEnumMemberOrdinal[edecl.Members[_emIdx]]:=_emIdx;
+          end;
+          aProg.EnumDecls.Add(edecl);
+        end
+
         // ---- 인터페이스 선언 ----
-        if Cur.Kind=tkInterface then
+        else if Cur.Kind=tkInterface then
         begin
           if genParamNames.Count>0 then
             raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': 제네릭 인터페이스는 아직 지원되지 않습니다');
@@ -1325,6 +1415,37 @@ type
               cd.HasUserConstructor:=true;
             end
 
+            // [Phase 1] 프로퍼티 시그니처: property Name: Type read FX write FX;
+            else if Cur.Kind=tkProperty then
+            begin
+              fPos:=fPos+1; // 'property' 소비
+              var propName:=Expect(tkIdent).Text;
+              Expect(tkColon);
+              var propIsExt:=false; var propCn:='';
+              var propType:=ParseParamTypeExt(propIsExt, propCn);
+              if (propType=vtEnum) then propCn:=fLastGenericName;
+              if (propType=vtGeneric) or (propType=vtGenericArray) then propCn:=fLastGenericName;
+              var ps:=new TPropertySignature(propName, propType);
+              ps.PropClassName:=propCn; ps.IsExternalType:=propIsExt;
+              // read 접근자 (선택)
+              if Cur.Kind=tkRead then
+              begin
+                fPos:=fPos+1;
+                ps.ReadName:=Expect(tkIdent).Text;
+              end;
+              // write 접근자 (선택)
+              if Cur.Kind=tkWrite then
+              begin
+                fPos:=fPos+1;
+                ps.WriteName:=Expect(tkIdent).Text;
+              end;
+              Expect(tkSemicolon);
+              cd.Properties.Add(ps);
+              // 프로퍼티는 클래스 필드 목록에 이름을 추가한다.
+              // 이를 통해 메서드 본문에서 Self.PropName 접근이 필드처럼 인식된다.
+              fClassFields[cn].Add(propName);
+            end
+
             // 메서드 시그니처: procedure/function
             else if (Cur.Kind=tkProcedure) or (Cur.Kind=tkFunction) then
             begin
@@ -1368,53 +1489,69 @@ type
               fClassMethods[cn][mname]:=isFunc;
             end
 
-            // 필드 선언: fname : type;  (기본 타입, 지역 클래스, 또는 외부 타입 System.Windows.Forms.Button)
+            // 필드 선언: fname1, fname2, ... : type;
+            // (기본 타입, 지역 클래스, 또는 외부 타입 System.Windows.Forms.Button)
+            // [Phase 1] FX, FY: real; 처럼 쉼표로 묶인 복수 이름도 지원
             else if Cur.Kind=tkIdent then
             begin
-              fname:=Cur.Text; fPos:=fPos+1;
+              var fnames:=new List<string>;
+              fnames.Add(Cur.Text); fPos:=fPos+1;
+              while Cur.Kind=tkComma do
+              begin
+                fPos:=fPos+1;
+                fnames.Add(Expect(tkIdent).Text);
+              end;
               Expect(tkColon);
-              var fld:=new TFieldDeclNode(fname, vtInteger);
+              var fldType: TVarType; var fldCn: string; var fldIsExt: boolean;
+              fldType:=vtInteger; fldCn:=''; fldIsExt:=false;
               if (Cur.Kind=tkIdent) and fCurGenericParams.Contains(Cur.Text) then
               begin
-                fld.FieldType:=vtGeneric; fld.ClassName:=Cur.Text; fPos:=fPos+1; // [Stage 32] 어느 타입 매개변수인지 기록
+                fldType:=vtGeneric; fldCn:=Cur.Text; fPos:=fPos+1;
               end
               else if (Cur.Kind=tkIdent) and fClassNames.Contains(Cur.Text) then
               begin
-                fld.FieldType:=vtObject; fld.ClassName:=Cur.Text; fPos:=fPos+1;
-                if (Cur.Kind=tkLt) and fGenericClassNames.Contains(fld.ClassName) then
-                  fld.ClassName:=ResolveGenericInstantiation(fld.ClassName);
+                fldType:=vtObject; fldCn:=Cur.Text; fPos:=fPos+1;
+                if (Cur.Kind=tkLt) and fGenericClassNames.Contains(fldCn) then
+                  fldCn:=ResolveGenericInstantiation(fldCn);
               end
               else if (Cur.Kind=tkIdent) and fInterfaceNames.Contains(Cur.Text) then
               begin
-                fld.FieldType:=vtInterface; fld.ClassName:=Cur.Text; fPos:=fPos+1;
+                fldType:=vtInterface; fldCn:=Cur.Text; fPos:=fPos+1;
+              end
+              else if (Cur.Kind=tkIdent) and fEnumNames.Contains(Cur.Text) then
+              begin
+                fldType:=vtEnum; fldCn:=Cur.Text; fPos:=fPos+1; // [Phase 1]
               end
               else if Cur.Kind=tkIdent then
               begin
-                // fClassNames/fInterfaceNames에 없는 식별자로 시작 → 점(.)으로 연결된
-                // 외부 .NET 타입일 가능성 확인 (예: System.Windows.Forms.Button)
                 var savedPos2:=fPos;
                 var qn:=Expect(tkIdent).Text;
                 if Cur.Kind=tkDot then
                 begin
                   while Cur.Kind=tkDot do
                   begin fPos:=fPos+1; qn:=qn+'.'+Expect(tkIdent).Text; end;
-                  fld.FieldType:=vtObject; fld.ClassName:=qn; fld.IsExternalType:=true;
+                  fldType:=vtObject; fldCn:=qn; fldIsExt:=true;
                 end
                 else
                 begin
-                  fPos:=savedPos2; // 점이 없으면 기본 타입 파서로 위임 (integer/string 등의 별칭이 아니므로 오류 처리됨)
-                  fld.FieldType:=ParseVarType;
-                  if fld.FieldType=vtGenericArray then fld.ClassName:=fLastGenericName; // [Stage 37]
+                  fPos:=savedPos2;
+                  fldType:=ParseVarType;
+                  if fldType=vtGenericArray then fldCn:=fLastGenericName;
                 end;
               end
               else
               begin
-                fld.FieldType:=ParseVarType;
-                if fld.FieldType=vtGenericArray then fld.ClassName:=fLastGenericName; // [Stage 37] 필드가 array of T인 경우
+                fldType:=ParseVarType;
+                if fldType=vtGenericArray then fldCn:=fLastGenericName;
               end;
               Expect(tkSemicolon);
-              cd.Fields.Add(fld);
-              fClassFields[cn].Add(fname);
+              foreach var fn in fnames do
+              begin
+                var fld:=new TFieldDeclNode(fn, fldType);
+                fld.ClassName:=fldCn; fld.IsExternalType:=fldIsExt;
+                cd.Fields.Add(fld);
+                fClassFields[cn].Add(fn);
+              end;
             end
 
             else
@@ -1779,6 +1916,9 @@ type
       fArrayNames:=new List<string>;
       fClassNames:=new List<string>;
       fInterfaceNames:=new List<string>;
+      fEnumNames:=new List<string>; // [Phase 1]
+      fEnumMemberEnumName:=new Dictionary<string, string>; // [Stage 51]
+      fEnumMemberOrdinal:=new Dictionary<string, integer>; // [Stage 51]
       fClassFields:=new Dictionary<string, List<string>>;
       fClassMethods:=new Dictionary<string, Dictionary<string, boolean>>;
       fClassParent:=new Dictionary<string, string>;

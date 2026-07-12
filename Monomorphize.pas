@@ -133,6 +133,13 @@ begin
       raise new Exception('단형화 실패: 알 수 없는 타입 매개변수 "'+srcGenericName+'"');
     if subst[srcGenericName].ArgType=vtInteger then outType:=vtIntArray
     else if subst[srcGenericName].ArgType=vtString then outType:=vtStrArray
+    // [Phase 1] real/char/int64 갰열 타입은 현재 지원하지 않는다 (의미있는 오류로 안내)
+    else if subst[srcGenericName].ArgType=vtReal then
+      raise new Exception('Phase 1: array of T 자리에 real 타입 인자 불ꬬ 비지원')
+    else if subst[srcGenericName].ArgType=vtChar then
+      raise new Exception('Phase 1: array of T 자리에 char 타입 인자 불ꬾ 비지원')
+    else if subst[srcGenericName].ArgType=vtInt64 then
+      raise new Exception('Phase 1: array of T 자리에 int64 타입 인자 비지원')
     else raise new Exception('단형화 실패: "array of '+srcGenericName+'" 자리에 정수/문자열이 아닌 타입 인자가 주어졌습니다 '
       +'— 이 컴파일러는 아직 정수/문자열 배열만 지원하며, 클래스 원소 배열은 지원하지 않습니다');
     outClassName:='';

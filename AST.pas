@@ -10,7 +10,8 @@ type
   // ----------------------------------------------------------
   // 변수/식 타입
   // ----------------------------------------------------------
-  TVarType = (vtInteger, vtString, vtIntArray, vtStrArray, vtObject, vtInterface, vtBoolean, vtGeneric, vtGenericArray);
+  TVarType = (vtInteger, vtString, vtIntArray, vtStrArray, vtObject, vtInterface, vtBoolean, vtGeneric, vtGenericArray,
+              vtReal, vtChar, vtInt64, vtEnum);
   // vtObject: 클래스 인스턴스 (TCounter 등)
   // vtInterface: 인터페이스 타입 변수 (ISpeaker 등)
   // vtBoolean: boolean 타입 (true/false)
@@ -21,6 +22,10 @@ type
   //   (현재는 정수/문자열 타입 인자만 지원 — 클래스 타입 인자로 인스턴스화하면 단형화 단계에서
   //   명확한 에러로 실패한다. "배열 원소가 임의의 클래스" 기능은 이 컴파일러가 아직 갖고 있지
   //   않은 별개의 큰 기능이라 제네릭과 무관하게도 지원되지 않는다.)
+  // [Phase 1] vtReal: double 정밀도 실수 (real/double 키워드 모두 이 타입으로 매핑)
+  // [Phase 1] vtChar: 단일 문자 (char 키워드, 문자 리터럴 'A' / #65)
+  // [Phase 1] vtInt64: 64비트 정수 (int64 키워드)
+  // [Phase 1] vtEnum: 열거형 (type TColor = (Red, Green, Blue); 형태)
 
   // ----------------------------------------------------------
   // Lexer
@@ -35,9 +40,38 @@ type
     constructor Create(v: integer); begin Value:=v; end;
   end;
 
+  // [Phase 1] 실수 리터럴 (3.14, 2.0e-5 등). CLR double로 방출.
+  TRealLiteralNode = class(TExprNode)
+  public Value: double;
+    constructor Create(v: double); begin Value:=v; end;
+  end;
+
+  // [Phase 1] 문자 리터럴 ('A', #65). CLR char로 방출.
+  TCharLiteralNode = class(TExprNode)
+  public Value: char;
+    constructor Create(v: char); begin Value:=v; end;
+  end;
+
+  // [Phase 1] int64 리터럴 (9999999999 등 integer 범위 초과값, 또는 명시적 int64 변수에 대입되는 값).
+  TInt64LiteralNode = class(TExprNode)
+  public Value: int64;
+    constructor Create(v: int64); begin Value:=v; end;
+  end;
+
   TStrLiteralNode = class(TExprNode)
   public Value: string;
     constructor Create(v: string); begin Value:=v; end;
+  end;
+
+  // [Stage 51] 열거형 값 리터럴 (예: North, South — TDirection = (North, South, ...) 의 멤버).
+  // 선언 순서대로 0, 1, 2, ... 정수 서수(Ordinal)에 대응하며 CLR에서는 Ldc_I4로 방출된다.
+  TEnumValueExprNode = class(TExprNode)
+  public
+    EnumName: string;
+    MemberName: string;
+    Ordinal: integer;
+    constructor Create(en, mn: string; ord: integer);
+    begin EnumName:=en; MemberName:=mn; Ordinal:=ord; end;
   end;
 
   TVarRefNode = class(TExprNode)
@@ -303,6 +337,21 @@ type
     begin Name:=n; ParamType:=t; ClassName:=cn; IsExternal:=isExt; end;
   end;
 
+  // [Phase 1] 클래스 선언부 안의 프로퍼티 시그니처.
+  // property X: T read FX write FX;
+  // ReadName/WriteName 이 ''이면 해당 접근자 없음 (읽기 전용/쓰기 전용).
+  TPropertySignature = class
+  public
+    Name: string;
+    PropType: TVarType;
+    PropClassName: string;  // PropType=vtObject/vtEnum일 때 타입 이름
+    IsExternalType: boolean;
+    ReadName: string;  // getter 필드/메서드 이름 ('' = 없음)
+    WriteName: string; // setter 필드/메서드 이름 ('' = 없음)
+    constructor Create(n: string; pt: TVarType);
+    begin Name:=n; PropType:=pt; PropClassName:=''; IsExternalType:=false; ReadName:=''; WriteName:=''; end;
+  end;
+
   TFieldDeclNode = class
   public
     Name: string; FieldType: TVarType;
@@ -354,6 +403,7 @@ type
     // 이후 ConstructorImpls에서 사용자가 작성한 본문을 채워 넣을 때까지 비워 둔다.
     HasUserConstructor: boolean;
     ConstructorParams: List<TParamDef>; // [Stage 47] constructor Create(a: integer; ...) 매개변수 목록. 없으면 빈 목록.
+    Properties: List<TPropertySignature>; // [Phase 1] property 선언 목록
     constructor Create(n: string);
     begin
       Name:=n; ParentName:=''; IsExternalParent:=false; InterfaceName:='';
@@ -361,6 +411,7 @@ type
       IsGeneric:=false; GenericParamNames:=new List<string>; GenericParamConstraints:=new List<string>;
       HasUserConstructor:=false;
       ConstructorParams:=new List<TParamDef>; // [Stage 47]
+      Properties:=new List<TPropertySignature>; // [Phase 1]
     end;
   end;
 
@@ -377,6 +428,16 @@ type
     ArgClassNames: List<string>; // ArgTypes[i]=vtObject일 때 그 클래스 이름(단형화된 이름 포함), 아니면 ''
     constructor Create(tn, cnm: string; ats: List<TVarType>; acns: List<string>);
     begin TemplateName:=tn; ConcreteName:=cnm; ArgTypes:=ats; ArgClassNames:=acns; end;
+  end;
+
+  // [Phase 1] 열거형 선언: type TColor = (Red, Green, Blue);
+  // CLR에서 System.Enum을 상속하는 int32 기반 enum 타입으로 방출된다.
+  TEnumDeclNode = class
+  public
+    Name: string;
+    Members: List<string>; // 선언 순서대로 0, 1, 2, ... 값에 대응
+    constructor Create(n: string);
+    begin Name:=n; Members:=new List<string>; end;
   end;
 
   // 인터페이스 선언 (메서드 시그니처만, 본문 없음)
@@ -495,6 +556,7 @@ type
     GenericInstantiations: List<TGenericInstantiation>; // Parser가 채우고 Monomorphize가 소비
     GenericFuncInstantiations: List<TGenericFuncInstantiation>; // [Stage 36] 함수/프로시저용, 동일한 방식
     IsLibrary: boolean; // [Stage 44] true면 "library Name;"으로 시작 — exe 대신 dll로 생성, begin...end 블록 생략 가능
+    EnumDecls: List<TEnumDeclNode>; // [Phase 1] 열거형 선언 목록
     constructor Create(n: string);
     begin
       Name:=n;
@@ -509,6 +571,7 @@ type
       GenericInstantiations:=new List<TGenericInstantiation>;
       GenericFuncInstantiations:=new List<TGenericFuncInstantiation>;
       IsLibrary:=false;
+      EnumDecls:=new List<TEnumDeclNode>; // [Phase 1]
     end;
   end;
 

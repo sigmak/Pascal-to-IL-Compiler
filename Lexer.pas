@@ -28,7 +28,10 @@ type
     tkNew, // [Stage 40] new TypeName(args) 객체 생성 구문
     tkConstructor, // [Stage 42] constructor Create; 선언/구현
     tkLibrary, // [Stage 44] library Name; 선언 (dll 산출물, begin...end 블록 생략 가능)
-    tkIdent, tkString, tkIntLiteral,
+    // [Phase 1] 타입 시스템 확장
+    tkReal, tkDouble, tkChar, tkInt64, // 숫자·문자 기본 타입
+    tkProperty, tkRead, tkWrite,       // 프로퍼티 선언
+    tkIdent, tkString, tkIntLiteral, tkRealLiteral, tkCharLiteral,
     tkSemicolon, tkColon, tkComma, tkAssign,
     tkPlus, tkMinus, tkStar, tkSlash, tkPlusAssign,
     tkEq, tkNeq, tkLt, tkGt, tkLe, tkGe,
@@ -40,8 +43,13 @@ type
   public
     Kind: TTokenKind; Text: string; Line: integer;
     Column: integer; // [Stage 35] 토큰이 시작하는 열 번호 (1-based)
+    // [Phase 1] 실수 리터럴의 파싱된 값 (Kind=tkRealLiteral일 때만 유효).
+    // Parser가 Text를 다시 ParseDouble 하는 대신 여기서 한 번만 변환.
+    RealValue: double;
+    // [Phase 1] 문자 리터럴의 파싱된 값 (Kind=tkCharLiteral일 때만 유효).
+    CharValue: char;
     constructor Create(k: TTokenKind; t: string; l: integer; c: integer);
-    begin Kind:=k; Text:=t; Line:=l; Column:=c; end;
+    begin Kind:=k; Text:=t; Line:=l; Column:=c; RealValue:=0.0; CharValue:=#0; end;
   end;
 
   TLexer = class
@@ -172,15 +180,62 @@ type
       else if lw='new'       then Result:=new TToken(tkNew,       w,sl,sc) // [Stage 40]
       else if lw='constructor' then Result:=new TToken(tkConstructor, w,sl,sc) // [Stage 42]
       else if lw='library' then Result:=new TToken(tkLibrary, w,sl,sc) // [Stage 44]
+      // [Phase 1] 타입 시스템 확장 키워드
+      else if lw='real'     then Result:=new TToken(tkReal,     w,sl,sc)
+      else if lw='double'   then Result:=new TToken(tkDouble,   w,sl,sc)
+      else if lw='char'     then Result:=new TToken(tkChar,     w,sl,sc)
+      else if lw='int64'    then Result:=new TToken(tkInt64,    w,sl,sc)
+      else if lw='property' then Result:=new TToken(tkProperty, w,sl,sc)
+      else if lw='read'     then Result:=new TToken(tkRead,     w,sl,sc)
+      else if lw='write'    then Result:=new TToken(tkWrite,    w,sl,sc)
       else                        Result:=new TToken(tkIdent,     w,sl,sc);
     end;
 
+    // [Phase 1] 정수 또는 실수 리터럴을 읽는다.
+    // 소수점(.) 또는 지수부(e/E)가 있으면 tkRealLiteral, 없으면 tkIntLiteral.
     function ReadNum: TToken;
-    var sl, sc: integer; sb: StringBuilder;
+    var sl, sc: integer; sb: StringBuilder; tok: TToken;
     begin
       sl:=fLine; sc:=fCol; sb:=new StringBuilder;
       while Char.IsDigit(CC) do begin sb.Append(CC); Adv; end;
-      Result:=new TToken(tkIntLiteral, sb.ToString, sl, sc);
+      // 소수점이 있고, 그 다음이 숫자면 실수 (예: 3.14). 단, '.' 단독(레코드 접근 등)은 제외.
+      if (CC='.') and Char.IsDigit(PC) then
+      begin
+        sb.Append(CC); Adv; // '.' 소비
+        while Char.IsDigit(CC) do begin sb.Append(CC); Adv; end;
+      end;
+      // 지수부 (e/E [+/-] digits)
+      if (CC='e') or (CC='E') then
+      begin
+        sb.Append(CC); Adv;
+        if (CC='+') or (CC='-') then begin sb.Append(CC); Adv; end;
+        while Char.IsDigit(CC) do begin sb.Append(CC); Adv; end;
+      end;
+      var s:=sb.ToString;
+      if s.Contains('.') or s.Contains('e') or s.Contains('E') then
+      begin
+        tok:=new TToken(tkRealLiteral, s, sl, sc);
+        tok.RealValue:=double.Parse(s, System.Globalization.CultureInfo.InvariantCulture);
+        Result:=tok;
+      end
+      else
+        Result:=new TToken(tkIntLiteral, s, sl, sc);
+    end;
+
+    // [Phase 1] #N 형태의 문자 리터럴 (예: #65 = 'A', #10 = 줄바꿈)
+    function ReadCharCode: TToken;
+    var sl, sc: integer; sb: StringBuilder; code: integer;
+    begin
+      sl:=fLine; sc:=fCol;
+      Adv; // '#' 소비
+      sb:=new StringBuilder;
+      while Char.IsDigit(CC) do begin sb.Append(CC); Adv; end;
+      if sb.Length=0 then
+        raise new Exception('줄 '+sl.ToString+', 열 '+sc.ToString+': # 뒤에 숫자가 와야 합니다');
+      code:=integer.Parse(sb.ToString);
+      var tok:=new TToken(tkCharLiteral, '#'+sb.ToString, sl, sc);
+      tok.CharValue:=char(code);
+      Result:=tok;
     end;
 
     function ReadStr: TToken;
@@ -211,7 +266,42 @@ type
         if ch=#0 then begin toks.Add(new TToken(tkEOF,'',fLine,fCol)); break; end
         else if Char.IsLetter(ch) or (ch='_') then toks.Add(ReadIdent)
         else if Char.IsDigit(ch) then toks.Add(ReadNum)
-        else if ch=#39 then toks.Add(ReadStr)
+        else if ch='#' then toks.Add(ReadCharCode) // [Phase 1] #65 형태 문자 리터럴
+        else if ch=#39 then
+        begin
+          // [Phase 1] 단일 문자 리터럴 'A'와 문자열 리터럴 'hello'를 구분한다.
+          // 따옴표 사이 내용이 정확히 1글자이고 닫히면 tkCharLiteral, 그 외에는 tkString.
+          var _csl:=fLine; var _csc:=fCol;
+          Adv; // 여는 따옴표 소비
+          if (CC<>#39) and (CC<>#0) then
+          begin
+            var _ch:=CC; Adv;
+            if CC=#39 then
+            begin
+              // 'X' — 단일 문자 리터럴
+              Adv; // 닫는 따옴표
+              var _ct:=new TToken(tkCharLiteral, #39+_ch+#39, _csl, _csc);
+              _ct.CharValue:=_ch;
+              toks.Add(_ct);
+            end
+            else
+            begin
+              // 두 글자 이상 → 문자열 리터럴로 처리. 이미 첫 글자를 소비했으므로 나머지를 읽는다.
+              var _sb2:=new System.Text.StringBuilder;
+              _sb2.Append(_ch);
+              while (CC<>#39) and (CC<>#0) do begin _sb2.Append(CC); Adv; end;
+              if CC=#39 then Adv
+              else raise new Exception('줄 '+_csl.ToString+', 열 '+_csc.ToString+': 문자열 닫히지 않음');
+              toks.Add(new TToken(tkString, _sb2.ToString, _csl, _csc));
+            end;
+          end
+          else
+          begin
+            // '' — 빈 문자열
+            if CC=#39 then Adv;
+            toks.Add(new TToken(tkString, '', _csl, _csc));
+          end;
+        end
         else if ch=';' then begin toks.Add(new TToken(tkSemicolon,';',fLine,sc)); Adv; end
         else if ch=',' then begin toks.Add(new TToken(tkComma,',',fLine,sc)); Adv; end
         else if ch='[' then begin toks.Add(new TToken(tkLBracket,'[',fLine,sc)); Adv; end

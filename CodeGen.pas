@@ -61,6 +61,8 @@ type
     // 인터페이스 관련 (클래스보다 먼저 완전히 빌드됨)
     fInterfaceBuilders: Dictionary<string, TypeBuilder>;  // 인터페이스명 → TypeBuilder
     fBuiltInterfaces:   Dictionary<string, System.Type>;  // 인터페이스명 → 완성된 Type
+    // [Phase 1] 열거형 관련
+    fBuiltEnums: Dictionary<string, System.Type>; // 열거형명 → 완성된 Type
 
     // 현재 메서드 컨텍스트
     fResultLocal:  LocalBuilder;
@@ -71,8 +73,18 @@ type
     begin
       if t=vtString then Result:=typeof(string)
       else if t=vtBoolean then Result:=typeof(boolean)
-      else if t=vtIntArray then Result:=typeof(integer).MakeArrayType() //typeof(integer[])
-      else if t=vtStrArray then Result:=typeof(string).MakeArrayType() //typeof(string[])
+      // [Phase 1] 새 기본 타입
+      else if t=vtReal  then Result:=typeof(double)
+      else if t=vtChar  then Result:=typeof(char)
+      else if t=vtInt64 then Result:=typeof(int64)
+      else if t=vtEnum  then
+      begin
+        // 열거형은 BuildEnumTypes 단계에서 완성된 Type이 fBuiltEnums에 등록된다.
+        if fBuiltEnums.ContainsKey(cn) then Result:=fBuiltEnums[cn]
+        else Result:=typeof(integer); // 아직 빌드 전이면 int32로 폴백
+      end
+      else if t=vtIntArray then Result:=typeof(integer).MakeArrayType()
+      else if t=vtStrArray then Result:=typeof(string).MakeArrayType()
       else if t=vtObject then
       begin
         if fBuiltTypes.ContainsKey(cn) then Result:=fBuiltTypes[cn]
@@ -202,6 +214,10 @@ type
     var b: TBinOpNode;
     begin
       if e is TIntLiteralNode then Result:=vtInteger
+      else if e is TRealLiteralNode  then Result:=vtReal   // [Phase 1]
+      else if e is TCharLiteralNode  then Result:=vtChar   // [Phase 1]
+      else if e is TInt64LiteralNode then Result:=vtInt64  // [Phase 1]
+      else if e is TEnumValueExprNode then Result:=vtEnum  // [Stage 51]
       else if e is TNilLiteralNode then Result:=vtObject // [Stage 29]
       else if e is TStrLiteralNode then Result:=vtString
       else if e is TIntToStrNode then Result:=vtString
@@ -222,7 +238,10 @@ type
           // 그 결과 객체 참조값이 정수로 해석되어 엉뚱한 숫자가 출력되는 버그가 있었다.
           // FieldBuilder.FieldType을 실제로 확인해 string이면 vtString으로 판정한다.
           if _fb.FieldType=typeof(string) then Result:=vtString
-          else if _fb.FieldType=typeof(boolean) then Result:=vtBoolean // [Stage 45 수정 2026.07.11] boolean 필드가 vtInteger로 오판되어 Writeln(w.Loaded1)이 True 대신 1로 출력되던 버그
+          else if _fb.FieldType=typeof(boolean) then Result:=vtBoolean
+          else if _fb.FieldType=typeof(double)  then Result:=vtReal   // [Phase 1]
+          else if _fb.FieldType=typeof(char)    then Result:=vtChar   // [Phase 1]
+          else if _fb.FieldType=typeof(int64)   then Result:=vtInt64  // [Phase 1]
           else Result:=vtInteger;
         end
         else
@@ -238,6 +257,9 @@ type
               var _fi:=_extType.GetField(_fr.FieldName);
               if (_fi<>nil) and (_fi.FieldType=typeof(string)) then Result:=vtString
               else if (_fi<>nil) and (_fi.FieldType=typeof(boolean)) then Result:=vtBoolean
+              else if (_fi<>nil) and (_fi.FieldType=typeof(double)) then Result:=vtReal   // [Phase 1]
+              else if (_fi<>nil) and (_fi.FieldType=typeof(char))   then Result:=vtChar   // [Phase 1]
+              else if (_fi<>nil) and (_fi.FieldType=typeof(int64))  then Result:=vtInt64  // [Phase 1]
               else Result:=vtInteger;
             end;
           end
@@ -296,7 +318,21 @@ type
           if (_mc4.Args.Count=0) and TryFindFieldBuilder(_cn4c, _mc4.MethodName, _fb4c) then
           begin
             if _fb4c.FieldType=typeof(string) then Result:=vtString
-            else if _fb4c.FieldType=typeof(boolean) then Result:=vtBoolean // [Stage 45 수정 2026.07.11] w.Loaded1 같은 obj.field(괄호 없음) 접근이 이 분기를 타는데 boolean이 누락되어 Writeln(w.Loaded1)이 1로 출력되던 버그
+            else if _fb4c.FieldType=typeof(boolean) then Result:=vtBoolean
+            else if _fb4c.FieldType=typeof(double)  then Result:=vtReal   // [Phase 1]
+            else if _fb4c.FieldType=typeof(char)    then Result:=vtChar   // [Phase 1]
+            else if _fb4c.FieldType=typeof(int64)   then Result:=vtInt64  // [Phase 1]
+            else Result:=vtInteger;
+          end
+          else if (_mc4.Args.Count=0) and fInstanceMethods.ContainsKey(_cn4c) and fInstanceMethods[_cn4c].ContainsKey('get_'+_mc4.MethodName) then
+          begin
+            // [Stage 51] 로컬 클래스의 프로퍼티(get_X) — 실제 getter의 반환 CLR 타입으로 판정한다.
+            var _getMB4c:=fInstanceMethods[_cn4c]['get_'+_mc4.MethodName];
+            if _getMB4c.ReturnType=typeof(string) then Result:=vtString
+            else if _getMB4c.ReturnType=typeof(boolean) then Result:=vtBoolean
+            else if _getMB4c.ReturnType=typeof(double)  then Result:=vtReal
+            else if _getMB4c.ReturnType=typeof(char)    then Result:=vtChar
+            else if _getMB4c.ReturnType=typeof(int64)   then Result:=vtInt64
             else Result:=vtInteger;
           end
           else if (_mc4.Args.Count=0) and (not (fMethodReturnTypes.ContainsKey(_cn4c) and fMethodReturnTypes[_cn4c].ContainsKey(_mc4.MethodName))) then
@@ -315,6 +351,9 @@ type
                 var _extFi4c:=_extAnc4c.GetField(_mc4.MethodName);
                 if (_extFi4c<>nil) and (_extFi4c.FieldType=typeof(string)) then Result:=vtString
                 else if (_extFi4c<>nil) and (_extFi4c.FieldType=typeof(boolean)) then Result:=vtBoolean
+                else if (_extFi4c<>nil) and (_extFi4c.FieldType=typeof(double))  then Result:=vtReal  // [Phase 1]
+                else if (_extFi4c<>nil) and (_extFi4c.FieldType=typeof(char))    then Result:=vtChar  // [Phase 1]
+                else if (_extFi4c<>nil) and (_extFi4c.FieldType=typeof(int64))   then Result:=vtInt64 // [Phase 1]
                 else Result:=vtInteger;
               end;
             end
@@ -505,6 +544,20 @@ type
       if e is TIntLiteralNode then
       begin lit:=TIntLiteralNode(e); aIL.Emit(OpCodes.Ldc_I4, lit.Value); end
 
+      // [Phase 1] 새 리터럴 노드
+      else if e is TRealLiteralNode then
+        aIL.Emit(OpCodes.Ldc_R8, TRealLiteralNode(e).Value)
+
+      else if e is TCharLiteralNode then
+        aIL.Emit(OpCodes.Ldc_I4, integer(TCharLiteralNode(e).Value))
+
+      else if e is TInt64LiteralNode then
+        aIL.Emit(OpCodes.Ldc_I8, TInt64LiteralNode(e).Value)
+
+      else if e is TEnumValueExprNode then
+        // [Stage 51] 열거형 값(North 등)은 CLR에서 int32 기반 Enum이므로 서수를 그대로 Ldc_I4로 방출한다.
+        aIL.Emit(OpCodes.Ldc_I4, TEnumValueExprNode(e).Ordinal)
+
       else if e is TNilLiteralNode then
         aIL.Emit(OpCodes.Ldnull) // [Stage 29] — 참조 타입 지역/필드 변수와만 비교·대입에 사용
 
@@ -648,25 +701,33 @@ type
             aIL.Emit(OpCodes.Ldfld, fb)
           else if (mc.Args.Count=0) and (vtVar<>vtInterface) and (not TryFindInstanceMethod(cn, mc.MethodName, imb)) then
           begin
-            // [Stage 46] 로컬 필드도 로컬 메서드도 아니면 외부 상속 타입(예: WPF Window)의
-            // 프로퍼티/필드일 수 있다 (예: w.Title). 객체 참조는 이미 스택에 로드돼 있다(위 Ldloc).
-            var _extAnc:=FindExternalAncestorType(cn);
-            if _extAnc=nil then
-              raise new Exception('알 수 없는 메서드 "'+cn+'.'+mc.MethodName+'"');
-            var _extPi:=_extAnc.GetProperty(mc.MethodName);
-            if _extPi<>nil then
-            begin
-              var _extGetter:=_extPi.GetGetMethod;
-              if _extGetter=nil then
-                raise new Exception('속성 "'+_extAnc.FullName+'.'+mc.MethodName+'"에 getter가 없습니다 (쓰기 전용).');
-              aIL.Emit(OpCodes.Callvirt, _extGetter);
-            end
+            // [Stage 51] 로컬(우리 컴파일러가 만든) 클래스의 프로퍼티 읽기.
+            // property X: T read FX ... 는 get_X 라는 이름의 메서드로 등록되어 있어서
+            // TryFindInstanceMethod(cn, 'X', ...)로는 못 찾는다 — 여기서 'get_'+X로 먼저 확인한다.
+            if fInstanceMethods.ContainsKey(cn) and fInstanceMethods[cn].ContainsKey('get_'+mc.MethodName) then
+              aIL.Emit(OpCodes.Callvirt, fInstanceMethods[cn]['get_'+mc.MethodName])
             else
             begin
-              var _extFi:=_extAnc.GetField(mc.MethodName);
-              if _extFi=nil then
-                raise new Exception('외부 타입 "'+_extAnc.FullName+'"에 필드/속성 "'+mc.MethodName+'"가 없습니다.');
-              aIL.Emit(OpCodes.Ldfld, _extFi);
+              // [Stage 46] 로컬 필드도 로컬 메서드도 아니면 외부 상속 타입(예: WPF Window)의
+              // 프로퍼티/필드일 수 있다 (예: w.Title). 객체 참조는 이미 스택에 로드돼 있다(위 Ldloc).
+              var _extAnc:=FindExternalAncestorType(cn);
+              if _extAnc=nil then
+                raise new Exception('알 수 없는 메서드 "'+cn+'.'+mc.MethodName+'"');
+              var _extPi:=_extAnc.GetProperty(mc.MethodName);
+              if _extPi<>nil then
+              begin
+                var _extGetter:=_extPi.GetGetMethod;
+                if _extGetter=nil then
+                  raise new Exception('속성 "'+_extAnc.FullName+'.'+mc.MethodName+'"에 getter가 없습니다 (쓰기 전용).');
+                aIL.Emit(OpCodes.Callvirt, _extGetter);
+              end
+              else
+              begin
+                var _extFi:=_extAnc.GetField(mc.MethodName);
+                if _extFi=nil then
+                  raise new Exception('외부 타입 "'+_extAnc.FullName+'"에 필드/속성 "'+mc.MethodName+'"가 없습니다.');
+                aIL.Emit(OpCodes.Ldfld, _extFi);
+              end;
             end;
           end
           else
@@ -739,18 +800,38 @@ type
         b:=TBinOpNode(e); lt:=InferType(b.Left); rt:=InferType(b.Right);
         if (b.Op=boAdd) and ((lt=vtString) or (rt=vtString)) then
         begin
+          // 문자열 연결: 피연산자를 string으로 변환 후 Concat
           EmitExpr(aIL, b.Left);
           if lt=vtInteger then
-          begin ts:=typeof(System.Convert).GetMethod('ToString',[typeof(integer)]); aIL.Emit(OpCodes.Call,ts); end;
+          begin ts:=typeof(System.Convert).GetMethod('ToString',[typeof(integer)]); aIL.Emit(OpCodes.Call,ts); end
+          else if lt=vtReal then
+          begin ts:=typeof(System.Convert).GetMethod('ToString',[typeof(double)]); aIL.Emit(OpCodes.Call,ts); end
+          else if lt=vtChar then
+          begin ts:=typeof(System.Convert).GetMethod('ToString',[typeof(char)]); aIL.Emit(OpCodes.Call,ts); end
+          else if lt=vtInt64 then
+          begin ts:=typeof(System.Convert).GetMethod('ToString',[typeof(int64)]); aIL.Emit(OpCodes.Call,ts); end;
           EmitExpr(aIL, b.Right);
           if rt=vtInteger then
-          begin ts:=typeof(System.Convert).GetMethod('ToString',[typeof(integer)]); aIL.Emit(OpCodes.Call,ts); end;
+          begin ts:=typeof(System.Convert).GetMethod('ToString',[typeof(integer)]); aIL.Emit(OpCodes.Call,ts); end
+          else if rt=vtReal then
+          begin ts:=typeof(System.Convert).GetMethod('ToString',[typeof(double)]); aIL.Emit(OpCodes.Call,ts); end
+          else if rt=vtChar then
+          begin ts:=typeof(System.Convert).GetMethod('ToString',[typeof(char)]); aIL.Emit(OpCodes.Call,ts); end
+          else if rt=vtInt64 then
+          begin ts:=typeof(System.Convert).GetMethod('ToString',[typeof(int64)]); aIL.Emit(OpCodes.Call,ts); end;
           cat:=typeof(string).GetMethod('Concat',[typeof(string),typeof(string)]);
           aIL.Emit(OpCodes.Call, cat);
         end
         else
         begin
-          EmitExpr(aIL, b.Left); EmitExpr(aIL, b.Right);
+          // [Phase 1] real 혼합 산술: 한쪽이 real이면 다른 쪽을 double로 승격
+          var isReal:=(lt=vtReal) or (rt=vtReal);
+          EmitExpr(aIL, b.Left);
+          if isReal and (lt=vtInteger) then aIL.Emit(OpCodes.Conv_R8)
+          else if isReal and (lt=vtInt64) then aIL.Emit(OpCodes.Conv_R8);
+          EmitExpr(aIL, b.Right);
+          if isReal and (rt=vtInteger) then aIL.Emit(OpCodes.Conv_R8)
+          else if isReal and (rt=vtInt64) then aIL.Emit(OpCodes.Conv_R8);
           if b.Op=boAdd then aIL.Emit(OpCodes.Add)
           else if b.Op=boSub then aIL.Emit(OpCodes.Sub)
           else if b.Op=boMul then aIL.Emit(OpCodes.Mul)
@@ -887,11 +968,26 @@ type
           wlS:=typeof(Console).GetMethod('WriteLine',[typeof(string)]);
           EmitExpr(aIL, we.Arg); aIL.Emit(OpCodes.Call, wlS);
         end
-        else if et=vtBoolean then // [Stage 41 수정 2026.07.11]
+        else if et=vtBoolean then
         begin
           wlS:=typeof(Console).GetMethod('WriteLine',[typeof(boolean)]);
+          EmitExpr(aIL, we.Arg); aIL.Emit(OpCodes.Call, wlS);
+        end
+        // [Phase 1] 새 타입별 Writeln 오버로드
+        else if et=vtReal then
+        begin
           EmitExpr(aIL, we.Arg);
-          aIL.Emit(OpCodes.Call, wlS);
+          aIL.Emit(OpCodes.Call, typeof(Console).GetMethod('WriteLine',[typeof(double)]));
+        end
+        else if et=vtChar then
+        begin
+          EmitExpr(aIL, we.Arg);
+          aIL.Emit(OpCodes.Call, typeof(Console).GetMethod('WriteLine',[typeof(char)]));
+        end
+        else if et=vtInt64 then
+        begin
+          EmitExpr(aIL, we.Arg);
+          aIL.Emit(OpCodes.Call, typeof(Console).GetMethod('WriteLine',[typeof(int64)]));
         end
         else
         begin
@@ -1423,6 +1519,7 @@ type
       if (p.ParamType=vtObject) and p.IsExternal then Result:=ResolveExternalType(p.ClassName)
       else if p.ParamType=vtObject then Result:=VTC(vtObject, p.ClassName)
       else if p.ParamType=vtInterface then Result:=VTC(vtInterface, p.ClassName)
+      else if p.ParamType=vtEnum then Result:=VTC(vtEnum, p.ClassName) // [Phase 1]
       else Result:=VTC(p.ParamType, '');
     end;
 
@@ -1439,6 +1536,21 @@ type
 
     // 인터페이스 TypeBuilder 생성 + 즉시 완성(CreateType)
     // 인터페이스는 클래스처럼 나중에 몸체를 채울 필요가 없으므로(메서드 시그니처뿐)
+    // [Phase 1] 열거형을 Reflection.Emit으로 빌드한다.
+    // 인터페이스·클래스보다 먼저 완성시켜야 필드/매개변수 타입으로 참조할 수 있다.
+    procedure BuildEnumTypes(modBuilder: ModuleBuilder);
+    var ed: TEnumDeclNode; eb: EnumBuilder; i: integer;
+    begin
+      foreach ed in fProg.EnumDecls do
+      begin
+        // EnumBuilder는 ModuleBuilder.DefineEnum으로 생성. int32 기반.
+        eb:=modBuilder.DefineEnum(ed.Name, TypeAttributes.Public, typeof(integer));
+        for i:=0 to ed.Members.Count-1 do
+          eb.DefineLiteral(ed.Members[i], integer(i));
+        fBuiltEnums[ed.Name]:=eb.CreateType;
+      end;
+    end;
+
     // 클래스들보다 먼저 완전히 빌드해둔다. 클래스가 AddInterfaceImplementation을
     // 호출할 때 완성된(Type, TypeBuilder 아님) 인터페이스 타입이 필요하기 때문.
     procedure BuildInterfaceShell(modBuilder: ModuleBuilder; id: TInterfaceDeclNode);
@@ -1745,6 +1857,60 @@ type
       begin
         fb:=tb.DefineField(fd.Name, ResolveFieldClrType(fd), FieldAttributes.Public);
         fFieldBuilders[cd.Name][fd.Name]:=fb;
+      end;
+
+      // [Phase 1] 프로퍼티 — CLR PropertyBuilder + get/set 메서드 쌍으로 방출
+      foreach var ps in cd.Properties do
+      begin
+        var propClrType: System.Type;
+        if (ps.PropType=vtObject) and ps.IsExternalType then
+          propClrType:=ResolveExternalType(ps.PropClassName)
+        else
+          propClrType:=VTC(ps.PropType, ps.PropClassName);
+
+        var pb:=tb.DefineProperty(ps.Name, PropertyAttributes.None, propClrType, nil);
+
+        // getter
+        if ps.ReadName<>'' then
+        begin
+          var getM:=tb.DefineMethod('get_'+ps.Name,
+            MethodAttributes.Public or MethodAttributes.SpecialName or
+            MethodAttributes.HideBySig or MethodAttributes.Virtual,
+            propClrType, System.Type.EmptyTypes);
+          var gIL:=getM.GetILGenerator;
+          // ReadName은 반드시 같은 클래스에 선언된 필드 이름이어야 한다.
+          if fFieldBuilders.ContainsKey(cd.Name) and fFieldBuilders[cd.Name].ContainsKey(ps.ReadName) then
+          begin
+            gIL.Emit(OpCodes.Ldarg_0);
+            gIL.Emit(OpCodes.Ldfld, fFieldBuilders[cd.Name][ps.ReadName]);
+          end
+          else
+            raise new Exception('프로퍼티 "'+cd.Name+'.'+ps.Name+'" getter: 필드 "'+ps.ReadName+'"을 찾을 수 없습니다');
+          gIL.Emit(OpCodes.Ret);
+          pb.SetGetMethod(getM);
+          fInstanceMethods[cd.Name]['get_'+ps.Name]:=getM;
+        end;
+
+        // setter
+        if ps.WriteName<>'' then
+        begin
+          var setM:=tb.DefineMethod('set_'+ps.Name,
+            MethodAttributes.Public or MethodAttributes.SpecialName or
+            MethodAttributes.HideBySig or MethodAttributes.Virtual,
+            typeof(System.Void), [propClrType]);
+          var sIL:=setM.GetILGenerator;
+          if fFieldBuilders.ContainsKey(cd.Name) and fFieldBuilders[cd.Name].ContainsKey(ps.WriteName) then
+          begin
+            sIL.Emit(OpCodes.Ldarg_0);
+            sIL.Emit(OpCodes.Ldarg_1);
+            sIL.Emit(OpCodes.Stfld, fFieldBuilders[cd.Name][ps.WriteName]);
+          end
+          else
+            raise new Exception('프로퍼티 "'+cd.Name+'.'+ps.Name+'" setter: 필드 "'+ps.WriteName+'"을 찾을 수 없습니다');
+          sIL.Emit(OpCodes.Ret);
+          pb.SetSetMethod(setM);
+          fInstanceMethods[cd.Name]['set_'+ps.Name]:=setM;
+        end;
       end;
 
       // 메서드 시그니처만 정의
@@ -2128,6 +2294,7 @@ type
       fCtorParamClrTypes:=new Dictionary<string, array of System.Type>; // [Stage 47]
       fInterfaceBuilders:=new Dictionary<string, TypeBuilder>;
       fBuiltInterfaces:=new Dictionary<string, System.Type>;
+      fBuiltEnums:=new Dictionary<string, System.Type>; // [Phase 1]
       fLoadedAssemblies:=new List<Assembly>;
       fClassExternalParentType:=new Dictionary<string, System.Type>;
       fResultLocal:=nil; fResultType:=vtInteger; fCurClassName:='';
@@ -2187,6 +2354,9 @@ type
       an:=new AssemblyName(fProg.Name);
       ab:=AssemblyBuilder.DefineDynamicAssembly(an, AssemblyBuilderAccess.RunAndSave);
       modB:=ab.DefineDynamicModule(fProg.Name, outName);
+
+      // -2. [Phase 1] 열거형을 가장 먼저 빌드 (인터페이스·클래스 필드 타입으로 참조됨)
+      BuildEnumTypes(modB);
 
       // -1. 인터페이스 타입을 클래스보다 먼저 완전히 빌드 (CreateType까지)
       //     클래스의 AddInterfaceImplementation에는 완성된 Type이 필요하기 때문
