@@ -374,11 +374,21 @@ type
     // ParamTypes[i]=vtObject일 때는 클래스/외부타입 이름, vtGeneric일 때는 [Stage 32] 타입 매개변수 이름(예: 'K')
     ParamClassNames: List<string>;
     ParamIsExternal: List<boolean>;  // true면 ParamClassNames[i]가 외부 .NET 타입
+    // [Stage 53] virtual/override/abstract 지시자.
+    // 이 컴파일러는 모든 인스턴스 메서드를 이미 Virtual+HideBySig로 정의하고 이름/시그니처
+    // 일치로 자동 override(슬롯 재사용)하므로, IsVirtual/IsOverride는 지금 당장 코드생성
+    // 동작을 바꾸지 않는다 — 파싱을 허용하고 의도를 기록해두는 정도. 반면 IsAbstract는
+    // 실제로 동작이 다르다: 본문이 없어야 하고(구현을 파싱/요구하지 않음), CLR 메서드는
+    // Abstract 플래그로 정의되며, 소유 클래스는 TypeAttributes.Abstract가 되어야 한다.
+    IsVirtual: boolean;
+    IsOverride: boolean;
+    IsAbstract: boolean;
     constructor Create(n: string; isFunc: boolean; ret: TVarType);
     begin
       Name:=n; IsFunction:=isFunc; ReturnType:=ret; ReturnGenericName:='';
       ParamNames:=new List<string>; ParamTypes:=new List<TVarType>;
       ParamClassNames:=new List<string>; ParamIsExternal:=new List<boolean>;
+      IsVirtual:=false; IsOverride:=false; IsAbstract:=false;
     end;
   end;
 

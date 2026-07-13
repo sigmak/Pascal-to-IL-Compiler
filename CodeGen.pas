@@ -37,6 +37,7 @@ type
     fBuiltTypes:   Dictionary<string, System.Type>;  // 클래스명 → 완성된 Type
     fFieldBuilders: Dictionary<string, Dictionary<string, FieldBuilder>>; // 클래스명 → 필드명 → FieldBuilder
     fInstanceMethods: Dictionary<string, Dictionary<string, MethodBuilder>>; // 클래스명 → 메서드명 → MB
+    fAbstractMethods: Dictionary<string, List<string>>; // [Stage 53] 클래스명 → abstract로 선언된 메서드명 목록
     fClassParents: Dictionary<string, string>; // 클래스명 → 부모 클래스명 ('' 이면 없음)
     fMethodReturnTypes: Dictionary<string, Dictionary<string, TVarType>>; // 클래스명/인터페이스명 → 메서드명 → 반환타입
     fMethodParamClrTypes: Dictionary<string, Dictionary<string, array of System.Type>>; // 클래스명 → 메서드명 → 매개변수 CLR 타입 배열
@@ -647,6 +648,11 @@ type
         begin
           if not fCtorBuilders.ContainsKey(neo.ClassName) then
             raise new Exception('알 수 없는 클래스 "'+neo.ClassName+'"');
+          // [Stage 53] abstract 메서드가 있는 클래스는 인스턴스화할 수 없다. CLR도 런타임에
+          // MemberAccessException으로 막긴 하지만, 실행 시점이 아니라 지금(컴파일 시점)
+          // 알려주는 게 훨씬 낫다.
+          if fAbstractMethods.ContainsKey(neo.ClassName) and (fAbstractMethods[neo.ClassName].Count>0) then
+            raise new Exception('"'+neo.ClassName+'"은(는) abstract 메서드를 갖고 있어 인스턴스를 생성할 수 없습니다 (abstract 클래스).');
           // [Stage 47] 로컬(우리 컴파일러가 만든) 클래스도 매개변수 있는 생성자를 지원한다.
           foreach ae in neo.Args do EmitExpr(aIL, ae);
           ctor:=fCtorBuilders[neo.ClassName];
@@ -1857,9 +1863,16 @@ type
       else
         parentType:=typeof(System.Object);
 
-      tb:=modBuilder.DefineType(cd.Name,
-        TypeAttributes.Public or TypeAttributes.Class,
-        parentType);
+      // [Stage 53] 이 클래스에 abstract 메서드가 하나라도 있으면 타입 자체도 Abstract여야 한다
+      // (CLR 규칙: abstract 메서드를 가진 타입은 반드시 Abstract 타입이어야 CreateType()이 통과한다).
+      var classHasAbstractMethod:=false;
+      foreach var sigChk in cd.Methods do
+        if sigChk.IsAbstract then classHasAbstractMethod:=true;
+
+      var classTypeAttrs:=TypeAttributes.Public or TypeAttributes.Class;
+      if classHasAbstractMethod then classTypeAttrs:=classTypeAttrs or TypeAttributes.Abstract;
+
+      tb:=modBuilder.DefineType(cd.Name, classTypeAttrs, parentType);
       fTypeBuilders[cd.Name]:=tb;
       fFieldBuilders[cd.Name]:=new Dictionary<string, FieldBuilder>;
       fInstanceMethods[cd.Name]:=new Dictionary<string, MethodBuilder>;
@@ -1938,16 +1951,20 @@ type
       // 메서드 시그니처만 정의
       // 모두 Virtual + HideBySig로 정의: 자식 클래스에서 같은 이름/시그니처의
       // 메서드를 정의하면 CLR이 이름/시그니처 매칭으로 자동 override(슬롯 재사용) 처리한다.
+      // (virtual/override 지시자는 이미 이 기본 동작과 일치하므로 별도 분기가 필요 없다.
+      //  abstract만 실제로 다르다: 본문이 없으므로 MethodAttributes.Abstract를 추가한다.)
       methAttrs:=MethodAttributes.Public or MethodAttributes.Virtual or MethodAttributes.HideBySig;
       foreach sig in cd.Methods do
       begin
         paramTypes:=new System.Type[sig.ParamNames.Count];
         for i:=0 to sig.ParamNames.Count-1 do
           paramTypes[i]:=ResolveParamClrType(sig, i);
+        var thisMethAttrs:=methAttrs;
+        if sig.IsAbstract then thisMethAttrs:=thisMethAttrs or MethodAttributes.Abstract;
         if sig.IsFunction then
-          mb:=tb.DefineMethod(sig.Name, methAttrs, VTC(sig.ReturnType, ''), paramTypes)
+          mb:=tb.DefineMethod(sig.Name, thisMethAttrs, VTC(sig.ReturnType, ''), paramTypes)
         else
-          mb:=tb.DefineMethod(sig.Name, methAttrs, typeof(System.Void), paramTypes);
+          mb:=tb.DefineMethod(sig.Name, thisMethAttrs, typeof(System.Void), paramTypes);
         fInstanceMethods[cd.Name][sig.Name]:=mb;
         if not fMethodReturnTypes.ContainsKey(cd.Name) then
           fMethodReturnTypes[cd.Name]:=new Dictionary<string, TVarType>;
@@ -1955,6 +1972,15 @@ type
         if not fMethodParamClrTypes.ContainsKey(cd.Name) then
           fMethodParamClrTypes[cd.Name]:=new Dictionary<string, array of System.Type>;
         fMethodParamClrTypes[cd.Name][sig.Name]:=paramTypes;
+        // [Stage 53] abstract 메서드는 본문이 없다 — 사용자가 실수로 구현을 작성했을 때
+        // BuildMethodBody가 GetILGenerator()를 부르면 Reflection.Emit이 알아보기 힘든
+        // 예외를 던지므로, 여기서 미리 표시해두고 BuildMethodBody 쪽에서 친절한 오류를 낸다.
+        if sig.IsAbstract then
+        begin
+          if not fAbstractMethods.ContainsKey(cd.Name) then
+            fAbstractMethods[cd.Name]:=new List<string>;
+          fAbstractMethods[cd.Name].Add(sig.Name);
+        end;
       end;
 
       // 기본 생성자 추가 (부모 생성자 호출로 체이닝)
@@ -2075,6 +2101,12 @@ type
       if not (fInstanceMethods.ContainsKey(impl.ClassName)
         and fInstanceMethods[impl.ClassName].ContainsKey(impl.MethodName)) then
         raise new Exception('메서드를 찾을 수 없음: '+impl.ClassName+'.'+impl.MethodName);
+
+      // [Stage 53] abstract 메서드는 본문이 있으면 안 된다 — CLR도 이를 금지하지만
+      // (Reflection.Emit에서 GetILGenerator 호출 시 알아보기 힘든 예외가 남) 여기서 먼저
+      // 명확한 한국어 오류로 알려준다.
+      if fAbstractMethods.ContainsKey(impl.ClassName) and fAbstractMethods[impl.ClassName].Contains(impl.MethodName) then
+        raise new Exception('"'+impl.ClassName+'.'+impl.MethodName+'"은(는) abstract로 선언되어 본문(구현)을 가질 수 없습니다');
 
       mb:=fInstanceMethods[impl.ClassName][impl.MethodName];
       il:=mb.GetILGenerator;
@@ -2286,6 +2318,7 @@ type
       fBuiltTypes:=new Dictionary<string, System.Type>;
       fFieldBuilders:=new Dictionary<string, Dictionary<string, FieldBuilder>>;
       fInstanceMethods:=new Dictionary<string, Dictionary<string, MethodBuilder>>;
+      fAbstractMethods:=new Dictionary<string, List<string>>; // [Stage 53]
       fClassParents:=new Dictionary<string, string>;
       fMethodReturnTypes:=new Dictionary<string, Dictionary<string, TVarType>>;
       fMethodParamClrTypes:=new Dictionary<string, Dictionary<string, array of System.Type>>;

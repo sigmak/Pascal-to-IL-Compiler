@@ -21,7 +21,8 @@ uses
 
 const
   DefaultExampleDir = 'Examples';
-  //DefaultExampleFile = 'Test_stage52.pas';
+  DefaultExampleFile = 'Test_stage53.pas';
+  //DefaultExampleFile = 'Test_stage52.pas'; // 오류 4가지 표시되면 정상임.
   //DefaultExampleFile = 'Test_stage51.pas';
   //DefaultExampleFile = 'Test_stage50.pas';
   //DefaultExampleFile = 'Test_stage49.pas';
@@ -36,7 +37,7 @@ const
   //DefaultExampleFile = 'Test_stage40.pas';
   // 38~39는 문서 작업이라 소스코드및 예제 소스코드가 없음.
   //DefaultExampleFile = 'Test_stage37.pas';
-  //DefaultExampleFile = 'Test_stage36.pas';
+  //DefaultExampleFile = 'Test_stage36.pas'; // 현재 0.53 버전에서 오류발생 차후 다시 검토예정.
   //DefaultExampleFile = 'Test_stage35_parse_errors.pas'; // 오류 메세지 검증용
   //DefaultExampleFile = 'Test_stage35_lex_errors.pas';   // 오류 메세지 검증용
   //DefaultExampleFile = 'test_stage34.pas';
@@ -45,7 +46,7 @@ const
   //DefaultExampleFile = 'test_stage30.pas';
   //DefaultExampleFile = 'test_stage29.pas';
   //DefaultExampleFile = 'LocalVars_Test_Stage28.pas';
-  DefaultExampleFile = 'Staticfunctypes_test_Stage27.pas';
+  //DefaultExampleFile = 'Staticfunctypes_test_Stage27.pas';
   //DefaultExampleFile = 'GenericBox_Test_Stage26.pas';
   //DefaultExampleFile = 'StaticWrite_Test_Stage25.pas';  
   //DefaultExampleFile = 'StaticMember_Test_Stage24.pas';

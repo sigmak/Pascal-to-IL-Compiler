@@ -1539,6 +1539,16 @@ type
                 if (sig.ReturnType=vtGeneric) or (sig.ReturnType=vtGenericArray) then sig.ReturnGenericName:=fLastGenericName; // [Stage 32/37]
               end;
               Expect(tkSemicolon);
+              // [Stage 53] 메서드 지시자: virtual;/override;/abstract; — 순서·조합 무관하게 여러 개 허용
+              // (예: "procedure Foo; virtual; abstract;"). 지시자마다 세미콜론이 따라온다.
+              while (Cur.Kind=tkVirtual) or (Cur.Kind=tkOverride) or (Cur.Kind=tkAbstract) do
+              begin
+                if Cur.Kind=tkVirtual then sig.IsVirtual:=true
+                else if Cur.Kind=tkOverride then sig.IsOverride:=true
+                else sig.IsAbstract:=true;
+                fPos:=fPos+1;
+                Expect(tkSemicolon);
+              end;
               cd.Methods.Add(sig);
               fClassMethods[cn][mname]:=isFunc;
             end
