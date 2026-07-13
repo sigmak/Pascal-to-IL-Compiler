@@ -21,7 +21,7 @@ uses
 
 const
   DefaultExampleDir = 'Examples';
-  DefaultExampleFile = 'Test_stage52.pas';
+  //DefaultExampleFile = 'Test_stage52.pas';
   //DefaultExampleFile = 'Test_stage51.pas';
   //DefaultExampleFile = 'Test_stage50.pas';
   //DefaultExampleFile = 'Test_stage49.pas';
@@ -57,7 +57,7 @@ const
   //DefaultExampleFile = 'FieldExternalType_Test_Stage18.pas';
   //DefaultExampleFile = 'ExternalRead_Test_Stage17.pas';
   //DefaultExampleFile = 'StaticCall_Test_Stage16.pas';
-  //DefaultExampleFile = 'ExternalMember_Test_Stage15.pas';
+  DefaultExampleFile = 'ExternalMember_Test_Stage15.pas';
   //DefaultExampleFile = 'ExternalType_Test_Stage14.pas'; //오류 유형: System.Exception // 메시지: 외부 타입 "System.Windows.Forms.Form"을(를) 찾을 수 없습니다. AddReferenceAssembly로 해당 타입이 들어있는 어셈블리를 먼저 등록했는지 확인하세요.
   //DefaultExampleFile = 'InterfaceTest_Stage12.pas';
   //DefaultExampleFile = 'InterfaceTest_Stage11.pas';

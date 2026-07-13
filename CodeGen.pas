@@ -45,6 +45,13 @@ type
 
     // 외부 .NET 어셈블리 (WPF/WinForm/Avalonia 등) — GenerateExe 전에 AddReferenceAssembly로 채워짐
     fLoadedAssemblies: List<Assembly>;
+    // [Stage 51] 자동 참조 해결: 네임스페이스 접두사 → GAC에서 시도해볼 어셈블리 짧은 이름 후보 목록.
+    // {$reference}가 없어도 System.Windows.Forms.Form 같은 "기본적인" BCL/프레임워크 타입은
+    // 이 표를 보고 자동으로 Assembly.Load를 시도한다. Avalonia처럼 GAC에 없는 서드파티 DLL은
+    // 여전히 {$reference 경로.dll}로 명시해야 한다(자동표에 없으면 기존처럼 예외 발생).
+    fAutoAssemblyMap: Dictionary<string, array of string>;
+    // 자동 로드를 이미 실패한 어셈블리 짧은 이름은 다시 시도하지 않는다(반복 예외로 인한 지연 방지).
+    fFailedAutoLoads: HashSet<string>;
     // 클래스명 → 그 클래스가 직접 상속한 "외부" 부모의 실제 System.Type
     // (외부 타입 자신의 조상 체인은 Reflection이 알아서 다 검색해주므로 1단계만 기록하면 충분)
     fClassExternalParentType: Dictionary<string, System.Type>;
@@ -1579,21 +1586,47 @@ type
     // 외부 어셈블리(WPF/WinForm/Avalonia 등)에서 dottedName(예: System.Windows.Window)에
     // 해당하는 Type을 찾는다. AddReferenceAssembly로 미리 등록된 어셈블리만 검색한다.
     function ResolveExternalType(dottedName: string): System.Type;
-    var asm: Assembly; t: System.Type;
+    var asm: Assembly; t: System.Type; prefix, candidate: string; candidates: array of string;
     begin
       // 1) 어셈블리 지정 없이 바로 찾히는 경우 (mscorlib/coreLib에 있는 타입 등)
       t:=System.Type.GetType(dottedName);
       if t<>nil then begin Result:=t; exit; end;
 
-      // 2) 등록된 참조 어셈블리들을 순서대로 검색
+      // 2) 이미 등록된(수동 {$reference} 포함) 참조 어셈블리들을 순서대로 검색
       foreach asm in fLoadedAssemblies do
       begin
         t:=asm.GetType(dottedName);
         if t<>nil then begin Result:=t; exit; end;
       end;
 
+      // 3) [Stage 51] {$reference}가 없어도, dottedName이 "기본" 프레임워크 네임스페이스에
+      // 속하면 GAC 어셈블리를 자동으로 Assembly.Load 시도한다. 가장 구체적인(긴) 접두사가
+      // 우선하도록(예: "System.Windows.Forms"가 "System.Windows"보다 먼저) 직접 최장일치를 찾는다.
+      var _bestPrefix:='';
+      foreach prefix in fAutoAssemblyMap.Keys do
+        if ((dottedName=prefix) or dottedName.StartsWith(prefix+'.')) and (prefix.Length>_bestPrefix.Length) then
+          _bestPrefix:=prefix;
+
+      if _bestPrefix<>'' then
+      begin
+        candidates:=fAutoAssemblyMap[_bestPrefix];
+        foreach candidate in candidates do
+        begin
+          if fFailedAutoLoads.Contains(candidate) then continue;
+          try
+            asm:=Assembly.Load(candidate);
+            fLoadedAssemblies.Add(asm);
+            t:=asm.GetType(dottedName);
+            if t<>nil then begin Result:=t; exit; end;
+          except
+            on E: Exception do fFailedAutoLoads.Add(candidate); // 이 어셈블리는 GAC에 없음 — 다음부터 재시도 안 함
+          end;
+        end;
+      end;
+
       raise new Exception('외부 타입 "'+dottedName+'"을(를) 찾을 수 없습니다. '+
-        'AddReferenceAssembly로 해당 타입이 들어있는 어셈블리를 먼저 등록했는지 확인하세요.');
+        '기본 프레임워크(WinForms/WPF/System.*)가 아니라면 {$reference 어셈블리명.dll} 지시문으로 '+
+        '해당 타입이 들어있는 어셈블리를 먼저 등록했는지 확인하세요.');
     end;
 
     // [Stage 50] 인자 식(expr)이 런타임에 어떤 CLR 타입일지 최대한 추정한다.
@@ -2264,6 +2297,40 @@ type
       fLoadedAssemblies:=new List<Assembly>;
       fClassExternalParentType:=new Dictionary<string, System.Type>;
       fResultLocal:=nil; fResultType:=vtInteger; fCurClassName:='';
+
+      // [Stage 51] GAC에 항상 있다고 볼 수 있는 "기본" 프레임워크들의 네임스페이스 접두사 표.
+      // 접두사는 가장 구체적인 것부터 매칭되도록 ResolveExternalType에서 길이 내림차순으로 검사한다.
+      // 값은 해당 접두사의 타입이 실제로 들어있을 만한 어셈블리 이름 후보들 — 각각 "짧은 이름"을
+      // 먼저 시도하고, .NET Framework GAC 환경에서는 짧은 이름만으로 바인딩이 실패할 수 있으므로
+      // (AddReferenceAssembly 주석 참고) Version/Culture/PublicKeyToken까지 포함한 정식 강명(strong name)을
+      // 바로 다음 후보로 넣어 자동 재시도되게 한다.
+      fAutoAssemblyMap:=new Dictionary<string, array of string>;
+      fAutoAssemblyMap['System.Windows.Forms']:=
+        ['System.Windows.Forms','System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'];
+      fAutoAssemblyMap['System.Drawing']:=
+        ['System.Drawing','System.Drawing, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a'];
+      fAutoAssemblyMap['System.Data']:=
+        ['System.Data','System.Data, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'];
+      fAutoAssemblyMap['System.Xml.Linq']:=
+        ['System.Xml.Linq','System.Xml.Linq, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'];
+      fAutoAssemblyMap['System.Xml']:=
+        ['System.Xml','System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'];
+      fAutoAssemblyMap['System.Net.Http']:=
+        ['System.Net.Http','System.Net.Http, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a'];
+      fAutoAssemblyMap['System.Net']:=
+        ['System','System, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'];
+      fAutoAssemblyMap['System.Text.RegularExpressions']:=
+        ['System','System, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'];
+      fAutoAssemblyMap['System.Xaml']:=
+        ['System.Xaml','System.Xaml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'];
+      // WPF: 네임스페이스 System.Windows.* 가 PresentationFramework/PresentationCore/WindowsBase에 흩어져 있음.
+      // WPF 계열 GAC 어셈블리는 PublicKeyToken이 BCL과 다르다(31bf3856ad364e35).
+      fAutoAssemblyMap['System.Windows']:=
+        ['PresentationFramework','PresentationFramework, Version=4.0.0.0, Culture=neutral, PublicKeyToken=31bf3856ad364e35',
+         'PresentationCore','PresentationCore, Version=4.0.0.0, Culture=neutral, PublicKeyToken=31bf3856ad364e35',
+         'WindowsBase','WindowsBase, Version=4.0.0.0, Culture=neutral, PublicKeyToken=31bf3856ad364e35',
+         'System.Xaml','System.Xaml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'];
+      fFailedAutoLoads:=new HashSet<string>;
     end;
 
     // WPF는 'PresentationFramework','PresentationCore','WindowsBase' (GAC),
