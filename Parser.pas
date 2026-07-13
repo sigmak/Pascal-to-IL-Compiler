@@ -73,11 +73,14 @@ type
     // [Stage 41] 점(.) 뒤 멤버 이름 소비 헬퍼.
     // .Length, .Count 등 Lexer가 키워드 토큰으로 분류하는 이름도
     // 속성/메서드 이름으로 허용한다. tkIdent이거나 알려진 키워드이면 통과.
+    // [Stage 52] tkLength만 하드코딩돼 있고 IsKeywordAllowedAsMemberName(바로 아래 정의,
+    // read/write/real/double/char/int64 포함)은 실제로 호출된 적이 없어서 obj.Real, obj.Write
+    // 같은 멤버 접근이 Length와 동일한 유형의 버그로 실패했다. 여기서 실제로 연결한다.
     function ExpectMemberName: string;
     var t: TToken;
     begin
       t:=Cur;
-      if (t.Kind=tkIdent) or (t.Kind=tkLength) then
+      if (t.Kind=tkIdent) or (t.Kind=tkLength) or IsKeywordAllowedAsMemberName(t.Kind) then
       begin
         fPos:=fPos+1; Result:=t.Text;
       end
@@ -526,6 +529,18 @@ type
         fPos:=fPos+1; Expect(tkLParen);
         argE:=ParseAddSub; Expect(tkRParen);
         Result:=new TIntToStrNode(argE);
+      end
+
+      // [Stage 52] Length(x) — Lexer가 'length'를 tkIdent가 아니라 tkLength 키워드 토큰으로
+      // 분류하기 때문에(줄 174, Lexer.pas), 아래 tkIdent 분기 안의 'length' 특수 처리(712번째 줄)까지
+      // 내려가지 못하고 매칭 실패로 떨어지던 문제. .Length 멤버 접근(arr.Length)은 ExpectMemberName이
+      // tkLength를 허용해서 이미 됐지만, 독립 함수 호출 Length(s)/Length(arr) 형태가 빠져 있었다.
+      else if t.Kind=tkLength then
+      begin
+        fPos:=fPos+1; // 'length' 소비 (tkLength)
+        Expect(tkLParen);
+        var ntL2:=Expect(tkIdent); Expect(tkRParen);
+        Result:=new TLengthExprNode(ntL2.Text);
       end
 
       // [Stage 41] tkLength 단독 분기 제거 — 'length'는 이제 tkIdent로 내려오므로

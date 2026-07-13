@@ -45,7 +45,7 @@ const
   //DefaultExampleFile = 'test_stage30.pas';
   //DefaultExampleFile = 'test_stage29.pas';
   //DefaultExampleFile = 'LocalVars_Test_Stage28.pas';
-  //DefaultExampleFile = 'Staticfunctypes_test_Stage27.pas';
+  DefaultExampleFile = 'Staticfunctypes_test_Stage27.pas';
   //DefaultExampleFile = 'GenericBox_Test_Stage26.pas';
   //DefaultExampleFile = 'StaticWrite_Test_Stage25.pas';  
   //DefaultExampleFile = 'StaticMember_Test_Stage24.pas';
@@ -57,7 +57,7 @@ const
   //DefaultExampleFile = 'FieldExternalType_Test_Stage18.pas';
   //DefaultExampleFile = 'ExternalRead_Test_Stage17.pas';
   //DefaultExampleFile = 'StaticCall_Test_Stage16.pas';
-  DefaultExampleFile = 'ExternalMember_Test_Stage15.pas';
+  //DefaultExampleFile = 'ExternalMember_Test_Stage15.pas';
   //DefaultExampleFile = 'ExternalType_Test_Stage14.pas'; //오류 유형: System.Exception // 메시지: 외부 타입 "System.Windows.Forms.Form"을(를) 찾을 수 없습니다. AddReferenceAssembly로 해당 타입이 들어있는 어셈블리를 먼저 등록했는지 확인하세요.
   //DefaultExampleFile = 'InterfaceTest_Stage12.pas';
   //DefaultExampleFile = 'InterfaceTest_Stage11.pas';
