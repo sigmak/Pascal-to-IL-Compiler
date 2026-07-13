@@ -21,7 +21,8 @@ uses
 
 const
   DefaultExampleDir = 'Examples';
-  DefaultExampleFile = 'Test_stage51.pas';
+  DefaultExampleFile = 'Test_stage52.pas';
+  //DefaultExampleFile = 'Test_stage51.pas';
   //DefaultExampleFile = 'Test_stage50.pas';
   //DefaultExampleFile = 'Test_stage49.pas';
   //DefaultExampleFile = 'Test_stage48.pas';
@@ -45,7 +46,30 @@ const
   //DefaultExampleFile = 'test_stage29.pas';
   //DefaultExampleFile = 'LocalVars_Test_Stage28.pas';
   //DefaultExampleFile = 'Staticfunctypes_test_Stage27.pas';
-  
+  //DefaultExampleFile = 'GenericBox_Test_Stage26.pas';
+  //DefaultExampleFile = 'StaticWrite_Test_Stage25.pas';  
+  //DefaultExampleFile = 'StaticMember_Test_Stage24.pas';
+  //DefaultExampleFile = 'ExprCast_Test_Stage23.pas';
+  //DefaultExampleFile = 'Cast_Test_Stage22.pas';
+  //DefaultExampleFile = 'HandlerParams_Test_Stage21.pas';
+  //DefaultExampleFile = 'EventSubscribe_Test_Stage20.pas';  
+  //DefaultExampleFile = 'QualifiedFieldAccess_Test_Stage19.pas';
+  //DefaultExampleFile = 'FieldExternalType_Test_Stage18.pas';
+  //DefaultExampleFile = 'ExternalRead_Test_Stage17.pas';
+  //DefaultExampleFile = 'StaticCall_Test_Stage16.pas';
+  //DefaultExampleFile = 'ExternalMember_Test_Stage15.pas';
+  //DefaultExampleFile = 'ExternalType_Test_Stage14.pas'; //오류 유형: System.Exception // 메시지: 외부 타입 "System.Windows.Forms.Form"을(를) 찾을 수 없습니다. AddReferenceAssembly로 해당 타입이 들어있는 어셈블리를 먼저 등록했는지 확인하세요.
+  //DefaultExampleFile = 'InterfaceTest_Stage12.pas';
+  //DefaultExampleFile = 'InterfaceTest_Stage11.pas';
+  //DefaultExampleFile = 'InheritTest_Stage10.pas';
+  //DefaultExampleFile = 'OOPTest_Stage9.pas';
+  //DefaultExampleFile = 'ArrayTest_Stage8.pas';
+  //DefaultExampleFile = 'StringTest_Stage7.pas';
+  //DefaultExampleFile = 'CalcTest_Stage6.pas';
+  //DefaultExampleFile = 'FizzBuzz_Stage5.pas';
+  //DefaultExampleFile = 'MiniCompiled_Stage4.pas';
+  //DefaultExampleFile = 'HelloWorld_Test_Stage3.pas';
+  //DefaultExampleFile = 'HelloWorld_Test_Stage1.pas';
 
 function ResolveInputPath: string;
 var

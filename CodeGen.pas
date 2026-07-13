@@ -13,29 +13,20 @@ uses
   System.Collections.Generic,
   System.Reflection,
   System.Reflection.Emit,
-  AST;
+  AST,
+  Scope;
 
 type
   TCodeGenerator = class
   private
     fProg: TProgramNode;
 
-    // 전역 변수
-    fGlobals:     Dictionary<string, LocalBuilder>;
-    fGlobalTypes: Dictionary<string, TVarType>;
-    fGlobalClass: Dictionary<string, string>; // 변수명 → 클래스명
-    fGlobalClrTypes: Dictionary<string, System.Type>; // 전역 object/외부타입 변수의 실제 CLR 타입 (fLocalClrTypes의 전역판)
-
-    // 현재 함수/메서드 로컬 변수
-    fLocals:      Dictionary<string, LocalBuilder>;
-    fLocalTypes:  Dictionary<string, TVarType>;
-    fLocalClrTypes: Dictionary<string, System.Type>; // object/외부타입 지역변수·매개변수의 실제 CLR 타입
-    fLocalClass: Dictionary<string, string>; // [Stage 30 fix] 로컬(우리 컴파일러가 만든) 클래스 타입 지역변수명 → 클래스명.
-      // fLocalClrTypes와 분리하는 이유: fLocalClrTypes에 담긴 타입은 이미 완성된 CLR 타입이라 가정하고
-      // GetProperty/GetMethod 같은 Reflection API를 직접 호출한다. 하지만 아직 CreateType()이 호출되지
-      // 않은 우리 클래스의 TypeBuilder에 Reflection을 걸면 "The invoked member is not supported in a
-      // dynamic module" 예외가 난다. 그래서 로컬 클래스 타입 변수는 이 딕셔너리로 분리해 GetVarClassName
-      // 경유 → FindMethodReturnType/FindInstanceMethod 같은 메타데이터 기반 조회로 처리한다.
+    // [Phase 2] 전역/로컬 변수 스코프 — 예전에는 이름당 4개 Dictionary(Locals/Types/Class/ClrTypes) ×
+    // (전역/로컬) = 8개로 흩어져 있던 것을 TScope 두 개(체인: fLocalScope.Parent=fGlobalScope)로 정리.
+    // fLocalClrTypes를 fLocalClass와 분리했던 이유(TypeBuilder에 Reflection 걸면 터지는 문제)는
+    // TScopeEntry.ClassName / .ClrType으로 그대로 보존된다 — 항목 하나에 둘 다 들어있을 뿐 의미는 그대로.
+    fGlobalScope: TScope;
+    fLocalScope:  TScope;
 
     // 일반 static 함수/프로시저
     fMethods:     Dictionary<string, MethodBuilder>;
@@ -101,15 +92,15 @@ type
 
     function GetVarType(name: string): TVarType;
     begin
-      if fLocalTypes.ContainsKey(name) then Result:=fLocalTypes[name]
-      else if fGlobalTypes.ContainsKey(name) then Result:=fGlobalTypes[name]
+      if fLocalScope.Has(name) then Result:=fLocalScope.GetVType(name)
+      else if fGlobalScope.Has(name) then Result:=fGlobalScope.GetVType(name)
       else Result:=vtInteger;
     end;
 
     function GetVarClassName(name: string): string;
     begin
-      if fLocalClass.ContainsKey(name) then Result:=fLocalClass[name]
-      else if fGlobalClass.ContainsKey(name) then Result:=fGlobalClass[name]
+      if fLocalScope.Has(name) then Result:=fLocalScope.GetClassName(name)
+      else if fGlobalScope.Has(name) then Result:=fGlobalScope.GetClassName(name)
       else Result:='';
     end;
 
@@ -290,11 +281,11 @@ type
             else Result:=vtInteger;
           end;
         end
-        else if fLocalClrTypes.ContainsKey(_mc4.ObjName) or fGlobalClrTypes.ContainsKey(_mc4.ObjName) then
+        else if fLocalScope.HasClrType(_mc4.ObjName) or fGlobalScope.HasClrType(_mc4.ObjName) then
         begin
           var _effType4: System.Type;
-          if fLocalClrTypes.ContainsKey(_mc4.ObjName) then _effType4:=fLocalClrTypes[_mc4.ObjName]
-          else _effType4:=fGlobalClrTypes[_mc4.ObjName];
+          if fLocalScope.HasClrType(_mc4.ObjName) then _effType4:=fLocalScope.GetClrType(_mc4.ObjName)
+          else _effType4:=fGlobalScope.GetClrType(_mc4.ObjName);
           if _mc4.ObjCastType<>'' then _effType4:=ResolveExternalType(_mc4.ObjCastType);
           var _pi4b:=_effType4.GetProperty(_mc4.MethodName);
           if (_pi4b<>nil) and (_pi4b.PropertyType=typeof(string)) then Result:=vtString
@@ -580,8 +571,8 @@ type
       else if e is TLengthExprNode then
       begin
         le:=TLengthExprNode(e);
-        if fLocals.ContainsKey(le.ArrName) then aIL.Emit(OpCodes.Ldloc, fLocals[le.ArrName])
-        else aIL.Emit(OpCodes.Ldloc, fGlobals[le.ArrName]);
+        if fLocalScope.Has(le.ArrName) then aIL.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(le.ArrName))
+        else aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(le.ArrName));
         aIL.Emit(OpCodes.Ldlen); aIL.Emit(OpCodes.Conv_I4);
       end
 
@@ -660,16 +651,16 @@ type
       begin
         // c.GetValue → Ldloc c + Call TCounter::GetValue
         mc:=TMethodCallExprNode(e);
-        if (fLocals.ContainsKey(mc.ObjName) or fGlobals.ContainsKey(mc.ObjName))
-           and (fLocalClrTypes.ContainsKey(mc.ObjName) or fGlobalClrTypes.ContainsKey(mc.ObjName)) then
+        if (fLocalScope.Has(mc.ObjName) or fGlobalScope.Has(mc.ObjName))
+           and (fLocalScope.HasClrType(mc.ObjName) or fGlobalScope.HasClrType(mc.ObjName)) then
         begin
           // sender/e 같은, 외부(또는 객체) 타입 매개변수/지역변수를 통한 접근.
           // 우리가 만든 클래스가 아니라 Reflection으로 속성/메서드를 찾는다.
-          if fLocals.ContainsKey(mc.ObjName) then aIL.Emit(OpCodes.Ldloc, fLocals[mc.ObjName])
-          else aIL.Emit(OpCodes.Ldloc, fGlobals[mc.ObjName]); // [전역 var 버그 수정] 항상 fLocals만 읽던 문제
+          if fLocalScope.Has(mc.ObjName) then aIL.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(mc.ObjName))
+          else aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(mc.ObjName)); // [전역 var 버그 수정] 항상 fLocals만 읽던 문제
           var _qType2: System.Type;
-          if fLocalClrTypes.ContainsKey(mc.ObjName) then _qType2:=fLocalClrTypes[mc.ObjName]
-          else _qType2:=fGlobalClrTypes[mc.ObjName];
+          if fLocalScope.HasClrType(mc.ObjName) then _qType2:=fLocalScope.GetClrType(mc.ObjName)
+          else _qType2:=fGlobalScope.GetClrType(mc.ObjName);
           if mc.ObjCastType<>'' then
           begin
             _qType2:=ResolveExternalType(mc.ObjCastType);
@@ -687,12 +678,12 @@ type
             aIL.Emit(OpCodes.Callvirt, _emi6);
           end;
         end
-        else if fLocals.ContainsKey(mc.ObjName) or fGlobals.ContainsKey(mc.ObjName) then
+        else if fLocalScope.Has(mc.ObjName) or fGlobalScope.Has(mc.ObjName) then
         begin
           cn:=GetVarClassName(mc.ObjName);
           vtVar:=GetVarType(mc.ObjName);
-          if fLocals.ContainsKey(mc.ObjName) then aIL.Emit(OpCodes.Ldloc, fLocals[mc.ObjName])
-          else aIL.Emit(OpCodes.Ldloc, fGlobals[mc.ObjName]);
+          if fLocalScope.Has(mc.ObjName) then aIL.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(mc.ObjName))
+          else aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(mc.ObjName));
           if cn='' then raise new Exception('알 수 없는 메서드 "'+cn+'.'+mc.MethodName+'"');
           // [버그 수정] obj.FieldName(괄호 없음, 인자 없음)은 메서드가 아니라 필드/속성 읽기일
           // 수도 있다 — 이전에는 무조건 FindInstanceMethod로 보내서 실제로는 필드인데
@@ -776,8 +767,8 @@ type
       else if e is TArrayIndexExprNode then
       begin
         ai:=TArrayIndexExprNode(e);
-        if fLocals.ContainsKey(ai.ArrName) then aIL.Emit(OpCodes.Ldloc, fLocals[ai.ArrName])
-        else aIL.Emit(OpCodes.Ldloc, fGlobals[ai.ArrName]);
+        if fLocalScope.Has(ai.ArrName) then aIL.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(ai.ArrName))
+        else aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(ai.ArrName));
         EmitExpr(aIL, ai.Index);
         // [Stage 37 버그 수정] 이전에는 배열 종류와 무관하게 항상 Ldelem_I4를 썼다 —
         // array of integer는 우연히 맞았지만 array of string은 참조(포인터)를 4바이트
@@ -790,8 +781,8 @@ type
       else if e is TVarRefNode then
       begin
         vr:=TVarRefNode(e);
-        if fLocals.ContainsKey(vr.VarName) then aIL.Emit(OpCodes.Ldloc, fLocals[vr.VarName])
-        else if fGlobals.ContainsKey(vr.VarName) then aIL.Emit(OpCodes.Ldloc, fGlobals[vr.VarName])
+        if fLocalScope.Has(vr.VarName) then aIL.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(vr.VarName))
+        else if fGlobalScope.Has(vr.VarName) then aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(vr.VarName))
         else raise new Exception('선언되지 않은 변수 "'+vr.VarName+'"');
       end
 
@@ -881,10 +872,10 @@ type
       begin
         // E.Message — 예외 변수(로컬)를 로드하고 get_Message 호출
         var emn:=TExceptionMsgExprNode(e);
-        if fLocals.ContainsKey(emn.VarName) then
-          aIL.Emit(OpCodes.Ldloc, fLocals[emn.VarName])
-        else if fGlobals.ContainsKey(emn.VarName) then
-          aIL.Emit(OpCodes.Ldloc, fGlobals[emn.VarName])
+        if fLocalScope.Has(emn.VarName) then
+          aIL.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(emn.VarName))
+        else if fGlobalScope.Has(emn.VarName) then
+          aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(emn.VarName))
         else raise new Exception('선언되지 않은 예외 변수 "'+emn.VarName+'"');
         var getMsgMI:=typeof(Exception).GetMethod('get_Message');
         if getMsgMI=nil then
@@ -1022,14 +1013,14 @@ type
             end;
             EmitPropertyOrFieldSet(aIL, qTargetType, fas.FieldName, fas.ValueExpr);
           end
-          else if (fLocals.ContainsKey(fas.Qualifier) or fGlobals.ContainsKey(fas.Qualifier))
-                  and (fLocalClrTypes.ContainsKey(fas.Qualifier) or fGlobalClrTypes.ContainsKey(fas.Qualifier)) then
+          else if (fLocalScope.Has(fas.Qualifier) or fGlobalScope.Has(fas.Qualifier))
+                  and (fLocalScope.HasClrType(fas.Qualifier) or fGlobalScope.HasClrType(fas.Qualifier)) then
           begin
             // 매개변수/지역변수가 외부(객체) 타입인 경우 — Reflection 기반 처리
-            if fLocals.ContainsKey(fas.Qualifier) then aIL.Emit(OpCodes.Ldloc, fLocals[fas.Qualifier])
-            else aIL.Emit(OpCodes.Ldloc, fGlobals[fas.Qualifier]); // [전역 var 버그 수정]
-            if fLocalClrTypes.ContainsKey(fas.Qualifier) then qTargetType:=fLocalClrTypes[fas.Qualifier]
-            else qTargetType:=fGlobalClrTypes[fas.Qualifier];
+            if fLocalScope.Has(fas.Qualifier) then aIL.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(fas.Qualifier))
+            else aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(fas.Qualifier)); // [전역 var 버그 수정]
+            if fLocalScope.HasClrType(fas.Qualifier) then qTargetType:=fLocalScope.GetClrType(fas.Qualifier)
+            else qTargetType:=fGlobalScope.GetClrType(fas.Qualifier);
             if fas.QualifierCastType<>'' then
             begin
               qTargetType:=ResolveExternalType(fas.QualifierCastType);
@@ -1037,11 +1028,11 @@ type
             end;
             EmitPropertyOrFieldSet(aIL, qTargetType, fas.FieldName, fas.ValueExpr);
           end
-          else if fLocals.ContainsKey(fas.Qualifier) or fGlobals.ContainsKey(fas.Qualifier) then
+          else if fLocalScope.Has(fas.Qualifier) or fGlobalScope.Has(fas.Qualifier) then
           begin
             cn:=GetVarClassName(fas.Qualifier);
-            if fLocals.ContainsKey(fas.Qualifier) then aIL.Emit(OpCodes.Ldloc, fLocals[fas.Qualifier])
-            else aIL.Emit(OpCodes.Ldloc, fGlobals[fas.Qualifier]);
+            if fLocalScope.Has(fas.Qualifier) then aIL.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(fas.Qualifier))
+            else aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(fas.Qualifier));
             if fBuiltTypes.ContainsKey(cn) then qTargetType:=fBuiltTypes[cn]
             else if fTypeBuilders.ContainsKey(cn) then qTargetType:=fTypeBuilders[cn]
             else raise new Exception('알 수 없는 타입 "'+cn+'" (변수 "'+fas.Qualifier+'")');
@@ -1114,14 +1105,14 @@ type
         else
           ivClrType:=VTC(ivVt, '');
         var ivLoc:=aIL.DeclareLocal(ivClrType);
-        fLocals[ivs.VarName]:=ivLoc; fLocalTypes[ivs.VarName]:=ivVt;
+        fLocalScope.Declare(ivs.VarName, ivLoc, ivVt);
         if (ivVt=vtObject) or (ivVt=vtInterface) then
         begin
-          if ivIsExternal then fLocalClrTypes[ivs.VarName]:=ivClrType
+          if ivIsExternal then fLocalScope.SetClrType(ivs.VarName, ivClrType)
           else if (ivClassName<>'') and (fTypeBuilders.ContainsKey(ivClassName) or fBuiltTypes.ContainsKey(ivClassName)) then
-            fLocalClass[ivs.VarName]:=ivClassName
+            fLocalScope.SetClassName(ivs.VarName, ivClassName)
           else
-            fLocalClrTypes[ivs.VarName]:=ivClrType;
+            fLocalScope.SetClrType(ivs.VarName, ivClrType);
         end;
         EmitExpr(aIL, ivs.ValueExpr);
         aIL.Emit(OpCodes.Stloc, ivLoc);
@@ -1130,10 +1121,10 @@ type
       else if s is TAssignStmtNode then
       begin
         asg:=TAssignStmtNode(s); EmitExpr(aIL, asg.ValueExpr);
-        if fLocals.ContainsKey(asg.VarName) then
-          aIL.Emit(OpCodes.Stloc, fLocals[asg.VarName])
-        else if fGlobals.ContainsKey(asg.VarName) then
-          aIL.Emit(OpCodes.Stloc, fGlobals[asg.VarName])
+        if fLocalScope.Has(asg.VarName) then
+          aIL.Emit(OpCodes.Stloc, fLocalScope.GetLoc(asg.VarName))
+        else if fGlobalScope.Has(asg.VarName) then
+          aIL.Emit(OpCodes.Stloc, fGlobalScope.GetLoc(asg.VarName))
         else raise new Exception('선언되지 않은 변수 "'+asg.VarName+'"');
       end
 
@@ -1162,14 +1153,14 @@ type
             if emi.ReturnType<>typeof(System.Void) then aIL.Emit(OpCodes.Pop);
           end;
         end
-        else if (fLocals.ContainsKey(mcs.ObjName) or fGlobals.ContainsKey(mcs.ObjName))
-                and (fLocalClrTypes.ContainsKey(mcs.ObjName) or fGlobalClrTypes.ContainsKey(mcs.ObjName)) then
+        else if (fLocalScope.Has(mcs.ObjName) or fGlobalScope.Has(mcs.ObjName))
+                and (fLocalScope.HasClrType(mcs.ObjName) or fGlobalScope.HasClrType(mcs.ObjName)) then
         begin
           // sender.Focus(); 같은, 외부(객체) 타입 매개변수/지역변수를 통한 호출.
-          if fLocals.ContainsKey(mcs.ObjName) then aIL.Emit(OpCodes.Ldloc, fLocals[mcs.ObjName])
-          else aIL.Emit(OpCodes.Ldloc, fGlobals[mcs.ObjName]); // [전역 var 버그 수정]
-          if fLocalClrTypes.ContainsKey(mcs.ObjName) then qTargetType:=fLocalClrTypes[mcs.ObjName]
-          else qTargetType:=fGlobalClrTypes[mcs.ObjName];
+          if fLocalScope.Has(mcs.ObjName) then aIL.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(mcs.ObjName))
+          else aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(mcs.ObjName)); // [전역 var 버그 수정]
+          if fLocalScope.HasClrType(mcs.ObjName) then qTargetType:=fLocalScope.GetClrType(mcs.ObjName)
+          else qTargetType:=fGlobalScope.GetClrType(mcs.ObjName);
           if mcs.ObjCastType<>'' then
           begin
             qTargetType:=ResolveExternalType(mcs.ObjCastType);
@@ -1191,13 +1182,13 @@ type
             if emi.ReturnType<>typeof(System.Void) then aIL.Emit(OpCodes.Pop);
           end;
         end
-        else if fLocals.ContainsKey(mcs.ObjName) or fGlobals.ContainsKey(mcs.ObjName) then
+        else if fLocalScope.Has(mcs.ObjName) or fGlobalScope.Has(mcs.ObjName) then
         begin
           // c.Init(10) → Ldloc c + args + Call
           cn:=GetVarClassName(mcs.ObjName);
           vtVar:=GetVarType(mcs.ObjName);
-          if fLocals.ContainsKey(mcs.ObjName) then aIL.Emit(OpCodes.Ldloc, fLocals[mcs.ObjName])
-          else aIL.Emit(OpCodes.Ldloc, fGlobals[mcs.ObjName]);
+          if fLocalScope.Has(mcs.ObjName) then aIL.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(mcs.ObjName))
+          else aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(mcs.ObjName));
           foreach ae in mcs.Args do EmitExpr(aIL, ae);
           if cn='' then raise new Exception('알 수 없는 메서드 "'+cn+'.'+mcs.MethodName+'"');
           // 인터페이스 타입 변수면 인터페이스 메서드로, 아니면 클래스 상속 체인에서 탐색
@@ -1281,12 +1272,12 @@ type
           aIL.Emit(OpCodes.Ldarg_0); aIL.Emit(OpCodes.Ldfld, qfb);
           qTargetType:=qfb.FieldType;
         end
-        else if fLocals.ContainsKey(evs.Qualifier) or fGlobals.ContainsKey(evs.Qualifier) then
+        else if fLocalScope.Has(evs.Qualifier) or fGlobalScope.Has(evs.Qualifier) then
         begin
-          if fLocals.ContainsKey(evs.Qualifier) then aIL.Emit(OpCodes.Ldloc, fLocals[evs.Qualifier])
-          else aIL.Emit(OpCodes.Ldloc, fGlobals[evs.Qualifier]);
-          if fLocalClrTypes.ContainsKey(evs.Qualifier) then qTargetType:=fLocalClrTypes[evs.Qualifier]
-          else if fGlobalClrTypes.ContainsKey(evs.Qualifier) then qTargetType:=fGlobalClrTypes[evs.Qualifier]
+          if fLocalScope.Has(evs.Qualifier) then aIL.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(evs.Qualifier))
+          else aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(evs.Qualifier));
+          if fLocalScope.HasClrType(evs.Qualifier) then qTargetType:=fLocalScope.GetClrType(evs.Qualifier)
+          else if fGlobalScope.HasClrType(evs.Qualifier) then qTargetType:=fGlobalScope.GetClrType(evs.Qualifier)
           else
           begin
             cn:=GetVarClassName(evs.Qualifier);
@@ -1334,10 +1325,10 @@ type
       else if s is TSetLengthStmtNode then
       begin
         sl:=TSetLengthStmtNode(s); at2:=vtIntArray;
-        if fGlobalTypes.ContainsKey(sl.ArrName) then at2:=fGlobalTypes[sl.ArrName]
-        else if fLocalTypes.ContainsKey(sl.ArrName) then at2:=fLocalTypes[sl.ArrName];
-        if fLocals.ContainsKey(sl.ArrName) then aIL.Emit(OpCodes.Ldloca, fLocals[sl.ArrName])
-        else aIL.Emit(OpCodes.Ldloca, fGlobals[sl.ArrName]);
+        if fGlobalScope.Has(sl.ArrName) then at2:=fGlobalScope.GetVType(sl.ArrName)
+        else if fLocalScope.Has(sl.ArrName) then at2:=fLocalScope.GetVType(sl.ArrName);
+        if fLocalScope.Has(sl.ArrName) then aIL.Emit(OpCodes.Ldloca, fLocalScope.GetLoc(sl.ArrName))
+        else aIL.Emit(OpCodes.Ldloca, fGlobalScope.GetLoc(sl.ArrName));
         EmitExpr(aIL, sl.NewSize);
         if at2=vtStrArray then
           rm:=typeof(System.Array).GetMethod('Resize').MakeGenericMethod([typeof(string)])
@@ -1349,10 +1340,10 @@ type
       else if s is TArrayAssignStmtNode then
       begin
         aa:=TArrayAssignStmtNode(s); at2:=vtIntArray;
-        if fGlobalTypes.ContainsKey(aa.ArrName) then at2:=fGlobalTypes[aa.ArrName]
-        else if fLocalTypes.ContainsKey(aa.ArrName) then at2:=fLocalTypes[aa.ArrName];
-        if fLocals.ContainsKey(aa.ArrName) then aIL.Emit(OpCodes.Ldloc, fLocals[aa.ArrName])
-        else aIL.Emit(OpCodes.Ldloc, fGlobals[aa.ArrName]);
+        if fGlobalScope.Has(aa.ArrName) then at2:=fGlobalScope.GetVType(aa.ArrName)
+        else if fLocalScope.Has(aa.ArrName) then at2:=fLocalScope.GetVType(aa.ArrName);
+        if fLocalScope.Has(aa.ArrName) then aIL.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(aa.ArrName))
+        else aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(aa.ArrName));
         EmitExpr(aIL, aa.Index); EmitExpr(aIL, aa.ValueExpr);
         if at2=vtStrArray then aIL.Emit(OpCodes.Stelem_Ref)
         else aIL.Emit(OpCodes.Stelem_I4);
@@ -1401,8 +1392,8 @@ type
         //   ckL: if isDownto then (i>=endVal) else (i<=endVal) → brtrue bdL
         var fs:=TForStmtNode(s);
         var forVarLoc: LocalBuilder;
-        if fLocals.ContainsKey(fs.VarName) then forVarLoc:=fLocals[fs.VarName]
-        else if fGlobals.ContainsKey(fs.VarName) then forVarLoc:=fGlobals[fs.VarName]
+        if fLocalScope.Has(fs.VarName) then forVarLoc:=fLocalScope.GetLoc(fs.VarName)
+        else if fGlobalScope.Has(fs.VarName) then forVarLoc:=fGlobalScope.GetLoc(fs.VarName)
         else raise new Exception('for 변수 선언 안 됨: '+fs.VarName);
         // end값을 임시 로컬에 저장 (매 반복 재평가 방지)
         var endValLoc:=aIL.DeclareLocal(typeof(integer));
@@ -1438,12 +1429,11 @@ type
         if (ts2.ExVarName<>'') and (ts2.ExceptStmts<>nil) then
         begin
           exLoc:=aIL.DeclareLocal(typeof(Exception));
-          fLocals[ts2.ExVarName]:=exLoc;
-          fLocalTypes[ts2.ExVarName]:=vtString; // 내부 타입은 string으로 (Message는 string)
+          fLocalScope.Declare(ts2.ExVarName, exLoc, vtString); // 내부 타입은 string으로 (Message는 string)
           // [Stage 49] .Message는 TExceptionMsgExprNode가 전용으로 처리하지만, .ToString()
           // 같은 다른 멤버는 이게 없으면 "외부 타입 로컬 변수" 경로를 못 타서
           // "알 수 없는 메서드"로 막혔다 — 실제 예외 객체 타입을 등록해 리플렉션 경로를 열어준다.
-          fLocalClrTypes[ts2.ExVarName]:=typeof(Exception);
+          fLocalScope.SetClrType(ts2.ExVarName, typeof(Exception));
         end;
 
         aIL.BeginExceptionBlock;
@@ -1475,8 +1465,7 @@ type
         // 예외 변수 이름을 로컬에서 제거 (스코프 종료)
         if ts2.ExVarName<>'' then
         begin
-          fLocals.Remove(ts2.ExVarName);
-          fLocalClrTypes.Remove(ts2.ExVarName); // [Stage 49]
+          fLocalScope.Remove(ts2.ExVarName); // [Stage 49] ClrType도 같은 항목 안에 있으므로 한 번에 제거됨
         end;
       end
 
@@ -1622,17 +1611,17 @@ type
       else if e is TVarRefNode then
       begin
         var vn50:=TVarRefNode(e).VarName;
-        if fLocalClrTypes.ContainsKey(vn50) then Result:=fLocalClrTypes[vn50]
-        else if fGlobalClrTypes.ContainsKey(vn50) then Result:=fGlobalClrTypes[vn50] // [전역 var 버그 수정]
-        else if fLocalClass.ContainsKey(vn50) then
+        if fLocalScope.HasClrType(vn50) then Result:=fLocalScope.GetClrType(vn50)
+        else if fGlobalScope.HasClrType(vn50) then Result:=fGlobalScope.GetClrType(vn50) // [전역 var 버그 수정]
+        else if fLocalScope.HasClassName(vn50) then
         begin
-          var cn50:=fLocalClass[vn50];
+          var cn50:=fLocalScope.GetClassName(vn50);
           if fBuiltTypes.ContainsKey(cn50) then Result:=fBuiltTypes[cn50]
           else if fTypeBuilders.ContainsKey(cn50) then Result:=fTypeBuilders[cn50];
         end
-        else if fGlobalClass.ContainsKey(vn50) then // [전역 var 버그 수정]
+        else if fGlobalScope.HasClassName(vn50) then // [전역 var 버그 수정]
         begin
-          var cn50b:=fGlobalClass[vn50];
+          var cn50b:=fGlobalScope.GetClassName(vn50);
           if fBuiltTypes.ContainsKey(cn50b) then Result:=fBuiltTypes[cn50b]
           else if fTypeBuilders.ContainsKey(cn50b) then Result:=fTypeBuilders[cn50b];
         end
@@ -1743,8 +1732,8 @@ type
       if (argExpr is TVarRefNode) and typeof(System.Delegate).IsAssignableFrom(paramType) then
       begin
         _vr48:=TVarRefNode(argExpr);
-        if fMethods.ContainsKey(_vr48.VarName) and not fLocals.ContainsKey(_vr48.VarName)
-           and not fGlobals.ContainsKey(_vr48.VarName) then
+        if fMethods.ContainsKey(_vr48.VarName) and not fLocalScope.Has(_vr48.VarName)
+           and not fGlobalScope.Has(_vr48.VarName) then
         begin
           // static 메서드를 가리키는 델리게이트이므로 대상 인스턴스는 없다(Ldnull).
           aIL.Emit(OpCodes.Ldnull);
@@ -1979,10 +1968,7 @@ type
     procedure BuildConstructorBody(impl: TConstructorImplNode);
     var
       il: ILGenerator; st: TStmtNode; i: integer; p: string;
-      svLocals: Dictionary<string, LocalBuilder>;
-      svLocalTypes: Dictionary<string, TVarType>;
-      svLocalClrTypes: Dictionary<string, System.Type>;
-      svLocalClass: Dictionary<string, string>;
+      savedLocalScope: TScope; // [Phase 2] 예전의 sv4종 Dictionary를 스코프 객체 하나로
       svResult: LocalBuilder; svResultType: TVarType;
       svCurClass: string;
     begin
@@ -1991,14 +1977,11 @@ type
 
       il:=fCtorBuilders[impl.ClassName].GetILGenerator;
 
-      svLocals:=fLocals; svLocalTypes:=fLocalTypes; svLocalClrTypes:=fLocalClrTypes; svLocalClass:=fLocalClass;
+      savedLocalScope:=fLocalScope;
       svResult:=fResultLocal; svResultType:=fResultType;
       svCurClass:=fCurClassName;
 
-      fLocals:=new Dictionary<string, LocalBuilder>;
-      fLocalTypes:=new Dictionary<string, TVarType>;
-      fLocalClrTypes:=new Dictionary<string, System.Type>;
-      fLocalClass:=new Dictionary<string, string>;
+      fLocalScope:=new TScope('local(ctor)', fGlobalScope);
       fResultLocal:=nil; // 생성자는 반환값이 없음
       fCurClassName:=impl.ClassName;
 
@@ -2012,9 +1995,8 @@ type
         if fCtorParamClrTypes.ContainsKey(impl.ClassName) and (i<fCtorParamClrTypes[impl.ClassName].Length) then
           pClrType:=fCtorParamClrTypes[impl.ClassName][i];
         var loc:=il.DeclareLocal(pClrType);
-        fLocals[p]:=loc;
-        fLocalTypes[p]:=impl.Parameters[i].ParamType;
-        if pClrType<>typeof(integer) then fLocalClrTypes[p]:=pClrType;
+        fLocalScope.Declare(p, loc, impl.Parameters[i].ParamType);
+        if pClrType<>typeof(integer) then fLocalScope.SetClrType(p, pClrType);
         if i=0 then il.Emit(OpCodes.Ldarg_1)
         else if i=1 then il.Emit(OpCodes.Ldarg_2)
         else if i=2 then il.Emit(OpCodes.Ldarg_3)
@@ -2028,22 +2010,22 @@ type
         if lv.IsExternal then lvClrType:=ResolveExternalType(lv.ClassName)
         else lvClrType:=VTC(lv.VarType, lv.ClassName);
         var lvLoc:=il.DeclareLocal(lvClrType);
-        fLocals[lv.Name]:=lvLoc; fLocalTypes[lv.Name]:=lv.VarType;
+        fLocalScope.Declare(lv.Name, lvLoc, lv.VarType);
         if (lv.VarType=vtObject) or (lv.VarType=vtInterface) then
         begin
           if lv.IsExternal then
-            fLocalClrTypes[lv.Name]:=lvClrType
+            fLocalScope.SetClrType(lv.Name, lvClrType)
           else if fTypeBuilders.ContainsKey(lv.ClassName) or fBuiltTypes.ContainsKey(lv.ClassName) then
-            fLocalClass[lv.Name]:=lv.ClassName
+            fLocalScope.SetClassName(lv.Name, lv.ClassName)
           else
-            fLocalClrTypes[lv.Name]:=lvClrType;
+            fLocalScope.SetClrType(lv.Name, lvClrType);
         end;
       end;
 
       foreach st in impl.Body.Statements do EmitStatement(il, st);
       il.Emit(OpCodes.Ret);
 
-      fLocals:=svLocals; fLocalTypes:=svLocalTypes; fLocalClrTypes:=svLocalClrTypes; fLocalClass:=svLocalClass;
+      fLocalScope:=savedLocalScope;
       fResultLocal:=svResult; fResultType:=svResultType;
       fCurClassName:=svCurClass;
     end;
@@ -2053,10 +2035,7 @@ type
     var
       mb: MethodBuilder; il: ILGenerator;
       i: integer; p: string;
-      svLocals: Dictionary<string, LocalBuilder>;
-      svLocalTypes: Dictionary<string, TVarType>;
-      svLocalClrTypes: Dictionary<string, System.Type>;
-      svLocalClass: Dictionary<string, string>;
+      savedLocalScope: TScope; // [Phase 2]
       svResult: LocalBuilder; svResultType: TVarType;
       svCurClass: string; st: TStmtNode;
     begin
@@ -2067,14 +2046,11 @@ type
       mb:=fInstanceMethods[impl.ClassName][impl.MethodName];
       il:=mb.GetILGenerator;
 
-      svLocals:=fLocals; svLocalTypes:=fLocalTypes; svLocalClrTypes:=fLocalClrTypes; svLocalClass:=fLocalClass;
+      savedLocalScope:=fLocalScope;
       svResult:=fResultLocal; svResultType:=fResultType;
       svCurClass:=fCurClassName;
 
-      fLocals:=new Dictionary<string, LocalBuilder>;
-      fLocalTypes:=new Dictionary<string, TVarType>;
-      fLocalClrTypes:=new Dictionary<string, System.Type>;
-      fLocalClass:=new Dictionary<string, string>;
+      fLocalScope:=new TScope('local(method)', fGlobalScope);
       fCurClassName:=impl.ClassName;
 
       if impl.IsFunction then
@@ -2098,15 +2074,14 @@ type
            and (i<fMethodParamClrTypes[impl.ClassName][impl.MethodName].Length) then
           pClrType:=fMethodParamClrTypes[impl.ClassName][impl.MethodName][i];
         var loc:=il.DeclareLocal(pClrType);
-        fLocals[p]:=loc;
         // [버그 수정] 예전에는 인스턴스 메서드의 매개변수 타입을 무조건 vtInteger로 기록해서,
         // GetVarType()에 의존하는 배열 원소 접근(Ldelem_I4 vs Ldelem_Ref 선택, Writeln 오버로드
         // 선택 등)이 array of string 매개변수에서도 항상 정수로 취급됐다 — 문자열 배열 원소를
         // 4바이트로 잘못 읽어 포인터가 깨지고 쓰레기 값이 출력되는 원인이었다. 이제 단형화 단계가
         // 이미 채워 둔 impl.ParamTypes[i](구체 타입)를 그대로 사용한다.
-        if i<impl.ParamTypes.Count then fLocalTypes[p]:=impl.ParamTypes[i]
-        else fLocalTypes[p]:=vtInteger;
-        if pClrType<>typeof(integer) then fLocalClrTypes[p]:=pClrType;
+        if i<impl.ParamTypes.Count then fLocalScope.Declare(p, loc, impl.ParamTypes[i])
+        else fLocalScope.Declare(p, loc, vtInteger);
+        if pClrType<>typeof(integer) then fLocalScope.SetClrType(p, pClrType);
         // self=Ldarg_0 이므로 매개변수는 Ldarg_1부터
         if i=0 then il.Emit(OpCodes.Ldarg_1)
         else if i=1 then il.Emit(OpCodes.Ldarg_2)
@@ -2123,16 +2098,16 @@ type
       begin
         var lvClrType:=ResolveLocalVarClrType(lv); // [Stage 41]
         var lvLoc:=il.DeclareLocal(lvClrType);
-        fLocals[lv.Name]:=lvLoc; fLocalTypes[lv.Name]:=lv.VarType;
+        fLocalScope.Declare(lv.Name, lvLoc, lv.VarType);
         if (lv.VarType=vtObject) or (lv.VarType=vtInterface) then
         begin
           // [Stage 30 fix] 우리 컴파일러가 만든 로컬 클래스면(TypeBuilder/완성타입이 이미 등록돼 있으면)
           // 아직 CreateType() 전일 수 있으므로 Reflection 경로(fLocalClrTypes) 대신
           // 메타데이터 기반 경로(fLocalClass → GetVarClassName)로 보낸다.
           if fTypeBuilders.ContainsKey(lv.ClassName) or fBuiltTypes.ContainsKey(lv.ClassName) then
-            fLocalClass[lv.Name]:=lv.ClassName
+            fLocalScope.SetClassName(lv.Name, lv.ClassName)
           else
-            fLocalClrTypes[lv.Name]:=lvClrType;
+            fLocalScope.SetClrType(lv.Name, lvClrType);
         end;
       end;
 
@@ -2144,7 +2119,7 @@ type
       end;
       il.Emit(OpCodes.Ret);
 
-      fLocals:=svLocals; fLocalTypes:=svLocalTypes; fLocalClrTypes:=svLocalClrTypes; fLocalClass:=svLocalClass;
+      fLocalScope:=savedLocalScope;
       fResultLocal:=svResult; fResultType:=svResultType;
       fCurClassName:=svCurClass;
     end;
@@ -2159,8 +2134,7 @@ type
     procedure BuildStaticFunc(tb: TypeBuilder; d: TFuncDeclNode);
     var
       pt: array of System.Type; i: integer; mb: MethodBuilder; il: ILGenerator;
-      svL: Dictionary<string, LocalBuilder>; svLT: Dictionary<string, TVarType>;
-      svLC: Dictionary<string, System.Type>; svLClass: Dictionary<string, string>;
+      savedLocalScope: TScope; // [Phase 2]
       svR: LocalBuilder; svRT: TVarType; st: TStmtNode; retClrType: System.Type;
     begin
       pt:=new System.Type[d.Parameters.Count];
@@ -2169,24 +2143,23 @@ type
       mb:=tb.DefineMethod(d.Name, MethodAttributes.Public or MethodAttributes.Static,
         retClrType, pt);
       fMethods[d.Name]:=mb; fFuncReturnTypes[d.Name]:=d.ReturnType; il:=mb.GetILGenerator;
-      svL:=fLocals; svLT:=fLocalTypes; svLC:=fLocalClrTypes; svLClass:=fLocalClass; svR:=fResultLocal; svRT:=fResultType;
-      fLocals:=new Dictionary<string,LocalBuilder>; fLocalTypes:=new Dictionary<string,TVarType>;
-      fLocalClrTypes:=new Dictionary<string,System.Type>; fLocalClass:=new Dictionary<string,string>;
+      savedLocalScope:=fLocalScope; svR:=fResultLocal; svRT:=fResultType;
+      fLocalScope:=new TScope('local(func)', fGlobalScope);
       fResultType:=d.ReturnType; fResultLocal:=il.DeclareLocal(retClrType);
       for i:=0 to d.Parameters.Count-1 do
       begin
         var loc:=il.DeclareLocal(pt[i]);
         var pdef:=d.Parameters[i];
-        fLocals[pdef.Name]:=loc; fLocalTypes[pdef.Name]:=pdef.ParamType;
+        fLocalScope.Declare(pdef.Name, loc, pdef.ParamType);
         // [Stage 31] 지역 변수(var 섹션)와 동일한 원칙: 우리 컴파일러가 만든 로컬 클래스면
         // 아직 CreateType() 전일 수 있으므로 fLocalClass(메타데이터 기반 조회)로,
         // 외부 .NET 타입이면 기존처럼 fLocalClrTypes(Reflection 기반 조회)로 보낸다.
         if (pdef.ParamType=vtObject) or (pdef.ParamType=vtInterface) then
         begin
           if fTypeBuilders.ContainsKey(pdef.ClassName) or fBuiltTypes.ContainsKey(pdef.ClassName) then
-            fLocalClass[pdef.Name]:=pdef.ClassName
+            fLocalScope.SetClassName(pdef.Name, pdef.ClassName)
           else
-            fLocalClrTypes[pdef.Name]:=pt[i];
+            fLocalScope.SetClrType(pdef.Name, pt[i]);
         end;
         if i=0 then il.Emit(OpCodes.Ldarg_0) else if i=1 then il.Emit(OpCodes.Ldarg_1)
         else if i=2 then il.Emit(OpCodes.Ldarg_2) else if i=3 then il.Emit(OpCodes.Ldarg_3)
@@ -2197,28 +2170,27 @@ type
       begin
         var lvClrType:=ResolveLocalVarClrType(lv); // [Stage 41]
         var lvLoc:=il.DeclareLocal(lvClrType);
-        fLocals[lv.Name]:=lvLoc; fLocalTypes[lv.Name]:=lv.VarType;
+        fLocalScope.Declare(lv.Name, lvLoc, lv.VarType);
         if (lv.VarType=vtObject) or (lv.VarType=vtInterface) then
         begin
           // [Stage 30 fix] 우리 컴파일러가 만든 로컬 클래스면(TypeBuilder/완성타입이 이미 등록돼 있으면)
           // 아직 CreateType() 전일 수 있으므로 Reflection 경로(fLocalClrTypes) 대신
           // 메타데이터 기반 경로(fLocalClass → GetVarClassName)로 보낸다.
           if fTypeBuilders.ContainsKey(lv.ClassName) or fBuiltTypes.ContainsKey(lv.ClassName) then
-            fLocalClass[lv.Name]:=lv.ClassName
+            fLocalScope.SetClassName(lv.Name, lv.ClassName)
           else
-            fLocalClrTypes[lv.Name]:=lvClrType;
+            fLocalScope.SetClrType(lv.Name, lvClrType);
         end;
       end;
       foreach st in d.Body.Statements do EmitStatement(il, st);
       il.Emit(OpCodes.Ldloc, fResultLocal); il.Emit(OpCodes.Ret);
-      fLocals:=svL; fLocalTypes:=svLT; fLocalClrTypes:=svLC; fLocalClass:=svLClass; fResultLocal:=svR; fResultType:=svRT;
+      fLocalScope:=savedLocalScope; fResultLocal:=svR; fResultType:=svRT;
     end;
 
     procedure BuildStaticProc(tb: TypeBuilder; d: TProcDeclNode);
     var
       pt: array of System.Type; i: integer; mb: MethodBuilder; il: ILGenerator;
-      svL: Dictionary<string, LocalBuilder>; svLT: Dictionary<string, TVarType>;
-      svLC: Dictionary<string, System.Type>; svLClass: Dictionary<string, string>;
+      savedLocalScope: TScope; // [Phase 2]
       svR: LocalBuilder; svRT: TVarType; st: TStmtNode;
     begin
       pt:=new System.Type[d.Parameters.Count];
@@ -2226,21 +2198,20 @@ type
       mb:=tb.DefineMethod(d.Name, MethodAttributes.Public or MethodAttributes.Static,
         typeof(System.Void), pt);
       fMethods[d.Name]:=mb; il:=mb.GetILGenerator;
-      svL:=fLocals; svLT:=fLocalTypes; svLC:=fLocalClrTypes; svLClass:=fLocalClass; svR:=fResultLocal; svRT:=fResultType;
-      fLocals:=new Dictionary<string,LocalBuilder>; fLocalTypes:=new Dictionary<string,TVarType>;
-      fLocalClrTypes:=new Dictionary<string,System.Type>; fLocalClass:=new Dictionary<string,string>;
+      savedLocalScope:=fLocalScope; svR:=fResultLocal; svRT:=fResultType;
+      fLocalScope:=new TScope('local(proc)', fGlobalScope);
       fResultLocal:=nil;
       for i:=0 to d.Parameters.Count-1 do
       begin
         var loc:=il.DeclareLocal(pt[i]);
         var pdef:=d.Parameters[i];
-        fLocals[pdef.Name]:=loc; fLocalTypes[pdef.Name]:=pdef.ParamType;
+        fLocalScope.Declare(pdef.Name, loc, pdef.ParamType);
         if (pdef.ParamType=vtObject) or (pdef.ParamType=vtInterface) then
         begin
           if fTypeBuilders.ContainsKey(pdef.ClassName) or fBuiltTypes.ContainsKey(pdef.ClassName) then
-            fLocalClass[pdef.Name]:=pdef.ClassName
+            fLocalScope.SetClassName(pdef.Name, pdef.ClassName)
           else
-            fLocalClrTypes[pdef.Name]:=pt[i];
+            fLocalScope.SetClrType(pdef.Name, pt[i]);
         end;
         if i=0 then il.Emit(OpCodes.Ldarg_0) else if i=1 then il.Emit(OpCodes.Ldarg_1)
         else if i=2 then il.Emit(OpCodes.Ldarg_2) else if i=3 then il.Emit(OpCodes.Ldarg_3)
@@ -2252,35 +2223,30 @@ type
       begin
         var lvClrType:=ResolveLocalVarClrType(lv); // [Stage 41]
         var lvLoc:=il.DeclareLocal(lvClrType);
-        fLocals[lv.Name]:=lvLoc; fLocalTypes[lv.Name]:=lv.VarType;
+        fLocalScope.Declare(lv.Name, lvLoc, lv.VarType);
         if (lv.VarType=vtObject) or (lv.VarType=vtInterface) then
         begin
           // [Stage 30 fix] 우리 컴파일러가 만든 로컬 클래스면(TypeBuilder/완성타입이 이미 등록돼 있으면)
           // 아직 CreateType() 전일 수 있으므로 Reflection 경로(fLocalClrTypes) 대신
           // 메타데이터 기반 경로(fLocalClass → GetVarClassName)로 보낸다.
           if fTypeBuilders.ContainsKey(lv.ClassName) or fBuiltTypes.ContainsKey(lv.ClassName) then
-            fLocalClass[lv.Name]:=lv.ClassName
+            fLocalScope.SetClassName(lv.Name, lv.ClassName)
           else
-            fLocalClrTypes[lv.Name]:=lvClrType;
+            fLocalScope.SetClrType(lv.Name, lvClrType);
         end;
       end;
       foreach st in d.Body.Statements do EmitStatement(il, st);
       il.Emit(OpCodes.Ret);
-      fLocals:=svL; fLocalTypes:=svLT; fLocalClrTypes:=svLC; fLocalClass:=svLClass; fResultLocal:=svR; fResultType:=svRT;
+      fLocalScope:=savedLocalScope; fResultLocal:=svR; fResultType:=svRT;
     end;
 
   public
     constructor Create(p: TProgramNode);
     begin
       fProg:=p;
-      fGlobals:=new Dictionary<string, LocalBuilder>;
-      fGlobalTypes:=new Dictionary<string, TVarType>;
-      fGlobalClass:=new Dictionary<string, string>;
-      fGlobalClrTypes:=new Dictionary<string, System.Type>;
-      fLocals:=new Dictionary<string, LocalBuilder>;
-      fLocalTypes:=new Dictionary<string, TVarType>;
-      fLocalClrTypes:=new Dictionary<string, System.Type>;
-      fLocalClass:=new Dictionary<string, string>;
+      // [Phase 2] 전역/로컬 변수 스코프 — fLocalScope.Parent=fGlobalScope로 체인 연결.
+      fGlobalScope:=new TScope('global', nil);
+      fLocalScope:=new TScope('local', fGlobalScope);
       fMethods:=new Dictionary<string, MethodBuilder>;
       fFuncReturnTypes:=new Dictionary<string, TVarType>;
       fTypeBuilders:=new Dictionary<string, TypeBuilder>;
@@ -2431,13 +2397,15 @@ type
         foreach vd in fProg.VarDecls do
         begin
           var clrType: System.Type;
+          var vdIsClrTyped:=false; var vdClrType: System.Type:=nil;
+          var vdIsClassNamed:=false;
           if (vd.VarType=vtObject) and vd.IsExternal then
           begin
             // [전역 var 버그 수정] System.Text.StringBuilder 같은 외부 .NET 타입 전역변수.
             // 로컬/매개변수의 fLocalClrTypes와 같은 역할을 하는 fGlobalClrTypes에 등록해야
             // 메서드/속성 호출 시 Reflection 기반 조회 경로를 탈 수 있다.
             clrType:=ResolveExternalType(vd.ClassName);
-            fGlobalClrTypes[vd.Name]:=clrType;
+            vdIsClrTyped:=true; vdClrType:=clrType;
           end
           else if vd.VarType=vtObject then
           begin
@@ -2445,7 +2413,7 @@ type
               clrType:=fBuiltTypes[vd.ClassName]
             else
               clrType:=typeof(System.Object);
-            fGlobalClass[vd.Name]:=vd.ClassName;
+            vdIsClassNamed:=true;
           end
           else if vd.VarType=vtInterface then
           begin
@@ -2453,14 +2421,17 @@ type
               clrType:=fBuiltInterfaces[vd.ClassName]
             else
               clrType:=typeof(System.Object);
-            fGlobalClass[vd.Name]:=vd.ClassName;
+            vdIsClassNamed:=true;
           end
           // [Stage 27] string/boolean/array 전역 변수도 예전에는 무조건 typeof(integer)로
           // 선언되어 있었다 — fGlobalTypes만 올바르고 실제 LocalBuilder 슬롯 타입은 틀려서
           // 대입 시 IL 검증에서 깨졌다. object/interface가 아닌 나머지는 VTC로 위임한다.
           else clrType:=VTC(vd.VarType, '');
-          fGlobals[vd.Name]:=il.DeclareLocal(clrType);
-          fGlobalTypes[vd.Name]:=vd.VarType;
+          // [Phase 2] TScope.Declare로 항목을 먼저 만든 뒤에 SetClrType/SetClassName으로 채운다
+          // (예전엔 4개 딕셔너리가 독립적이라 순서가 상관없었지만, 이제는 한 항목이라 Declare가 먼저다).
+          fGlobalScope.Declare(vd.Name, il.DeclareLocal(clrType), vd.VarType);
+          if vdIsClrTyped then fGlobalScope.SetClrType(vd.Name, vdClrType);
+          if vdIsClassNamed then fGlobalScope.SetClassName(vd.Name, vd.ClassName);
         end;
 
         foreach st in fProg.Statements do EmitStatement(il, st);

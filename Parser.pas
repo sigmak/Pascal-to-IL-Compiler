@@ -30,6 +30,9 @@ type
     // 식(expression) 안에서 괄호 없는 식별자로 등장하는 열거형 값을 판별하는 데 쓰인다.
     fEnumMemberEnumName: Dictionary<string, string>;
     fEnumMemberOrdinal: Dictionary<string, integer>;
+    // [Stage 51] 문(statement) 파싱 중 발생한 오류들을 즉시 던지지 않고 모아둔다 —
+    // IDE에서 한 번에 여러 오류를 보여주기 위한 panic-mode 오류 복구용.
+    ParseErrors: List<string>;
     // 클래스별 필드 이름 목록 (메서드 본문에서 필드 vs 변수 구분) — 상속받은 필드 포함
     fClassFields: Dictionary<string, List<string>>;
     // 클래스별 메서드 이름 → isFunction — 상속받은 메서드 포함
@@ -800,6 +803,37 @@ type
       else Result:=left;
     end;
 
+    // ---- [Stage 51] 문장 목록 파싱 (panic-mode 오류 복구 포함) ----
+    // 'end' 토큰(또는 파일 끝)을 만날 때까지 문장을 반복 파싱한다. 예전에는 이 루프가
+    // begin...end 블록마다(프로그램 본문, 메서드/함수/생성자 본문 등 총 6곳) 그대로
+    // 복사되어 있었고, 문장 하나라도 파싱 오류가 나면 예외가 즉시 위로 전파되어 전체
+    // 파싱이 중단됐다 — IDE 연동 시 오타 하나 때문에 나머지 오류를 전혀 볼 수 없는 문제.
+    // 이제 문장 파싱 실패 시 오류를 ParseErrors에 기록만 해두고, 다음 안전한 지점
+    // (';', 'end', 파일 끝)까지 토큰을 건너뛴 뒤 이어서 파싱한다.
+    procedure ParseStatementsUntilEnd(target: List<TStmtNode>);
+    var stmtStartPos: integer;
+    begin
+      while (Cur.Kind<>tkEnd) and (Cur.Kind<>tkEOF) do
+      begin
+        stmtStartPos:=fPos;
+        try
+          target.Add(ParseStatement);
+          if Cur.Kind=tkSemicolon then fPos:=fPos+1;
+        except
+          on ex: Exception do
+          begin
+            ParseErrors.Add(ex.Message);
+            // 무한루프 방지: 문장 파싱이 토큰을 하나도 전진시키지 못했다면 최소 한 개는 건너뛴다.
+            if fPos=stmtStartPos then fPos:=fPos+1;
+            // 다음 동기화 지점(';' 또는 'end' 또는 파일 끝)까지 건너뛴다.
+            while (Cur.Kind<>tkSemicolon) and (Cur.Kind<>tkEnd) and (Cur.Kind<>tkEOF) do
+              fPos:=fPos+1;
+            if Cur.Kind=tkSemicolon then fPos:=fPos+1;
+          end;
+        end;
+      end;
+    end;
+
     // ---- 문장 파싱 ----
     function ParseStatement: TStmtNode;
     var
@@ -1250,6 +1284,11 @@ type
       Expect(tkType);
       while Cur.Kind=tkIdent do
       begin
+        // [Phase 2] 타입 선언 하나가 깨져도(오타, 괄호 누락 등) 전체 구문분석을 멈추지 않고
+        // 오류를 모아둔 뒤 다음 타입 선언(또는 var/함수/프로시저/begin) 자리로 건너뛰어 계속한다.
+        var typeDeclStartPos:=fPos;
+        try
+        begin
         cn:=Cur.Text; fPos:=fPos+1;
 
         // 선택적 제네릭 타입 매개변수: TStack<T> = class ... end; 또는 [Stage 32] TPair<K,V> = class ... end;
@@ -1562,6 +1601,21 @@ type
           Expect(tkEnd); Expect(tkSemicolon);
           aProg.ClassDecls.Add(cd);
         end;
+        end; // [Phase 2] try 안의 begin 닫기
+        except
+          on ex: Exception do
+          begin
+            ParseErrors.Add(ex.Message);
+            // 무한루프 방지: 최소 한 토큰은 전진.
+            if fPos=typeDeclStartPos then fPos:=fPos+1;
+            // 다음 안전 지점(다음 타입 선언 시작, 또는 var/함수/프로시저/생성자/begin/파일 끝)까지 건너뛴다.
+            while (Cur.Kind<>tkSemicolon) and (Cur.Kind<>tkVar) and (Cur.Kind<>tkFunction)
+              and (Cur.Kind<>tkProcedure) and (Cur.Kind<>tkConstructor) and (Cur.Kind<>tkBegin)
+              and (Cur.Kind<>tkEOF) do
+              fPos:=fPos+1;
+            if Cur.Kind=tkSemicolon then fPos:=fPos+1;
+          end;
+        end;
       end;
     end;
 
@@ -1858,12 +1912,16 @@ type
     end;
 
     procedure ParseVarSection(aProg: TProgramNode);
-    var vt: TVarType; ns: List<string>; cn: string; isExt: boolean;
+    var vt: TVarType; ns: List<string>; cn: string; isExt: boolean; varDeclStartPos: integer;
     begin
       Expect(tkVar);
       while (Cur.Kind<>tkBegin) and (Cur.Kind<>tkFunction)
-        and (Cur.Kind<>tkProcedure) do
+        and (Cur.Kind<>tkProcedure) and (Cur.Kind<>tkEOF) do
       begin
+        // [Phase 2] var 선언 한 줄이 깨져도 전체를 멈추지 않고 오류를 모은 뒤 다음 줄로 건너뛴다.
+        varDeclStartPos:=fPos;
+        try
+        begin
         ns:=new List<string>; ns.Add(Expect(tkIdent).Text);
         while Cur.Kind=tkComma do begin fPos:=fPos+1; ns.Add(Expect(tkIdent).Text); end;
         Expect(tkColon);
@@ -1903,6 +1961,18 @@ type
           aProg.VarDecls.Add(new TVarDecl(nm, vt, cn, isExt));
           if (vt=vtIntArray) or (vt=vtStrArray) then fArrayNames.Add(nm);
         end;
+        end;
+        except
+          on ex: Exception do
+          begin
+            ParseErrors.Add(ex.Message);
+            if fPos=varDeclStartPos then fPos:=fPos+1;
+            while (Cur.Kind<>tkSemicolon) and (Cur.Kind<>tkBegin) and (Cur.Kind<>tkFunction)
+              and (Cur.Kind<>tkProcedure) and (Cur.Kind<>tkEOF) do
+              fPos:=fPos+1;
+            if Cur.Kind=tkSemicolon then fPos:=fPos+1;
+          end;
+        end;
       end;
     end;
 
@@ -1919,6 +1989,7 @@ type
       fEnumNames:=new List<string>; // [Phase 1]
       fEnumMemberEnumName:=new Dictionary<string, string>; // [Stage 51]
       fEnumMemberOrdinal:=new Dictionary<string, integer>; // [Stage 51]
+      ParseErrors:=new List<string>; // [Stage 51]
       fClassFields:=new Dictionary<string, List<string>>;
       fClassMethods:=new Dictionary<string, Dictionary<string, boolean>>;
       fClassParent:=new Dictionary<string, string>;
@@ -1974,6 +2045,11 @@ type
       // 클래스 메서드 구현 또는 일반 함수/프로시저
       while (Cur.Kind=tkFunction) or (Cur.Kind=tkProcedure) or (Cur.Kind=tkConstructor) do
       begin
+        // [Phase 2] 함수/프로시저/메서드/생성자 구현 하나가 깨져도 전체를 멈추지 않고
+        // 오류를 모은 뒤 다음 구현부(또는 var/begin) 자리로 건너뛰어 계속한다.
+        var implStartPos:=fPos;
+        try
+        begin
         // [Stage 42] 생성자 구현은 항상 "constructor ClassName.Create;" 형태 (top-level 생성자는 없음)
         if Cur.Kind=tkConstructor then
         begin
@@ -2010,6 +2086,28 @@ type
           else prog.ProcDecls.Add(ParseProcDecl);
         end;
         end;
+        end;
+        except
+          on ex: Exception do
+          begin
+            ParseErrors.Add(ex.Message);
+            if fPos=implStartPos then fPos:=fPos+1;
+            // 다음 안전 지점: 새 함수/프로시저/생성자 선언, var 섹션, 또는 메인 begin.
+            // [주의] 깨진 선언 자신의 begin...end 본문을 통째로 건너뛰어야 한다 — 그렇지 않으면
+            // 그 안의 'begin'을 "다음 안전 지점"으로 착각해서 멈추고, 결과적으로 그 뒤의 진짜
+            // var 섹션/메인 begin을 못 찾고 파싱 전체가 어긋난다. begin/end 중첩 깊이를 추적한다.
+            var syncDepth:=0;
+            while Cur.Kind<>tkEOF do
+            begin
+              if (syncDepth=0) and ((Cur.Kind=tkFunction) or (Cur.Kind=tkProcedure)
+                 or (Cur.Kind=tkConstructor) or (Cur.Kind=tkVar)) then
+                break;
+              if Cur.Kind=tkBegin then syncDepth:=syncDepth+1
+              else if (Cur.Kind=tkEnd) and (syncDepth>0) then syncDepth:=syncDepth-1;
+              fPos:=fPos+1;
+            end;
+          end;
+        end;
       end;
 
       if Cur.Kind=tkVar then ParseVarSection(prog);
@@ -2020,13 +2118,21 @@ type
       if (not prog.IsLibrary) or (Cur.Kind=tkBegin) then
       begin
         Expect(tkBegin);
-        while Cur.Kind<>tkEnd do
-        begin prog.Statements.Add(ParseStatement); if Cur.Kind=tkSemicolon then fPos:=fPos+1; end;
+        // [Phase 2] 예전엔 여기 별도의 인라인 루프가 있어서 ParseStatementsUntilEnd의
+        // 오류 복구(수집 후 다음 안전 지점으로 건너뛰기)를 못 받았다 — 재사용으로 통일.
+        ParseStatementsUntilEnd(prog.Statements);
         Expect(tkEnd);
       end
       else
         Expect(tkEnd); // begin 없이 바로 "end."
       Expect(tkDot); Expect(tkEOF);
+
+      // [Phase 2] 파싱 도중 여러 곳에서 모아둔 오류가 있으면 이제야 한꺼번에 보고한다.
+      // (Lexer의 다중 오류 형식과 동일하게 맞춰서 Main.pas의 PrintCompileError가
+      // 줄마다 따로 소스 문맥을 보여줄 수 있게 한다 — Main.pas는 손댈 필요가 없다.)
+      if ParseErrors.Count>0 then
+        raise new Exception('구문 분석 오류 '+ParseErrors.Count.ToString+'건 발견:'#10+string.Join(#10, ParseErrors));
+
       Result:=prog;
     end;
   end;
