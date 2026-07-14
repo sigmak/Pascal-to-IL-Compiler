@@ -21,8 +21,8 @@ uses
 
 const
   DefaultExampleDir = 'Examples';
-  
-  DefaultExampleFile = 'Units_DupTest\Dupentry.pas'; // stage56 오류 나는 예제 Examples\Units_DupTest\ 폴더에 Dupa.pas, Dupb.pas, Dupentry.pas 이렇게 3개 가 있음.
+  DefaultExampleFile = 'Test_stage57.pas';
+  //DefaultExampleFile = 'Units_DupTest\Dupentry.pas'; // stage56 오류 나는 예제 Examples\Units_DupTest\ 폴더에 Dupa.pas, Dupb.pas, Dupentry.pas 이렇게 3개 가 있음.
   //DefaultExampleFile = 'Units\Entry.pas'; // stage56 정상적인 예제 Examples\Untis\ 폴더에 StringUtils.pas, MathUtils.pas, Entry.pas 이렇게 3개 가 있음.
   //DefaultExampleFile = 'Units\Entry.pas'; // stage54  Examples\Untis\ 폴더에 StringUtils.pas, MathUtils.pas, Entry.pas 이렇게 3개 가 있음. 
   //DefaultExampleFile = 'Test_stage54.pas';

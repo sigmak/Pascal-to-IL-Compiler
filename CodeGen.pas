@@ -1064,9 +1064,11 @@ type
 
       else if s is TResultAssignStmtNode then
       begin
+        // [Stage 57] Result := 'a'; 에서 함수 반환형이 string이면 char 리터럴을
+        // 문자열로 승격해야 한다 (fResultType이 함수 선언의 반환 타입을 들고 있다).
         ra:=TResultAssignStmtNode(s);
         if fResultLocal=nil then raise new Exception('Result는 함수 안에서만');
-        EmitExpr(aIL, ra.ValueExpr); aIL.Emit(OpCodes.Stloc, fResultLocal);
+        EmitValueForVType(aIL, ra.ValueExpr, fResultType); aIL.Emit(OpCodes.Stloc, fResultLocal);
       end
 
       else if s is TFieldAssignStmtNode then
@@ -1123,10 +1125,14 @@ type
         end
         else
         // self.fieldName := 식  (지역 필드) 또는 외부 상속 타입의 속성/필드 설정
+        // [Stage 57] self.field := 'a'; / 상속받은 외부 속성·필드 대입에서도 필드/속성/
+        // setter의 실제 CLR 타입이 string이면 char 리터럴을 문자열로 승격해야 한다.
+        // EmitArgForParamType이 이미 (paramType=typeof(string) and TCharLiteralNode) 규칙을
+        // 갖고 있으므로 그대로 재사용한다.
         if TryFindFieldBuilder(fCurClassName, fas.FieldName, fb) then
         begin
           aIL.Emit(OpCodes.Ldarg_0); // self
-          EmitExpr(aIL, fas.ValueExpr);
+          EmitArgForParamType(aIL, fas.ValueExpr, fb.FieldType);
           aIL.Emit(OpCodes.Stfld, fb);
         end
         else
@@ -1141,7 +1147,7 @@ type
             if setter=nil then
               raise new Exception('속성 "'+extType.FullName+'.'+fas.FieldName+'"에 setter가 없습니다 (읽기 전용).');
             aIL.Emit(OpCodes.Ldarg_0);
-            EmitExpr(aIL, fas.ValueExpr);
+            EmitArgForParamType(aIL, fas.ValueExpr, propInfo.PropertyType);
             aIL.Emit(OpCodes.Callvirt, setter);
           end
           else
@@ -1150,7 +1156,7 @@ type
             if extFld=nil then
               raise new Exception('외부 타입 "'+extType.FullName+'"에 필드/속성 "'+fas.FieldName+'"가 없습니다.');
             aIL.Emit(OpCodes.Ldarg_0);
-            EmitExpr(aIL, fas.ValueExpr);
+            EmitArgForParamType(aIL, fas.ValueExpr, extFld.FieldType);
             aIL.Emit(OpCodes.Stfld, extFld);
           end;
         end;
@@ -1195,11 +1201,20 @@ type
 
       else if s is TAssignStmtNode then
       begin
-        asg:=TAssignStmtNode(s); EmitExpr(aIL, asg.ValueExpr);
+        // [Stage 57] x := 'a'; 에서 x가 string 변수면, EmitExpr이 'a'를 문자 코드로
+        // 스택에 올리기 전에 목표 타입(vtString)을 먼저 확인해 Ldstr로 로드해야 한다.
+        // Stloc은 그대로 유지되므로, "어떤 값을 로드할지"만 EmitValueForVType으로 바꾼다.
+        asg:=TAssignStmtNode(s);
         if fLocalScope.Has(asg.VarName) then
-          aIL.Emit(OpCodes.Stloc, fLocalScope.GetLoc(asg.VarName))
+        begin
+          EmitValueForVType(aIL, asg.ValueExpr, fLocalScope.GetVType(asg.VarName));
+          aIL.Emit(OpCodes.Stloc, fLocalScope.GetLoc(asg.VarName));
+        end
         else if fGlobalScope.Has(asg.VarName) then
-          aIL.Emit(OpCodes.Stloc, fGlobalScope.GetLoc(asg.VarName))
+        begin
+          EmitValueForVType(aIL, asg.ValueExpr, fGlobalScope.GetVType(asg.VarName));
+          aIL.Emit(OpCodes.Stloc, fGlobalScope.GetLoc(asg.VarName));
+        end
         else raise new Exception('선언되지 않은 변수 "'+asg.VarName+'"');
       end
 
@@ -1431,7 +1446,12 @@ type
         else if fLocalScope.Has(aa.ArrName) then at2:=fLocalScope.GetVType(aa.ArrName);
         if fLocalScope.Has(aa.ArrName) then aIL.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(aa.ArrName))
         else aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(aa.ArrName));
-        EmitExpr(aIL, aa.Index); EmitExpr(aIL, aa.ValueExpr);
+        // [Stage 57] arr[i] := 'a'; 에서 arr가 문자열 배열이면 char 리터럴을 문자열로
+        // 승격해야 한다 — 안 그러면 정수(문자코드)가 그대로 Stelem_Ref로 들어가
+        // 힙 참조로 오인되어 GC/접근 시 크래시가 난다.
+        EmitExpr(aIL, aa.Index);
+        if at2=vtStrArray then EmitValueForVType(aIL, aa.ValueExpr, vtString)
+        else EmitExpr(aIL, aa.ValueExpr);
         if at2=vtStrArray then aIL.Emit(OpCodes.Stelem_Ref)
         else aIL.Emit(OpCodes.Stelem_I4);
       end
@@ -1897,6 +1917,20 @@ type
     // 이름 하나뿐이면(예: "new System.Threading.Thread(RunApp)") 그 이름을 호출하는 게
     // 아니라 델리게이트 인스턴스로 변환해서 넘긴다.
     //
+    // [Stage 57] EmitArgForParamType과 같은 문제를, 목표 타입이 CLR System.Type이 아니라
+    // TVarType(vtString 등)으로 추적되는 자리(지역/전역 변수 대입, Result 대입, 문자열
+    // 배열 원소 대입)에서도 겪는다. 매개변수는 EmitArgForParamType이 이미 처리하지만
+    // 그 함수는 System.Type을 받으므로, 여기서는 TVarType 버전을 별도로 둔다.
+    // 대입문 규칙: 목표가 vtString이고 값이 TCharLiteralNode('a' 같은 한 글자 리터럴로
+    // 오인식된 문자열 리터럴)면 Ldc_I4(문자코드) 대신 Ldstr(문자열)로 로드한다.
+    procedure EmitValueForVType(aIL: ILGenerator; valueExpr: TExprNode; targetVType: TVarType);
+    begin
+      if (targetVType=vtString) and (valueExpr is TCharLiteralNode) then
+        aIL.Emit(OpCodes.Ldstr, TCharLiteralNode(valueExpr).Value.ToString)
+      else
+        EmitExpr(aIL, valueExpr);
+    end;
+
     // [버그 수정] Lexer가 따옴표 안이 정확히 한 글자면 무조건 tkCharLiteral로 만들기
     // 때문에('a' 처럼), string 매개변수 자리에 한 글자짜리 문자열을 넘기면
     // TCharLiteralNode가 되어 EmitExpr이 문자 코드값을 32비트 정수로 스택에 올려버렸다.
@@ -1935,13 +1969,15 @@ type
     procedure EmitPropertyOrFieldSet(aIL: ILGenerator; targetType: System.Type; memberName: string; valueExpr: TExprNode);
     var pi: PropertyInfo; fi: System.Reflection.FieldInfo; setr: MethodInfo;
     begin
+      // [Stage 57] Button1.Text := 'a'; 같은 Qualifier.Field 대입 경로. 목표 속성/필드의
+      // 실제 CLR 타입을 이미 알고 있으므로 EmitArgForParamType으로 char→string 승격.
       pi:=targetType.GetProperty(memberName);
       if pi<>nil then
       begin
         setr:=pi.GetSetMethod;
         if setr=nil then
           raise new Exception('속성 "'+targetType.FullName+'.'+memberName+'"에 setter가 없습니다 (읽기 전용).');
-        EmitExpr(aIL, valueExpr);
+        EmitArgForParamType(aIL, valueExpr, pi.PropertyType);
         aIL.Emit(OpCodes.Callvirt, setr);
       end
       else
@@ -1949,7 +1985,7 @@ type
         fi:=targetType.GetField(memberName);
         if fi=nil then
           raise new Exception('타입 "'+targetType.FullName+'"에 필드/속성 "'+memberName+'"가 없습니다.');
-        EmitExpr(aIL, valueExpr);
+        EmitArgForParamType(aIL, valueExpr, fi.FieldType);
         aIL.Emit(OpCodes.Stfld, fi);
       end;
     end;
@@ -1959,11 +1995,12 @@ type
     procedure EmitStaticPropertyOrFieldSet(aIL: ILGenerator; targetType: System.Type; memberName: string; valueExpr: TExprNode);
     var pi2: PropertyInfo; fi2: System.Reflection.FieldInfo; setr2: MethodInfo;
     begin
+      // [Stage 57] System.Console.Title := 'a'; 같은 정적 속성/필드 대입 경로도 동일하게 처리.
       pi2:=targetType.GetProperty(memberName);
       if (pi2<>nil) and (pi2.GetSetMethod<>nil) then
       begin
         setr2:=pi2.GetSetMethod;
-        EmitExpr(aIL, valueExpr);
+        EmitArgForParamType(aIL, valueExpr, pi2.PropertyType);
         aIL.Emit(OpCodes.Call, setr2);
       end
       else
@@ -1971,7 +2008,7 @@ type
         fi2:=targetType.GetField(memberName);
         if fi2=nil then
           raise new Exception('타입 "'+targetType.FullName+'"에 정적 필드/속성 "'+memberName+'"가 없습니다 (또는 읽기 전용).');
-        EmitExpr(aIL, valueExpr);
+        EmitArgForParamType(aIL, valueExpr, fi2.FieldType);
         aIL.Emit(OpCodes.Stsfld, fi2);
       end;
     end;
