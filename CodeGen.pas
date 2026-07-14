@@ -31,6 +31,12 @@ type
     // 일반 static 함수/프로시저
     fMethods:     Dictionary<string, MethodBuilder>;
     fFuncReturnTypes: Dictionary<string, TVarType>; // [Stage 27] 최상위 함수명 → 반환타입 (InferType이 함수 호출식의 타입을 알 수 있도록)
+    // [버그 수정] MethodBuilder.GetParameters()는 소속 TypeBuilder가 CreateType되기 전에는
+    // NotSupportedException("Type has not been created.")을 던진다. 최상위 함수/프로시저는
+    // 전부 같은 모듈 타입 안에 있고, 그 타입은 모든 메서드 본문을 다 만든 뒤에야 CreateType되므로
+    // 코드 생성 도중(다른 함수 본문 안에서 호출식을 만들 때)에는 항상 "아직 안 만들어진" 상태다.
+    // 그래서 정의 시점에 이미 계산해 둔 매개변수 CLR 타입을 따로 보관해 뒀다가 그걸 쓴다.
+    fTopParamClrTypes: Dictionary<string, array of System.Type>; // 함수/프로시저명 → 매개변수 CLR 타입 배열
 
     // 클래스 관련
     fTypeBuilders: Dictionary<string, TypeBuilder>;  // 클래스명 → TypeBuilder
@@ -183,6 +189,39 @@ type
         if fClassParents.ContainsKey(c) then c:=fClassParents[c] else c:='';
       end;
       Result:=false;
+    end;
+
+    // [버그 수정] FindInstanceMethod/TryFindInstanceMethod가 돌려주는 MethodBuilder는
+    // 아직 CreateType되지 않은(우리가 만드는 중인) 타입 소속이라 .GetParameters()를 호출하면
+    // NotSupportedException("Type has not been created.")이 난다. 대신 메서드를 정의할 때
+    // 이미 계산해 둔 fMethodParamClrTypes를, FindInstanceMethod와 동일하게 상속 체인을
+    // 따라 올라가며 찾는다. 못 찾으면 nil을 돌려주고, 호출부는 그러면 그냥 EmitExpr로 폴백한다.
+    function FindInstanceMethodParamTypes(startClass, mname: string): array of System.Type;
+    var c: string;
+    begin
+      c:=startClass;
+      while c<>'' do
+      begin
+        if fMethodParamClrTypes.ContainsKey(c) and fMethodParamClrTypes[c].ContainsKey(mname) then
+        begin Result:=fMethodParamClrTypes[c][mname]; exit; end;
+        if fClassParents.ContainsKey(c) then c:=fClassParents[c] else c:='';
+      end;
+      Result:=nil;
+    end;
+
+    // 이미 알고 있는(또는 nil일 수 있는) 매개변수 CLR 타입 배열을 이용해 인자들을 순서대로
+    // 스택에 올린다. paramTypes가 nil이거나 길이가 모자라면 그 인자는 그냥 EmitExpr로 폴백한다
+    // (기존 동작과 동일하게 유지 — coercion은 "할 수 있을 때만" 보너스로 적용).
+    procedure EmitArgsCoerced(aIL: ILGenerator; args: List<TExprNode>; paramTypes: array of System.Type);
+    var _eacI: integer;
+    begin
+      for _eacI:=0 to args.Count-1 do
+      begin
+        if (paramTypes<>nil) and (_eacI<paramTypes.Length) then
+          EmitArgForParamType(aIL, args[_eacI], paramTypes[_eacI])
+        else
+          EmitExpr(aIL, args[_eacI]);
+      end;
     end;
 
     // 클래스 계층을 따라 올라가며 메서드의 선언된 반환 타입 탐색 (없으면 vtInteger)
@@ -450,12 +489,16 @@ type
       if fClassParents.ContainsKey(fCurClassName) then startCls3:=fClassParents[fCurClassName];
 
       aIL.Emit(OpCodes.Ldarg_0); // self
-      foreach ae3 in args do EmitExpr(aIL, ae3);
 
       if (startCls3<>'') and fCtorBuilders.ContainsKey(startCls3) then
       begin
         // [Stage 47] 로컬 부모 클래스도 이제 매개변수 있는 생성자를 지원한다.
-        // 인자는 위에서 이미 스택에 올려뒀으므로(EmitExpr(aIL, ae3)) 바로 Call.
+        // [버그 수정] ConstructorBuilder.GetParameters()는 CreateType 전에는 예외를 던지므로
+        // 정의 시점에 미리 계산해 둔 fCtorParamClrTypes를 대신 사용한다.
+        var _parentCtorParams3: array of System.Type;
+        if fCtorParamClrTypes.ContainsKey(startCls3) then _parentCtorParams3:=fCtorParamClrTypes[startCls3]
+        else _parentCtorParams3:=nil;
+        EmitArgsCoerced(aIL, args, _parentCtorParams3);
         aIL.Emit(OpCodes.Call, fCtorBuilders[startCls3]);
       end
       else
@@ -475,6 +518,9 @@ type
           if parentCtor3=nil then
             raise new Exception('외부 조상 타입 "'+extType3.FullName+'"에 인자 '+args.Count.ToString+'개짜리 public 생성자가 없습니다.');
         end;
+        var _parentCtorParams3b:=parentCtor3.GetParameters;
+        for var _pcAi3b:=0 to args.Count-1 do
+          EmitArgForParamType(aIL, args[_pcAi3b], _parentCtorParams3b[_pcAi3b].ParameterType);
         aIL.Emit(OpCodes.Call, parentCtor3);
       end;
     end;
@@ -498,10 +544,10 @@ type
       if startCls<>'' then found:=TryFindInstanceMethod(startCls, mname, imb2);
 
       aIL.Emit(OpCodes.Ldarg_0); // self
-      foreach ae2 in args do EmitExpr(aIL, ae2);
 
       if found then
       begin
+        EmitArgsCoerced(aIL, args, FindInstanceMethodParamTypes(startCls, mname));
         aIL.Emit(OpCodes.Call, imb2); // 비가상 호출 — 부모의 실제 구현을 직접 호출
         if keepReturnValue then
         begin
@@ -518,6 +564,9 @@ type
         emi2:=ResolveMethodByArity(extType2, mname, args, false);
         if emi2=nil then
           raise new Exception('외부 조상 타입 "'+extType2.FullName+'"에 메서드 "'+mname+'"가 없습니다 (인자 '+args.Count.ToString+'개).');
+        var _emi2Params:=emi2.GetParameters;
+        for var _emi2Ai:=0 to args.Count-1 do
+          EmitArgForParamType(aIL, args[_emi2Ai], _emi2Params[_emi2Ai].ParameterType);
         aIL.Emit(OpCodes.Call, emi2); // 비가상 호출
         if keepReturnValue then
         begin
@@ -654,8 +703,11 @@ type
           if fAbstractMethods.ContainsKey(neo.ClassName) and (fAbstractMethods[neo.ClassName].Count>0) then
             raise new Exception('"'+neo.ClassName+'"은(는) abstract 메서드를 갖고 있어 인스턴스를 생성할 수 없습니다 (abstract 클래스).');
           // [Stage 47] 로컬(우리 컴파일러가 만든) 클래스도 매개변수 있는 생성자를 지원한다.
-          foreach ae in neo.Args do EmitExpr(aIL, ae);
           ctor:=fCtorBuilders[neo.ClassName];
+          var _ctorParamsLocal: array of System.Type;
+          if fCtorParamClrTypes.ContainsKey(neo.ClassName) then _ctorParamsLocal:=fCtorParamClrTypes[neo.ClassName]
+          else _ctorParamsLocal:=nil;
+          EmitArgsCoerced(aIL, neo.Args, _ctorParamsLocal);
           aIL.Emit(OpCodes.Newobj, ctor);
         end;
       end
@@ -679,7 +731,6 @@ type
             _qType2:=ResolveExternalType(mc.ObjCastType);
             aIL.Emit(OpCodes.Castclass, _qType2);
           end;
-          foreach ae in mc.Args do EmitExpr(aIL, ae);
           var _pi6:=_qType2.GetProperty(mc.MethodName);
           if (mc.Args.Count=0) and (_pi6<>nil) and (_pi6.GetGetMethod<>nil) then
             aIL.Emit(OpCodes.Callvirt, _pi6.GetGetMethod)
@@ -688,6 +739,9 @@ type
             var _emi6:=ResolveMethodByArity(_qType2, mc.MethodName, mc.Args, false);
             if _emi6=nil then
               raise new Exception('타입 "'+_qType2.FullName+'"에 메서드 "'+mc.MethodName+'"가 없습니다 (인자 '+mc.Args.Count.ToString+'개).');
+            var _emi6Params:=_emi6.GetParameters;
+            for var _emi6Ai:=0 to mc.Args.Count-1 do
+              EmitArgForParamType(aIL, mc.Args[_emi6Ai], _emi6Params[_emi6Ai].ParameterType);
             aIL.Emit(OpCodes.Callvirt, _emi6);
           end;
         end
@@ -736,16 +790,19 @@ type
           end
           else
           begin
-            foreach ae in mc.Args do EmitExpr(aIL, ae);
             // 인터페이스 타입 변수면 인터페이스 메서드로, 아니면 클래스 상속 체인에서 탐색
             if vtVar=vtInterface then
             begin
               var imi:=FindInterfaceMethod(cn, mc.MethodName);
+              var _imiParams:=imi.GetParameters;
+              for var _imiAi:=0 to mc.Args.Count-1 do
+                EmitArgForParamType(aIL, mc.Args[_imiAi], _imiParams[_imiAi].ParameterType);
               aIL.Emit(OpCodes.Callvirt, imi);
             end
             else
             begin
               imb:=FindInstanceMethod(cn, mc.MethodName);
+              EmitArgsCoerced(aIL, mc.Args, FindInstanceMethodParamTypes(cn, mc.MethodName));
               // virtual 메서드이므로 Callvirt 사용 (다형성 대비)
               aIL.Emit(OpCodes.Callvirt, imb);
             end;
@@ -762,7 +819,6 @@ type
             _qType:=ResolveExternalType(mc.ObjCastType);
             aIL.Emit(OpCodes.Castclass, _qType);
           end;
-          foreach ae in mc.Args do EmitExpr(aIL, ae);
           var _pi5:=_qType.GetProperty(mc.MethodName);
           if (mc.Args.Count=0) and (_pi5<>nil) and (_pi5.GetGetMethod<>nil) then
             aIL.Emit(OpCodes.Callvirt, _pi5.GetGetMethod)
@@ -771,6 +827,9 @@ type
             var _emi5:=ResolveMethodByArity(_qType, mc.MethodName, mc.Args, false);
             if _emi5=nil then
               raise new Exception('타입 "'+_qType.FullName+'"에 메서드 "'+mc.MethodName+'"가 없습니다 (인자 '+mc.Args.Count.ToString+'개).');
+            var _emi5Params:=_emi5.GetParameters;
+            for var _emi5Ai:=0 to mc.Args.Count-1 do
+              EmitArgForParamType(aIL, mc.Args[_emi5Ai], _emi5Params[_emi5Ai].ParameterType);
             aIL.Emit(OpCodes.Callvirt, _emi5);
           end;
         end
@@ -864,7 +923,10 @@ type
         if not fMethods.ContainsKey(fc.FuncName) then
           raise new Exception('알 수 없는 함수 "'+fc.FuncName+'"');
         mb:=fMethods[fc.FuncName];
-        foreach ae in fc.Args do EmitExpr(aIL, ae);
+        var _fcParams: array of System.Type;
+        if fTopParamClrTypes.ContainsKey(fc.FuncName) then _fcParams:=fTopParamClrTypes[fc.FuncName]
+        else _fcParams:=nil;
+        EmitArgsCoerced(aIL, fc.Args, _fcParams);
         aIL.Emit(OpCodes.Call, mb);
       end
 
@@ -1148,9 +1210,9 @@ type
         begin
           // 암시적 self 호출: Show; Close(); 등 — 지역 메서드 우선, 없으면 외부 상속 타입에서 탐색
           aIL.Emit(OpCodes.Ldarg_0); // self
-          foreach ae in mcs.Args do EmitExpr(aIL, ae);
           if TryFindInstanceMethod(fCurClassName, mcs.MethodName, imb) then
           begin
+            EmitArgsCoerced(aIL, mcs.Args, FindInstanceMethodParamTypes(fCurClassName, mcs.MethodName));
             aIL.Emit(OpCodes.Callvirt, imb);
             if imb.ReturnType<>typeof(System.Void) then aIL.Emit(OpCodes.Pop);
           end
@@ -1162,6 +1224,9 @@ type
             emi:=ResolveMethodByArity(extType, mcs.MethodName, mcs.Args, false);
             if emi=nil then
               raise new Exception('외부 타입 "'+extType.FullName+'"에 메서드 "'+mcs.MethodName+'"가 없습니다 (인자 '+mcs.Args.Count.ToString+'개).');
+            var _emiParams0:=emi.GetParameters;
+            for var _emiAi0:=0 to mcs.Args.Count-1 do
+              EmitArgForParamType(aIL, mcs.Args[_emiAi0], _emiParams0[_emiAi0].ParameterType);
             aIL.Emit(OpCodes.Callvirt, emi);
             if emi.ReturnType<>typeof(System.Void) then aIL.Emit(OpCodes.Pop);
           end;
@@ -1179,7 +1244,6 @@ type
             qTargetType:=ResolveExternalType(mcs.ObjCastType);
             aIL.Emit(OpCodes.Castclass, qTargetType);
           end;
-          foreach ae in mcs.Args do EmitExpr(aIL, ae);
           var _getP2:=qTargetType.GetProperty(mcs.MethodName);
           if (mcs.Args.Count=0) and (_getP2<>nil) and (_getP2.GetGetMethod<>nil) then
           begin
@@ -1191,6 +1255,9 @@ type
             emi:=ResolveMethodByArity(qTargetType, mcs.MethodName, mcs.Args, false);
             if emi=nil then
               raise new Exception('타입 "'+qTargetType.FullName+'"에 메서드 "'+mcs.MethodName+'"가 없습니다 (인자 '+mcs.Args.Count.ToString+'개).');
+            var _emiParams2:=emi.GetParameters;
+            for var _emiAi2:=0 to mcs.Args.Count-1 do
+              EmitArgForParamType(aIL, mcs.Args[_emiAi2], _emiParams2[_emiAi2].ParameterType);
             aIL.Emit(OpCodes.Callvirt, emi);
             if emi.ReturnType<>typeof(System.Void) then aIL.Emit(OpCodes.Pop);
           end;
@@ -1202,7 +1269,6 @@ type
           vtVar:=GetVarType(mcs.ObjName);
           if fLocalScope.Has(mcs.ObjName) then aIL.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(mcs.ObjName))
           else aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(mcs.ObjName));
-          foreach ae in mcs.Args do EmitExpr(aIL, ae);
           if cn='' then raise new Exception('알 수 없는 메서드 "'+cn+'.'+mcs.MethodName+'"');
           // 인터페이스 타입 변수면 인터페이스 메서드로, 아니면 클래스 상속 체인에서 탐색
           // (Stage 10에서는 fInstanceMethods[cn] 직접 조회 + Call만 사용해 상속받은
@@ -1210,12 +1276,16 @@ type
           if vtVar=vtInterface then
           begin
             var imi:=FindInterfaceMethod(cn, mcs.MethodName);
+            var _imiParams2:=imi.GetParameters;
+            for var _imiAi2:=0 to mcs.Args.Count-1 do
+              EmitArgForParamType(aIL, mcs.Args[_imiAi2], _imiParams2[_imiAi2].ParameterType);
             aIL.Emit(OpCodes.Callvirt, imi);
             if imi.ReturnType<>typeof(System.Void) then aIL.Emit(OpCodes.Pop);
           end
           else
           begin
             imb:=FindInstanceMethod(cn, mcs.MethodName);
+            EmitArgsCoerced(aIL, mcs.Args, FindInstanceMethodParamTypes(cn, mcs.MethodName));
             aIL.Emit(OpCodes.Callvirt, imb);
             // void 메서드가 아닌 경우 반환값 버리기
             if imb.ReturnType<>typeof(System.Void) then
@@ -1234,7 +1304,6 @@ type
             qTargetType:=ResolveExternalType(mcs.ObjCastType);
             aIL.Emit(OpCodes.Castclass, qTargetType);
           end;
-          foreach ae in mcs.Args do EmitExpr(aIL, ae);
           var _getP:=qTargetType.GetProperty(mcs.MethodName);
           if (mcs.Args.Count=0) and (_getP<>nil) and (_getP.GetGetMethod<>nil) then
           begin
@@ -1246,6 +1315,9 @@ type
             emi:=ResolveMethodByArity(qTargetType, mcs.MethodName, mcs.Args, false);
             if emi=nil then
               raise new Exception('타입 "'+qTargetType.FullName+'"에 메서드 "'+mcs.MethodName+'"가 없습니다 (인자 '+mcs.Args.Count.ToString+'개).');
+            var _emiParams3:=emi.GetParameters;
+            for var _emiAi3:=0 to mcs.Args.Count-1 do
+              EmitArgForParamType(aIL, mcs.Args[_emiAi3], _emiParams3[_emiAi3].ParameterType);
             aIL.Emit(OpCodes.Callvirt, emi);
             if emi.ReturnType<>typeof(System.Void) then aIL.Emit(OpCodes.Pop);
           end;
@@ -1256,10 +1328,12 @@ type
           // 외부 타입의 정적(static) 멤버 호출로 간주한다. 정적 호출은 인스턴스를
           // 먼저 로드하지 않고 인자만 쌓은 뒤 Call(비가상)로 호출한다.
           extType:=ResolveExternalType(mcs.ObjName);
-          foreach ae in mcs.Args do EmitExpr(aIL, ae);
           emi:=ResolveMethodByArity(extType, mcs.MethodName, mcs.Args, true);
           if emi=nil then
             raise new Exception('외부 타입 "'+extType.FullName+'"에 정적 메서드 "'+mcs.MethodName+'"가 없습니다 (인자 '+mcs.Args.Count.ToString+'개).');
+          var _emiParams4:=emi.GetParameters;
+          for var _emiAi4:=0 to mcs.Args.Count-1 do
+            EmitArgForParamType(aIL, mcs.Args[_emiAi4], _emiParams4[_emiAi4].ParameterType);
           aIL.Emit(OpCodes.Call, emi);
           if emi.ReturnType<>typeof(System.Void) then aIL.Emit(OpCodes.Pop);
         end;
@@ -1393,7 +1467,10 @@ type
         if not fMethods.ContainsKey(pc.ProcName) then
           raise new Exception('알 수 없는 프로시저 "'+pc.ProcName+'"');
         mb:=fMethods[pc.ProcName];
-        foreach ae in pc.Args do EmitExpr(aIL, ae);
+        var _pcParams: array of System.Type;
+        if fTopParamClrTypes.ContainsKey(pc.ProcName) then _pcParams:=fTopParamClrTypes[pc.ProcName]
+        else _pcParams:=nil;
+        EmitArgsCoerced(aIL, pc.Args, _pcParams);
         aIL.Emit(OpCodes.Call, mb);
       end
 
@@ -1764,10 +1841,22 @@ type
     // [Stage 48] 외부 생성자/메서드에 인자를 하나씩 넣을 때, 기대하는 매개변수 타입이
     // 델리게이트(예: System.Threading.ThreadStart)이고 실제 인자가 최상위 프로시저
     // 이름 하나뿐이면(예: "new System.Threading.Thread(RunApp)") 그 이름을 호출하는 게
-    // 아니라 델리게이트 인스턴스로 변환해서 넘긴다. 그 외에는 그냥 평범하게 EmitExpr.
+    // 아니라 델리게이트 인스턴스로 변환해서 넘긴다.
+    //
+    // [버그 수정] Lexer가 따옴표 안이 정확히 한 글자면 무조건 tkCharLiteral로 만들기
+    // 때문에('a' 처럼), string 매개변수 자리에 한 글자짜리 문자열을 넘기면
+    // TCharLiteralNode가 되어 EmitExpr이 문자 코드값을 32비트 정수로 스택에 올려버렸다.
+    // 그 정수값이 그대로 string 참조 자리에 들어가면서(예: ShowBoth<string>('a','b'))
+    // 호출된 쪽에서 그 값을 문자열 객체 포인터로 잘못 역참조해 NullReferenceException이
+    // 발생했다. 여기서 기대 타입이 string이고 인자가 char 리터럴이면 문자열로 승격한다.
     procedure EmitArgForParamType(aIL: ILGenerator; argExpr: TExprNode; paramType: System.Type);
     var _vr48: TVarRefNode; _delCtor48: ConstructorInfo;
     begin
+      if (paramType=typeof(string)) and (argExpr is TCharLiteralNode) then
+      begin
+        aIL.Emit(OpCodes.Ldstr, TCharLiteralNode(argExpr).Value.ToString);
+        exit;
+      end;
       if (argExpr is TVarRefNode) and typeof(System.Delegate).IsAssignableFrom(paramType) then
       begin
         _vr48:=TVarRefNode(argExpr);
@@ -2207,7 +2296,7 @@ type
       retClrType:=VTC(d.ReturnType, '');
       mb:=tb.DefineMethod(d.Name, MethodAttributes.Public or MethodAttributes.Static,
         retClrType, pt);
-      fMethods[d.Name]:=mb; fFuncReturnTypes[d.Name]:=d.ReturnType; il:=mb.GetILGenerator;
+      fMethods[d.Name]:=mb; fTopParamClrTypes[d.Name]:=pt; fFuncReturnTypes[d.Name]:=d.ReturnType; il:=mb.GetILGenerator;
       savedLocalScope:=fLocalScope; svR:=fResultLocal; svRT:=fResultType;
       fLocalScope:=new TScope('local(func)', fGlobalScope);
       fResultType:=d.ReturnType; fResultLocal:=il.DeclareLocal(retClrType);
@@ -2262,7 +2351,7 @@ type
       for i:=0 to d.Parameters.Count-1 do pt[i]:=ResolveTopParamClrType(d.Parameters[i]);
       mb:=tb.DefineMethod(d.Name, MethodAttributes.Public or MethodAttributes.Static,
         typeof(System.Void), pt);
-      fMethods[d.Name]:=mb; il:=mb.GetILGenerator;
+      fMethods[d.Name]:=mb; fTopParamClrTypes[d.Name]:=pt; il:=mb.GetILGenerator;
       savedLocalScope:=fLocalScope; svR:=fResultLocal; svRT:=fResultType;
       fLocalScope:=new TScope('local(proc)', fGlobalScope);
       fResultLocal:=nil;
@@ -2313,6 +2402,7 @@ type
       fGlobalScope:=new TScope('global', nil);
       fLocalScope:=new TScope('local', fGlobalScope);
       fMethods:=new Dictionary<string, MethodBuilder>;
+      fTopParamClrTypes:=new Dictionary<string, array of System.Type>;
       fFuncReturnTypes:=new Dictionary<string, TVarType>;
       fTypeBuilders:=new Dictionary<string, TypeBuilder>;
       fBuiltTypes:=new Dictionary<string, System.Type>;
