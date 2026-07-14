@@ -1125,16 +1125,27 @@ type
       begin
         fPos:=fPos+1;
         var vn:=Expect(tkIdent).Text;
-        Expect(tkAssign);
-        var seE:=ParseExpr;
-        var isDown:=false;
-        if Cur.Kind=tkTo then fPos:=fPos+1
-        else if Cur.Kind=tkDownto then begin isDown:=true; fPos:=fPos+1; end
-        else raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': for문에는 to 또는 downto가 와야 합니다');
-        var eeE:=ParseExpr;
-        Expect(tkDo);
-        var forBody:=ParseStatement;
-        Result:=new TForStmtNode(vn, seE, eeE, isDown, forBody);
+        if Cur.Kind=tkIn then // [Stage 54] for VarName in CollExpr do Body
+        begin
+          fPos:=fPos+1;
+          var collE:=ParseExpr;
+          Expect(tkDo);
+          var forInBody:=ParseStatement;
+          Result:=new TForInStmtNode(vn, collE, forInBody);
+        end
+        else
+        begin
+          Expect(tkAssign);
+          var seE:=ParseExpr;
+          var isDown:=false;
+          if Cur.Kind=tkTo then fPos:=fPos+1
+          else if Cur.Kind=tkDownto then begin isDown:=true; fPos:=fPos+1; end
+          else raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': for문에는 to 또는 downto가 와야 합니다');
+          var eeE:=ParseExpr;
+          Expect(tkDo);
+          var forBody:=ParseStatement;
+          Result:=new TForStmtNode(vn, seE, eeE, isDown, forBody);
+        end;
       end
 
       else if Cur.Kind=tkTry then

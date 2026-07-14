@@ -18,7 +18,7 @@ type
     tkVar, tkInteger, tkStringType, tkArray, tkOf,
     tkBegin, tkEnd, tkWriteln,
     tkIf, tkThen, tkElse, tkWhile, tkDo, tkMod,
-    tkFor, tkTo, tkDownto,
+    tkFor, tkTo, tkDownto, tkIn, // [Stage 54] for-in 순회 구문의 'in' 키워드
     tkAnd, tkOr, tkNot, tkBoolean, tkTrue, tkFalse,
     tkTry, tkExcept, tkFinally, tkRaise, tkOn,
     tkFunction, tkProcedure, tkResult,
@@ -156,6 +156,7 @@ type
       else if lw='for'       then Result:=new TToken(tkFor,       w,sl,sc)
       else if lw='to'        then Result:=new TToken(tkTo,        w,sl,sc)
       else if lw='downto'    then Result:=new TToken(tkDownto,    w,sl,sc)
+      else if lw='in'        then Result:=new TToken(tkIn,        w,sl,sc) // [Stage 54]
       else if lw='and'       then Result:=new TToken(tkAnd,       w,sl,sc)
       else if lw='or'        then Result:=new TToken(tkOr,        w,sl,sc)
       else if lw='not'       then Result:=new TToken(tkNot,       w,sl,sc)

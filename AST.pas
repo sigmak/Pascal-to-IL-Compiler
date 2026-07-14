@@ -226,6 +226,15 @@ type
     begin VarName:=v; StartExpr:=s; EndExpr:=e; IsDownto:=dn; Body:=b; end;
   end;
 
+  // [Stage 54] for VarName in CollExpr do Body — 배열/컬렉션 순회.
+  // CollExpr은 IEnumerable을 구현하는 값이면 무엇이든 될 수 있다(배열, List<T> 등 외부 컬렉션).
+  // CodeGen에서 GetEnumerator/MoveNext/Current 패턴으로 desugar된다.
+  TForInStmtNode = class(TStmtNode)
+  public VarName: string; CollExpr: TExprNode; Body: TStmtNode;
+    constructor Create(v: string; c: TExprNode; b: TStmtNode);
+    begin VarName:=v; CollExpr:=c; Body:=b; end;
+  end;
+
   TProcCallStmtNode = class(TStmtNode)
   public ProcName: string; Args: List<TExprNode>;
     constructor Create(n: string); begin ProcName:=n; Args:=new List<TExprNode>; end;

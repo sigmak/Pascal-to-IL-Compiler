@@ -1511,6 +1511,60 @@ type
         aIL.Emit(OpCodes.Brtrue, forBdL);
       end
 
+      else if s is TForInStmtNode then
+      begin
+        // [Stage 54] for VarName in CollExpr do Body
+        // "중간" 단계: 배열(T[])이든 List<T> 같은 외부 컬렉션이든, .NET IEnumerable을
+        // 구현하는 값이면 무엇이든 동일한 방식으로 순회한다 — 원소마다 특수 케이스를
+        // 나누는 대신, System.Collections.IEnumerable / IEnumerator의 (비제네릭)
+        // GetEnumerator/MoveNext/Current 3종 멤버만으로 desugar한다:
+        //
+        //   var _e := CollExpr.GetEnumerator();
+        //   goto ckL;
+        //   bdL: VarName := (T)_e.Current; Body;
+        //   ckL: if _e.MoveNext() then goto bdL;
+        //
+        // Current가 object를 돌려주므로 값 타입(정수 등)은 Unbox_Any, 참조 타입은
+        // Castclass로 VarName의 선언된 타입으로 되돌린다. 배열도 CLR에서는 참조
+        // 타입(IEnumerable 구현체)이라 별도 분기 없이 이 경로를 그대로 탄다.
+        // (배열의 값 타입 원소를 Current로 꺼낼 때 매 반복 boxing이 발생하는 점은
+        // "중간" 단계의 알려진 트레이드오프 — 다음 단계에서 IEnumerator<T> 특수화로
+        // 제거할 수 있다.)
+        var fis:=TForInStmtNode(s);
+        var forInVarLoc: LocalBuilder;
+        if fLocalScope.Has(fis.VarName) then forInVarLoc:=fLocalScope.GetLoc(fis.VarName)
+        else if fGlobalScope.Has(fis.VarName) then forInVarLoc:=fGlobalScope.GetLoc(fis.VarName)
+        else raise new Exception('for-in 변수 선언 안 됨: '+fis.VarName);
+
+        var forInVarClrType:=VTC(GetVarType(fis.VarName), GetVarClassName(fis.VarName));
+
+        EmitExpr(aIL, fis.CollExpr); // 컬렉션 참조를 스택에 올린다
+        var getEnumMI:=typeof(System.Collections.IEnumerable).GetMethod('GetEnumerator');
+        aIL.Emit(OpCodes.Callvirt, getEnumMI);
+        var forInEnumLoc:=aIL.DeclareLocal(typeof(System.Collections.IEnumerator));
+        aIL.Emit(OpCodes.Stloc, forInEnumLoc);
+
+        var forInCkL:=aIL.DefineLabel; var forInBdL:=aIL.DefineLabel;
+        aIL.Emit(OpCodes.Br, forInCkL);
+        aIL.MarkLabel(forInBdL);
+
+        // VarName := (T)_e.Current;
+        aIL.Emit(OpCodes.Ldloc, forInEnumLoc);
+        var getCurMI:=typeof(System.Collections.IEnumerator).GetProperty('Current').GetGetMethod;
+        aIL.Emit(OpCodes.Callvirt, getCurMI);
+        if forInVarClrType.IsValueType then aIL.Emit(OpCodes.Unbox_Any, forInVarClrType)
+        else aIL.Emit(OpCodes.Castclass, forInVarClrType);
+        aIL.Emit(OpCodes.Stloc, forInVarLoc);
+
+        EmitStatement(aIL, fis.Body);
+
+        aIL.MarkLabel(forInCkL);
+        aIL.Emit(OpCodes.Ldloc, forInEnumLoc);
+        var moveNextMI:=typeof(System.Collections.IEnumerator).GetMethod('MoveNext');
+        aIL.Emit(OpCodes.Callvirt, moveNextMI);
+        aIL.Emit(OpCodes.Brtrue, forInBdL);
+      end
+
       else if s is TTryStmtNode then
       begin
         var ts2:=TTryStmtNode(s);
