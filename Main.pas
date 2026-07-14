@@ -21,7 +21,8 @@ uses
 
 const
   DefaultExampleDir = 'Examples';
-  DefaultExampleFile = 'Test_stage54.pas';
+  DefaultExampleFile = 'Units\Entry.pas'; // stage54  Examples\Untis\ 폴더에 StringUtils.pas, MathUtils.pas, Entry.pas 이렇게 3개 가 있음. 
+  //DefaultExampleFile = 'Test_stage54.pas';
   //DefaultExampleFile = 'Test_stage53.pas';
   //DefaultExampleFile = 'Test_stage52.pas'; // 오류 4가지 표시되면 정상임.
   //DefaultExampleFile = 'Test_stage51.pas';
@@ -194,6 +195,113 @@ begin
   Writeln('=====================================================');
 end;
 
+// ------------------------------------------------------------
+// [Stage 55] unit/멀티파일: 파일탐색 + 의존성 정렬
+// ------------------------------------------------------------
+// 지금 컴파일러의 Parser는 program의 uses 절 이름을 파싱만 하고 버린다(Parser.pas 주석 참고) —
+// 즉 uses에 적힌 이름이 실제로 로컬 .pas 유닛 파일인지, System.* 같은 프레임워크
+// 네임스페이스인지는 여태 구분한 적이 없다. 이 단계는 그 구분을 처음 도입한다:
+// 이름이 "<이름>.pas" 파일로 실제 존재하면 로컬 유닛(의존성)으로, 없으면 지금까지처럼
+// 프레임워크 네임스페이스로 취급해 그냥 무시한다.
+//
+// 범위는 "탐색 + 순서 계산"까지다. 찾아낸 여러 파일의 선언을 하나의 AST로 합쳐
+// 실제로 함께 컴파일하는 것(Parser/CodeGen이 여러 TProgramNode를 병합하는 것)은
+// 다음 단계 과제로 남겨둔다 — 지금은 순서를 계산해 화면에 보여주는 것까지만 한다.
+
+// entry 소스 텍스트에서 최초의 uses 절 하나만 뽑아 이름 목록으로 돌려준다.
+// Parser.ParseProgram이 인식하는 문법과 동일: uses Ident(.Ident)*, Ident(.Ident)*, ... ;
+// 점(.)이 포함된 이름(System.Windows.Forms 등)은 프레임워크 네임스페이스이므로
+// 첫 세그먼트만 후보로 남긴다 — 그래도 파일탐색에서 못 찾으면 어차피 무시된다.
+function ExtractUsesNames(sourceCode: string): List<string>;
+var
+  m: System.Text.RegularExpressions.Match;
+  raw, nm: string; parts: array of string; p: string;
+begin
+  Result := new List<string>;
+  m := System.Text.RegularExpressions.Regex.Match(sourceCode,
+    '\b(program|library)\s+\w+\s*;\s*uses\s+(.*?);',
+    System.Text.RegularExpressions.RegexOptions.Singleline);
+  if not m.Success then exit;
+  raw := m.Groups[2].Value;
+  parts := raw.Split(',');
+  foreach p in parts do
+  begin
+    nm := p.Trim;
+    if nm = '' then continue;
+    if nm.Contains('.') then nm := nm.Substring(0, nm.IndexOf('.'));
+    if not Result.Contains(nm) then Result.Add(nm);
+  end;
+end;
+
+// 유닛 이름 → 실제 파일 경로. searchDirs를 순서대로 뒤져 "<이름>.pas"가 있으면 그 경로,
+// 없으면 '' (파일로 못 찾으면 에러가 아니라 "프레임워크 이름이겠거니" 하고 조용히 넘어간다).
+function ResolveUnitFile(unitName: string; searchDirs: List<string>): string;
+var dir, candidate: string;
+begin
+  Result := '';
+  foreach dir in searchDirs do
+  begin
+    candidate := System.IO.Path.Combine(dir, unitName + '.pas');
+    if System.IO.File.Exists(candidate) then begin Result := candidate; exit; end;
+  end;
+end;
+
+// DiscoverCompileOrder의 재귀 방문자. visiting/visited/order/pathStack은 모두 참조 타입
+// 컬렉션이라 재귀 호출 사이에 그대로 누적된다(var 매개변수 없이도 공유됨).
+// 위상 정렬: 후위 순회로 order에 추가하므로 "의존하는 파일이 항상 의존 대상보다 뒤에" 온다.
+procedure VisitUnitForOrder(filePath: string; searchDirs: List<string>;
+  visiting, visited: HashSet<string>; order, pathStack: List<string>);
+var
+  key, src, depName, depPath: string;
+  deps: List<string>;
+begin
+  key := System.IO.Path.GetFullPath(filePath);
+  if visited.Contains(key) then exit;
+
+  if visiting.Contains(key) then
+  begin
+    pathStack.Add(filePath);
+    var cycleNames := new List<string>;
+    var ci: integer;
+    for ci := 0 to pathStack.Count - 1 do
+      cycleNames.Add(System.IO.Path.GetFileName(pathStack[ci]));
+    raise new Exception('유닛 순환 참조 발견: ' + string.Join(' -> ', cycleNames));
+  end;
+
+  visiting.Add(key);
+  pathStack.Add(filePath);
+
+  src := System.IO.File.ReadAllText(filePath, Encoding.UTF8);
+  deps := ExtractUsesNames(src);
+  foreach depName in deps do
+  begin
+    depPath := ResolveUnitFile(depName, searchDirs);
+    if depPath <> '' then
+      VisitUnitForOrder(depPath, searchDirs, visiting, visited, order, pathStack);
+  end;
+
+  pathStack.RemoveAt(pathStack.Count - 1);
+  visiting.Remove(key);
+  visited.Add(key);
+  order.Add(filePath);
+end;
+
+// entryFile부터 시작해 uses로 연결된 로컬 유닛 파일들을 재귀적으로 찾아내고,
+// 의존성이 먼저 오도록 위상 정렬한 컴파일 순서를 돌려준다(entryFile이 항상 마지막).
+// 순환 참조가 있으면 예외를 던진다.
+function DiscoverCompileOrder(entryFile: string; searchDirs: List<string>): List<string>;
+var
+  visiting, visited: HashSet<string>;
+  order, pathStack: List<string>;
+begin
+  visiting := new HashSet<string>;
+  visited := new HashSet<string>;
+  order := new List<string>;
+  pathStack := new List<string>;
+  VisitUnitForOrder(entryFile, searchDirs, visiting, visited, order, pathStack);
+  Result := order;
+end;
+
 var
   inputPath, sourceCode, outputName: string;
   lexer: TLexer; tokens: List<TToken>;
@@ -221,6 +329,37 @@ begin
     Writeln;
 
     ok := true;
+
+    // [Stage 55] 유닛 파일탐색 + 의존성 정렬. entry 파일 디렉터리, 그 아래 Examples\,
+    // 그 아래 Units\ 를 검색 경로로 쓴다. 실패해도(순환 참조 등) 이후 단계는 막지 않고
+    // 진단만 보여준다 — 아직 실제 컴파일 파이프라인은 entry 파일 하나만 사용하기 때문.
+    var unitSearchDirs := new List<string>;
+    var inputDir := System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(inputPath));
+    unitSearchDirs.Add(inputDir);
+    var examplesDir := System.IO.Path.Combine(inputDir, DefaultExampleDir);
+    if System.IO.Directory.Exists(examplesDir) then unitSearchDirs.Add(examplesDir);
+    var unitsDir := System.IO.Path.Combine(inputDir, 'Units');
+    if System.IO.Directory.Exists(unitsDir) then unitSearchDirs.Add(unitsDir);
+
+    try
+      var compileOrder := DiscoverCompileOrder(inputPath, unitSearchDirs);
+      if compileOrder.Count > 1 then
+      begin
+        Writeln('[유닛탐색] 의존성 ' + (compileOrder.Count - 1).ToString + '개 파일 발견 — 컴파일 순서(의존성 먼저):');
+        for var oi := 0 to compileOrder.Count - 1 do
+          Writeln('    ' + (oi + 1).ToString + '. ' + System.IO.Path.GetFileName(compileOrder[oi]));
+        Writeln('  (참고: 이번 단계는 순서 계산까지 — 실제 다중 파일 병합 컴파일은 다음 단계에서 연결됩니다)');
+      end
+      else
+        Writeln('[유닛탐색] 로컬 유닛 의존성 없음 — 단일 파일 컴파일');
+      Writeln;
+    except
+      on E: Exception do
+      begin
+        Writeln('[유닛탐색] 실패: ' + E.Message);
+        Writeln;
+      end;
+    end;
 
     // [Stage 33] 단계별로 try/except를 분리해 어느 단계에서 실패했는지 항상 알 수 있게 한다.
     if ok then
