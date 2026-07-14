@@ -1146,8 +1146,7 @@ type
       else if Cur.Kind=tkBegin then
       begin
         fPos:=fPos+1; comp:=new TCompoundStmtNode;
-        while Cur.Kind<>tkEnd do
-        begin comp.Statements.Add(ParseStatement); if Cur.Kind=tkSemicolon then fPos:=fPos+1; end;
+        ParseStatementsUntilEnd(comp.Statements); // [Stage 58] panic-mode 오류 복구
         Expect(tkEnd); Result:=comp;
       end
 
@@ -1197,11 +1196,24 @@ type
         // try <stmts> (except [on E: Type do <stmt>] | finally <stmts>) end
         fPos:=fPos+1;
         var tryNode:=new TTryStmtNode;
-        // try 본문 파싱 (except/finally 키워드가 나올 때까지)
-        while (Cur.Kind<>tkExcept) and (Cur.Kind<>tkFinally) and (Cur.Kind<>tkEnd) do
+        // try 본문 파싱 (except/finally 키워드가 나올 때까지) [Stage 58] panic-mode 오류 복구
+        while (Cur.Kind<>tkExcept) and (Cur.Kind<>tkFinally) and (Cur.Kind<>tkEnd) and (Cur.Kind<>tkEOF) do
         begin
-          tryNode.BodyStmts.Add(ParseStatement);
-          if Cur.Kind=tkSemicolon then fPos:=fPos+1;
+          var tryBodyStart:=fPos;
+          try
+            tryNode.BodyStmts.Add(ParseStatement);
+            if Cur.Kind=tkSemicolon then fPos:=fPos+1;
+          except
+            on ex2: Exception do
+            begin
+              ParseErrors.Add(ex2.Message);
+              if fPos=tryBodyStart then fPos:=fPos+1;
+              while (Cur.Kind<>tkSemicolon) and (Cur.Kind<>tkExcept) and
+                    (Cur.Kind<>tkFinally) and (Cur.Kind<>tkEnd) and (Cur.Kind<>tkEOF) do
+                fPos:=fPos+1;
+              if Cur.Kind=tkSemicolon then fPos:=fPos+1;
+            end;
+          end;
         end;
         if Cur.Kind=tkExcept then
         begin
@@ -1224,22 +1236,47 @@ type
           end
           else
           begin
-            // on 없이 bare except
-            while (Cur.Kind<>tkEnd) and (Cur.Kind<>tkFinally) do
+            // on 없이 bare except [Stage 58] panic-mode 오류 복구
+            while (Cur.Kind<>tkEnd) and (Cur.Kind<>tkFinally) and (Cur.Kind<>tkEOF) do
             begin
-              tryNode.ExceptStmts.Add(ParseStatement);
-              if Cur.Kind=tkSemicolon then fPos:=fPos+1;
+              var bareExStart:=fPos;
+              try
+                tryNode.ExceptStmts.Add(ParseStatement);
+                if Cur.Kind=tkSemicolon then fPos:=fPos+1;
+              except
+                on ex3: Exception do
+                begin
+                  ParseErrors.Add(ex3.Message);
+                  if fPos=bareExStart then fPos:=fPos+1;
+                  while (Cur.Kind<>tkSemicolon) and (Cur.Kind<>tkEnd) and
+                        (Cur.Kind<>tkFinally) and (Cur.Kind<>tkEOF) do
+                    fPos:=fPos+1;
+                  if Cur.Kind=tkSemicolon then fPos:=fPos+1;
+                end;
+              end;
             end;
           end;
-          // 선택적 finally after except
+          // 선택적 finally after except [Stage 58] panic-mode 오류 복구
           if Cur.Kind=tkFinally then
           begin
             fPos:=fPos+1;
             tryNode.FinallyStmts:=new List<TStmtNode>;
-            while Cur.Kind<>tkEnd do
+            while (Cur.Kind<>tkEnd) and (Cur.Kind<>tkEOF) do
             begin
-              tryNode.FinallyStmts.Add(ParseStatement);
-              if Cur.Kind=tkSemicolon then fPos:=fPos+1;
+              var fin1Start:=fPos;
+              try
+                tryNode.FinallyStmts.Add(ParseStatement);
+                if Cur.Kind=tkSemicolon then fPos:=fPos+1;
+              except
+                on ex4: Exception do
+                begin
+                  ParseErrors.Add(ex4.Message);
+                  if fPos=fin1Start then fPos:=fPos+1;
+                  while (Cur.Kind<>tkSemicolon) and (Cur.Kind<>tkEnd) and (Cur.Kind<>tkEOF) do
+                    fPos:=fPos+1;
+                  if Cur.Kind=tkSemicolon then fPos:=fPos+1;
+                end;
+              end;
             end;
           end;
         end
@@ -1247,10 +1284,23 @@ type
         begin
           fPos:=fPos+1; // 'finally' 소비
           tryNode.FinallyStmts:=new List<TStmtNode>;
-          while Cur.Kind<>tkEnd do
+          // [Stage 58] panic-mode 오류 복구
+          while (Cur.Kind<>tkEnd) and (Cur.Kind<>tkEOF) do
           begin
-            tryNode.FinallyStmts.Add(ParseStatement);
-            if Cur.Kind=tkSemicolon then fPos:=fPos+1;
+            var fin2Start:=fPos;
+            try
+              tryNode.FinallyStmts.Add(ParseStatement);
+              if Cur.Kind=tkSemicolon then fPos:=fPos+1;
+            except
+              on ex5: Exception do
+              begin
+                ParseErrors.Add(ex5.Message);
+                if fPos=fin2Start then fPos:=fPos+1;
+                while (Cur.Kind<>tkSemicolon) and (Cur.Kind<>tkEnd) and (Cur.Kind<>tkEOF) do
+                  fPos:=fPos+1;
+                if Cur.Kind=tkSemicolon then fPos:=fPos+1;
+              end;
+            end;
           end;
         end;
         Expect(tkEnd);
@@ -1805,8 +1855,7 @@ type
         foreach var lvcp in impl.LocalVars do fCurParams.Add(lvcp.Name);
       end;
       Expect(tkBegin); comp:=new TCompoundStmtNode;
-      while Cur.Kind<>tkEnd do
-      begin comp.Statements.Add(ParseStatement); if Cur.Kind=tkSemicolon then fPos:=fPos+1; end;
+      ParseStatementsUntilEnd(comp.Statements); // [Stage 58] panic-mode 오류 복구
       Expect(tkEnd); Expect(tkSemicolon);
 
       fCurClass:=savedClass; fCurFunc:=savedFunc; fCurGenericParams:=savedGP3;
@@ -1871,8 +1920,7 @@ type
         foreach var lvcp2 in impl.LocalVars do fCurParams.Add(lvcp2.Name);
       end;
       Expect(tkBegin); comp:=new TCompoundStmtNode;
-      while Cur.Kind<>tkEnd do
-      begin comp.Statements.Add(ParseStatement); if Cur.Kind=tkSemicolon then fPos:=fPos+1; end;
+      ParseStatementsUntilEnd(comp.Statements); // [Stage 58] panic-mode 오류 복구
       Expect(tkEnd); Expect(tkSemicolon);
 
       fCurClass:=savedClass2; fCurFunc:=savedFunc2; fCurGenericParams:=savedGP4;
@@ -1947,8 +1995,7 @@ type
       sv:=fCurFunc; fCurFunc:=d.Name;
       if Cur.Kind=tkVar then ParseLocalVarSection(d.LocalVars);
       Expect(tkBegin); c:=new TCompoundStmtNode;
-      while Cur.Kind<>tkEnd do
-      begin c.Statements.Add(ParseStatement); if Cur.Kind=tkSemicolon then fPos:=fPos+1; end;
+      ParseStatementsUntilEnd(c.Statements); // [Stage 58] panic-mode 오류 복구
       Expect(tkEnd); Expect(tkSemicolon); fCurFunc:=sv; d.Body:=c;
       fCurGenericParams:=savedGP4;
       Result:=d;
@@ -1984,8 +2031,7 @@ type
       sv:=fCurFunc; fCurFunc:='';
       if Cur.Kind=tkVar then ParseLocalVarSection(d.LocalVars);
       Expect(tkBegin); c:=new TCompoundStmtNode;
-      while Cur.Kind<>tkEnd do
-      begin c.Statements.Add(ParseStatement); if Cur.Kind=tkSemicolon then fPos:=fPos+1; end;
+      ParseStatementsUntilEnd(c.Statements); // [Stage 58] panic-mode 오류 복구
       Expect(tkEnd); Expect(tkSemicolon); fCurFunc:=sv; d.Body:=c;
       fCurGenericParams:=savedGP5;
       Result:=d;
