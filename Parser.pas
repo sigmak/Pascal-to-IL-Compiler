@@ -15,6 +15,50 @@ uses
   Lexer;
 
 type
+  // [Stage 56] Main.pas는 파일마다 별도의 TParser 인스턴스를 만들어 독립적으로 파싱한다.
+  // 그런데 아래 TParser의 fFuncNames/fClassNames/... 같은 "이름 인식 테이블"은 그 파일
+  // 자신이 선언한 것만 채워지므로, 예를 들어 Entry.pas가 StringUtils.pas에서 선언된
+  // Greet 함수를 호출하면 Entry.pas 전용 TParser는 "Greet"를 모르는 이름으로 보고
+  // "greeting := Greet('World');"의 '(' 를 "알 수 없는 문장"으로 오인해 실패한다
+  // (Parser.pas 714번째 줄 근처: fFuncNames.Contains(t.Text)일 때만 함수 호출로 인식).
+  //
+  // 이 클래스는 그 이름 테이블들을 파일 경계 너머로 실어 나르는 스냅샷이다.
+  // Main.pas가 compileOrder 순서대로 각 파일을 파싱하면서, 매 파일이 끝날 때마다
+  // TParser.ExportSymbols로 뽑아 누적하고, 다음 파일의 TParser.ImportExternalSymbols에
+  // 그대로 넘겨 계속 이어붙인다 — 즉 뒤에 오는 파일은 앞서 컴파일된 모든 파일이
+  // 선언한 이름을 알고 시작한다.
+  TParserExternalSymbols = class
+  public
+    FuncNames, ProcNames, ClassNames, InterfaceNames, EnumNames: List<string>;
+    GenericClassNames, GenericFuncNames, GenericProcNames: List<string>;
+    ClassFields: Dictionary<string, List<string>>;
+    ClassMethods: Dictionary<string, Dictionary<string, boolean>>;
+    ClassParent, ClassInterface: Dictionary<string, string>;
+    ClassGenericParam, ClassGenericConstraint: Dictionary<string, List<string>>;
+    FuncGenericParam, ProcGenericParam: Dictionary<string, List<string>>;
+    FuncGenericConstraint, ProcGenericConstraint: Dictionary<string, List<string>>;
+    EnumMemberEnumName: Dictionary<string, string>;
+    EnumMemberOrdinal: Dictionary<string, integer>;
+    constructor Create;
+    begin
+      FuncNames:=new List<string>; ProcNames:=new List<string>;
+      ClassNames:=new List<string>; InterfaceNames:=new List<string>; EnumNames:=new List<string>;
+      GenericClassNames:=new List<string>; GenericFuncNames:=new List<string>; GenericProcNames:=new List<string>;
+      ClassFields:=new Dictionary<string, List<string>>;
+      ClassMethods:=new Dictionary<string, Dictionary<string, boolean>>;
+      ClassParent:=new Dictionary<string, string>;
+      ClassInterface:=new Dictionary<string, string>;
+      ClassGenericParam:=new Dictionary<string, List<string>>;
+      ClassGenericConstraint:=new Dictionary<string, List<string>>;
+      FuncGenericParam:=new Dictionary<string, List<string>>;
+      ProcGenericParam:=new Dictionary<string, List<string>>;
+      FuncGenericConstraint:=new Dictionary<string, List<string>>;
+      ProcGenericConstraint:=new Dictionary<string, List<string>>;
+      EnumMemberEnumName:=new Dictionary<string, string>;
+      EnumMemberOrdinal:=new Dictionary<string, integer>;
+    end;
+  end;
+
   TParser = class
   private
     fTokens: List<TToken>; fPos: integer;
@@ -2041,6 +2085,65 @@ type
       fProcGenericConstraint:=new Dictionary<string, List<string>>; // [Stage 36]
       fCurGenericParams:=new List<string>;
       fLastGenericName:='';
+    end;
+
+    // [Stage 56] 반드시 생성자 직후, ParseProgram 호출 전에 불러야 한다.
+    // ext(이전에 컴파일된 파일들이 내보낸 이름 테이블)를 이 파서의 인식 테이블에 병합한다 —
+    // 이후 ParseProgram이 문장을 파싱하면서 이 이름들을 "이미 알려진 함수/클래스/..." 로 인정한다.
+    // ext가 nil이면(=첫 파일이라 아직 아무것도 안 쌓였으면) 아무 것도 하지 않는다.
+    procedure ImportExternalSymbols(ext: TParserExternalSymbols);
+    begin
+      if ext=nil then exit;
+      foreach var s in ext.FuncNames do if not fFuncNames.Contains(s) then fFuncNames.Add(s);
+      foreach var s in ext.ProcNames do if not fProcNames.Contains(s) then fProcNames.Add(s);
+      foreach var s in ext.ClassNames do if not fClassNames.Contains(s) then fClassNames.Add(s);
+      foreach var s in ext.InterfaceNames do if not fInterfaceNames.Contains(s) then fInterfaceNames.Add(s);
+      foreach var s in ext.EnumNames do if not fEnumNames.Contains(s) then fEnumNames.Add(s);
+      foreach var s in ext.GenericClassNames do if not fGenericClassNames.Contains(s) then fGenericClassNames.Add(s);
+      foreach var s in ext.GenericFuncNames do if not fGenericFuncNames.Contains(s) then fGenericFuncNames.Add(s);
+      foreach var s in ext.GenericProcNames do if not fGenericProcNames.Contains(s) then fGenericProcNames.Add(s);
+
+      foreach var k in ext.ClassFields.Keys do if not fClassFields.ContainsKey(k) then fClassFields.Add(k, ext.ClassFields[k]);
+      foreach var k in ext.ClassMethods.Keys do if not fClassMethods.ContainsKey(k) then fClassMethods.Add(k, ext.ClassMethods[k]);
+      foreach var k in ext.ClassParent.Keys do if not fClassParent.ContainsKey(k) then fClassParent.Add(k, ext.ClassParent[k]);
+      foreach var k in ext.ClassInterface.Keys do if not fClassInterface.ContainsKey(k) then fClassInterface.Add(k, ext.ClassInterface[k]);
+      foreach var k in ext.ClassGenericParam.Keys do if not fClassGenericParam.ContainsKey(k) then fClassGenericParam.Add(k, ext.ClassGenericParam[k]);
+      foreach var k in ext.ClassGenericConstraint.Keys do if not fClassGenericConstraint.ContainsKey(k) then fClassGenericConstraint.Add(k, ext.ClassGenericConstraint[k]);
+      foreach var k in ext.FuncGenericParam.Keys do if not fFuncGenericParam.ContainsKey(k) then fFuncGenericParam.Add(k, ext.FuncGenericParam[k]);
+      foreach var k in ext.ProcGenericParam.Keys do if not fProcGenericParam.ContainsKey(k) then fProcGenericParam.Add(k, ext.ProcGenericParam[k]);
+      foreach var k in ext.FuncGenericConstraint.Keys do if not fFuncGenericConstraint.ContainsKey(k) then fFuncGenericConstraint.Add(k, ext.FuncGenericConstraint[k]);
+      foreach var k in ext.ProcGenericConstraint.Keys do if not fProcGenericConstraint.ContainsKey(k) then fProcGenericConstraint.Add(k, ext.ProcGenericConstraint[k]);
+      foreach var k in ext.EnumMemberEnumName.Keys do if not fEnumMemberEnumName.ContainsKey(k) then fEnumMemberEnumName.Add(k, ext.EnumMemberEnumName[k]);
+      foreach var k in ext.EnumMemberOrdinal.Keys do if not fEnumMemberOrdinal.ContainsKey(k) then fEnumMemberOrdinal.Add(k, ext.EnumMemberOrdinal[k]);
+    end;
+
+    // [Stage 56] ParseProgram이 성공적으로 끝난 뒤에 불러야 한다.
+    // 이 파서가 (ImportExternalSymbols로 미리 받아둔 것 + 이 파일 자신이 새로 선언한 것을
+    // 합친) 지금 시점의 전체 이름 테이블을 스냅샷으로 내보낸다. 다음 파일에
+    // ImportExternalSymbols로 그대로 넘기면 계속 누적된다.
+    function ExportSymbols: TParserExternalSymbols;
+    begin
+      Result:=new TParserExternalSymbols;
+      Result.FuncNames.AddRange(fFuncNames);
+      Result.ProcNames.AddRange(fProcNames);
+      Result.ClassNames.AddRange(fClassNames);
+      Result.InterfaceNames.AddRange(fInterfaceNames);
+      Result.EnumNames.AddRange(fEnumNames);
+      Result.GenericClassNames.AddRange(fGenericClassNames);
+      Result.GenericFuncNames.AddRange(fGenericFuncNames);
+      Result.GenericProcNames.AddRange(fGenericProcNames);
+      foreach var k in fClassFields.Keys do Result.ClassFields.Add(k, fClassFields[k]);
+      foreach var k in fClassMethods.Keys do Result.ClassMethods.Add(k, fClassMethods[k]);
+      foreach var k in fClassParent.Keys do Result.ClassParent.Add(k, fClassParent[k]);
+      foreach var k in fClassInterface.Keys do Result.ClassInterface.Add(k, fClassInterface[k]);
+      foreach var k in fClassGenericParam.Keys do Result.ClassGenericParam.Add(k, fClassGenericParam[k]);
+      foreach var k in fClassGenericConstraint.Keys do Result.ClassGenericConstraint.Add(k, fClassGenericConstraint[k]);
+      foreach var k in fFuncGenericParam.Keys do Result.FuncGenericParam.Add(k, fFuncGenericParam[k]);
+      foreach var k in fProcGenericParam.Keys do Result.ProcGenericParam.Add(k, fProcGenericParam[k]);
+      foreach var k in fFuncGenericConstraint.Keys do Result.FuncGenericConstraint.Add(k, fFuncGenericConstraint[k]);
+      foreach var k in fProcGenericConstraint.Keys do Result.ProcGenericConstraint.Add(k, fProcGenericConstraint[k]);
+      foreach var k in fEnumMemberEnumName.Keys do Result.EnumMemberEnumName.Add(k, fEnumMemberEnumName[k]);
+      foreach var k in fEnumMemberOrdinal.Keys do Result.EnumMemberOrdinal.Add(k, fEnumMemberOrdinal[k]);
     end;
 
     function ParseProgram: TProgramNode;

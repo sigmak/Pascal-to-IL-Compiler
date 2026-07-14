@@ -21,7 +21,10 @@ uses
 
 const
   DefaultExampleDir = 'Examples';
-  DefaultExampleFile = 'Units\Entry.pas'; // stage54  Examples\Untis\ 폴더에 StringUtils.pas, MathUtils.pas, Entry.pas 이렇게 3개 가 있음. 
+  
+  DefaultExampleFile = 'Units_DupTest\Dupentry.pas'; // stage56 오류 나는 예제 Examples\Units_DupTest\ 폴더에 Dupa.pas, Dupb.pas, Dupentry.pas 이렇게 3개 가 있음.
+  //DefaultExampleFile = 'Units\Entry.pas'; // stage56 정상적인 예제 Examples\Untis\ 폴더에 StringUtils.pas, MathUtils.pas, Entry.pas 이렇게 3개 가 있음.
+  //DefaultExampleFile = 'Units\Entry.pas'; // stage54  Examples\Untis\ 폴더에 StringUtils.pas, MathUtils.pas, Entry.pas 이렇게 3개 가 있음. 
   //DefaultExampleFile = 'Test_stage54.pas';
   //DefaultExampleFile = 'Test_stage53.pas';
   //DefaultExampleFile = 'Test_stage52.pas'; // 오류 4가지 표시되면 정상임.
@@ -204,9 +207,8 @@ end;
 // 이름이 "<이름>.pas" 파일로 실제 존재하면 로컬 유닛(의존성)으로, 없으면 지금까지처럼
 // 프레임워크 네임스페이스로 취급해 그냥 무시한다.
 //
-// 범위는 "탐색 + 순서 계산"까지다. 찾아낸 여러 파일의 선언을 하나의 AST로 합쳐
-// 실제로 함께 컴파일하는 것(Parser/CodeGen이 여러 TProgramNode를 병합하는 것)은
-// 다음 단계 과제로 남겨둔다 — 지금은 순서를 계산해 화면에 보여주는 것까지만 한다.
+// 범위는 "탐색 + 순서 계산"까지다. 찾아낸 여러 파일의 선언을 하나의 AST로 실제
+// 병합하는 것은 [Stage 56]에서 이어받는다(아래 MergeProgramInto 관련 함수들).
 
 // entry 소스 텍스트에서 최초의 uses 절 하나만 뽑아 이름 목록으로 돌려준다.
 // Parser.ParseProgram이 인식하는 문법과 동일: uses Ident(.Ident)*, Ident(.Ident)*, ... ;
@@ -302,13 +304,86 @@ begin
   Result := order;
 end;
 
+// ------------------------------------------------------------
+// [Stage 56] 여러 파일의 선언을 하나의 AST로 실제 병합
+// ------------------------------------------------------------
+// Stage 55는 파일 탐색과 컴파일 순서 계산까지만 했다. 이 단계는 그 순서(의존성 먼저,
+// entry 파일이 마지막)대로 각 파일을 실제로 Lex/Parse해서 나온 TProgramNode들을,
+// 이름 충돌을 검사하면서 하나의 TProgramNode로 합친다.
+//
+// - entry 파일(목록의 마지막)의 Name / IsLibrary / Statements(메인 begin...end 블록)만
+//   최종 결과에 쓰인다.
+// - 그 앞의 의존 유닛 파일들은 타입(class/interface/enum)·함수·프로시저·메서드구현·
+//   생성자구현·전역변수·제네릭 인스턴스화 요청만 제공한다. 유닛 파일은 관례상
+//   "library Unit이름; ... end."처럼 begin...end 없이 끝나므로 자신의 메인 블록은 없다
+//   (있어도 병합 시 버려진다 — entry의 메인 블록만 실행된다).
+// - 서로 다른 파일에 같은 이름의 클래스/함수/프로시저/인터페이스/열거형이 있으면
+//   CodeGen 단계에서 알 수 없는 오류로 나타나기 전에 여기서 바로 "어느 두 파일이
+//   충돌했는지" 명확한 오류로 알린다.
+// - CodeGen은 "ClassDecls는 부모가 자식보다 먼저 나온다"는 순서를 전제한다
+//   (CodeGen.pas의 BuildClassShell 호출부 주석 참고). compileOrder가 의존성을
+//   먼저 방문하는 위상 정렬이므로, 병합 순서(의존 파일 → entry 파일)가 그대로
+//   이 전제를 만족시킨다 — 단, 같은 파일 안에서는 여전히 부모를 자식보다 먼저
+//   선언해야 한다(이건 병합 이전부터 있던 제약).
+
+procedure RegisterDeclName(seen: Dictionary<string,string>; name, kind, fileLabel: string);
+begin
+  if seen.ContainsKey(name) then
+    raise new Exception('중복 선언: ' + kind + ' "' + name + '" — "' + seen[name]
+      + '" 파일과 "' + fileLabel + '" 파일에 모두 선언되어 있습니다.');
+  seen.Add(name, fileLabel);
+end;
+
+// 이미 만들어져 있는 TProgramNode(병합의 뼈대로 삼는 첫 파일) 안의 선언 이름들을
+// 중복검사 사전에 등록만 한다 — 아직 아무것도 옮기지는 않는다.
+procedure RegisterProgramNames(prog: TProgramNode; fileLabel: string;
+  seenClasses, seenFuncs, seenProcs, seenIfaces, seenEnums: Dictionary<string,string>);
+var c: TClassDeclNode; f: TFuncDeclNode; p: TProcDeclNode; i: TInterfaceDeclNode; e: TEnumDeclNode;
+begin
+  foreach c in prog.ClassDecls do RegisterDeclName(seenClasses, c.Name, '클래스', fileLabel);
+  foreach f in prog.FuncDecls do RegisterDeclName(seenFuncs, f.Name, '함수', fileLabel);
+  foreach p in prog.ProcDecls do RegisterDeclName(seenProcs, p.Name, '프로시저', fileLabel);
+  foreach i in prog.InterfaceDecls do RegisterDeclName(seenIfaces, i.Name, '인터페이스', fileLabel);
+  foreach e in prog.EnumDecls do RegisterDeclName(seenEnums, e.Name, '열거형', fileLabel);
+end;
+
+// src(다른 파일에서 파싱된 TProgramNode)의 선언들을 target으로 옮겨 붙인다.
+// 옮기기 전에 이름 충돌부터 검사한다(충돌 시 target은 손대지 않고 예외를 던진다).
+procedure MergeProgramInto(target, src: TProgramNode; fileLabel: string;
+  seenClasses, seenFuncs, seenProcs, seenIfaces, seenEnums: Dictionary<string,string>);
+var c: TClassDeclNode; f: TFuncDeclNode; p: TProcDeclNode; i: TInterfaceDeclNode; e: TEnumDeclNode;
+begin
+  foreach c in src.ClassDecls do RegisterDeclName(seenClasses, c.Name, '클래스', fileLabel);
+  foreach f in src.FuncDecls do RegisterDeclName(seenFuncs, f.Name, '함수', fileLabel);
+  foreach p in src.ProcDecls do RegisterDeclName(seenProcs, p.Name, '프로시저', fileLabel);
+  foreach i in src.InterfaceDecls do RegisterDeclName(seenIfaces, i.Name, '인터페이스', fileLabel);
+  foreach e in src.EnumDecls do RegisterDeclName(seenEnums, e.Name, '열거형', fileLabel);
+
+  target.ClassDecls.AddRange(src.ClassDecls);
+  target.FuncDecls.AddRange(src.FuncDecls);
+  target.ProcDecls.AddRange(src.ProcDecls);
+  target.InterfaceDecls.AddRange(src.InterfaceDecls);
+  target.EnumDecls.AddRange(src.EnumDecls);
+  target.MethodImpls.AddRange(src.MethodImpls);
+  target.ConstructorImpls.AddRange(src.ConstructorImpls);
+  target.VarDecls.AddRange(src.VarDecls);
+  target.GenericInstantiations.AddRange(src.GenericInstantiations);
+  target.GenericFuncInstantiations.AddRange(src.GenericFuncInstantiations);
+end;
+
 var
   inputPath, sourceCode, outputName: string;
-  lexer: TLexer; tokens: List<TToken>;
-  parser: TParser; prog: TProgramNode;
+  prog: TProgramNode;
   mono: TMonomorphizer;
   codegen: TCodeGenerator;
   ok: boolean;
+  mergedProg: TProgramNode;
+  allReferenceDirectives: List<string>;
+  seenClassNames, seenFuncNames, seenProcNames, seenIfaceNames, seenEnumNames: Dictionary<string,string>;
+  totalTokenCount: integer;
+  compileOrder: List<string>;
+  fileProg: TProgramNode;
+  symbolAccumulator: TParserExternalSymbols;
 
 begin
   Writeln('=== Pascal-to-.NET 컴파일러 ===');
@@ -331,8 +406,9 @@ begin
     ok := true;
 
     // [Stage 55] 유닛 파일탐색 + 의존성 정렬. entry 파일 디렉터리, 그 아래 Examples\,
-    // 그 아래 Units\ 를 검색 경로로 쓴다. 실패해도(순환 참조 등) 이후 단계는 막지 않고
-    // 진단만 보여준다 — 아직 실제 컴파일 파이프라인은 entry 파일 하나만 사용하기 때문.
+    // 그 아래 Units\ 를 검색 경로로 쓴다. 탐색 자체가 실패하면(순환 참조 등) entry
+    // 파일 하나만으로 컴파일을 계속한다 — 로컬 유닛을 안 쓰는 기존 단일 파일 테스트들이
+    // 계속 그대로 동작해야 하기 때문.
     var unitSearchDirs := new List<string>;
     var inputDir := System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(inputPath));
     unitSearchDirs.Add(inputDir);
@@ -342,13 +418,12 @@ begin
     if System.IO.Directory.Exists(unitsDir) then unitSearchDirs.Add(unitsDir);
 
     try
-      var compileOrder := DiscoverCompileOrder(inputPath, unitSearchDirs);
+      compileOrder := DiscoverCompileOrder(inputPath, unitSearchDirs);
       if compileOrder.Count > 1 then
       begin
         Writeln('[유닛탐색] 의존성 ' + (compileOrder.Count - 1).ToString + '개 파일 발견 — 컴파일 순서(의존성 먼저):');
         for var oi := 0 to compileOrder.Count - 1 do
           Writeln('    ' + (oi + 1).ToString + '. ' + System.IO.Path.GetFileName(compileOrder[oi]));
-        Writeln('  (참고: 이번 단계는 순서 계산까지 — 실제 다중 파일 병합 컴파일은 다음 단계에서 연결됩니다)');
       end
       else
         Writeln('[유닛탐색] 로컬 유닛 의존성 없음 — 단일 파일 컴파일');
@@ -357,28 +432,90 @@ begin
       on E: Exception do
       begin
         Writeln('[유닛탐색] 실패: ' + E.Message);
+        Writeln('  단일 파일(진입점만)로 컴파일을 계속합니다.');
         Writeln;
+        compileOrder := new List<string>;
+        compileOrder.Add(inputPath);
       end;
     end;
 
-    // [Stage 33] 단계별로 try/except를 분리해 어느 단계에서 실패했는지 항상 알 수 있게 한다.
-    if ok then
-    try
-      lexer := new TLexer(sourceCode);
-      tokens := lexer.Tokenize;
-      Writeln('[1/4] 토큰화 완료: ' + tokens.Count.ToString + '개 토큰');
-    except
-      on E: Exception do begin PrintCompileError('어휘분석(Lexer)', sourceCode, E); ok := false; end;
+    // [Stage 56] compileOrder 순서대로 각 파일을 Lex/Parse하고, 하나의 TProgramNode로 병합한다.
+    // 파일이 1개뿐이면(로컬 유닛 없음) 기존과 동일하게 동작한다.
+    mergedProg := nil;
+    allReferenceDirectives := new List<string>;
+    seenClassNames := new Dictionary<string,string>;
+    seenFuncNames := new Dictionary<string,string>;
+    seenProcNames := new Dictionary<string,string>;
+    seenIfaceNames := new Dictionary<string,string>;
+    seenEnumNames := new Dictionary<string,string>;
+    totalTokenCount := 0;
+    symbolAccumulator := nil; // [Stage 56] 파일이 하나씩 파싱될 때마다 뒤로 누적됨
+
+    var fi := 0;
+    while ok and (fi < compileOrder.Count) do
+    begin
+      var filePath := compileOrder[fi];
+      var fileLabel := System.IO.Path.GetFileName(filePath);
+      var fileSrc := System.IO.File.ReadAllText(filePath, Encoding.UTF8);
+      try
+        var fileLexer := new TLexer(fileSrc);
+        var fileTokens := fileLexer.Tokenize;
+        totalTokenCount := totalTokenCount + fileTokens.Count;
+        foreach var rd in fileLexer.ReferenceDirectives do
+          if not allReferenceDirectives.Contains(rd) then allReferenceDirectives.Add(rd);
+
+        var fileParser := new TParser(fileTokens);
+        // [Stage 56] 이전 파일들(의존성 먼저 순서)이 선언한 함수/클래스/... 이름을
+        // 이 파서에 미리 알려준다 — 안 그러면 다른 파일에서 선언된 함수를 호출하는
+        // 문장을 파싱할 때 "알 수 없는 문장"으로 오인해 실패한다.
+        fileParser.ImportExternalSymbols(symbolAccumulator);
+        fileProg := fileParser.ParseProgram;
+        symbolAccumulator := fileParser.ExportSymbols;
+      except
+        on E: Exception do
+        begin
+          PrintCompileError('어휘/구문분석(' + fileLabel + ')', fileSrc, E);
+          ok := false;
+        end;
+      end;
+
+      if ok then
+      try
+        if mergedProg = nil then
+        begin
+          // 첫 파일을 병합의 뼈대로 삼는다(마지막 파일이면 그대로 entry가 됨).
+          mergedProg := fileProg;
+          RegisterProgramNames(mergedProg, fileLabel, seenClassNames, seenFuncNames, seenProcNames, seenIfaceNames, seenEnumNames);
+        end
+        else
+        begin
+          MergeProgramInto(mergedProg, fileProg, fileLabel, seenClassNames, seenFuncNames, seenProcNames, seenIfaceNames, seenEnumNames);
+          if fi = compileOrder.Count - 1 then
+          begin
+            // entry 파일(항상 목록의 마지막): 이름/산출물 종류/메인 블록은 entry 것을 쓴다.
+            mergedProg.Name := fileProg.Name;
+            mergedProg.IsLibrary := fileProg.IsLibrary;
+            mergedProg.Statements := fileProg.Statements;
+          end;
+        end;
+      except
+        on E: Exception do
+        begin
+          PrintCompileError('다중 파일 병합(' + fileLabel + ')', fileSrc, E);
+          ok := false;
+        end;
+      end;
+      fi := fi + 1;
     end;
 
     if ok then
-    try
-      parser := new TParser(tokens);
-      prog := parser.ParseProgram;
-      Writeln('[2/4] 구문분석 완료: 클래스 ' + prog.ClassDecls.Count.ToString
+    begin
+      prog := mergedProg;
+      var mergeLabel := '';
+      if compileOrder.Count > 1 then mergeLabel := '(병합)';
+      Writeln('[1/4] 토큰화 완료: ' + totalTokenCount.ToString + '개 토큰 (파일 ' + compileOrder.Count.ToString + '개 합계)');
+      Writeln('[2/4] 구문분석 완료' + mergeLabel + ': 클래스 ' + prog.ClassDecls.Count.ToString
         + '개(제네릭 템플릿 포함), 인스턴스화 요청 ' + prog.GenericInstantiations.Count.ToString + '건');
-    except
-      on E: Exception do begin PrintCompileError('구문분석(Parser)', sourceCode, E); ok := false; end;
     end;
 
     if ok then
@@ -403,10 +540,11 @@ begin
       // [Stage 45] 소스 안의 {$reference X.dll} 지시문에서 뽑아둔 어셈블리를 codegen에 등록.
       // 이게 없으면 System.Windows.Window 같은 실제 WPF 타입은 참조할 수 없다
       // (mscorlib에 없는 타입은 Type.GetType만으로는 못 찾고, 미리 로드해둔 어셈블리 목록에서 찾는다).
-      if lexer.ReferenceDirectives.Count>0 then
+      // [Stage 56] 병합된 파일 전체(entry + 로컬 유닛들)에서 모은 지시문을 함께 등록한다.
+      if allReferenceDirectives.Count>0 then
       begin
-        Writeln('  참조 어셈블리 등록 중: ' + string.Join(', ', lexer.ReferenceDirectives));
-        foreach var refName in lexer.ReferenceDirectives do
+        Writeln('  참조 어셈블리 등록 중: ' + string.Join(', ', allReferenceDirectives));
+        foreach var refName in allReferenceDirectives do
           codegen.AddReferenceAssembly(refName);
       end;
 
