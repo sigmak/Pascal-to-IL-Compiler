@@ -221,6 +221,20 @@ begin
       ResolveType(subst, lv.VarType, lv.ClassName, lv.ClassName, lv.IsExternal, lot, locn, loext);
       impl.LocalVars.Add(new TVarDecl(lv.Name, lot, locn, loext));
     end;
+    // [Stage 61] 지역 const 선언도 LocalVars와 같은 원칙으로 복사한다. 타입 추론(HasExplicitType=false)이면
+    // ValueExpr만 그대로 공유해도 안전하고(본문처럼 타입 소거되어 이름으로만 참조됨), 명시적 타입이면
+    // LocalVars와 동일하게 ResolveType으로 제네릭 타입 매개변수를 구체 타입으로 치환한다.
+    foreach var cd in srcImpl.ConstDecls do
+    begin
+      if cd.HasExplicitType then
+      begin
+        var cot: TVarType; var cocn: string; var coext: boolean;
+        ResolveType(subst, cd.VarType, cd.ClassName, cd.ClassName, cd.IsExternal, cot, cocn, coext);
+        impl.ConstDecls.Add(new TConstDecl(cd.Name, cot, cocn, coext, cd.ValueExpr));
+      end
+      else
+        impl.ConstDecls.Add(new TConstDecl(cd.Name, cd.ValueExpr));
+    end;
     impl.Body:=srcImpl.Body;
     fProg.MethodImpls.Add(impl);
   end;
@@ -253,6 +267,19 @@ begin
     fn.LocalVars.Add(new TVarDecl(lv.Name, lot, locn, loext));
   end;
 
+  // [Stage 61] 지역 const 선언 복사 (BuildConcreteImpls와 동일한 원칙)
+  foreach var cd in tmpl.ConstDecls do
+  begin
+    if cd.HasExplicitType then
+    begin
+      var cot: TVarType; var cocn: string; var coext: boolean;
+      ResolveType(subst, cd.VarType, cd.ClassName, cd.ClassName, cd.IsExternal, cot, cocn, coext);
+      fn.ConstDecls.Add(new TConstDecl(cd.Name, cot, cocn, coext, cd.ValueExpr));
+    end
+    else
+      fn.ConstDecls.Add(new TConstDecl(cd.Name, cd.ValueExpr));
+  end;
+
   // 본문은 타입 소거되어 있으므로(매개변수/지역변수는 이름으로만 참조) 그대로 공유해도 안전하다.
   fn.Body:=tmpl.Body;
   Result:=fn;
@@ -279,6 +306,19 @@ begin
     // [Stage 41] lv.IsExternal을 입력으로 넘기고, 소거 결과 loext를 그대로 보존한다.
     ResolveType(subst, lv.VarType, lv.ClassName, lv.ClassName, lv.IsExternal, lot, locn, loext);
     pr.LocalVars.Add(new TVarDecl(lv.Name, lot, locn, loext));
+  end;
+
+  // [Stage 61] 지역 const 선언 복사
+  foreach var cd in tmpl.ConstDecls do
+  begin
+    if cd.HasExplicitType then
+    begin
+      var cot: TVarType; var cocn: string; var coext: boolean;
+      ResolveType(subst, cd.VarType, cd.ClassName, cd.ClassName, cd.IsExternal, cot, cocn, coext);
+      pr.ConstDecls.Add(new TConstDecl(cd.Name, cot, cocn, coext, cd.ValueExpr));
+    end
+    else
+      pr.ConstDecls.Add(new TConstDecl(cd.Name, cd.ValueExpr));
   end;
 
   pr.Body:=tmpl.Body;

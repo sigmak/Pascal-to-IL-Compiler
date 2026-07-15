@@ -1911,7 +1911,7 @@ type
             // 무한루프 방지: 최소 한 토큰은 전진.
             if fPos=typeDeclStartPos then fPos:=fPos+1;
             // 다음 안전 지점(다음 타입 선언 시작, 또는 var/함수/프로시저/생성자/begin/파일 끝)까지 건너뛴다.
-            while (Cur.Kind<>tkSemicolon) and (Cur.Kind<>tkVar) and (Cur.Kind<>tkFunction)
+            while (Cur.Kind<>tkSemicolon) and (Cur.Kind<>tkVar) and (Cur.Kind<>tkConst) and (Cur.Kind<>tkFunction)
               and (Cur.Kind<>tkProcedure) and (Cur.Kind<>tkConstructor) and (Cur.Kind<>tkBegin)
               and (Cur.Kind<>tkEOF) do
               fPos:=fPos+1;
@@ -1928,7 +1928,7 @@ type
     var vt: TVarType; ns: List<string>; cn: string; isExt: boolean;
     begin
       Expect(tkVar);
-      while Cur.Kind<>tkBegin do
+      while (Cur.Kind<>tkBegin) and (Cur.Kind<>tkConst) do // [Stage 61] const 섹션과 교차 가능
       begin
         ns:=new List<string>; ns.Add(Expect(tkIdent).Text);
         while Cur.Kind=tkComma do begin fPos:=fPos+1; ns.Add(Expect(tkIdent).Text); end;
@@ -1944,6 +1944,42 @@ type
           aList.Add(new TVarDecl(nm, vt, cn, isExt));
           if (vt=vtIntArray) or (vt=vtStrArray) or (vt=vtGenericArray) then fArrayNames.Add(nm); // [Stage 37]
         end;
+      end;
+    end;
+
+    // [Stage 61] 함수/프로시저/메서드/생성자 본문 안의 지역 const 선언(const 섹션)을 파싱한다.
+    // "const Name = 식;" 은 식으로부터 타입을 추론하고, "const Name: Type = 식;" 은 명시된 타입을 쓴다.
+    // var 섹션과 마찬가지로 tkBegin 또는 (교차하는) tkVar를 만나면 끝난다.
+    procedure ParseLocalConstSection(aList: List<TConstDecl>);
+    var vt: TVarType; nm: string; cn: string; isExt: boolean; ve: TExprNode; hasType: boolean;
+    begin
+      Expect(tkConst);
+      while (Cur.Kind<>tkBegin) and (Cur.Kind<>tkVar) do
+      begin
+        nm:=Expect(tkIdent).Text;
+        hasType:=false; cn:=''; isExt:=false; vt:=vtInteger;
+        if Cur.Kind=tkColon then
+        begin
+          fPos:=fPos+1;
+          vt:=ParseParamTypeExt(isExt, cn);
+          hasType:=true;
+        end;
+        Expect(tkEq);
+        ve:=ParseExpr;
+        Expect(tkSemicolon);
+        if hasType then aList.Add(new TConstDecl(nm, vt, cn, isExt, ve))
+        else aList.Add(new TConstDecl(nm, ve));
+      end;
+    end;
+
+    // [Stage 61] var/const 섹션은 순서에 상관없이 여러 번 번갈아 나올 수 있다
+    // (예: const ... var ... const ...). tkBegin을 만날 때까지 번갈아 파싱한다.
+    procedure ParseLocalDeclSections(aVarList: List<TVarDecl>; aConstList: List<TConstDecl>);
+    begin
+      while (Cur.Kind=tkVar) or (Cur.Kind=tkConst) do
+      begin
+        if Cur.Kind=tkVar then ParseLocalVarSection(aVarList)
+        else ParseLocalConstSection(aConstList);
       end;
     end;
 
@@ -2021,10 +2057,11 @@ type
       // [Stage 28] 지역 변수도 매개변수와 마찬가지로 "필드가 아님"으로 표시해야
       // ParsePrimary/ParseStatement의 필드 vs 지역변수 분기가 올바르게 동작한다.
       // (fCurParams는 사실상 "이 스코프에서 필드보다 우선하는 이름" 목록으로 쓰인다.)
-      if Cur.Kind=tkVar then
+      if (Cur.Kind=tkVar) or (Cur.Kind=tkConst) then // [Stage 61] const 섹션도 함께 처리
       begin
-        ParseLocalVarSection(impl.LocalVars);
+        ParseLocalDeclSections(impl.LocalVars, impl.ConstDecls);
         foreach var lvcp in impl.LocalVars do fCurParams.Add(lvcp.Name);
+        foreach var lccp in impl.ConstDecls do fCurParams.Add(lccp.Name);
       end;
       Expect(tkBegin); comp:=new TCompoundStmtNode;
       ParseStatementsUntilEnd(comp.Statements); // [Stage 58] panic-mode 오류 복구
@@ -2086,10 +2123,11 @@ type
       fCurMethodParamNames:=new List<string>;
       foreach var ctorPn4 in impl.Parameters do fCurMethodParamNames.Add(ctorPn4.Name); // [Stage 47]
 
-      if Cur.Kind=tkVar then
+      if (Cur.Kind=tkVar) or (Cur.Kind=tkConst) then // [Stage 61] const 섹션도 함께 처리
       begin
-        ParseLocalVarSection(impl.LocalVars);
+        ParseLocalDeclSections(impl.LocalVars, impl.ConstDecls);
         foreach var lvcp2 in impl.LocalVars do fCurParams.Add(lvcp2.Name);
+        foreach var lccp2 in impl.ConstDecls do fCurParams.Add(lccp2.Name);
       end;
       Expect(tkBegin); comp:=new TCompoundStmtNode;
       ParseStatementsUntilEnd(comp.Statements); // [Stage 58] panic-mode 오류 복구
@@ -2165,7 +2203,7 @@ type
       if (d.ReturnType=vtGeneric) or (d.ReturnType=vtGenericArray) then d.ReturnGenericName:=fLastGenericName; // [Stage 36/37]
       Expect(tkSemicolon);
       sv:=fCurFunc; fCurFunc:=d.Name;
-      if Cur.Kind=tkVar then ParseLocalVarSection(d.LocalVars);
+      if (Cur.Kind=tkVar) or (Cur.Kind=tkConst) then ParseLocalDeclSections(d.LocalVars, d.ConstDecls); // [Stage 61]
       Expect(tkBegin); c:=new TCompoundStmtNode;
       ParseStatementsUntilEnd(c.Statements); // [Stage 58] panic-mode 오류 복구
       Expect(tkEnd); Expect(tkSemicolon); fCurFunc:=sv; d.Body:=c;
@@ -2201,7 +2239,7 @@ type
 
       ParseParams(d.Parameters); Expect(tkSemicolon);
       sv:=fCurFunc; fCurFunc:='';
-      if Cur.Kind=tkVar then ParseLocalVarSection(d.LocalVars);
+      if (Cur.Kind=tkVar) or (Cur.Kind=tkConst) then ParseLocalDeclSections(d.LocalVars, d.ConstDecls); // [Stage 61]
       Expect(tkBegin); c:=new TCompoundStmtNode;
       ParseStatementsUntilEnd(c.Statements); // [Stage 58] panic-mode 오류 복구
       Expect(tkEnd); Expect(tkSemicolon); fCurFunc:=sv; d.Body:=c;
@@ -2214,7 +2252,7 @@ type
     begin
       Expect(tkVar);
       while (Cur.Kind<>tkBegin) and (Cur.Kind<>tkFunction)
-        and (Cur.Kind<>tkProcedure) and (Cur.Kind<>tkEOF) do
+        and (Cur.Kind<>tkProcedure) and (Cur.Kind<>tkConst) and (Cur.Kind<>tkEOF) do // [Stage 61]
       begin
         // [Phase 2] var 선언 한 줄이 깨져도 전체를 멈추지 않고 오류를 모은 뒤 다음 줄로 건너뛴다.
         varDeclStartPos:=fPos;
@@ -2266,7 +2304,50 @@ type
             ParseErrors.Add(ex.Message);
             if fPos=varDeclStartPos then fPos:=fPos+1;
             while (Cur.Kind<>tkSemicolon) and (Cur.Kind<>tkBegin) and (Cur.Kind<>tkFunction)
-              and (Cur.Kind<>tkProcedure) and (Cur.Kind<>tkEOF) do
+              and (Cur.Kind<>tkProcedure) and (Cur.Kind<>tkConst) and (Cur.Kind<>tkEOF) do // [Stage 61]
+              fPos:=fPos+1;
+            if Cur.Kind=tkSemicolon then fPos:=fPos+1;
+          end;
+        end;
+      end;
+    end;
+
+    // [Stage 61] 전역 const 섹션: "const Name = 식;" (타입 추론) 또는
+    // "const Name: Type = 식;" (명시적 타입). 여러 const/var 섹션이 번갈아 나올 수 있으므로
+    // tkVar를 만나도(또한 함수/프로시저/begin/파일끝을 만나도) 멈춘다.
+    procedure ParseConstSection(aProg: TProgramNode);
+    var vt: TVarType; nm: string; cn: string; isExt: boolean; ve: TExprNode;
+        hasType: boolean; constDeclStartPos: integer;
+    begin
+      Expect(tkConst);
+      while (Cur.Kind<>tkBegin) and (Cur.Kind<>tkFunction)
+        and (Cur.Kind<>tkProcedure) and (Cur.Kind<>tkVar) and (Cur.Kind<>tkEOF) do
+      begin
+        // [Phase 2] var 섹션과 동일한 원칙: const 선언 한 줄이 깨져도 전체를 멈추지 않는다.
+        constDeclStartPos:=fPos;
+        try
+        begin
+        nm:=Expect(tkIdent).Text;
+        hasType:=false; cn:=''; isExt:=false; vt:=vtInteger;
+        if Cur.Kind=tkColon then
+        begin
+          fPos:=fPos+1;
+          vt:=ParseParamTypeExt(isExt, cn);
+          hasType:=true;
+        end;
+        Expect(tkEq);
+        ve:=ParseExpr;
+        Expect(tkSemicolon);
+        if hasType then aProg.ConstDecls.Add(new TConstDecl(nm, vt, cn, isExt, ve))
+        else aProg.ConstDecls.Add(new TConstDecl(nm, ve));
+        end;
+        except
+          on ex: Exception do
+          begin
+            ParseErrors.Add(ex.Message);
+            if fPos=constDeclStartPos then fPos:=fPos+1;
+            while (Cur.Kind<>tkSemicolon) and (Cur.Kind<>tkBegin) and (Cur.Kind<>tkFunction)
+              and (Cur.Kind<>tkProcedure) and (Cur.Kind<>tkVar) and (Cur.Kind<>tkEOF) do
               fPos:=fPos+1;
             if Cur.Kind=tkSemicolon then fPos:=fPos+1;
           end;
@@ -2457,7 +2538,7 @@ type
             while Cur.Kind<>tkEOF do
             begin
               if (syncDepth=0) and ((Cur.Kind=tkFunction) or (Cur.Kind=tkProcedure)
-                 or (Cur.Kind=tkConstructor) or (Cur.Kind=tkVar)) then
+                 or (Cur.Kind=tkConstructor) or (Cur.Kind=tkVar) or (Cur.Kind=tkConst)) then
                 break;
               if Cur.Kind=tkBegin then syncDepth:=syncDepth+1
               else if (Cur.Kind=tkEnd) and (syncDepth>0) then syncDepth:=syncDepth-1;
@@ -2467,7 +2548,11 @@ type
         end;
       end;
 
-      if Cur.Kind=tkVar then ParseVarSection(prog);
+      // [Stage 61] var/const 섹션은 순서 상관없이 번갈아 나올 수 있다.
+      while (Cur.Kind=tkVar) or (Cur.Kind=tkConst) do
+      begin
+        if Cur.Kind=tkVar then ParseVarSection(prog) else ParseConstSection(prog);
+      end;
 
       // [Stage 44] library는 begin...end 초기화 블록이 없을 수 있다 — 디자이너가 생성하는
       // ControlLib 코드는 타입/생성자/메서드 선언만 있고 바로 "end."으로 끝난다.

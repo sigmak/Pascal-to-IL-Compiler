@@ -21,7 +21,8 @@ uses
 
 const
   DefaultExampleDir = 'Examples';
-  DefaultExampleFile = 'Test_stage60.pas'; // [Stage 60] break/continue, repeat...until 테스트
+  DefaultExampleFile = 'Test_stage61.pas'; // [Stage 61] const 선언 (전역/지역, 타입 추론 포함) 테스트
+  //DefaultExampleFile = 'Test_stage60.pas'; // [Stage 60] break/continue, repeat...until 테스트
   //DefaultExampleFile = 'Test_stage59.pas'; // [Stage 59] case...of...else 문 테스트
   //DefaultExampleFile = 'Test_stage58.pas'; // 오류메세지 3개가 발생되는게 맞음. 
   //DefaultExampleFile = 'Test_stage57.pas';
@@ -370,6 +371,7 @@ begin
   target.MethodImpls.AddRange(src.MethodImpls);
   target.ConstructorImpls.AddRange(src.ConstructorImpls);
   target.VarDecls.AddRange(src.VarDecls);
+  target.ConstDecls.AddRange(src.ConstDecls); // [Stage 61]
   target.GenericInstantiations.AddRange(src.GenericInstantiations);
   target.GenericFuncInstantiations.AddRange(src.GenericFuncInstantiations);
 end;

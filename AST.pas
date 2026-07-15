@@ -524,6 +524,29 @@ type
     begin Name:=n; VarType:=t; ClassName:=cn; IsExternal:=isExt; end;
   end;
 
+  // [Stage 61] const 선언 (전역/지역). "const Name = 식;" 형태는 식으로부터 타입을 추론하고
+  // (TVarDeclStmtNode/TInlineVarStmtNode의 "var x := 식"과 같은 InferType 경로를 그대로 재사용),
+  // "const Name: Type = 식;" 형태는 명시된 타입을 그대로 쓴다(HasExplicitType=true).
+  // 값은 CodeGen이 선언 직후 한 번 대입해 초기화하는 일반 슬롯으로 구현하며(재대입 금지 검사는
+  // 아직 하지 않음), 전역 const는 var와 마찬가지로 사실상 Main 메서드의 로컬 슬롯이 된다.
+  TConstDecl = class
+  public
+    Name: string; VarType: TVarType; ClassName: string; IsExternal: boolean;
+    ValueExpr: TExprNode; HasExplicitType: boolean;
+    // 타입 추론: const Name = 식;
+    constructor Create(n: string; ve: TExprNode); overload;
+    begin
+      Name:=n; ValueExpr:=ve; VarType:=vtInteger; ClassName:=''; IsExternal:=false;
+      HasExplicitType:=false;
+    end;
+    // 명시적 타입: const Name: Type = 식;
+    constructor Create(n: string; t: TVarType; cn: string; isExt: boolean; ve: TExprNode); overload;
+    begin
+      Name:=n; VarType:=t; ClassName:=cn; IsExternal:=isExt; ValueExpr:=ve;
+      HasExplicitType:=true;
+    end;
+  end;
+
   // 클래스 메서드 구현 (ClassName.MethodName 형태)
   TMethodImplNode = class
   public
@@ -533,6 +556,7 @@ type
     ParamNames: List<string>; ParamTypes: List<TVarType>;
     ParamGenericNames: List<string>; // [Stage 32] ParamTypes[i]=vtGeneric일 때 그 타입 매개변수 이름, 아니면 ''
     LocalVars: List<TVarDecl>; // [Stage 28] 메서드 본문 안의 지역 변수 선언(var 섹션)
+    ConstDecls: List<TConstDecl>; // [Stage 61] 메서드 본문 안의 지역 const 선언
     Body: TCompoundStmtNode;
     constructor Create(cn, mn: string; isFunc: boolean; ret: TVarType);
     begin
@@ -540,6 +564,7 @@ type
       ParamNames:=new List<string>; ParamTypes:=new List<TVarType>;
       ParamGenericNames:=new List<string>;
       LocalVars:=new List<TVarDecl>;
+      ConstDecls:=new List<TConstDecl>; // [Stage 61]
     end;
   end;
 
@@ -551,15 +576,17 @@ type
     ClassName: string;
     Parameters: List<TParamDef>; // [Stage 47]
     LocalVars: List<TVarDecl>;
+    ConstDecls: List<TConstDecl>; // [Stage 61]
     Body: TCompoundStmtNode;
     constructor Create(cn: string);
-    begin ClassName:=cn; Parameters:=new List<TParamDef>; LocalVars:=new List<TVarDecl>; end;
+    begin ClassName:=cn; Parameters:=new List<TParamDef>; LocalVars:=new List<TVarDecl>; ConstDecls:=new List<TConstDecl>; end;
   end;
 
   TFuncDeclNode = class
   public Name: string; Parameters: List<TParamDef>;
     ReturnType: TVarType; Body: TCompoundStmtNode;
     LocalVars: List<TVarDecl>; // [Stage 28] 함수 본문 안의 지역 변수 선언(var 섹션)
+    ConstDecls: List<TConstDecl>; // [Stage 61] 함수 본문 안의 지역 const 선언
     // [Stage 36] 최상위 제네릭 함수: function Identity<T>(x: T): T;
     IsGeneric: boolean;
     GenericParamNames: List<string>;       // 예: ['T'] 또는 ['K','V']. IsGeneric=false면 빈 목록.
@@ -568,6 +595,7 @@ type
     constructor Create(n: string);
     begin
       Name:=n; Parameters:=new List<TParamDef>; LocalVars:=new List<TVarDecl>;
+      ConstDecls:=new List<TConstDecl>; // [Stage 61]
       IsGeneric:=false; GenericParamNames:=new List<string>; GenericParamConstraints:=new List<string>;
       ReturnGenericName:='';
     end;
@@ -576,6 +604,7 @@ type
   TProcDeclNode = class
   public Name: string; Parameters: List<TParamDef>; Body: TCompoundStmtNode;
     LocalVars: List<TVarDecl>; // [Stage 28] 프로시저 본문 안의 지역 변수 선언(var 섹션)
+    ConstDecls: List<TConstDecl>; // [Stage 61] 프로시저 본문 안의 지역 const 선언
     // [Stage 36] 최상위 제네릭 프로시저: procedure PrintBoth<T>(a, b: T);
     IsGeneric: boolean;
     GenericParamNames: List<string>;
@@ -583,6 +612,7 @@ type
     constructor Create(n: string);
     begin
       Name:=n; Parameters:=new List<TParamDef>; LocalVars:=new List<TVarDecl>;
+      ConstDecls:=new List<TConstDecl>; // [Stage 61]
       IsGeneric:=false; GenericParamNames:=new List<string>; GenericParamConstraints:=new List<string>;
     end;
   end;
@@ -613,6 +643,7 @@ type
     FuncDecls:   List<TFuncDeclNode>;
     ProcDecls:   List<TProcDeclNode>;
     VarDecls:    List<TVarDecl>;
+    ConstDecls:  List<TConstDecl>; // [Stage 61] 전역 const 선언
     Statements:  List<TStmtNode>;
     GenericInstantiations: List<TGenericInstantiation>; // Parser가 채우고 Monomorphize가 소비
     GenericFuncInstantiations: List<TGenericFuncInstantiation>; // [Stage 36] 함수/프로시저용, 동일한 방식
@@ -628,6 +659,7 @@ type
       FuncDecls:=new List<TFuncDeclNode>;
       ProcDecls:=new List<TProcDeclNode>;
       VarDecls:=new List<TVarDecl>;
+      ConstDecls:=new List<TConstDecl>; // [Stage 61]
       Statements:=new List<TStmtNode>;
       GenericInstantiations:=new List<TGenericInstantiation>;
       GenericFuncInstantiations:=new List<TGenericFuncInstantiation>;

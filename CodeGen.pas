@@ -1832,6 +1832,52 @@ type
       else Result:=VTC(lv.VarType, lv.ClassName);
     end;
 
+    // [Stage 61] const 선언 하나를 aScope(fLocalScope 또는 fGlobalScope)에 슬롯으로 선언하고
+    // 그 자리에서 곧바로 초기값을 대입한다. "var x := 식;"(TInlineVarStmtNode) 처리와 같은
+    // 패턴을 재사용한다 — 타입 명시가 없으면(HasExplicitType=false) InferType으로 추론하고,
+    // 있으면 그 타입을 그대로 쓴다. 전역/지역 모두 결국 "선언 직후 한 번 대입하는 슬롯"으로
+    // 구현되므로(재대입을 막는 검사는 아직 하지 않음) 같은 헬퍼를 공유할 수 있다.
+    procedure EmitConstDecl(aIL: ILGenerator; aScope: TScope; cd: TConstDecl);
+    var vt: TVarType; clrType: System.Type; clsName: string; isExtT: boolean; loc: LocalBuilder;
+    begin
+      clsName:=cd.ClassName; isExtT:=cd.IsExternal;
+      if cd.HasExplicitType then
+      begin
+        vt:=cd.VarType;
+        if (vt=vtObject) and isExtT then clrType:=ResolveExternalType(clsName)
+        else clrType:=VTC(vt, clsName);
+      end
+      else
+      begin
+        vt:=InferType(cd.ValueExpr);
+        if cd.ValueExpr is TNewObjectExprNode then
+        begin
+          // new Type(...) 이면 정확한 클래스명/외부 여부를 그 노드에서 직접 가져온다
+          // (InferType은 vtObject라는 것만 알려줌 — TInlineVarStmtNode 처리와 동일한 이유).
+          var neo:=TNewObjectExprNode(cd.ValueExpr);
+          clsName:=neo.ClassName; isExtT:=neo.IsExternalType;
+          if isExtT then clrType:=ResolveExternalType(clsName)
+          else if fBuiltTypes.ContainsKey(clsName) then clrType:=fBuiltTypes[clsName]
+          else if fTypeBuilders.ContainsKey(clsName) then clrType:=fTypeBuilders[clsName]
+          else clrType:=typeof(System.Object);
+        end
+        else
+          clrType:=VTC(vt, '');
+      end;
+      loc:=aIL.DeclareLocal(clrType);
+      aScope.Declare(cd.Name, loc, vt);
+      if (vt=vtObject) or (vt=vtInterface) then
+      begin
+        if isExtT then aScope.SetClrType(cd.Name, clrType)
+        else if (clsName<>'') and (fTypeBuilders.ContainsKey(clsName) or fBuiltTypes.ContainsKey(clsName)) then
+          aScope.SetClassName(cd.Name, clsName)
+        else
+          aScope.SetClrType(cd.Name, clrType);
+      end;
+      EmitValueForVType(aIL, cd.ValueExpr, vt);
+      aIL.Emit(OpCodes.Stloc, loc);
+    end;
+
     // 인터페이스 TypeBuilder 생성 + 즉시 완성(CreateType)
     // 인터페이스는 클래스처럼 나중에 몸체를 채울 필요가 없으므로(메서드 시그니처뿐)
     // [Phase 1] 열거형을 Reflection.Emit으로 빌드한다.
@@ -2406,6 +2452,9 @@ type
         end;
       end;
 
+      // [Stage 61] 생성자 본문의 지역 const 선언 처리
+      foreach var cd61 in impl.ConstDecls do EmitConstDecl(il, fLocalScope, cd61);
+
       foreach st in impl.Body.Statements do EmitStatement(il, st);
       il.Emit(OpCodes.Ret);
 
@@ -2501,6 +2550,9 @@ type
         end;
       end;
 
+      // [Stage 61] 메서드 본문의 지역 const 선언 처리
+      foreach var cd61 in impl.ConstDecls do EmitConstDecl(il, fLocalScope, cd61);
+
       foreach st in impl.Body.Statements do EmitStatement(il, st);
 
       if impl.IsFunction then
@@ -2572,6 +2624,9 @@ type
             fLocalScope.SetClrType(lv.Name, lvClrType);
         end;
       end;
+
+      // [Stage 61] 함수 본문의 지역 const 선언 처리
+      foreach var cd61 in d.ConstDecls do EmitConstDecl(il, fLocalScope, cd61);
       foreach st in d.Body.Statements do EmitStatement(il, st);
       il.Emit(OpCodes.Ldloc, fResultLocal); il.Emit(OpCodes.Ret);
       fLocalScope:=savedLocalScope; fResultLocal:=svR; fResultType:=svRT;
@@ -2625,6 +2680,9 @@ type
             fLocalScope.SetClrType(lv.Name, lvClrType);
         end;
       end;
+
+      // [Stage 61] 프로시저 본문의 지역 const 선언 처리
+      foreach var cd61 in d.ConstDecls do EmitConstDecl(il, fLocalScope, cd61);
       foreach st in d.Body.Statements do EmitStatement(il, st);
       il.Emit(OpCodes.Ret);
       fLocalScope:=savedLocalScope; fResultLocal:=svR; fResultType:=svRT;
@@ -2811,6 +2869,8 @@ type
       begin
         if fProg.VarDecls.Count>0 then
           raise new Exception('library는 지금 전역 var 섹션을 지원하지 않습니다 (Stage 44).');
+        if fProg.ConstDecls.Count>0 then
+          raise new Exception('library는 지금 전역 const 섹션을 지원하지 않습니다 (Stage 44/61).'); // [Stage 61]
         if fProg.Statements.Count>0 then
           raise new Exception('library는 지금 begin...end 초기화 블록을 지원하지 않습니다 (Stage 44).');
       end
@@ -2864,6 +2924,10 @@ type
           if vdIsClrTyped then fGlobalScope.SetClrType(vd.Name, vdClrType);
           if vdIsClassNamed then fGlobalScope.SetClassName(vd.Name, vd.ClassName);
         end;
+
+        // [Stage 61] 전역 const 선언 처리. var 슬롯이 모두 준비된 뒤,
+        // 최상위 begin...end 문장을 실행하기 전에 선언 순서대로 초기값을 대입한다.
+        foreach var cd61 in fProg.ConstDecls do EmitConstDecl(il, fGlobalScope, cd61);
 
         foreach st in fProg.Statements do EmitStatement(il, st);
 
