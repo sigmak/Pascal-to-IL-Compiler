@@ -870,7 +870,7 @@ type
     // 이제 문장 파싱 실패 시 오류를 ParseErrors에 기록만 해두고, 다음 안전한 지점
     // (';', 'end', 파일 끝)까지 토큰을 건너뛴 뒤 이어서 파싱한다.
     procedure ParseStatementsUntilEnd(target: List<TStmtNode>);
-    var stmtStartPos: integer;
+    var stmtStartPos: integer; syncDepth: integer;
     begin
       while (Cur.Kind<>tkEnd) and (Cur.Kind<>tkEOF) do
       begin
@@ -885,8 +885,18 @@ type
             // 무한루프 방지: 문장 파싱이 토큰을 하나도 전진시키지 못했다면 최소 한 개는 건너뛴다.
             if fPos=stmtStartPos then fPos:=fPos+1;
             // 다음 동기화 지점(';' 또는 'end' 또는 파일 끝)까지 건너뛴다.
-            while (Cur.Kind<>tkSemicolon) and (Cur.Kind<>tkEnd) and (Cur.Kind<>tkEOF) do
+            // [버그 수정] 깨진 문장 안에 중첩된 begin...end나 try...end가 있으면
+            // (예: "if x then begin ... end" 도중 오류) 그 안쪽 'end'를 이 블록 자신의
+            // 끝으로 착각하면 안 된다 — begin/try를 열림으로, end를 닫힘으로 세어
+            // 깊이가 0일 때 만나는 ';'나 'end'만 진짜 동기화 지점으로 인정한다.
+            syncDepth:=0;
+            while Cur.Kind<>tkEOF do
+            begin
+              if (syncDepth=0) and ((Cur.Kind=tkSemicolon) or (Cur.Kind=tkEnd)) then break;
+              if (Cur.Kind=tkBegin) or (Cur.Kind=tkTry) then syncDepth:=syncDepth+1
+              else if Cur.Kind=tkEnd then syncDepth:=syncDepth-1;
               fPos:=fPos+1;
+            end;
             if Cur.Kind=tkSemicolon then fPos:=fPos+1;
           end;
         end;
@@ -1392,6 +1402,26 @@ type
       Result:=sig;
     end;
 
+    // [Stage 58] 클래스/인터페이스 멤버 하나(필드/메서드 시그니처/프로퍼티/생성자 시그니처)가
+    // 깨졌을 때 그 멤버 하나만 버리고 다음 멤버(또는 클래스/인터페이스의 'end')로 건너뛴다.
+    // 멤버 선언은 항상 ';'으로 끝나므로 다음 ';' 지점까지 건너뛰면 되지만, 매개변수 목록의
+    // '(' ')' 안에 있는 ';'(매개변수 그룹 구분자, 예: "function F(a:integer; b:integer)")에
+    // 걸려 너무 일찍 멈추지 않도록 괄호 깊이를 추적한다.
+    // [주의] 클래스 본문 자체에는 begin...end가 없으므로(멤버는 시그니처뿐, 본문은 별도
+    // MethodImpl에서 파싱) ParseStatementsUntilEnd처럼 begin/end 깊이까지 추적할 필요는 없다.
+    procedure SkipToMemberBoundary;
+    var parenDepth: integer;
+    begin
+      parenDepth:=0;
+      while (Cur.Kind<>tkEOF) and (Cur.Kind<>tkEnd) do
+      begin
+        if Cur.Kind=tkLParen then parenDepth:=parenDepth+1
+        else if Cur.Kind=tkRParen then begin if parenDepth>0 then parenDepth:=parenDepth-1; end
+        else if (Cur.Kind=tkSemicolon) and (parenDepth=0) then begin fPos:=fPos+1; exit; end;
+        fPos:=fPos+1;
+      end;
+    end;
+
     // type 섹션: IFoo = interface ... end;  또는  TClassName = class ... end;
     procedure ParseTypeSection(aProg: TProgramNode);
     var
@@ -1466,7 +1496,19 @@ type
           fInterfaceNames.Add(cn);
 
           while Cur.Kind<>tkEnd do
-            idecl.Methods.Add(ParseInterfaceMethodSig);
+          begin
+            // [Stage 58] 인터페이스 메서드 시그니처 하나가 깨져도 인터페이스 전체를
+            // 버리지 않고 그 시그니처만 건너뛴다.
+            try
+              idecl.Methods.Add(ParseInterfaceMethodSig);
+            except
+              on ex: Exception do
+              begin
+                ParseErrors.Add(ex.Message);
+                SkipToMemberBoundary;
+              end;
+            end;
+          end;
 
           Expect(tkEnd); Expect(tkSemicolon);
           aProg.InterfaceDecls.Add(idecl);
@@ -1534,6 +1576,11 @@ type
           var savedGP1:=fCurGenericParams; fCurGenericParams:=genParamNames;
           while Cur.Kind<>tkEnd do
           begin
+            // [Stage 58] 클래스 멤버(필드/메서드/프로퍼티/생성자 시그니처) 하나가 깨져도
+            // 클래스 전체를 버리지 않고 그 멤버 하나만 건너뛴다.
+            var memberStartPos:=fPos;
+            try
+            begin
             // private / public 키워드는 건너뜀
             if (Cur.Kind=tkPrivate) or (Cur.Kind=tkPublic) then
             begin
@@ -1725,6 +1772,15 @@ type
 
             else
               raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': 클래스 선언 안에서 알 수 없는 토큰 "'+Cur.Text+'"');
+            end; // [Stage 58] 멤버 try 안의 begin 닫기
+            except
+              on ex: Exception do
+              begin
+                ParseErrors.Add(ex.Message);
+                if fPos=memberStartPos then fPos:=fPos+1;
+                SkipToMemberBoundary;
+              end;
+            end;
           end;
 
           fCurGenericParams:=savedGP1;
