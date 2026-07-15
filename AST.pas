@@ -235,6 +235,33 @@ type
     begin VarName:=v; CollExpr:=c; Body:=b; end;
   end;
 
+  // [Stage 59] case 라벨 하나. 단일 값(예: 3, 'A', Red)이면 HighExpr=nil.
+  // 범위(예: 1..5)면 LowExpr..HighExpr 둘 다 채워진다.
+  // (PascalABC.NET은 named constructor를 허용하지 않아 — 오류: "Constructor can have
+  //  only 'Create' name" — CreateRange 대신 Create를 매개변수 개수로 오버로드한다.)
+  TCaseLabel = class
+  public
+    LowExpr: TExprNode; HighExpr: TExprNode;
+    constructor Create(lo: TExprNode); overload; begin LowExpr:=lo; HighExpr:=nil; end;
+    constructor Create(lo, hi: TExprNode); overload; begin LowExpr:=lo; HighExpr:=hi; end;
+  end;
+
+  // [Stage 59] case의 분기 하나: "라벨1, 라벨2, ... : 문장;"
+  TCaseBranchNode = class
+  public
+    Labels: List<TCaseLabel>; Stmt: TStmtNode;
+    constructor Create; begin Labels:=new List<TCaseLabel>; end;
+  end;
+
+  // [Stage 59] case Selector of 분기들... [else 문장들] end
+  // ElseStmts=nil이면 else 절이 없는 것 (아무 분기도 안 맞으면 그냥 통과).
+  TCaseStmtNode = class(TStmtNode)
+  public
+    Selector: TExprNode; Branches: List<TCaseBranchNode>; ElseStmts: List<TStmtNode>;
+    constructor Create(sel: TExprNode);
+    begin Selector:=sel; Branches:=new List<TCaseBranchNode>; ElseStmts:=nil; end;
+  end;
+
   TProcCallStmtNode = class(TStmtNode)
   public ProcName: string; Args: List<TExprNode>;
     constructor Create(n: string); begin ProcName:=n; Args:=new List<TExprNode>; end;

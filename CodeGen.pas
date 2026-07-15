@@ -1481,6 +1481,67 @@ type
         aIL.Emit(OpCodes.Brtrue, bdL);
       end
 
+      else if s is TCaseStmtNode then
+      begin
+        // [Stage 59] case Selector of 라벨...: 문장; ... [else 문장들] end
+        // 점프 테이블 최적화 없이 분기를 순서대로 검사하는 조건 체인으로 desugar한다:
+        //   sel := Selector (임시 로컬에 한 번만 저장, 반복 평가 방지)
+        //   각 분기: 라벨 중 하나라도 맞으면 caseBodyL로 점프, 다 안 맞으면 caseNextL로 통과
+        //     caseBodyL: 문장; goto caseEndL;
+        //     caseNextL: (다음 분기 검사로 이어짐)
+        //   모든 분기가 안 맞으면 else문장들(있으면) 실행
+        //   caseEndL:
+        // 단일값 라벨은 Ceq, 범위(lo..hi) 라벨은 Clt/Cgt 조합으로 "범위 밖이면 실패" 판정.
+        var cse:=TCaseStmtNode(s);
+        var caseSelClrType: System.Type;
+        if cse.Selector is TVarRefNode then
+          caseSelClrType:=VTC(GetVarType(TVarRefNode(cse.Selector).VarName), GetVarClassName(TVarRefNode(cse.Selector).VarName))
+        else
+          caseSelClrType:=VTC(InferType(cse.Selector), '');
+        var caseSelLoc:=aIL.DeclareLocal(caseSelClrType);
+        EmitExpr(aIL, cse.Selector);
+        aIL.Emit(OpCodes.Stloc, caseSelLoc);
+
+        var caseEndL:=aIL.DefineLabel;
+        foreach var cbr in cse.Branches do
+        begin
+          var caseBodyL:=aIL.DefineLabel;
+          var caseNextL:=aIL.DefineLabel;
+          foreach var clbl in cbr.Labels do
+          begin
+            if clbl.HighExpr=nil then
+            begin
+              aIL.Emit(OpCodes.Ldloc, caseSelLoc);
+              EmitExpr(aIL, clbl.LowExpr);
+              aIL.Emit(OpCodes.Ceq);
+              aIL.Emit(OpCodes.Brtrue, caseBodyL);
+            end
+            else
+            begin
+              var caseRangeFailL:=aIL.DefineLabel;
+              aIL.Emit(OpCodes.Ldloc, caseSelLoc);
+              EmitExpr(aIL, clbl.LowExpr);
+              aIL.Emit(OpCodes.Clt);
+              aIL.Emit(OpCodes.Brtrue, caseRangeFailL); // sel < low → 범위 밖
+              aIL.Emit(OpCodes.Ldloc, caseSelLoc);
+              EmitExpr(aIL, clbl.HighExpr);
+              aIL.Emit(OpCodes.Cgt);
+              aIL.Emit(OpCodes.Brtrue, caseRangeFailL); // sel > high → 범위 밖
+              aIL.Emit(OpCodes.Br, caseBodyL);
+              aIL.MarkLabel(caseRangeFailL);
+            end;
+          end;
+          aIL.Emit(OpCodes.Br, caseNextL);
+          aIL.MarkLabel(caseBodyL);
+          EmitStatement(aIL, cbr.Stmt);
+          aIL.Emit(OpCodes.Br, caseEndL);
+          aIL.MarkLabel(caseNextL);
+        end;
+        if cse.ElseStmts<>nil then
+          foreach var celS in cse.ElseStmts do EmitStatement(aIL, celS);
+        aIL.MarkLabel(caseEndL);
+      end
+
       else if s is TProcCallStmtNode then
       begin
         pc:=TProcCallStmtNode(s);

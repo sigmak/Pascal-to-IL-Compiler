@@ -1174,6 +1174,65 @@ type
         Result:=new TWhileStmtNode(cond, bS);
       end
 
+      // [Stage 59] case Selector of 라벨1,라벨2..라벨3: 문장; ... [else 문장들] end
+      else if Cur.Kind=tkCase then
+      begin
+        fPos:=fPos+1; // 'case' 소비
+        var caseSelExpr:=ParseExpr;
+        Expect(tkOf);
+        var caseNode:=new TCaseStmtNode(caseSelExpr);
+        // 분기 목록: 'else' 또는 'end'(또는 파일 끝) 나올 때까지. [Stage 58]과 같은 panic-mode 복구.
+        while (Cur.Kind<>tkElse) and (Cur.Kind<>tkEnd) and (Cur.Kind<>tkEOF) do
+        begin
+          var caseBranchStart:=fPos;
+          try
+            var caseBranch:=new TCaseBranchNode;
+            while true do
+            begin
+              var caseLoE:=ParseExpr;
+              if Cur.Kind=tkDotDot then
+              begin
+                fPos:=fPos+1;
+                var caseHiE:=ParseExpr;
+                caseBranch.Labels.Add(new TCaseLabel(caseLoE, caseHiE));
+              end
+              else
+                caseBranch.Labels.Add(new TCaseLabel(caseLoE));
+              if Cur.Kind=tkComma then fPos:=fPos+1 else break;
+            end;
+            Expect(tkColon);
+            caseBranch.Stmt:=ParseStatement;
+            caseNode.Branches.Add(caseBranch);
+            if Cur.Kind=tkSemicolon then fPos:=fPos+1;
+          except
+            on exCase: Exception do
+            begin
+              ParseErrors.Add(exCase.Message);
+              if fPos=caseBranchStart then fPos:=fPos+1;
+              // 다음 동기화 지점(';' 또는 'else' 또는 'end')까지 건너뜀.
+              // 중첩된 begin/try/case의 안쪽 'end'를 이 case 자신의 끝으로 착각하지 않도록 깊이 추적.
+              var caseSyncDepth:=0;
+              while Cur.Kind<>tkEOF do
+              begin
+                if (caseSyncDepth=0) and ((Cur.Kind=tkSemicolon) or (Cur.Kind=tkElse) or (Cur.Kind=tkEnd)) then break;
+                if (Cur.Kind=tkBegin) or (Cur.Kind=tkTry) or (Cur.Kind=tkCase) then caseSyncDepth:=caseSyncDepth+1
+                else if Cur.Kind=tkEnd then caseSyncDepth:=caseSyncDepth-1;
+                fPos:=fPos+1;
+              end;
+              if Cur.Kind=tkSemicolon then fPos:=fPos+1;
+            end;
+          end;
+        end;
+        if Cur.Kind=tkElse then
+        begin
+          fPos:=fPos+1; // 'else' 소비
+          caseNode.ElseStmts:=new List<TStmtNode>;
+          ParseStatementsUntilEnd(caseNode.ElseStmts); // [Stage 58] panic-mode 오류 복구, 'end'에서 멈춤
+        end;
+        Expect(tkEnd);
+        Result:=caseNode;
+      end
+
       else if Cur.Kind=tkFor then
       begin
         fPos:=fPos+1;

@@ -32,12 +32,13 @@ type
     // [Phase 1] 타입 시스템 확장
     tkReal, tkDouble, tkChar, tkInt64, // 숫자·문자 기본 타입
     tkProperty, tkRead, tkWrite,       // 프로퍼티 선언
+    tkCase, // [Stage 59] case...of...else 문
     tkIdent, tkString, tkIntLiteral, tkRealLiteral, tkCharLiteral,
     tkSemicolon, tkColon, tkComma, tkAssign,
     tkPlus, tkMinus, tkStar, tkSlash, tkPlusAssign,
     tkEq, tkNeq, tkLt, tkGt, tkLe, tkGe,
     tkLParen, tkRParen, tkLBracket, tkRBracket,
-    tkDot, tkEOF
+    tkDot, tkDotDot, tkEOF // [Stage 59] tkDotDot: case 라벨의 1..5 형태 범위
   );
 
   TToken = class
@@ -193,6 +194,7 @@ type
       else if lw='property' then Result:=new TToken(tkProperty, w,sl,sc)
       else if lw='read'     then Result:=new TToken(tkRead,     w,sl,sc)
       else if lw='write'    then Result:=new TToken(tkWrite,    w,sl,sc)
+      else if lw='case'     then Result:=new TToken(tkCase,     w,sl,sc) // [Stage 59]
       else                        Result:=new TToken(tkIdent,     w,sl,sc);
     end;
 
@@ -331,6 +333,8 @@ type
         else if ch='/' then begin toks.Add(new TToken(tkSlash,'/',fLine,sc)); Adv; end
         else if ch='(' then begin toks.Add(new TToken(tkLParen,'(',fLine,sc)); Adv; end
         else if ch=')' then begin toks.Add(new TToken(tkRParen,')',fLine,sc)); Adv; end
+        else if (ch='.') and (PC='.') then // [Stage 59] '..' 범위 연산자 (case 라벨: 1..5)
+          begin toks.Add(new TToken(tkDotDot,'..',fLine,sc)); Adv; Adv; end
         else if ch='.' then begin toks.Add(new TToken(tkDot,'.',fLine,sc)); Adv; end
         else begin
           // [Stage 35] 즉시 던지지 않고 모아둔다 — 문제 문자 하나를 건너뛰고 스캔을 계속한다.
