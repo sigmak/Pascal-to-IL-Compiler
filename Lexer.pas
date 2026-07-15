@@ -33,6 +33,8 @@ type
     tkReal, tkDouble, tkChar, tkInt64, // 숫자·문자 기본 타입
     tkProperty, tkRead, tkWrite,       // 프로퍼티 선언
     tkCase, // [Stage 59] case...of...else 문
+    tkRepeat, tkUntil, // [Stage 60] repeat...until 루프
+    tkBreak, tkContinue, // [Stage 60] break/continue
     tkIdent, tkString, tkIntLiteral, tkRealLiteral, tkCharLiteral,
     tkSemicolon, tkColon, tkComma, tkAssign,
     tkPlus, tkMinus, tkStar, tkSlash, tkPlusAssign,
@@ -195,6 +197,10 @@ type
       else if lw='read'     then Result:=new TToken(tkRead,     w,sl,sc)
       else if lw='write'    then Result:=new TToken(tkWrite,    w,sl,sc)
       else if lw='case'     then Result:=new TToken(tkCase,     w,sl,sc) // [Stage 59]
+      else if lw='repeat'   then Result:=new TToken(tkRepeat,   w,sl,sc) // [Stage 60]
+      else if lw='until'    then Result:=new TToken(tkUntil,    w,sl,sc) // [Stage 60]
+      else if lw='break'    then Result:=new TToken(tkBreak,    w,sl,sc) // [Stage 60]
+      else if lw='continue' then Result:=new TToken(tkContinue, w,sl,sc) // [Stage 60]
       else                        Result:=new TToken(tkIdent,     w,sl,sc);
     end;
 

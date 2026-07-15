@@ -903,6 +903,38 @@ type
       end;
     end;
 
+    // [Stage 60] repeat 문장들 until Condition — ParseStatementsUntilEnd와 동일한 panic-mode
+    // 오류 복구 패턴이지만 종료 토큰이 'end'가 아니라 'until'이다. 중첩된 begin/try/case/repeat는
+    // 깊이를 늘리고 그에 대응하는 end/until을 만나면 깊이를 줄여, 깊이 0에서 만난 ';' 또는
+    // 'until'만 진짜 동기화 지점으로 인정한다 (caseSyncDepth와 같은 원리).
+    procedure ParseStatementsUntilRepeat(target: List<TStmtNode>);
+    var stmtStartPos: integer; syncDepth: integer;
+    begin
+      while (Cur.Kind<>tkUntil) and (Cur.Kind<>tkEOF) do
+      begin
+        stmtStartPos:=fPos;
+        try
+          target.Add(ParseStatement);
+          if Cur.Kind=tkSemicolon then fPos:=fPos+1;
+        except
+          on ex: Exception do
+          begin
+            ParseErrors.Add(ex.Message);
+            if fPos=stmtStartPos then fPos:=fPos+1;
+            syncDepth:=0;
+            while Cur.Kind<>tkEOF do
+            begin
+              if (syncDepth=0) and ((Cur.Kind=tkSemicolon) or (Cur.Kind=tkUntil)) then break;
+              if (Cur.Kind=tkBegin) or (Cur.Kind=tkTry) or (Cur.Kind=tkCase) or (Cur.Kind=tkRepeat) then syncDepth:=syncDepth+1
+              else if (Cur.Kind=tkEnd) or (Cur.Kind=tkUntil) then syncDepth:=syncDepth-1;
+              fPos:=fPos+1;
+            end;
+            if Cur.Kind=tkSemicolon then fPos:=fPos+1;
+          end;
+        end;
+      end;
+    end;
+
     // ---- 문장 파싱 ----
     function ParseStatement: TStmtNode;
     var
@@ -1172,6 +1204,31 @@ type
       begin
         fPos:=fPos+1; cond:=ParseExpr; Expect(tkDo); bS:=ParseStatement;
         Result:=new TWhileStmtNode(cond, bS);
+      end
+
+      // [Stage 60] repeat 문장들 [;문장들...] until Condition
+      else if Cur.Kind=tkRepeat then
+      begin
+        fPos:=fPos+1; // 'repeat' 소비
+        var repNode:=new TRepeatStmtNode;
+        ParseStatementsUntilRepeat(repNode.Statements);
+        Expect(tkUntil);
+        repNode.Condition:=ParseExpr;
+        Result:=repNode;
+      end
+
+      // [Stage 60] break — 가장 안쪽 루프 탈출
+      else if Cur.Kind=tkBreak then
+      begin
+        fPos:=fPos+1;
+        Result:=new TBreakStmtNode;
+      end
+
+      // [Stage 60] continue — 가장 안쪽 루프의 다음 반복으로
+      else if Cur.Kind=tkContinue then
+      begin
+        fPos:=fPos+1;
+        Result:=new TContinueStmtNode;
       end
 
       // [Stage 59] case Selector of 라벨1,라벨2..라벨3: 문장; ... [else 문장들] end

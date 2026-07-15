@@ -21,7 +21,8 @@ uses
 
 const
   DefaultExampleDir = 'Examples';
-  DefaultExampleFile = 'Test_stage59.pas'; // [Stage 59] case...of...else 문 테스트
+  DefaultExampleFile = 'Test_stage60.pas'; // [Stage 60] break/continue, repeat...until 테스트
+  //DefaultExampleFile = 'Test_stage59.pas'; // [Stage 59] case...of...else 문 테스트
   //DefaultExampleFile = 'Test_stage58.pas'; // 오류메세지 3개가 발생되는게 맞음. 
   //DefaultExampleFile = 'Test_stage57.pas';
   //DefaultExampleFile = 'Units_DupTest\Dupentry.pas'; // stage56 오류 나는 예제 Examples\Units_DupTest\ 폴더에 Dupa.pas, Dupb.pas, Dupentry.pas 이렇게 3개 가 있음.

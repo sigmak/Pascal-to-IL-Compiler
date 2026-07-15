@@ -235,6 +235,21 @@ type
     begin VarName:=v; CollExpr:=c; Body:=b; end;
   end;
 
+  // [Stage 60] repeat 문장들 until Condition — 조건을 맨 뒤에서 검사하므로 본문이 최소 한 번은 실행된다.
+  // (while과 달리 조건이 '참'이 되면 멈춘다: while은 조건이 참인 동안, repeat은 조건이 거짓인 동안 반복)
+  TRepeatStmtNode = class(TStmtNode)
+  public Statements: List<TStmtNode>; Condition: TExprNode;
+    constructor Create; begin Statements:=new List<TStmtNode>; end;
+  end;
+
+  // [Stage 60] break — 가장 안쪽 for/while/repeat 루프를 즉시 빠져나간다.
+  TBreakStmtNode = class(TStmtNode)
+  end;
+
+  // [Stage 60] continue — 가장 안쪽 for/while/repeat 루프의 다음 반복으로 건너뛴다.
+  TContinueStmtNode = class(TStmtNode)
+  end;
+
   // [Stage 59] case 라벨 하나. 단일 값(예: 3, 'A', Red)이면 HighExpr=nil.
   // 범위(예: 1..5)면 LowExpr..HighExpr 둘 다 채워진다.
   // (PascalABC.NET은 named constructor를 허용하지 않아 — 오류: "Constructor can have

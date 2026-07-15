@@ -74,6 +74,18 @@ type
     fResultType:   TVarType;
     fCurClassName: string; // 인스턴스 메서드 안에서 self 타입
 
+    // [Stage 60] break/continue 지원. 병렬 리스트 3개를 스택처럼 사용한다(Add=push,
+    // RemoveAt(Count-1)=pop) — 프로젝트 전반에서 List<T>를 스택 대용으로 쓰는 기존 관례를 따름.
+    // 루프에 진입할 때(for/while/repeat) 탈출 라벨(break)과 이어달리기 라벨(continue)을 push하고,
+    // 루프를 벗어나면 pop한다. break/continue는 항상 "가장 안쪽" 루프, 즉 리스트의 마지막 항목을 사용한다.
+    // fLoopExceptDepths는 그 루프가 시작된 시점의 try 중첩 깊이(fCurExceptDepth)를 같이 저장해 둔다 —
+    // break/continue가 try/except/finally 블록 "밖"으로 점프해야 하면(중첩 깊이가 그때보다 깊으면)
+    // 단순 Br이 아니라 Leave를 써야 CLR이 finally 블록을 정상적으로 실행하고 스택을 되감기 때문.
+    fLoopBreakLabels:    List<&Label>;
+    fLoopContinueLabels: List<&Label>;
+    fLoopExceptDepths:   List<integer>;
+    fCurExceptDepth: integer; // 현재 try/except/finally 중첩 깊이 (BeginExceptionBlock/EndExceptionBlock에서 증감)
+
     function VTC(t: TVarType; cn: string): System.Type;
     begin
       if t=vtString then Result:=typeof(string)
@@ -1004,6 +1016,25 @@ type
       else raise new Exception('알 수 없는 식 노드: '+e.GetType.Name);
     end;
 
+    // [Stage 60] break/continue 공용 헬퍼. isBreak=true면 가장 안쪽 루프의 탈출 라벨로,
+    // false면 이어달리기(continue) 라벨로 점프한다. 루프가 하나도 열려 있지 않으면(스택이 비어있으면)
+    // "루프 밖에서 break/continue 사용" 오류로 처리한다.
+    // try/except/finally 블록 "안"에서 그 블록 밖으로(또는 걸쳐서) 점프해야 하는 경우 —
+    // 즉 현재 try 중첩 깊이(fCurExceptDepth)가 루프 진입 시점의 깊이보다 깊은 경우 —
+    // 단순 Br이 아니라 Leave를 써야 한다. Reflection.Emit에서 보호된(try/catch/finally) 영역을
+    // Br로 그냥 빠져나가면 finally가 실행되지 않거나 검증(PEVerify) 실패로 이어질 수 있다.
+    procedure EmitLoopExit(aIL: ILGenerator; isBreak: boolean);
+    var targetLbl: &Label; loopDepth: integer;
+    begin
+      if fLoopBreakLabels.Count=0 then
+        raise new Exception('break/continue는 for/while/repeat 루프 안에서만 사용할 수 있습니다');
+      if isBreak then targetLbl:=fLoopBreakLabels[fLoopBreakLabels.Count-1]
+      else targetLbl:=fLoopContinueLabels[fLoopContinueLabels.Count-1];
+      loopDepth:=fLoopExceptDepths[fLoopExceptDepths.Count-1];
+      if fCurExceptDepth>loopDepth then aIL.Emit(OpCodes.Leave, targetLbl)
+      else aIL.Emit(OpCodes.Br, targetLbl);
+    end;
+
     procedure EmitStatement(aIL: ILGenerator; s: TStmtNode);
     var
       we: TWritelnExprStmtNode; ws: TWritelnStringStmtNode;
@@ -1475,10 +1506,17 @@ type
       else if s is TWhileStmtNode then
       begin
         whs:=TWhileStmtNode(s); ckL:=aIL.DefineLabel; bdL:=aIL.DefineLabel;
+        // [Stage 60] continue → 조건 검사(ckL)로, break → 루프 뒤(whEndL)로.
+        var whEndL:=aIL.DefineLabel;
+        fLoopBreakLabels.Add(whEndL); fLoopContinueLabels.Add(ckL); fLoopExceptDepths.Add(fCurExceptDepth);
         aIL.Emit(OpCodes.Br, ckL); aIL.MarkLabel(bdL);
         EmitStatement(aIL, whs.Body);
         aIL.MarkLabel(ckL); EmitExpr(aIL, whs.Condition);
         aIL.Emit(OpCodes.Brtrue, bdL);
+        aIL.MarkLabel(whEndL);
+        fLoopBreakLabels.RemoveAt(fLoopBreakLabels.Count-1);
+        fLoopContinueLabels.RemoveAt(fLoopContinueLabels.Count-1);
+        fLoopExceptDepths.RemoveAt(fLoopExceptDepths.Count-1);
       end
 
       else if s is TCaseStmtNode then
@@ -1573,9 +1611,14 @@ type
         EmitExpr(aIL, fs.EndExpr);
         aIL.Emit(OpCodes.Stloc, endValLoc);
         var forCkL:=aIL.DefineLabel; var forBdL:=aIL.DefineLabel;
+        // [Stage 60] continue는 본문 나머지를 건너뛰되 증감(i++/i--)은 그대로 해야 하므로
+        // 증감 코드 바로 앞에 별도 라벨(forIncL)을 둔다. break는 루프 완전히 밖(forEndL)으로.
+        var forIncL:=aIL.DefineLabel; var forEndL:=aIL.DefineLabel;
+        fLoopBreakLabels.Add(forEndL); fLoopContinueLabels.Add(forIncL); fLoopExceptDepths.Add(fCurExceptDepth);
         aIL.Emit(OpCodes.Br, forCkL);
         aIL.MarkLabel(forBdL);
         EmitStatement(aIL, fs.Body);
+        aIL.MarkLabel(forIncL);
         // i++ 또는 i--
         aIL.Emit(OpCodes.Ldloc, forVarLoc);
         aIL.Emit(OpCodes.Ldc_I4_1);
@@ -1590,6 +1633,10 @@ type
         else
         begin aIL.Emit(OpCodes.Cgt); aIL.Emit(OpCodes.Ldc_I4_0); aIL.Emit(OpCodes.Ceq); end;
         aIL.Emit(OpCodes.Brtrue, forBdL);
+        aIL.MarkLabel(forEndL);
+        fLoopBreakLabels.RemoveAt(fLoopBreakLabels.Count-1);
+        fLoopContinueLabels.RemoveAt(fLoopContinueLabels.Count-1);
+        fLoopExceptDepths.RemoveAt(fLoopExceptDepths.Count-1);
       end
 
       else if s is TForInStmtNode then
@@ -1626,6 +1673,9 @@ type
         aIL.Emit(OpCodes.Stloc, forInEnumLoc);
 
         var forInCkL:=aIL.DefineLabel; var forInBdL:=aIL.DefineLabel;
+        // [Stage 60] continue → MoveNext 검사(forInCkL)로, break → 루프 뒤(forInEndL)로.
+        var forInEndL:=aIL.DefineLabel;
+        fLoopBreakLabels.Add(forInEndL); fLoopContinueLabels.Add(forInCkL); fLoopExceptDepths.Add(fCurExceptDepth);
         aIL.Emit(OpCodes.Br, forInCkL);
         aIL.MarkLabel(forInBdL);
 
@@ -1644,7 +1694,39 @@ type
         var moveNextMI:=typeof(System.Collections.IEnumerator).GetMethod('MoveNext');
         aIL.Emit(OpCodes.Callvirt, moveNextMI);
         aIL.Emit(OpCodes.Brtrue, forInBdL);
+        aIL.MarkLabel(forInEndL);
+        fLoopBreakLabels.RemoveAt(fLoopBreakLabels.Count-1);
+        fLoopContinueLabels.RemoveAt(fLoopContinueLabels.Count-1);
+        fLoopExceptDepths.RemoveAt(fLoopExceptDepths.Count-1);
       end
+
+      else if s is TRepeatStmtNode then
+      begin
+        // [Stage 60] repeat 문장들 until Condition
+        // IL 패턴: bdL: 문장들; ckL(continue 대상): if not Condition then goto bdL;
+        //   endL(break 대상):
+        // while과 반대로 조건이 '참'이면 멈춘다 — 그래서 Condition 평가 후 Brfalse로 되돈다.
+        // 최초 진입 시 무조건 본문을 한 번 실행하므로(= "do...while" 형태) while처럼 진입 전
+        // 조건 검사로 건너뛰는 Br이 없다.
+        var reps:=TRepeatStmtNode(s);
+        var repBdL:=aIL.DefineLabel; var repCkL:=aIL.DefineLabel; var repEndL:=aIL.DefineLabel;
+        fLoopBreakLabels.Add(repEndL); fLoopContinueLabels.Add(repCkL); fLoopExceptDepths.Add(fCurExceptDepth);
+        aIL.MarkLabel(repBdL);
+        foreach var repSt in reps.Statements do EmitStatement(aIL, repSt);
+        aIL.MarkLabel(repCkL);
+        EmitExpr(aIL, reps.Condition);
+        aIL.Emit(OpCodes.Brfalse, repBdL);
+        aIL.MarkLabel(repEndL);
+        fLoopBreakLabels.RemoveAt(fLoopBreakLabels.Count-1);
+        fLoopContinueLabels.RemoveAt(fLoopContinueLabels.Count-1);
+        fLoopExceptDepths.RemoveAt(fLoopExceptDepths.Count-1);
+      end
+
+      else if s is TBreakStmtNode then
+        EmitLoopExit(aIL, true)
+
+      else if s is TContinueStmtNode then
+        EmitLoopExit(aIL, false)
 
       else if s is TTryStmtNode then
       begin
@@ -1662,6 +1744,7 @@ type
         end;
 
         aIL.BeginExceptionBlock;
+        fCurExceptDepth:=fCurExceptDepth+1; // [Stage 60] break/continue가 이 블록을 벗어나면 Leave를 써야 함을 표시
 
         // try 본문
         foreach var bs in ts2.BodyStmts do EmitStatement(aIL, bs);
@@ -1686,6 +1769,7 @@ type
         end;
 
         aIL.EndExceptionBlock;
+        fCurExceptDepth:=fCurExceptDepth-1; // [Stage 60]
 
         // 예외 변수 이름을 로컬에서 제거 (스코프 종료)
         if ts2.ExVarName<>'' then
@@ -2572,6 +2656,11 @@ type
       fLoadedAssemblies:=new List<Assembly>;
       fClassExternalParentType:=new Dictionary<string, System.Type>;
       fResultLocal:=nil; fResultType:=vtInteger; fCurClassName:='';
+      // [Stage 60]
+      fLoopBreakLabels:=new List<&Label>;
+      fLoopContinueLabels:=new List<&Label>;
+      fLoopExceptDepths:=new List<integer>;
+      fCurExceptDepth:=0;
 
       // [Stage 51] GAC에 항상 있다고 볼 수 있는 "기본" 프레임워크들의 네임스페이스 접두사 표.
       // 접두사는 가장 구체적인 것부터 매칭되도록 ResolveExternalType에서 길이 내림차순으로 검사한다.
