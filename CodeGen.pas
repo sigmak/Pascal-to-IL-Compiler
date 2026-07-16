@@ -68,6 +68,10 @@ type
     fBuiltInterfaces:   Dictionary<string, System.Type>;  // 인터페이스명 → 완성된 Type
     // [Phase 1] 열거형 관련
     fBuiltEnums: Dictionary<string, System.Type>; // 열거형명 → 완성된 Type
+    // [Stage 62] 레코드(값 타입) 이름 집합. 레코드는 fBuiltTypes/fFieldBuilders를 클래스와
+    // 공유하지만(타입 CLR 조회 경로 재사용), 필드를 읽고/쓸 때 Ldloc(값 복사) 대신
+    // Ldloca(주소)가 필요하다는 점이 다르다 — 그 분기를 위해서만 이 집합을 따로 둔다.
+    fRecordNames: HashSet<string>;
 
     // 현재 메서드 컨텍스트
     fResultLocal:  LocalBuilder;
@@ -761,8 +765,18 @@ type
         begin
           cn:=GetVarClassName(mc.ObjName);
           vtVar:=GetVarType(mc.ObjName);
-          if fLocalScope.Has(mc.ObjName) then aIL.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(mc.ObjName))
-          else aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(mc.ObjName));
+          // [Stage 62] cn이 레코드(값 타입)면 Ldfld가 값이 아니라 주소를 요구하므로 Ldloca를 쓴다.
+          // (레코드는 메서드가 없어 이 분기가 성공하는 유일한 경로는 바로 아래 필드 읽기뿐이다.)
+          if fLocalScope.Has(mc.ObjName) then
+          begin
+            if fRecordNames.Contains(cn) then aIL.Emit(OpCodes.Ldloca, fLocalScope.GetLoc(mc.ObjName))
+            else aIL.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(mc.ObjName));
+          end
+          else
+          begin
+            if fRecordNames.Contains(cn) then aIL.Emit(OpCodes.Ldloca, fGlobalScope.GetLoc(mc.ObjName))
+            else aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(mc.ObjName));
+          end;
           if cn='' then raise new Exception('알 수 없는 메서드 "'+cn+'.'+mc.MethodName+'"');
           // [버그 수정] obj.FieldName(괄호 없음, 인자 없음)은 메서드가 아니라 필드/속성 읽기일
           // 수도 있다 — 이전에는 무조건 FindInstanceMethod로 보내서 실제로는 필드인데
@@ -1139,8 +1153,17 @@ type
           else if fLocalScope.Has(fas.Qualifier) or fGlobalScope.Has(fas.Qualifier) then
           begin
             cn:=GetVarClassName(fas.Qualifier);
-            if fLocalScope.Has(fas.Qualifier) then aIL.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(fas.Qualifier))
-            else aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(fas.Qualifier));
+            // [Stage 62] cn이 레코드(값 타입)면 Stfld가 값이 아니라 주소를 요구하므로 Ldloca를 쓴다.
+            if fLocalScope.Has(fas.Qualifier) then
+            begin
+              if fRecordNames.Contains(cn) then aIL.Emit(OpCodes.Ldloca, fLocalScope.GetLoc(fas.Qualifier))
+              else aIL.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(fas.Qualifier));
+            end
+            else
+            begin
+              if fRecordNames.Contains(cn) then aIL.Emit(OpCodes.Ldloca, fGlobalScope.GetLoc(fas.Qualifier))
+              else aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(fas.Qualifier));
+            end;
             if fBuiltTypes.ContainsKey(cn) then qTargetType:=fBuiltTypes[cn]
             else if fTypeBuilders.ContainsKey(cn) then qTargetType:=fTypeBuilders[cn]
             else raise new Exception('알 수 없는 타입 "'+cn+'" (변수 "'+fas.Qualifier+'")');
@@ -1892,6 +1915,36 @@ type
         for i:=0 to ed.Members.Count-1 do
           eb.DefineLiteral(ed.Members[i], integer(i));
         fBuiltEnums[ed.Name]:=eb.CreateType;
+      end;
+    end;
+
+    // [Stage 62] 레코드(값 타입)를 System.ValueType을 상속하는 TypeBuilder로 빌드한다.
+    // 열거형 바로 다음, 인터페이스/클래스보다 먼저 완성시킨다 — 필드 타입은 지금 단계에서
+    // 기본 타입/열거형/외부 .NET 타입으로만 제한되므로(Parser가 이미 검증) 이 시점에
+    // 이미 열거형만 준비되어 있으면 충분하다. 메서드가 없으므로 클래스처럼 "껍데기 먼저,
+    // 본문은 나중에" 두 단계로 나눌 필요가 없어 필드를 정의하자마자 곧바로 CreateType한다.
+    //
+    // 값 타입이므로 지역변수/매개변수 슬롯에 Ldloc/Stloc(또는 인자로 전달)만 해도 CLR이
+    // 필드 전체를 그대로 복사해준다 — "대입 시 복사"라는 값 타입 의미론은 별도 코드 없이
+    // 여기서 공짜로 따라온다. 다만 필드 자체를 읽거나 쓸 때는(예: p.X, p.X := 5) Ldfld/Stfld가
+    // 값이 아니라 객체 참조 또는 관리 포인터를 요구하므로, 그 지점(EmitExpr의 TMethodCallExprNode
+    // 0-인자 필드읽기, TFieldAssignStmtNode)에서는 Ldloc 대신 Ldloca를 써야 한다 — fRecordNames로 분기.
+    procedure BuildRecordTypes(modBuilder: ModuleBuilder);
+    var rd: TRecordDeclNode; rfd: TFieldDeclNode; rtb: TypeBuilder; rfb: FieldBuilder;
+    begin
+      foreach rd in fProg.RecordDecls do
+      begin
+        rtb:=modBuilder.DefineType(rd.Name,
+          TypeAttributes.Public or TypeAttributes.SequentialLayout or TypeAttributes.Sealed,
+          typeof(System.ValueType));
+        fFieldBuilders[rd.Name]:=new Dictionary<string, FieldBuilder>;
+        foreach rfd in rd.Fields do
+        begin
+          rfb:=rtb.DefineField(rfd.Name, ResolveFieldClrType(rfd), FieldAttributes.Public);
+          fFieldBuilders[rd.Name][rfd.Name]:=rfb;
+        end;
+        fBuiltTypes[rd.Name]:=rtb.CreateType;
+        fRecordNames.Add(rd.Name);
       end;
     end;
 
@@ -2711,6 +2764,7 @@ type
       fInterfaceBuilders:=new Dictionary<string, TypeBuilder>;
       fBuiltInterfaces:=new Dictionary<string, System.Type>;
       fBuiltEnums:=new Dictionary<string, System.Type>; // [Phase 1]
+      fRecordNames:=new HashSet<string>; // [Stage 62]
       fLoadedAssemblies:=new List<Assembly>;
       fClassExternalParentType:=new Dictionary<string, System.Type>;
       fResultLocal:=nil; fResultType:=vtInteger; fCurClassName:='';
@@ -2812,6 +2866,10 @@ type
 
       // -2. [Phase 1] 열거형을 가장 먼저 빌드 (인터페이스·클래스 필드 타입으로 참조됨)
       BuildEnumTypes(modB);
+
+      // -1.5. [Stage 62] 레코드(값 타입)를 열거형 다음, 인터페이스/클래스보다 먼저 완전히 빌드한다.
+      // 메서드가 없어 클래스처럼 나중 단계를 기다릴 필요가 없으므로 여기서 CreateType까지 끝낸다.
+      BuildRecordTypes(modB);
 
       // -1. 인터페이스 타입을 클래스보다 먼저 완전히 빌드 (CreateType까지)
       //     클래스의 AddInterfaceImplementation에는 완성된 Type이 필요하기 때문

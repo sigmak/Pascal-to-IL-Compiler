@@ -501,6 +501,21 @@ type
     begin Name:=n; Members:=new List<string>; end;
   end;
 
+  // [Stage 62] 레코드 선언: type TPoint = record X, Y: integer; end;
+  // 클래스(TClassDeclNode)와 달리 값 타입(System.ValueType 상속)으로 CodeGen이 빌드하며,
+  // 그래서 대입/매개변수 전달 시 CLR이 필드 전체를 복사해준다(값 타입 의미론).
+  // 이번 단계에서는 필드만 지원한다 — 메서드/생성자/프로퍼티/상속은 클래스의 몫으로 남겨둔다.
+  // 필드 타입도 기본 타입(integer/string/boolean/real/char/int64)·열거형·외부 .NET 타입만
+  // 허용한다(지역 클래스/인터페이스/다른 레코드를 필드로 담는 것은 CodeGen의 빌드 순서
+  // 문제 때문에 아직 지원하지 않음 — Parser가 명확한 오류로 막는다).
+  TRecordDeclNode = class
+  public
+    Name: string;
+    Fields: List<TFieldDeclNode>;
+    constructor Create(n: string);
+    begin Name:=n; Fields:=new List<TFieldDeclNode>; end;
+  end;
+
   // 인터페이스 선언 (메서드 시그니처만, 본문 없음)
   TInterfaceDeclNode = class
   public
@@ -649,6 +664,7 @@ type
     GenericFuncInstantiations: List<TGenericFuncInstantiation>; // [Stage 36] 함수/프로시저용, 동일한 방식
     IsLibrary: boolean; // [Stage 44] true면 "library Name;"으로 시작 — exe 대신 dll로 생성, begin...end 블록 생략 가능
     EnumDecls: List<TEnumDeclNode>; // [Phase 1] 열거형 선언 목록
+    RecordDecls: List<TRecordDeclNode>; // [Stage 62] 레코드 선언 목록
     constructor Create(n: string);
     begin
       Name:=n;
@@ -665,6 +681,7 @@ type
       GenericFuncInstantiations:=new List<TGenericFuncInstantiation>;
       IsLibrary:=false;
       EnumDecls:=new List<TEnumDeclNode>; // [Phase 1]
+      RecordDecls:=new List<TRecordDeclNode>; // [Stage 62]
     end;
   end;
 

@@ -30,6 +30,7 @@ type
   TParserExternalSymbols = class
   public
     FuncNames, ProcNames, ClassNames, InterfaceNames, EnumNames: List<string>;
+    RecordNames: List<string>; // [Stage 62]
     GenericClassNames, GenericFuncNames, GenericProcNames: List<string>;
     ClassFields: Dictionary<string, List<string>>;
     ClassMethods: Dictionary<string, Dictionary<string, boolean>>;
@@ -43,6 +44,7 @@ type
     begin
       FuncNames:=new List<string>; ProcNames:=new List<string>;
       ClassNames:=new List<string>; InterfaceNames:=new List<string>; EnumNames:=new List<string>;
+      RecordNames:=new List<string>; // [Stage 62]
       GenericClassNames:=new List<string>; GenericFuncNames:=new List<string>; GenericProcNames:=new List<string>;
       ClassFields:=new Dictionary<string, List<string>>;
       ClassMethods:=new Dictionary<string, Dictionary<string, boolean>>;
@@ -70,6 +72,10 @@ type
     fClassNames: List<string>; // 선언된 클래스 이름 목록 (제네릭 템플릿 이름 + 단형화된 구체 이름 포함)
     fInterfaceNames: List<string>; // 선언된 인터페이스 이름 목록
     fEnumNames: List<string>; // [Phase 1] 선언된 열거형 이름 목록 (타입 파싱 시 vtEnum 분류용)
+    // [Stage 62] 선언된 레코드 이름 목록. 레코드 이름은 fClassNames에도 함께 등록해서
+    // (var/필드/매개변수 타입 인식 같은) 기존 "지역 클래스 이름" 인식 경로를 그대로 재사용한다 —
+    // fRecordNames는 그중 "값 타입이라 new/상속이 금지된다" 같은 레코드 전용 규칙을 걸 때만 따로 확인한다.
+    fRecordNames: List<string>;
     // [Stage 51] 열거형 멤버 이름 → 소속 열거형 이름 / 서수. North → ('TDirection', 0) 처럼
     // 식(expression) 안에서 괄호 없는 식별자로 등장하는 열거형 값을 판별하는 데 쓰인다.
     fEnumMemberEnumName: Dictionary<string, string>;
@@ -286,6 +292,9 @@ type
           var nestedConcrete:=ResolveGenericInstantiation(nestedTemplate);
           oneType:=vtObject; oneClassName:=nestedConcrete; oneTag:=nestedConcrete;
         end
+        else if (Cur.Kind=tkIdent) and fRecordNames.Contains(Cur.Text) then // [Stage 62]
+          raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': 레코드 "'+Cur.Text
+            +'"는 아직 제네릭 타입 인자로 쓸 수 없습니다 (값 타입 — Stage 62)')
         else if (Cur.Kind=tkIdent) and fClassNames.Contains(Cur.Text) then
           begin oneClassName:=Cur.Text; oneType:=vtObject; oneTag:=Cur.Text; fPos:=fPos+1; end
         else
@@ -550,6 +559,9 @@ type
         if (Cur.Kind=tkLt) and fGenericClassNames.Contains(newTn) then
           newTn:=ResolveGenericInstantiation(newTn);
         while Cur.Kind=tkDot do begin fPos:=fPos+1; newTn:=newTn+'.'+Expect(tkIdent).Text; end;
+        if fRecordNames.Contains(newTn) then // [Stage 62]
+          raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': 레코드 "'+newTn
+            +'"는 new로 생성할 수 없습니다 — 변수 선언만으로 이미 필드가 기본값(0/빈 문자열 등)으로 초기화됩니다');
         var neoN:=new TNewObjectExprNode(newTn);
         neoN.IsExternalType:=not fClassNames.Contains(newTn);
         if Cur.Kind=tkLParen then
@@ -1630,6 +1642,46 @@ type
           aProg.InterfaceDecls.Add(idecl);
         end
 
+        // ---- [Stage 62] 레코드 선언: TPoint = record X, Y: integer; end; ----
+        // 값 타입 의미론(대입 시 복사)이 필요해서 클래스와 구조는 비슷해도 CodeGen에서
+        // System.ValueType을 상속하는 별도 타입으로 빌드한다. 이번 단계는 필드만 지원한다
+        // (메서드/생성자/상속/제네릭은 지원하지 않음 — 필요해지면 별도 스테이지로).
+        else if Cur.Kind=tkRecord then
+        begin
+          if genParamNames.Count>0 then
+            raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': 레코드는 제네릭 타입 매개변수를 지원하지 않습니다 (Stage 62)');
+          fPos:=fPos+1; // 'record' 소비
+          var rdecl:=new TRecordDeclNode(cn);
+          while Cur.Kind<>tkEnd do
+          begin
+            var rfnames:=new List<string>;
+            rfnames.Add(Expect(tkIdent).Text);
+            while Cur.Kind=tkComma do begin fPos:=fPos+1; rfnames.Add(Expect(tkIdent).Text); end;
+            Expect(tkColon);
+            var rfIsExt:=false; var rfCn:='';
+            var rfType:=ParseParamTypeExt(rfIsExt, rfCn);
+            // [Stage 62] 필드 타입 제한: 기본 타입/열거형/외부 .NET 타입만 허용.
+            // 지역 클래스·인터페이스·다른 레코드는 CodeGen의 타입 빌드 순서(레코드가 클래스보다
+            // 먼저 완성됨) 때문에 지금은 지원하지 않는다 — 여기서 명확한 오류로 막는다.
+            if ((rfType=vtObject) and (not rfIsExt)) or (rfType=vtInterface)
+               or (rfType=vtGeneric) or (rfType=vtGenericArray) then
+              raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString
+                +': 레코드 필드 "'+rfnames[rfnames.Count-1]+'"는 기본 타입/열거형/외부 .NET 타입만 지원합니다 '
+                +'(지역 클래스·인터페이스·다른 레코드를 필드로 담는 것은 아직 지원하지 않음, Stage 62)');
+            Expect(tkSemicolon);
+            foreach var rfn in rfnames do
+            begin
+              var rfld:=new TFieldDeclNode(rfn, rfType);
+              rfld.ClassName:=rfCn; rfld.IsExternalType:=rfIsExt;
+              rdecl.Fields.Add(rfld);
+            end;
+          end;
+          Expect(tkEnd); Expect(tkSemicolon);
+          fRecordNames.Add(cn);
+          fClassNames.Add(cn); // [Stage 62] var/필드/매개변수 타입 인식 경로를 클래스와 공유
+          aProg.RecordDecls.Add(rdecl);
+        end
+
         // ---- 클래스 선언 ----
         else
         begin
@@ -1655,7 +1707,9 @@ type
               fPos:=fPos+1;
               pname:=pname+'.'+Expect(tkIdent).Text;
             end;
-            if fClassNames.Contains(pname) then
+            if fRecordNames.Contains(pname) then // [Stage 62]
+              raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': 레코드 "'+pname+'"는 상속할 수 없습니다 (값 타입)')
+            else if fClassNames.Contains(pname) then
               cd.ParentName:=pname
             else if fInterfaceNames.Contains(pname) then
               cd.InterfaceName:=pname
@@ -2366,6 +2420,7 @@ type
       fClassNames:=new List<string>;
       fInterfaceNames:=new List<string>;
       fEnumNames:=new List<string>; // [Phase 1]
+      fRecordNames:=new List<string>; // [Stage 62]
       fEnumMemberEnumName:=new Dictionary<string, string>; // [Stage 51]
       fEnumMemberOrdinal:=new Dictionary<string, integer>; // [Stage 51]
       ParseErrors:=new List<string>; // [Stage 51]
@@ -2398,6 +2453,7 @@ type
       foreach var s in ext.ClassNames do if not fClassNames.Contains(s) then fClassNames.Add(s);
       foreach var s in ext.InterfaceNames do if not fInterfaceNames.Contains(s) then fInterfaceNames.Add(s);
       foreach var s in ext.EnumNames do if not fEnumNames.Contains(s) then fEnumNames.Add(s);
+      foreach var s in ext.RecordNames do if not fRecordNames.Contains(s) then fRecordNames.Add(s); // [Stage 62]
       foreach var s in ext.GenericClassNames do if not fGenericClassNames.Contains(s) then fGenericClassNames.Add(s);
       foreach var s in ext.GenericFuncNames do if not fGenericFuncNames.Contains(s) then fGenericFuncNames.Add(s);
       foreach var s in ext.GenericProcNames do if not fGenericProcNames.Contains(s) then fGenericProcNames.Add(s);
@@ -2428,6 +2484,7 @@ type
       Result.ClassNames.AddRange(fClassNames);
       Result.InterfaceNames.AddRange(fInterfaceNames);
       Result.EnumNames.AddRange(fEnumNames);
+      Result.RecordNames.AddRange(fRecordNames); // [Stage 62]
       Result.GenericClassNames.AddRange(fGenericClassNames);
       Result.GenericFuncNames.AddRange(fGenericFuncNames);
       Result.GenericProcNames.AddRange(fGenericProcNames);

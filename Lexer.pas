@@ -14,7 +14,7 @@ uses
 
 type
   TTokenKind = (
-    tkProgram, tkType, tkClass, tkInterface, tkPrivate, tkPublic,
+    tkProgram, tkType, tkClass, tkRecord, tkInterface, tkPrivate, tkPublic,
     tkVar, tkInteger, tkStringType, tkArray, tkOf,
     tkBegin, tkEnd, tkWriteln,
     tkIf, tkThen, tkElse, tkWhile, tkDo, tkMod,
@@ -140,6 +140,7 @@ type
       if      lw='program'   then Result:=new TToken(tkProgram,   w,sl,sc)
       else if lw='type'      then Result:=new TToken(tkType,      w,sl,sc)
       else if lw='class'     then Result:=new TToken(tkClass,     w,sl,sc)
+      else if lw='record'    then Result:=new TToken(tkRecord,    w,sl,sc) // [Stage 62]
       else if lw='interface' then Result:=new TToken(tkInterface, w,sl,sc)
       else if lw='private'   then Result:=new TToken(tkPrivate,   w,sl,sc)
       else if lw='public'    then Result:=new TToken(tkPublic,    w,sl,sc)

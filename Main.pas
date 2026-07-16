@@ -21,7 +21,8 @@ uses
 
 const
   DefaultExampleDir = 'Examples';
-  DefaultExampleFile = 'Test_stage61.pas'; // [Stage 61] const 선언 (전역/지역, 타입 추론 포함) 테스트
+  DefaultExampleFile = 'Test_stage62.pas'; // [Stage 62] record 타입 (값 타입 의미론 — 대입 시 복사) 테스트
+  //DefaultExampleFile = 'Test_stage61.pas'; // [Stage 61] const 선언 (전역/지역, 타입 추론 포함) 테스트
   //DefaultExampleFile = 'Test_stage60.pas'; // [Stage 60] break/continue, repeat...until 테스트
   //DefaultExampleFile = 'Test_stage59.pas'; // [Stage 59] case...of...else 문 테스트
   //DefaultExampleFile = 'Test_stage58.pas'; // 오류메세지 3개가 발생되는게 맞음. 
@@ -349,6 +350,9 @@ begin
   foreach p in prog.ProcDecls do RegisterDeclName(seenProcs, p.Name, '프로시저', fileLabel);
   foreach i in prog.InterfaceDecls do RegisterDeclName(seenIfaces, i.Name, '인터페이스', fileLabel);
   foreach e in prog.EnumDecls do RegisterDeclName(seenEnums, e.Name, '열거형', fileLabel);
+  // [Stage 62] 레코드는 클래스와 이름공간을 공유하므로(같은 곳에서 "타입 이름"으로 참조됨)
+  // seenClasses에 함께 등록한다 — 다른 파일의 클래스와 이름이 겹쳐도 여기서 잡힌다.
+  foreach var r62 in prog.RecordDecls do RegisterDeclName(seenClasses, r62.Name, '레코드', fileLabel);
 end;
 
 // src(다른 파일에서 파싱된 TProgramNode)의 선언들을 target으로 옮겨 붙인다.
@@ -362,12 +366,14 @@ begin
   foreach p in src.ProcDecls do RegisterDeclName(seenProcs, p.Name, '프로시저', fileLabel);
   foreach i in src.InterfaceDecls do RegisterDeclName(seenIfaces, i.Name, '인터페이스', fileLabel);
   foreach e in src.EnumDecls do RegisterDeclName(seenEnums, e.Name, '열거형', fileLabel);
+  foreach var r62 in src.RecordDecls do RegisterDeclName(seenClasses, r62.Name, '레코드', fileLabel); // [Stage 62]
 
   target.ClassDecls.AddRange(src.ClassDecls);
   target.FuncDecls.AddRange(src.FuncDecls);
   target.ProcDecls.AddRange(src.ProcDecls);
   target.InterfaceDecls.AddRange(src.InterfaceDecls);
   target.EnumDecls.AddRange(src.EnumDecls);
+  target.RecordDecls.AddRange(src.RecordDecls); // [Stage 62]
   target.MethodImpls.AddRange(src.MethodImpls);
   target.ConstructorImpls.AddRange(src.ConstructorImpls);
   target.VarDecls.AddRange(src.VarDecls);
