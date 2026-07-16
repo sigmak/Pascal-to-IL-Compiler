@@ -633,6 +633,11 @@ type
     begin ClassName:=cn; Parameters:=new List<TParamDef>; LocalVars:=new List<TVarDecl>; ConstDecls:=new List<TConstDecl>; end;
   end;
 
+  // [Stage 65] TFuncDeclNode.NestedProcs가 아직 정의되지 않은 TProcDeclNode를 미리 참조해야 하고,
+  // 반대로 TProcDeclNode.NestedFuncs도 TFuncDeclNode를 참조한다 — 서로가 서로를 참조하는 상호
+  // 참조 관계라 어느 한쪽을 먼저 완전히 정의해도 다른 한쪽이 걸린다. 전방 선언으로 해결한다.
+  TProcDeclNode = class;
+
   TFuncDeclNode = class
   public Name: string; Parameters: List<TParamDef>;
     ReturnType: TVarType; Body: TCompoundStmtNode;
@@ -643,12 +648,18 @@ type
     GenericParamNames: List<string>;       // 예: ['T'] 또는 ['K','V']. IsGeneric=false면 빈 목록.
     GenericParamConstraints: List<string>; // GenericParamNames와 인덱스 대응. ''=제약없음, 'class'=참조타입, 그 외=클래스/인터페이스 이름
     ReturnGenericName: string;             // ReturnType=vtGeneric일 때 어느 타입 매개변수인지 (예: 'T')
+    // [Stage 65, 1차] 이 함수 본문 안에 선언된 지역(중첩) 함수/프로시저. 한 겹만 허용되므로
+    // NestedFuncs/NestedProcs 안의 항목들은 자기 자신의 NestedFuncs/NestedProcs가 항상 비어 있다.
+    // 캡처(클로저) 없음 — Name은 이미 파서 단계에서 "바깥이름$지역이름"으로 맹글링되어 있다.
+    NestedFuncs: List<TFuncDeclNode>;
+    NestedProcs: List<TProcDeclNode>;
     constructor Create(n: string);
     begin
       Name:=n; Parameters:=new List<TParamDef>; LocalVars:=new List<TVarDecl>;
       ConstDecls:=new List<TConstDecl>; // [Stage 61]
       IsGeneric:=false; GenericParamNames:=new List<string>; GenericParamConstraints:=new List<string>;
       ReturnGenericName:='';
+      NestedFuncs:=new List<TFuncDeclNode>; NestedProcs:=new List<TProcDeclNode>; // [Stage 65]
     end;
   end;
 
@@ -660,11 +671,15 @@ type
     IsGeneric: boolean;
     GenericParamNames: List<string>;
     GenericParamConstraints: List<string>;
+    // [Stage 65, 1차] TFuncDeclNode.NestedFuncs/NestedProcs와 동일한 규칙(한 겹, 캡처 없음).
+    NestedFuncs: List<TFuncDeclNode>;
+    NestedProcs: List<TProcDeclNode>;
     constructor Create(n: string);
     begin
       Name:=n; Parameters:=new List<TParamDef>; LocalVars:=new List<TVarDecl>;
       ConstDecls:=new List<TConstDecl>; // [Stage 61]
       IsGeneric:=false; GenericParamNames:=new List<string>; GenericParamConstraints:=new List<string>;
+      NestedFuncs:=new List<TFuncDeclNode>; NestedProcs:=new List<TProcDeclNode>; // [Stage 65]
     end;
   end;
 

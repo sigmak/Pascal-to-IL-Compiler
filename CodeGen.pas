@@ -2735,6 +2735,16 @@ type
       mb:=tb.DefineMethod(d.Name, MethodAttributes.Public or MethodAttributes.Static,
         retClrType, pt);
       fMethods[d.Name]:=mb; fTopParamClrTypes[d.Name]:=pt; fFuncReturnTypes[d.Name]:=d.ReturnType; il:=mb.GetILGenerator;
+
+      // [Stage 65, 1차] 지역(중첩) 함수/프로시저를 먼저 별도의 static 메서드로 빌드해 둔다 —
+      // 이 함수(d) 자신의 본문을 방출하기 전에 fMethods에 등록되어 있어야 그 본문 안에서
+      // 호출할 수 있다. BuildStaticFunc/BuildStaticProc는 fLocalScope/fResultLocal 등을
+      // 자체적으로 save/restore하므로, 아직 d 자신의 로컬 스코프를 만들기 전인 지금
+      // 호출해도 안전하다. 캡처는 없다 — 지역 서브프로그램의 스코프는 전역(fGlobalScope)에서만
+      // 시작한다.
+      foreach var nf65 in d.NestedFuncs do BuildStaticFunc(tb, nf65);
+      foreach var np65 in d.NestedProcs do BuildStaticProc(tb, np65);
+
       savedLocalScope:=fLocalScope; svR:=fResultLocal; svRT:=fResultType;
       fLocalScope:=new TScope('local(func)', fGlobalScope);
       fResultType:=d.ReturnType; fResultLocal:=il.DeclareLocal(retClrType);
@@ -2793,6 +2803,11 @@ type
       mb:=tb.DefineMethod(d.Name, MethodAttributes.Public or MethodAttributes.Static,
         typeof(System.Void), pt);
       fMethods[d.Name]:=mb; fTopParamClrTypes[d.Name]:=pt; il:=mb.GetILGenerator;
+
+      // [Stage 65, 1차] BuildStaticFunc의 동일 위치 주석 참고.
+      foreach var nf65 in d.NestedFuncs do BuildStaticFunc(tb, nf65);
+      foreach var np65 in d.NestedProcs do BuildStaticProc(tb, np65);
+
       savedLocalScope:=fLocalScope; svR:=fResultLocal; svRT:=fResultType;
       fLocalScope:=new TScope('local(proc)', fGlobalScope);
       fResultLocal:=nil;

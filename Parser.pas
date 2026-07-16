@@ -69,6 +69,11 @@ type
     fCurParams: List<string>; // 현재 파싱 중인 메서드의 매개변수 이름 목록 (필드보다 우선) — 지역변수도 나중에 추가됨
     fCurMethodParamNames: List<string>; // [Stage 30] 순수 매개변수 이름만(지역변수 제외) — bare 'inherited;' 인자 전달용
     fFuncNames, fProcNames, fArrayNames: List<string>;
+    // [Stage 65, 1차] 현재 파싱 중인 최상위 함수/프로시저 안에 선언된 지역(중첩) 서브프로그램의
+    // "소스에 쓰인 이름 → 맹글링된 실제 이름(Outer$Inner)" 매핑. 최상위 함수/프로시저에
+    // 들어갈 때 새로 만들고 나올 때 이전 값(보통 nil)으로 복원한다 — 한 겹만 지원하므로
+    // 지역 서브프로그램 자신의 본문 파싱 중에는 새로 만들지 않고 그대로 이어서 쓴다.
+    fCurNestedAlias: Dictionary<string, string>;
     fClassNames: List<string>; // 선언된 클래스 이름 목록 (제네릭 템플릿 이름 + 단형화된 구체 이름 포함)
     fInterfaceNames: List<string>; // 선언된 인터페이스 이름 목록
     fEnumNames: List<string>; // [Phase 1] 선언된 열거형 이름 목록 (타입 파싱 시 vtEnum 분류용)
@@ -822,7 +827,7 @@ type
         // 일반 함수 호출
         else if (Cur.Kind=tkLParen) and fFuncNames.Contains(t.Text) then
         begin
-          cn:=new TFuncCallExprNode(t.Text); fPos:=fPos+1;
+          cn:=new TFuncCallExprNode(ResolveCallName(t.Text)); fPos:=fPos+1; // [Stage 65] 지역 함수면 맹글링된 이름으로
           if Cur.Kind<>tkRParen then
           begin
             cn.Args.Add(ParseAddSub);
@@ -1207,7 +1212,7 @@ type
         // 프로시저 호출
         else if (Cur.Kind=tkLParen) and fProcNames.Contains(nt.Text) then
         begin
-          pcn:=new TProcCallStmtNode(nt.Text); fPos:=fPos+1;
+          pcn:=new TProcCallStmtNode(ResolveCallName(nt.Text)); fPos:=fPos+1; // [Stage 65] 지역 프로시저면 맹글링된 이름으로
           if Cur.Kind<>tkRParen then
           begin
             pcn.Args.Add(ParseExpr);
@@ -2082,13 +2087,15 @@ type
     end;
 
     // [Stage 28] 함수/프로시저/메서드 본문 안의 지역 변수 선언(var 섹션)을 파싱한다.
-    // 최상위 var 섹션(ParseVarSection)과 로직은 같지만, 중첩 함수/프로시저 선언이
-    // 없으므로 tkBegin 하나만 만나면 끝난다.
+    // 최상위 var 섹션(ParseVarSection)과 로직은 같다.
+    // [Stage 65] 지역(중첩) 함수/프로시저 선언은 var/const 섹션 "다음"에만 올 수 있으므로
+    // (1차 제약 — 임의로 섞어 쓸 수 없음), tkFunction/tkProcedure를 만나도 여기서 끝낸다.
     procedure ParseLocalVarSection(aList: List<TVarDecl>);
     var vt: TVarType; ns: List<string>; cn: string; isExt: boolean;
     begin
       Expect(tkVar);
-      while (Cur.Kind<>tkBegin) and (Cur.Kind<>tkConst) do // [Stage 61] const 섹션과 교차 가능
+      while (Cur.Kind<>tkBegin) and (Cur.Kind<>tkConst)
+        and (Cur.Kind<>tkFunction) and (Cur.Kind<>tkProcedure) do // [Stage 61] const 섹션과 교차 가능, [Stage 65] 지역 서브프로그램 앞에서 정지
       begin
         ns:=new List<string>; ns.Add(Expect(tkIdent).Text);
         while Cur.Kind=tkComma do begin fPos:=fPos+1; ns.Add(Expect(tkIdent).Text); end;
@@ -2110,11 +2117,13 @@ type
     // [Stage 61] 함수/프로시저/메서드/생성자 본문 안의 지역 const 선언(const 섹션)을 파싱한다.
     // "const Name = 식;" 은 식으로부터 타입을 추론하고, "const Name: Type = 식;" 은 명시된 타입을 쓴다.
     // var 섹션과 마찬가지로 tkBegin 또는 (교차하는) tkVar를 만나면 끝난다.
+    // [Stage 65] tkFunction/tkProcedure를 만나도 끝낸다 — 지역 서브프로그램은 var/const 다음.
     procedure ParseLocalConstSection(aList: List<TConstDecl>);
     var vt: TVarType; nm: string; cn: string; isExt: boolean; ve: TExprNode; hasType: boolean;
     begin
       Expect(tkConst);
-      while (Cur.Kind<>tkBegin) and (Cur.Kind<>tkVar) do
+      while (Cur.Kind<>tkBegin) and (Cur.Kind<>tkVar)
+        and (Cur.Kind<>tkFunction) and (Cur.Kind<>tkProcedure) do
       begin
         nm:=Expect(tkIdent).Text;
         hasType:=false; cn:=''; isExt:=false; vt:=vtInteger;
@@ -2299,6 +2308,15 @@ type
       Result:=impl;
     end;
 
+    // [Stage 65] 식/문장에서 함수·프로시저 호출 이름을 만들 때 항상 이 함수를 거친다.
+    // 그 이름이 현재 감싸는 함수/프로시저의 지역 서브프로그램이면(fCurNestedAlias에 등록됨)
+    // 맹글링된 실제 이름으로 바꿔주고, 아니면(최상위/외부 이름) 그대로 돌려준다.
+    function ResolveCallName(n: string): string;
+    begin
+      if (fCurNestedAlias<>nil) and fCurNestedAlias.ContainsKey(n) then Result:=fCurNestedAlias[n]
+      else Result:=n;
+    end;
+
     procedure ParseParams(aP: List<TParamDef>);
     var pt: TVarType; ns: List<string>;
     begin
@@ -2364,9 +2382,23 @@ type
       Expect(tkSemicolon);
       sv:=fCurFunc; fCurFunc:=d.Name;
       if (Cur.Kind=tkVar) or (Cur.Kind=tkConst) then ParseLocalDeclSections(d.LocalVars, d.ConstDecls); // [Stage 61]
+
+      // [Stage 65, 1차] var/const 섹션 다음, begin 앞에 오는 지역(중첩) 함수/프로시저 선언.
+      // 이 함수(d) 자신이 최상위이므로 한 겹 중첩만 허용 — ParseNestedFuncDecl/ParseNestedProcDecl은
+      // 스스로 또 다른 중첩을 파싱하지 않는다. fCurNestedAlias는 d의 본문(아래 begin...end)을
+      // 파싱하는 동안에도 계속 유지되어야 하므로 Expect(tkEnd) 뒤에서 복원한다.
+      var savedAlias4:=fCurNestedAlias;
+      fCurNestedAlias:=new Dictionary<string, string>;
+      while (Cur.Kind=tkFunction) or (Cur.Kind=tkProcedure) do
+      begin
+        if Cur.Kind=tkFunction then d.NestedFuncs.Add(ParseNestedFuncDecl(d.Name))
+        else d.NestedProcs.Add(ParseNestedProcDecl(d.Name));
+      end;
+
       Expect(tkBegin); c:=new TCompoundStmtNode;
       ParseStatementsUntilEnd(c.Statements); // [Stage 58] panic-mode 오류 복구
       Expect(tkEnd); Expect(tkSemicolon); fCurFunc:=sv; d.Body:=c;
+      fCurNestedAlias:=savedAlias4; // [Stage 65]
       fCurGenericParams:=savedGP4;
       Result:=d;
     end;
@@ -2400,10 +2432,74 @@ type
       ParseParams(d.Parameters); Expect(tkSemicolon);
       sv:=fCurFunc; fCurFunc:='';
       if (Cur.Kind=tkVar) or (Cur.Kind=tkConst) then ParseLocalDeclSections(d.LocalVars, d.ConstDecls); // [Stage 61]
+
+      // [Stage 65, 1차] ParseFuncDecl과 동일한 규칙 — 자세한 설명은 그쪽 주석 참고.
+      var savedAlias5:=fCurNestedAlias;
+      fCurNestedAlias:=new Dictionary<string, string>;
+      while (Cur.Kind=tkFunction) or (Cur.Kind=tkProcedure) do
+      begin
+        if Cur.Kind=tkFunction then d.NestedFuncs.Add(ParseNestedFuncDecl(d.Name))
+        else d.NestedProcs.Add(ParseNestedProcDecl(d.Name));
+      end;
+
       Expect(tkBegin); c:=new TCompoundStmtNode;
       ParseStatementsUntilEnd(c.Statements); // [Stage 58] panic-mode 오류 복구
       Expect(tkEnd); Expect(tkSemicolon); fCurFunc:=sv; d.Body:=c;
+      fCurNestedAlias:=savedAlias5; // [Stage 65]
       fCurGenericParams:=savedGP5;
+      Result:=d;
+    end;
+
+    // [Stage 65, 1차] 최상위 함수/프로시저(enclosingName) 본문 안에 선언된 지역 함수.
+    // ParseFuncDecl과 거의 같지만:
+    //   - 제네릭 지역 함수는 지원하지 않는다(1차 범위 밖 — <T> 파싱 자체를 시도하지 않음).
+    //   - 또 다른 지역 서브프로그램을 자신 안에 선언할 수 없다(한 겹만 허용, panic-mode 오류
+    //     복구를 단순하게 유지하기 위함이기도 함).
+    //   - 캡처(클로저) 없음: 바깥 함수의 매개변수/지역변수는 안 보이고, 자신의 매개변수/지역변수와
+    //     전역만 본다. CodeGen이 이를 그냥 독립된 static 메서드로 만들기 때문에 애초에 접근 경로가 없다.
+    //   - 이름은 "enclosingName$지역이름"으로 맹글링해서 전역 fMethods 네임스페이스 충돌을 피한다.
+    //     소스에는 여전히 지역이름 그대로 쓰므로, fCurNestedAlias에 등록해 두고 fFuncNames에는
+    //     지역이름을 등록한다(호출 인식용) — 실제 호출 노드 생성은 ResolveCallName이 맹글링된
+    //     이름으로 바꿔준다.
+    function ParseNestedFuncDecl(enclosingName: string): TFuncDeclNode;
+    var d: TFuncDeclNode; c: TCompoundStmtNode; sv: string; localName, mangled: string;
+    begin
+      Expect(tkFunction);
+      localName:=Expect(tkIdent).Text;
+      mangled:=enclosingName+'$'+localName;
+      d:=new TFuncDeclNode(mangled);
+      fFuncNames.Add(localName);
+      fCurNestedAlias[localName]:=mangled;
+
+      ParseParams(d.Parameters);
+      Expect(tkColon); d.ReturnType:=ParseVarType;
+      if (d.ReturnType=vtGeneric) or (d.ReturnType=vtGenericArray) then d.ReturnGenericName:=fLastGenericName;
+      Expect(tkSemicolon);
+      sv:=fCurFunc; fCurFunc:=mangled;
+      if (Cur.Kind=tkVar) or (Cur.Kind=tkConst) then ParseLocalDeclSections(d.LocalVars, d.ConstDecls);
+      Expect(tkBegin); c:=new TCompoundStmtNode;
+      ParseStatementsUntilEnd(c.Statements); // [Stage 58] panic-mode 오류 복구
+      Expect(tkEnd); Expect(tkSemicolon); fCurFunc:=sv; d.Body:=c;
+      Result:=d;
+    end;
+
+    // [Stage 65, 1차] ParseNestedFuncDecl과 동일한 규칙의 지역 프로시저. 설명은 그쪽 주석 참고.
+    function ParseNestedProcDecl(enclosingName: string): TProcDeclNode;
+    var d: TProcDeclNode; c: TCompoundStmtNode; sv: string; localName, mangled: string;
+    begin
+      Expect(tkProcedure);
+      localName:=Expect(tkIdent).Text;
+      mangled:=enclosingName+'$'+localName;
+      d:=new TProcDeclNode(mangled);
+      fProcNames.Add(localName);
+      fCurNestedAlias[localName]:=mangled;
+
+      ParseParams(d.Parameters); Expect(tkSemicolon);
+      sv:=fCurFunc; fCurFunc:='';
+      if (Cur.Kind=tkVar) or (Cur.Kind=tkConst) then ParseLocalDeclSections(d.LocalVars, d.ConstDecls);
+      Expect(tkBegin); c:=new TCompoundStmtNode;
+      ParseStatementsUntilEnd(c.Statements); // [Stage 58] panic-mode 오류 복구
+      Expect(tkEnd); Expect(tkSemicolon); fCurFunc:=sv; d.Body:=c;
       Result:=d;
     end;
 
@@ -2521,6 +2617,7 @@ type
     begin
       fTokens:=aTokens; fPos:=0; fCurFunc:=''; fCurClass:=''; fCurParams:=new List<string>;
       fCurMethodParamNames:=new List<string>; // [Stage 30]
+      fCurNestedAlias:=nil; // [Stage 65] 최상위 함수/프로시저 밖에서는 지역 서브프로그램 별칭이 없음
       fFuncNames:=new List<string>;
       fProcNames:=new List<string>;
       fArrayNames:=new List<string>;
