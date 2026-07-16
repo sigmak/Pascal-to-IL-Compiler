@@ -330,13 +330,9 @@ type
   end;
 
   // Qualifier.EventName += HandlerName;  (예: Button1.Click += Button1_Click;)
-  // HandlerName은 현재 클래스의 인스턴스 메서드 이름이어야 한다 (델리게이트로 감싸짐).
-  TEventSubscribeStmtNode = class(TStmtNode)
-  public Qualifier: string; EventName: string; HandlerName: string;
-    QualifierCastType: string; // ''이 아니면 Qualifier를 이 타입으로 캐스트
-    constructor Create(q, ev, h: string);
-    begin Qualifier:=q; EventName:=ev; HandlerName:=h; QualifierCastType:=''; end;
-  end;
+  // [Stage 64] TEventSubscribeStmtNode/TLambdaExprNode 정의는 TParamDef 선언 뒤로 옮겨져
+  // 있다 — 람다가 List<TParamDef>를 담는데, 제네릭 인스턴스화는 클래스 필드 전방 참조와
+  // 달리 TParamDef가 이미 정의돼 있어야 하기 때문. (아래쪽, TParamDef 바로 뒤 참고)
 
   // [Stage 48] begin...end 안에서 "var x := 식;" 형태로 선언과 동시에 대입하는 문장.
   // (앞서 있던 "var 섹션"과 달리, 임의의 문장 사이에서 바로 새 지역 변수를 만든다.)
@@ -404,6 +400,28 @@ type
     begin Name:=n; ParamType:=t; ClassName:=''; IsExternal:=false; end;
     constructor Create(n: string; t: TVarType; cn: string; isExt: boolean); overload;
     begin Name:=n; ParamType:=t; ClassName:=cn; IsExternal:=isExt; end;
+  end;
+
+  // [Stage 64] Button1.Click += (a: T1; b: T2) -> 문장;  형태의 인라인 람다.
+  // LamParams: 매개변수 목록(타입 명시 필수). Body: 본문 문장 하나(begin...end 블록 금지).
+  TLambdaExprNode = class
+  public LamParams: List<TParamDef>; Body: TStmtNode;
+    constructor Create(ps: List<TParamDef>; b: TStmtNode);
+    begin LamParams:=ps; Body:=b; end;
+  end;
+
+  // Qualifier.EventName += HandlerName;  또는 Qualifier.EventName += (매개변수) -> 문장;
+  // (예: Button1.Click += Button1_Click;  /  Button1.Click += (sender, e) -> ...;)
+  // Lambda<>nil 이면 인라인 람다를 구독하며 HandlerName은 무시된다('').
+  TEventSubscribeStmtNode = class(TStmtNode)
+  public Qualifier: string; EventName: string; HandlerName: string;
+    QualifierCastType: string; // ''이 아니면 Qualifier를 이 타입으로 캐스트 (예: TButton(sender).Click += ...)
+    Lambda: TLambdaExprNode;   // nil이 아니면 인라인 람다 구독
+    constructor Create(q, ev, h: string);
+    begin
+      Qualifier:=q; EventName:=ev; HandlerName:=h;
+      QualifierCastType:=''; Lambda:=nil;
+    end;
   end;
 
   // [Phase 1] 클래스 선언부 안의 프로퍼티 시그니처.

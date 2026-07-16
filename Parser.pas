@@ -1006,6 +1006,35 @@ type
     end;
 
     // ---- 문장 파싱 ----
+    // [Stage 64] 람다 매개변수 목록과 본문을 파싱한다. 호출 시점에 '(' 은 아직 소비되지 않은 상태.
+    // (a: T1; b: T2) -> 문장  — 문장 하나만 허용(begin...end 블록 금지, 클로저 없음).
+    // 타입은 항상 명시해야 한다(문맥 기반 타입 추론은 1차 범위 밖).
+    function ParseLambdaExpr: TLambdaExprNode;
+    var ps: List<TParamDef>;
+    begin
+      Expect(tkLParen);
+      ps:=new List<TParamDef>;
+      if Cur.Kind<>tkRParen then
+      begin
+        while true do
+        begin
+          var lpNames:=new List<string>; lpNames.Add(Expect(tkIdent).Text);
+          while Cur.Kind=tkComma do begin fPos:=fPos+1; lpNames.Add(Expect(tkIdent).Text); end;
+          Expect(tkColon);
+          var lpIsExt:=false; var lpCn:='';
+          var lpType:=ParseParamTypeExt(lpIsExt, lpCn);
+          foreach var lpn in lpNames do ps.Add(new TParamDef(lpn, lpType, lpCn, lpIsExt));
+          if Cur.Kind=tkSemicolon then fPos:=fPos+1 else break;
+        end;
+      end;
+      Expect(tkRParen);
+      Expect(tkArrow);
+      if Cur.Kind=tkBegin then
+        raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString
+          +': 람다 본문에는 begin...end 블록을 쓸 수 없습니다 — 문장 하나만 허용됩니다 (Stage 64, 1차)');
+      Result:=new TLambdaExprNode(ps, ParseStatement);
+    end;
+
     function ParseStatement: TStmtNode;
     var
       nt: TToken; rhs, idx, sz: TExprNode;
@@ -1077,10 +1106,19 @@ type
           else if Cur.Kind=tkPlusAssign then
           begin
             // Button1.Click += Button1_Click;  이벤트 구독.
-            // 오른쪽은 항상 "현재 클래스의 메서드 이름" 하나만 온다 (괄호 없음).
+            // [Stage 64] 오른쪽이 '('로 시작하면 이름 있는 핸들러 대신 인라인 람다로 취급한다.
             fPos:=fPos+1;
-            var handlerName:=Expect(tkIdent).Text;
-            Result:=new TEventSubscribeStmtNode(qualifier, mname, handlerName);
+            if Cur.Kind=tkLParen then
+            begin
+              var evsLam:=new TEventSubscribeStmtNode(qualifier, mname, '');
+              evsLam.Lambda:=ParseLambdaExpr;
+              Result:=evsLam;
+            end
+            else
+            begin
+              var handlerName:=Expect(tkIdent).Text;
+              Result:=new TEventSubscribeStmtNode(qualifier, mname, handlerName);
+            end;
           end
           else
           begin
@@ -1235,8 +1273,17 @@ type
         else if Cur.Kind=tkPlusAssign then
         begin
           fPos:=fPos+1;
-          var handlerName3:=Expect(tkIdent).Text;
-          Result:=new TEventSubscribeStmtNode('', selfMname2, handlerName3); // Qualifier='' → self가 이벤트 소유자
+          if Cur.Kind=tkLParen then // [Stage 64]
+          begin
+            var evsLam3:=new TEventSubscribeStmtNode('', selfMname2, ''); // Qualifier='' → self가 이벤트 소유자
+            evsLam3.Lambda:=ParseLambdaExpr;
+            Result:=evsLam3;
+          end
+          else
+          begin
+            var handlerName3:=Expect(tkIdent).Text;
+            Result:=new TEventSubscribeStmtNode('', selfMname2, handlerName3); // Qualifier='' → self가 이벤트 소유자
+          end;
         end
         else
         begin

@@ -37,7 +37,7 @@ type
     tkBreak, tkContinue, // [Stage 60] break/continue
     tkConst, // [Stage 61] const 선언 (전역/지역, 타입 추론 포함)
     tkIdent, tkString, tkIntLiteral, tkRealLiteral, tkCharLiteral,
-    tkSemicolon, tkColon, tkComma, tkAssign,
+    tkSemicolon, tkColon, tkComma, tkAssign, tkArrow, // [Stage 64] tkArrow = '->'
     tkPlus, tkMinus, tkStar, tkSlash, tkPlusAssign,
     tkEq, tkNeq, tkLt, tkGt, tkLe, tkGe,
     tkLParen, tkRParen, tkLBracket, tkRBracket,
@@ -338,6 +338,8 @@ type
         else if (ch='+') and (PC='=') then
           begin toks.Add(new TToken(tkPlusAssign,'+=',fLine,sc)); Adv; Adv; end
         else if ch='+' then begin toks.Add(new TToken(tkPlus,'+',fLine,sc)); Adv; end
+        else if (ch='-') and (PC='>') then // [Stage 64] 람다 화살표
+          begin toks.Add(new TToken(tkArrow,'->',fLine,sc)); Adv; Adv; end
         else if ch='-' then begin toks.Add(new TToken(tkMinus,'-',fLine,sc)); Adv; end
         else if ch='*' then begin toks.Add(new TToken(tkStar,'*',fLine,sc)); Adv; end
         else if ch='/' then begin toks.Add(new TToken(tkSlash,'/',fLine,sc)); Adv; end

@@ -72,6 +72,12 @@ type
     // 공유하지만(타입 CLR 조회 경로 재사용), 필드를 읽고/쓸 때 Ldloc(값 복사) 대신
     // Ldloca(주소)가 필요하다는 점이 다르다 — 그 분기를 위해서만 이 집합을 따로 둔다.
     fRecordNames: HashSet<string>;
+    // [Stage 64] 익명 메서드(람다)는 'Program' 정적 메서드 컨테이너(mainTB)에 새 static 메서드로
+    // 하나씩 추가된다. GenerateExe 안의 지역변수였던 mainTB를 EmitStatement에서도 쓸 수 있도록
+    // 인스턴스 필드로 승격해 둔다. fLambdaCounter는 매번 다른 메서드 이름(__Lambda1, __Lambda2, ...)을
+    // 만들기 위한 일련번호.
+    fMainTB: TypeBuilder;
+    fLambdaCounter: integer;
 
     // 현재 메서드 컨텍스트
     fResultLocal:  LocalBuilder;
@@ -1490,17 +1496,33 @@ type
         if delCtor=nil then
           raise new Exception('델리게이트 "'+evInfo.EventHandlerType.FullName+'"의 생성자를 찾을 수 없습니다.');
 
-        // 3) 델리게이트 생성: self(핸들러의 target) + 핸들러 메서드 포인터 → Newobj
-        // 핸들러 메서드는 (다른 모든 메서드와 마찬가지로) virtual로 정의되어 있으므로
-        // Ldftn이 아니라 Ldvirtftn을 써야 한다 — 이때는 대상 참조를 두 번 로드해야
-        // 한다: 하나는 델리게이트의 target 인자로 남고, 하나는 Ldvirtftn이 소비해서
-        // 가상 디스패치로 실제 메서드 포인터를 구한다.
-        if not TryFindInstanceMethod(fCurClassName, evs.HandlerName, imb) then
-          raise new Exception('핸들러 메서드를 찾을 수 없음: '+fCurClassName+'.'+evs.HandlerName);
-        aIL.Emit(OpCodes.Ldarg_0); // target (newobj용, 남겨둠)
-        aIL.Emit(OpCodes.Ldarg_0); // ldvirtftn이 소비할 참조
-        aIL.Emit(OpCodes.Ldvirtftn, imb);
-        aIL.Emit(OpCodes.Newobj, delCtor);
+        // 3) 델리게이트 생성.
+        // [Stage 64] 람다면: 이미 방금 만든 static 메서드를 가리키는 델리게이트이므로 target이
+        // 없다(Ldnull) — Ldftn(비가상)이면 충분하고 Ldvirtftn/Ldarg_0 두 번이 필요 없다.
+        if evs.Lambda<>nil then
+        begin
+          var lamMB:=EmitLambdaAsStaticMethod(evs.Lambda);
+          var lamInvoke:=evInfo.EventHandlerType.GetMethod('Invoke');
+          if (lamInvoke<>nil) and (lamInvoke.GetParameters.Length<>evs.Lambda.LamParams.Count) then
+            raise new Exception('람다 매개변수 개수('+evs.Lambda.LamParams.Count.ToString+'개)가 이벤트 "'
+              +evs.EventName+'"의 델리게이트 시그니처('+lamInvoke.GetParameters.Length.ToString+'개)와 다릅니다.');
+          aIL.Emit(OpCodes.Ldnull);
+          aIL.Emit(OpCodes.Ldftn, lamMB);
+          aIL.Emit(OpCodes.Newobj, delCtor);
+        end
+        else
+        begin
+          // 핸들러 메서드는 (다른 모든 메서드와 마찬가지로) virtual로 정의되어 있으므로
+          // Ldftn이 아니라 Ldvirtftn을 써야 한다 — 이때는 대상 참조를 두 번 로드해야
+          // 한다: 하나는 델리게이트의 target 인자로 남고, 하나는 Ldvirtftn이 소비해서
+          // 가상 디스패치로 실제 메서드 포인터를 구한다.
+          if not TryFindInstanceMethod(fCurClassName, evs.HandlerName, imb) then
+            raise new Exception('핸들러 메서드를 찾을 수 없음: '+fCurClassName+'.'+evs.HandlerName);
+          aIL.Emit(OpCodes.Ldarg_0); // target (newobj용, 남겨둠)
+          aIL.Emit(OpCodes.Ldarg_0); // ldvirtftn이 소비할 참조
+          aIL.Emit(OpCodes.Ldvirtftn, imb);
+          aIL.Emit(OpCodes.Newobj, delCtor);
+        end;
 
         // 4) add_XXX(delegate) 호출 — 스택: [리시버, 델리게이트]
         emi:=evInfo.GetAddMethod;
@@ -1873,6 +1895,50 @@ type
       else if p.ParamType=vtInterface then Result:=VTC(vtInterface, p.ClassName)
       else if p.ParamType=vtEnum then Result:=VTC(vtEnum, p.ClassName) // [Phase 1]
       else Result:=VTC(p.ParamType, '');
+    end;
+
+    // [Stage 64] 람다(익명 메서드) 본문을 새 static 메서드(Program.__LambdaN)로 컴파일하고
+    // 그 MethodBuilder를 돌려준다. 클로저가 없으므로(1차 범위) 지역 스코프를 통째로 새 것
+    // (부모=fGlobalScope, 즉 전역 변수/함수는 보이지만 바깥 메서드의 지역변수는 안 보임)으로
+    // 바꿔치기한 뒤 컴파일하고 끝나면 원래대로 되돌린다 — 이렇게 하면 본문 안에서 바깥
+    // 메서드의 지역변수를 참조하려는 시도가 여기서 "선언되지 않은 변수" 오류로 자연스럽게
+    // 걸러진다(별도의 캡처 검사 코드가 필요 없다). self/inherited도 지원하지 않는다 — 정적
+    // 메서드라 인스턴스가 없으므로, 람다 본문에서 이들을 쓰면 정의되지 않은 동작이다(1차 제약).
+    function EmitLambdaAsStaticMethod(lam: TLambdaExprNode): MethodBuilder;
+    var paramTypes: array of System.Type; li: integer; lmb: MethodBuilder; lil: ILGenerator;
+        savedLocalScope: TScope; lloc: LocalBuilder;
+    begin
+      fLambdaCounter:=fLambdaCounter+1;
+      paramTypes:=new System.Type[lam.LamParams.Count];
+      for li:=0 to lam.LamParams.Count-1 do paramTypes[li]:=ResolveTopParamClrType(lam.LamParams[li]);
+      lmb:=fMainTB.DefineMethod('__Lambda'+fLambdaCounter.ToString,
+        MethodAttributes.Public or MethodAttributes.Static, typeof(System.Void), paramTypes);
+      lil:=lmb.GetILGenerator;
+
+      savedLocalScope:=fLocalScope;
+      fLocalScope:=new TScope('lambda', fGlobalScope); // [Stage 64] 클로저 차단
+      for li:=0 to lam.LamParams.Count-1 do
+      begin
+        lloc:=lil.DeclareLocal(paramTypes[li]);
+        fLocalScope.Declare(lam.LamParams[li].Name, lloc, lam.LamParams[li].ParamType);
+        if (lam.LamParams[li].ParamType=vtObject) or (lam.LamParams[li].ParamType=vtInterface) then
+        begin
+          if fTypeBuilders.ContainsKey(lam.LamParams[li].ClassName) or fBuiltTypes.ContainsKey(lam.LamParams[li].ClassName) then
+            fLocalScope.SetClassName(lam.LamParams[li].Name, lam.LamParams[li].ClassName)
+          else
+            fLocalScope.SetClrType(lam.LamParams[li].Name, paramTypes[li]);
+        end;
+        if li=0 then lil.Emit(OpCodes.Ldarg_0) else if li=1 then lil.Emit(OpCodes.Ldarg_1)
+        else if li=2 then lil.Emit(OpCodes.Ldarg_2) else if li=3 then lil.Emit(OpCodes.Ldarg_3)
+        else lil.Emit(OpCodes.Ldarg_S, byte(li));
+        lil.Emit(OpCodes.Stloc, lloc);
+      end;
+
+      EmitStatement(lil, lam.Body);
+      lil.Emit(OpCodes.Ret);
+
+      fLocalScope:=savedLocalScope; // 바깥 메서드 컴파일을 이어서 할 수 있도록 복원
+      Result:=lmb;
     end;
 
     // [Stage 41] 지역 변수(TVarDecl)의 실제 CLR 타입을 결정한다. ResolveTopParamClrType과 동일한 패턴 —
@@ -2796,6 +2862,7 @@ type
       fBuiltInterfaces:=new Dictionary<string, System.Type>;
       fBuiltEnums:=new Dictionary<string, System.Type>; // [Phase 1]
       fRecordNames:=new HashSet<string>; // [Stage 62]
+      fLambdaCounter:=0; // [Stage 64]
       fLoadedAssemblies:=new List<Assembly>;
       fClassExternalParentType:=new Dictionary<string, System.Type>;
       fResultLocal:=nil; fResultType:=vtInteger; fCurClassName:='';
@@ -2827,6 +2894,8 @@ type
       fAutoAssemblyMap['System.Net']:=
         ['System','System, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'];
       fAutoAssemblyMap['System.Text.RegularExpressions']:=
+        ['System','System, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'];
+      fAutoAssemblyMap['System.Timers']:=
         ['System','System, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'];
       fAutoAssemblyMap['System.Xaml']:=
         ['System.Xaml','System.Xaml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'];
@@ -2919,6 +2988,7 @@ type
 
       // 2. 메인 프로그램 타입 (static 메서드들을 담을 타입)
       mainTB:=modB.DefineType('Program', TypeAttributes.Public);
+      fMainTB:=mainTB; // [Stage 64] 람다가 EmitStatement에서도 static 메서드를 여기 추가할 수 있도록
 
       // 3. 일반 static 함수/프로시저 빌드
       foreach fd in fProg.FuncDecls do BuildStaticFunc(mainTB, fd);

@@ -21,10 +21,11 @@ uses
 
 const
   DefaultExampleDir = 'Examples';
-  DefaultExampleFile = 'Test_stage63.pas'; // [Stage 63]
+  DefaultExampleFile = 'Test_stage64.pas'; // [Stage 64] 익명 메서드/람다 (-> 구문) 테스트
+  //DefaultExampleFile = 'Test_stage63.pas'; // [Stage 63] set of 타입과 집합 연산 (in, +, -, *) 테스트
   //DefaultExampleFile = 'Test_stage62.pas'; // [Stage 62] record 타입 (값 타입 의미론 — 대입 시 복사) 테스트
   //DefaultExampleFile = 'Test_stage61.pas'; // [Stage 61] const 선언 (전역/지역, 타입 추론 포함) 테스트
-  //DefaultExampleFile = 'Test_stage60.pas'; // [Stage 60] break/continue, repeat...until 테스트  
+  //DefaultExampleFile = 'Test_stage60.pas'; // [Stage 60] break/continue, repeat...until 테스트
   //DefaultExampleFile = 'Test_stage59.pas'; // [Stage 59] case...of...else 문 테스트
   //DefaultExampleFile = 'Test_stage58.pas'; // 오류메세지 3개가 발생되는게 맞음. 
   //DefaultExampleFile = 'Test_stage57.pas';
