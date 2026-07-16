@@ -11,7 +11,9 @@ type
   // 변수/식 타입
   // ----------------------------------------------------------
   TVarType = (vtInteger, vtString, vtIntArray, vtStrArray, vtObject, vtInterface, vtBoolean, vtGeneric, vtGenericArray,
-              vtReal, vtChar, vtInt64, vtEnum);
+              vtReal, vtChar, vtInt64, vtEnum, vtSet);
+  // vtSet: [Stage 63] set of <열거형>. 런타임 표현은 System.Int32 비트마스크(비트 i = 서수 i 포함 여부).
+  //   ClassName 필드(TVarDecl/TParamDef/TFieldDeclNode 공통 관례)에 대상 열거형 이름을 담는다 — vtEnum과 동일한 관례.
   // vtObject: 클래스 인스턴스 (TCounter 등)
   // vtInterface: 인터페이스 타입 변수 (ISpeaker 등)
   // vtBoolean: boolean 타입 (true/false)
@@ -158,6 +160,22 @@ type
     // 위와 동일한 이유로 매개변수명을 aOp로 사용 (Op와 대소문자만 다른 이름 금지).
     constructor Create(aOp: TCompareKind; l, r: TExprNode);
     begin Op:=aOp; Left:=l; Right:=r; end;
+  end;
+
+  // [Stage 63] 집합 리터럴 [Red, Blue]. Mask는 파싱 시점에 이미 비트마스크로 접혀 있다
+  // (원소가 전부 컴파일타임에 알려진 열거형 멤버이므로). EnumName은 ''일 수도 있는데,
+  // 빈 집합 리터럴([])은 어떤 "set of X" 타입에도 그대로 쓸 수 있어(값이 항상 0이므로)
+  // 굳이 특정 열거형에 묶어둘 필요가 없다.
+  TSetLiteralExprNode = class(TExprNode)
+  public EnumName: string; Mask: integer;
+    constructor Create(e: string; m: integer); begin EnumName:=e; Mask:=m; end;
+  end;
+
+  // [Stage 63] Elem in SetExpr — 집합 멤버십 검사. Elem은 열거형 값(리터럴/변수 모두 가능,
+  // 런타임 표현이 곧 서수이므로), SetExpr은 vtSet 식이다.
+  TInExprNode = class(TExprNode)
+  public Elem, SetExpr: TExprNode;
+    constructor Create(e, s: TExprNode); begin Elem:=e; SetExpr:=s; end;
   end;
 
   // true / false 리터럴

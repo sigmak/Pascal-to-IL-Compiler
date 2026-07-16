@@ -80,6 +80,7 @@ type
     // 식(expression) 안에서 괄호 없는 식별자로 등장하는 열거형 값을 판별하는 데 쓰인다.
     fEnumMemberEnumName: Dictionary<string, string>;
     fEnumMemberOrdinal: Dictionary<string, integer>;
+    fEnumSize: Dictionary<string, integer>; // [Stage 63] 열거형명 → 멤버 개수
     // [Stage 51] 문(statement) 파싱 중 발생한 오류들을 즉시 던지지 않고 모아둔다 —
     // IDE에서 한 번에 여러 오류를 보여주기 위한 panic-mode 오류 복구용.
     ParseErrors: List<string>;
@@ -181,6 +182,18 @@ type
       begin
         fLastGenericName:=Cur.Text; fPos:=fPos+1; Result:=vtEnum; // [Phase 1]
       end
+      // [Stage 63] set of <열거형>. 원소는 열거형 하나로 한정하며(정수 범위 집합은 아직 미지원),
+      // 런타임 표현이 32비트 비트마스크이므로 열거형 멤버가 32개를 넘으면 지원 범위 밖이다.
+      else if Cur.Kind=tkSet then
+      begin
+        fPos:=fPos+1; Expect(tkOf);
+        if not ((Cur.Kind=tkIdent) and fEnumNames.Contains(Cur.Text)) then
+          raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': set of 뒤에는 열거형 이름이 와야 합니다 (Stage 63)');
+        if fEnumSize.ContainsKey(Cur.Text) and (fEnumSize[Cur.Text]>32) then
+          raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': 열거형 "'+Cur.Text
+            +'"의 멤버가 32개를 넘어 집합으로 표현할 수 없습니다 (Stage 63은 32비트 비트마스크 사용)');
+        fLastGenericName:=Cur.Text; fPos:=fPos+1; Result:=vtSet;
+      end
       else if (Cur.Kind=tkIdent) and fClassNames.Contains(Cur.Text) then
       begin
         fPos:=fPos+1; Result:=vtObject;
@@ -201,6 +214,17 @@ type
       if (Cur.Kind=tkIdent) and fEnumNames.Contains(Cur.Text) then
       begin
         cn:=Cur.Text; fLastGenericName:=cn; fPos:=fPos+1; Result:=vtEnum; exit;
+      end;
+      // [Stage 63] set of <열거형>
+      if Cur.Kind=tkSet then
+      begin
+        fPos:=fPos+1; Expect(tkOf);
+        if not ((Cur.Kind=tkIdent) and fEnumNames.Contains(Cur.Text)) then
+          raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': set of 뒤에는 열거형 이름이 와야 합니다 (Stage 63)');
+        if fEnumSize.ContainsKey(Cur.Text) and (fEnumSize[Cur.Text]>32) then
+          raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': 열거형 "'+Cur.Text
+            +'"의 멤버가 32개를 넘어 집합으로 표현할 수 없습니다 (Stage 63은 32비트 비트마스크 사용)');
+        cn:=Cur.Text; fLastGenericName:=cn; fPos:=fPos+1; Result:=vtSet; exit;
       end;
       if (Cur.Kind=tkIdent) and fClassNames.Contains(Cur.Text) then
       begin
@@ -503,6 +527,35 @@ type
 
       else if t.Kind=tkNil then
         begin fPos:=fPos+1; Result:=new TNilLiteralNode; end // [Stage 29]
+
+      // [Stage 63] 집합 리터럴: [Red, Blue] 또는 빈 집합 []. 원소는 열거형 멤버 이름만
+      // 지원한다(정수 범위 집합 등은 아직 지원하지 않음). 모든 원소가 같은 열거형에
+      // 속해야 하며, 여기서 곧바로 32비트 비트마스크 상수로 접어(fold) 둔다 — 런타임에는
+      // 그냥 정수 하나일 뿐이라 CodeGen은 Ldc_I4 한 번이면 된다.
+      else if t.Kind=tkLBracket then
+      begin
+        fPos:=fPos+1; // '[' 소비
+        var setEnumName:=''; var setMask:=0;
+        if Cur.Kind<>tkRBracket then
+        begin
+          while true do
+          begin
+            var memName:=Expect(tkIdent).Text;
+            if not fEnumMemberEnumName.ContainsKey(memName) then
+              raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': 집합 리터럴의 원소 "'+memName
+                +'"는 열거형 멤버가 아닙니다 (Stage 63은 열거형 원소 집합만 지원)');
+            var memEnumName:=fEnumMemberEnumName[memName];
+            if (setEnumName<>'') and (setEnumName<>memEnumName) then
+              raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': 집합 리터럴 안의 원소는 모두 같은 열거형이어야 합니다 ("'
+                +setEnumName+'"와 "'+memEnumName+'" 혼용)');
+            setEnumName:=memEnumName;
+            setMask:=setMask or (1 shl fEnumMemberOrdinal[memName]);
+            if Cur.Kind=tkComma then fPos:=fPos+1 else break;
+          end;
+        end;
+        Expect(tkRBracket);
+        Result:=new TSetLiteralExprNode(setEnumName, setMask);
+      end
 
       else if t.Kind=tkSelf then // [Stage 30]
       begin
@@ -871,6 +924,11 @@ type
       else if Cur.Kind=tkGe  then ck:=cmpGe
       else has:=false;
       if has then begin fPos:=fPos+1; Result:=new TCompareNode(ck, left, ParseAddSub); end
+      else if Cur.Kind=tkIn then // [Stage 63] Elem in SetExpr — 관계 연산자와 같은 우선순위
+      begin
+        fPos:=fPos+1;
+        Result:=new TInExprNode(left, ParseAddSub);
+      end
       else Result:=left;
     end;
 
@@ -1605,6 +1663,7 @@ type
           Expect(tkRParen);
           Expect(tkSemicolon);
           fEnumNames.Add(cn);
+          fEnumSize[cn]:=edecl.Members.Count; // [Stage 63]
           // [Stage 51] 각 멤버 이름을 (열거형명, 서수)로 등록 — North → ('TDirection', 0)
           for var _emIdx:=0 to edecl.Members.Count-1 do
           begin
@@ -2342,9 +2401,10 @@ type
           begin
             fPos:=savedPosV;
             vt:=ParseVarType;
+            if (vt=vtEnum) or (vt=vtSet) then cn:=fLastGenericName; // [Stage 63] (vtEnum 쪽은 기존 누락도 함께 수정)
           end;
         end
-        else vt:=ParseVarType;
+        else begin vt:=ParseVarType; if (vt=vtEnum) or (vt=vtSet) then cn:=fLastGenericName; end;
         Expect(tkSemicolon);
         foreach var nm in ns do
         begin
@@ -2423,6 +2483,7 @@ type
       fRecordNames:=new List<string>; // [Stage 62]
       fEnumMemberEnumName:=new Dictionary<string, string>; // [Stage 51]
       fEnumMemberOrdinal:=new Dictionary<string, integer>; // [Stage 51]
+      fEnumSize:=new Dictionary<string, integer>; // [Stage 63] 열거형명 → 멤버 개수 (set of X의 32비트 한도 검사용)
       ParseErrors:=new List<string>; // [Stage 51]
       fClassFields:=new Dictionary<string, List<string>>;
       fClassMethods:=new Dictionary<string, Dictionary<string, boolean>>;

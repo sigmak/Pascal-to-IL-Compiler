@@ -15,7 +15,7 @@ uses
 type
   TTokenKind = (
     tkProgram, tkType, tkClass, tkRecord, tkInterface, tkPrivate, tkPublic,
-    tkVar, tkInteger, tkStringType, tkArray, tkOf,
+    tkVar, tkInteger, tkStringType, tkArray, tkOf, tkSet, // [Stage 63] tkSet
     tkBegin, tkEnd, tkWriteln,
     tkIf, tkThen, tkElse, tkWhile, tkDo, tkMod,
     tkFor, tkTo, tkDownto, tkIn, // [Stage 54] for-in 순회 구문의 'in' 키워드
@@ -149,6 +149,7 @@ type
       else if lw='string'    then Result:=new TToken(tkStringType,w,sl,sc)
       else if lw='array'     then Result:=new TToken(tkArray,     w,sl,sc)
       else if lw='of'        then Result:=new TToken(tkOf,        w,sl,sc)
+      else if lw='set'       then Result:=new TToken(tkSet,       w,sl,sc) // [Stage 63]
       else if lw='begin'     then Result:=new TToken(tkBegin,     w,sl,sc)
       else if lw='end'       then Result:=new TToken(tkEnd,       w,sl,sc)
       else if lw='writeln'   then Result:=new TToken(tkWriteln,   w,sl,sc)

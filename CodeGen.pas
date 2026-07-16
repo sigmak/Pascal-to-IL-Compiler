@@ -104,6 +104,8 @@ type
         if fBuiltEnums.ContainsKey(cn) then Result:=fBuiltEnums[cn]
         else Result:=typeof(integer); // 아직 빌드 전이면 int32로 폴백
       end
+      // [Stage 63] set of X — 런타임 표현은 항상 System.Int32 비트마스크(어떤 열거형이든 동일).
+      else if t=vtSet then Result:=typeof(integer)
       else if t=vtIntArray then Result:=typeof(integer).MakeArrayType()
       else if t=vtStrArray then Result:=typeof(string).MakeArrayType()
       else if t=vtObject then
@@ -464,10 +466,15 @@ type
       end
       else if e is TCompareNode then // [Stage 41 수정 2026.07.11]
         Result:=vtBoolean
+      // [Stage 63] 집합 리터럴/멤버십 검사
+      else if e is TSetLiteralExprNode then Result:=vtSet
+      else if e is TInExprNode then Result:=vtBoolean
       else if e is TBinOpNode then
       begin
         b:=TBinOpNode(e);
-        if (InferType(b.Left)=vtString) or (InferType(b.Right)=vtString) then
+        // [Stage 63] 피연산자 중 하나라도 집합이면 결과도 집합 (합집합/차집합/교집합)
+        if (InferType(b.Left)=vtSet) or (InferType(b.Right)=vtSet) then Result:=vtSet
+        else if (InferType(b.Left)=vtString) or (InferType(b.Right)=vtString) then
           Result:=vtString
         else Result:=vtInteger;
       end
@@ -884,10 +891,34 @@ type
         else raise new Exception('선언되지 않은 변수 "'+vr.VarName+'"');
       end
 
+      else if e is TSetLiteralExprNode then // [Stage 63]
+        aIL.Emit(OpCodes.Ldc_I4, TSetLiteralExprNode(e).Mask)
+
+      else if e is TInExprNode then // [Stage 63] Elem in SetExpr → (SetExpr and (1 shl Elem)) 부호없이 0보다 큼
+      begin
+        var _inE:=TInExprNode(e);
+        EmitExpr(aIL, _inE.SetExpr);
+        aIL.Emit(OpCodes.Ldc_I4_1);
+        EmitExpr(aIL, _inE.Elem);
+        aIL.Emit(OpCodes.Shl);
+        aIL.Emit(OpCodes.And);
+        aIL.Emit(OpCodes.Ldc_I4_0);
+        aIL.Emit(OpCodes.Cgt_Un);
+      end
+
       else if e is TBinOpNode then
       begin
         b:=TBinOpNode(e); lt:=InferType(b.Left); rt:=InferType(b.Right);
-        if (b.Op=boAdd) and ((lt=vtString) or (rt=vtString)) then
+        if (lt=vtSet) or (rt=vtSet) then // [Stage 63] 집합 연산: + 합집합, - 차집합, * 교집합
+        begin
+          EmitExpr(aIL, b.Left);
+          EmitExpr(aIL, b.Right);
+          if b.Op=boAdd then aIL.Emit(OpCodes.Or)
+          else if b.Op=boMul then aIL.Emit(OpCodes.And)
+          else if b.Op=boSub then begin aIL.Emit(OpCodes.Not); aIL.Emit(OpCodes.And); end
+          else raise new Exception('집합에는 +(합집합), -(차집합), *(교집합)만 지원합니다 (Stage 63)');
+        end
+        else if (b.Op=boAdd) and ((lt=vtString) or (rt=vtString)) then
         begin
           // 문자열 연결: 피연산자를 string으로 변환 후 Concat
           EmitExpr(aIL, b.Left);
