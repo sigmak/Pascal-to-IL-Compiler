@@ -124,6 +124,17 @@ type
       else if t=vtSet then Result:=typeof(integer)
       else if t=vtIntArray then Result:=typeof(integer).MakeArrayType()
       else if t=vtStrArray then Result:=typeof(string).MakeArrayType()
+      // [Stage 67] vtMatrix: array of array of <elemtype> → CLR jagged array (elemtype)[][]
+      else if t=vtMatrix then
+      begin
+        var elemClr: System.Type;
+        if (cn='real') or (cn='double') then elemClr:=typeof(double)
+        else if cn='char' then elemClr:=typeof(char)
+        else if cn='int64' then elemClr:=typeof(int64)
+        else if cn='string' then elemClr:=typeof(string)
+        else elemClr:=typeof(integer); // 기본: integer
+        Result:=elemClr.MakeArrayType().MakeArrayType(); // (elemtype)[][]
+      end
       else if t=vtObject then
       begin
         if fBuiltTypes.ContainsKey(cn) then Result:=fBuiltTypes[cn]
@@ -513,6 +524,17 @@ type
       else if e is TArrayIndexExprNode then
       begin
         if GetVarType(TArrayIndexExprNode(e).ArrName)=vtStrArray then Result:=vtString
+        else Result:=vtInteger;
+      end
+      // [Stage 67] 2차원 배열 원소 읽기 타입 추론
+      else if e is TMatrix2DIndexExprNode then
+      begin
+        var _m2n:=TMatrix2DIndexExprNode(e);
+        var _m2etn:=GetVarClassName(_m2n.ArrName); // 원소 타입 이름
+        if _m2etn='string' then Result:=vtString
+        else if (_m2etn='real') or (_m2etn='double') then Result:=vtReal
+        else if _m2etn='char' then Result:=vtChar
+        else if _m2etn='int64' then Result:=vtInt64
         else Result:=vtInteger;
       end
       else if e is TVarRefNode then Result:=GetVarType(TVarRefNode(e).VarName)
@@ -959,6 +981,24 @@ type
         // 이미 배열 타입을 보고 Stelem_Ref/Stelem_I4를 갈라 쓰고 있었으므로 읽는 쪽도 맞춘다.
         if GetVarType(ai.ArrName)=vtStrArray then aIL.Emit(OpCodes.Ldelem_Ref)
         else aIL.Emit(OpCodes.Ldelem_I4);
+      end
+
+      // [Stage 67] 2차원 배열 원소 읽기: arr[i][j]
+      // CLR jagged array: 먼저 arr[i]로 행 배열(T[])을 로드, 그 뒤 [j]로 원소를 로드.
+      else if e is TMatrix2DIndexExprNode then
+      begin
+        var m2r:=TMatrix2DIndexExprNode(e);
+        if fLocalScope.Has(m2r.ArrName) then aIL.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(m2r.ArrName))
+        else aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(m2r.ArrName));
+        EmitExpr(aIL, m2r.Row);
+        aIL.Emit(OpCodes.Ldelem_Ref); // arr[i] → T[]
+        EmitExpr(aIL, m2r.Col);
+        var _m2etn2:=GetVarClassName(m2r.ArrName);
+        if _m2etn2='string' then aIL.Emit(OpCodes.Ldelem_Ref)
+        else if (_m2etn2='real') or (_m2etn2='double') then aIL.Emit(OpCodes.Ldelem_R8)
+        else if _m2etn2='char' then aIL.Emit(OpCodes.Ldelem_U2)
+        else if _m2etn2='int64' then aIL.Emit(OpCodes.Ldelem_I8)
+        else aIL.Emit(OpCodes.Ldelem_I4); // integer 기본
       end
 
       else if e is TVarRefNode then
@@ -1652,6 +1692,89 @@ type
         else EmitExpr(aIL, aa.ValueExpr);
         if at2=vtStrArray then aIL.Emit(OpCodes.Stelem_Ref)
         else aIL.Emit(OpCodes.Stelem_I4);
+      end
+
+      // [Stage 67] 2차원 배열 원소 쓰기: arr[i][j] := val
+      // 패턴: Ldloc arr → Ldelem_Ref (행 배열) → EmitIdx j → EmitVal → Stelem_<T>
+      else if s is TMatrix2DAssignStmtNode then
+      begin
+        var m2a:=TMatrix2DAssignStmtNode(s);
+        // 원소 타입 이름 스코프에서 조회
+        var _m2aetn:=GetVarClassName(m2a.ArrName);
+        // 외부 배열(행 배열 참조) 로드
+        if fLocalScope.Has(m2a.ArrName) then aIL.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(m2a.ArrName))
+        else aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(m2a.ArrName));
+        EmitExpr(aIL, m2a.Row);
+        aIL.Emit(OpCodes.Ldelem_Ref); // arr[i] → T[]
+        EmitExpr(aIL, m2a.Col);
+        // 값 emit (타입별 강제 변환)
+        if _m2aetn='string' then EmitValueForVType(aIL, m2a.ValueExpr, vtString)
+        else if (_m2aetn='real') or (_m2aetn='double') then EmitValueForVType(aIL, m2a.ValueExpr, vtReal)
+        else if _m2aetn='int64' then EmitValueForVType(aIL, m2a.ValueExpr, vtInt64)
+        else EmitExpr(aIL, m2a.ValueExpr);
+        // Stelem
+        if _m2aetn='string' then aIL.Emit(OpCodes.Stelem_Ref)
+        else if (_m2aetn='real') or (_m2aetn='double') then aIL.Emit(OpCodes.Stelem_R8)
+        else if _m2aetn='char' then aIL.Emit(OpCodes.Stelem_I2)
+        else if _m2aetn='int64' then aIL.Emit(OpCodes.Stelem_I8)
+        else aIL.Emit(OpCodes.Stelem_I4); // integer 기본
+      end
+
+      // [Stage 67] 2차원 배열 초기화: SetLength(arr, rows, cols)
+      // 전략:
+      //   1) Newarr (행 배열) → arr에 저장
+      //   2) for i := 0 to rows-1: arr[i] := Newarr (열 배열)
+      // CLR for 루프를 직접 IL로 방출한다 (재귀적 EmitStatement 없이).
+      else if s is TSetLengthMatrix2DStmtNode then
+      begin
+        var m2sl:=TSetLengthMatrix2DStmtNode(s);
+        var _m2stn:=GetVarClassName(m2sl.ArrName);
+        // 원소 CLR 타입 결정
+        var _m2sElemClr: System.Type;
+        if _m2stn='string' then _m2sElemClr:=typeof(string)
+        else if (_m2stn='real') or (_m2stn='double') then _m2sElemClr:=typeof(double)
+        else if _m2stn='char' then _m2sElemClr:=typeof(char)
+        else if _m2stn='int64' then _m2sElemClr:=typeof(int64)
+        else _m2sElemClr:=typeof(integer);
+        var _m2sRowClr:=_m2sElemClr.MakeArrayType(); // T[]
+
+        // 임시 지역변수: 루프 카운터 i, rows 값, cols 값
+        var _iLoc:=aIL.DeclareLocal(typeof(integer));
+        var _rowsLoc:=aIL.DeclareLocal(typeof(integer));
+        var _colsLoc:=aIL.DeclareLocal(typeof(integer));
+
+        // rows, cols 값을 임시 변수에 저장
+        EmitExpr(aIL, m2sl.Rows); aIL.Emit(OpCodes.Stloc, _rowsLoc);
+        EmitExpr(aIL, m2sl.Cols); aIL.Emit(OpCodes.Stloc, _colsLoc);
+
+        // 1) 바깥 배열 생성: arr = new T[][rows]
+        aIL.Emit(OpCodes.Ldloc, _rowsLoc);
+        aIL.Emit(OpCodes.Newarr, _m2sRowClr);
+        if fLocalScope.Has(m2sl.ArrName) then aIL.Emit(OpCodes.Stloc, fLocalScope.GetLoc(m2sl.ArrName))
+        else aIL.Emit(OpCodes.Stloc, fGlobalScope.GetLoc(m2sl.ArrName));
+
+        // 2) for i := 0 to rows-1: arr[i] = new T[cols]
+        aIL.Emit(OpCodes.Ldc_I4_0); aIL.Emit(OpCodes.Stloc, _iLoc);
+        var _loopStart:=aIL.DefineLabel;
+        var _loopEnd:=aIL.DefineLabel;
+        aIL.MarkLabel(_loopStart);
+        aIL.Emit(OpCodes.Ldloc, _iLoc);
+        aIL.Emit(OpCodes.Ldloc, _rowsLoc);
+        aIL.Emit(OpCodes.Bge, _loopEnd); // i >= rows → 종료
+        // arr[i] = new T[cols]
+        if fLocalScope.Has(m2sl.ArrName) then aIL.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(m2sl.ArrName))
+        else aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(m2sl.ArrName));
+        aIL.Emit(OpCodes.Ldloc, _iLoc);
+        aIL.Emit(OpCodes.Ldloc, _colsLoc);
+        aIL.Emit(OpCodes.Newarr, _m2sElemClr);
+        aIL.Emit(OpCodes.Stelem_Ref);
+        // i++
+        aIL.Emit(OpCodes.Ldloc, _iLoc);
+        aIL.Emit(OpCodes.Ldc_I4_1);
+        aIL.Emit(OpCodes.Add);
+        aIL.Emit(OpCodes.Stloc, _iLoc);
+        aIL.Emit(OpCodes.Br, _loopStart);
+        aIL.MarkLabel(_loopEnd);
       end
 
       else if s is TCompoundStmtNode then
@@ -2705,6 +2828,9 @@ type
           else
             fLocalScope.SetClrType(lv.Name, lvClrType);
         end;
+        // [Stage 67] vtMatrix의 원소 타입 이름을 ClassName에 보존 (GetVarClassName이 참조)
+        if (lv.VarType=vtMatrix) and (lv.ClassName<>'') then
+          fLocalScope.SetClassName(lv.Name, lv.ClassName);
       end;
 
       // [Stage 61] 생성자 본문의 지역 const 선언 처리
@@ -2803,6 +2929,9 @@ type
           else
             fLocalScope.SetClrType(lv.Name, lvClrType);
         end;
+        // [Stage 67] vtMatrix 원소 타입 이름 보존
+        if (lv.VarType=vtMatrix) and (lv.ClassName<>'') then
+          fLocalScope.SetClassName(lv.Name, lv.ClassName);
       end;
 
       // [Stage 61] 메서드 본문의 지역 const 선언 처리
@@ -2923,6 +3052,9 @@ type
           else
             fLocalScope.SetClrType(lv.Name, lvClrType);
         end;
+        // [Stage 67] vtMatrix 원소 타입 이름 보존
+        if (lv.VarType=vtMatrix) and (lv.ClassName<>'') then
+          fLocalScope.SetClassName(lv.Name, lv.ClassName);
       end;
 
       // [Stage 61] 함수 본문의 지역 const 선언 처리
@@ -2983,6 +3115,9 @@ type
           else
             fLocalScope.SetClrType(lv.Name, lvClrType);
         end;
+        // [Stage 67] vtMatrix 원소 타입 이름 보존
+        if (lv.VarType=vtMatrix) and (lv.ClassName<>'') then
+          fLocalScope.SetClassName(lv.Name, lv.ClassName);
       end;
 
       // [Stage 61] 프로시저 본문의 지역 const 선언 처리
@@ -3244,12 +3379,15 @@ type
           // [Stage 27] string/boolean/array 전역 변수도 예전에는 무조건 typeof(integer)로
           // 선언되어 있었다 — fGlobalTypes만 올바르고 실제 LocalBuilder 슬롯 타입은 틀려서
           // 대입 시 IL 검증에서 깨졌다. object/interface가 아닌 나머지는 VTC로 위임한다.
-          else clrType:=VTC(vd.VarType, '');
+          else clrType:=VTC(vd.VarType, vd.ClassName); // [Stage 67] vtMatrix는 ClassName(원소 타입)을 넘겨야 T[][] 반환
           // [Phase 2] TScope.Declare로 항목을 먼저 만든 뒤에 SetClrType/SetClassName으로 채운다
           // (예전엔 4개 딕셔너리가 독립적이라 순서가 상관없었지만, 이제는 한 항목이라 Declare가 먼저다).
           fGlobalScope.Declare(vd.Name, il.DeclareLocal(clrType), vd.VarType);
           if vdIsClrTyped then fGlobalScope.SetClrType(vd.Name, vdClrType);
           if vdIsClassNamed then fGlobalScope.SetClassName(vd.Name, vd.ClassName);
+          // [Stage 67] vtMatrix 전역 변수의 원소 타입 이름 보존
+          if (vd.VarType=vtMatrix) and (vd.ClassName<>'') then
+            fGlobalScope.SetClassName(vd.Name, vd.ClassName);
         end;
 
         // [Stage 61] 전역 const 선언 처리. var 슬롯이 모두 준비된 뒤,

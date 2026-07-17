@@ -11,7 +11,12 @@ type
   // 변수/식 타입
   // ----------------------------------------------------------
   TVarType = (vtInteger, vtString, vtIntArray, vtStrArray, vtObject, vtInterface, vtBoolean, vtGeneric, vtGenericArray,
-              vtReal, vtChar, vtInt64, vtEnum, vtSet);
+              vtReal, vtChar, vtInt64, vtEnum, vtSet, vtMatrix);
+  // [Stage 67] vtMatrix: 2차원 배열 (array of array of <elemtype>).
+  //   런타임 표현은 CLR jagged array: integer[][] / string[][] / double[][].
+  //   원소 타입은 TVarDecl/TParamDef.ClassName 필드에 'integer'/'string'/'real'/'char'/'int64'로 기록된다.
+  //   SetLength(m, rows, cols) → 먼저 바깥 배열을 rows 크기로, 이후 각 행을 cols 크기로 초기화.
+  //   m[i][j] 읽기 → TMatrix2DIndexExprNode, 쓰기 → TMatrix2DAssignStmtNode.
   // vtSet: [Stage 63] set of <열거형>. 런타임 표현은 System.Int32 비트마스크(비트 i = 서수 i 포함 여부).
   //   ClassName 필드(TVarDecl/TParamDef/TFieldDeclNode 공통 관례)에 대상 열거형 이름을 담는다 — vtEnum과 동일한 관례.
   // vtObject: 클래스 인스턴스 (TCounter 등)
@@ -309,6 +314,29 @@ type
   public ArrName: string; Index, ValueExpr: TExprNode;
     constructor Create(n: string; i, v: TExprNode);
     begin ArrName:=n; Index:=i; ValueExpr:=v; end;
+  end;
+
+  // [Stage 67] 2차원 배열 원소 읽기: arr[i][j]
+  // ElemTypeName: 'integer'/'string'/'real'/'char'/'int64' — Ldelem 명령 선택에 사용.
+  TMatrix2DIndexExprNode = class(TExprNode)
+  public ArrName: string; Row, Col: TExprNode; ElemTypeName: string;
+    constructor Create(n: string; r, c: TExprNode; etn: string);
+    begin ArrName:=n; Row:=r; Col:=c; ElemTypeName:=etn; end;
+  end;
+
+  // [Stage 67] 2차원 배열 원소 쓰기: arr[i][j] := val
+  TMatrix2DAssignStmtNode = class(TStmtNode)
+  public ArrName: string; Row, Col, ValueExpr: TExprNode; ElemTypeName: string;
+    constructor Create(n: string; r, c, v: TExprNode; etn: string);
+    begin ArrName:=n; Row:=r; Col:=c; ValueExpr:=v; ElemTypeName:=etn; end;
+  end;
+
+  // [Stage 67] 2차원 SetLength: SetLength(arr, rows, cols)
+  // rows/cols가 모두 있을 때 이 노드가 만들어진다.
+  TSetLengthMatrix2DStmtNode = class(TStmtNode)
+  public ArrName: string; Rows, Cols: TExprNode; ElemTypeName: string;
+    constructor Create(n: string; r, c: TExprNode; etn: string);
+    begin ArrName:=n; Rows:=r; Cols:=c; ElemTypeName:=etn; end;
   end;
 
   // c.Init(10); 인스턴스 메서드 호출 (반환값 없는 프로시저)

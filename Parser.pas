@@ -171,7 +171,19 @@ type
       else if Cur.Kind=tkArray then
       begin
         fPos:=fPos+1; Expect(tkOf);
-        if Cur.Kind=tkInteger then begin fPos:=fPos+1; Result:=vtIntArray; end
+        // [Stage 67] array of array of <elemtype> → 2차원 배열 (vtMatrix)
+        if Cur.Kind=tkArray then
+        begin
+          fPos:=fPos+1; Expect(tkOf);
+          if Cur.Kind=tkInteger then begin fPos:=fPos+1; fLastGenericName:='integer'; Result:=vtMatrix; end
+          else if Cur.Kind=tkStringType then begin fPos:=fPos+1; fLastGenericName:='string'; Result:=vtMatrix; end
+          else if (Cur.Kind=tkReal) or (Cur.Kind=tkDouble) then begin fPos:=fPos+1; fLastGenericName:='real'; Result:=vtMatrix; end
+          else if Cur.Kind=tkChar  then begin fPos:=fPos+1; fLastGenericName:='char'; Result:=vtMatrix; end
+          else if Cur.Kind=tkInt64 then begin fPos:=fPos+1; fLastGenericName:='int64'; Result:=vtMatrix; end
+          else raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString
+            +': array of array of 뒤에는 integer/string/real/char/int64만 지원 (Stage 67)');
+        end
+        else if Cur.Kind=tkInteger then begin fPos:=fPos+1; Result:=vtIntArray; end
         else if Cur.Kind=tkStringType then begin fPos:=fPos+1; Result:=vtStrArray; end
         // [Phase 1] array of real/char/int64 — vtObject + ClassName으로 표현 (CLR double[]/char[]/long[])
         else if (Cur.Kind=tkReal) or (Cur.Kind=tkDouble) then
@@ -257,7 +269,10 @@ type
         end;
       end
       else
+      begin
         Result:=ParseVarType;
+        if Result=vtMatrix then cn:=fLastGenericName; // [Stage 67] array of array of <type> → cn에 원소 타입 보존
+      end;
     end;
 
     // [Stage 34] 타입 매개변수 하나 뒤에 선택적으로 붙는 제약조건을 파싱한다: <T: TAnimal>, <T: IComparable>, <T: class>
@@ -806,11 +821,19 @@ type
           end;
         end
 
-        // 배열 인덱스
+        // 배열 인덱스 (1차원 또는 2차원)
         else if (Cur.Kind=tkLBracket) and fArrayNames.Contains(t.Text) then
         begin
           fPos:=fPos+1; idxE:=ParseAddSub; Expect(tkRBracket);
-          Result:=new TArrayIndexExprNode(t.Text, idxE);
+          // [Stage 67] arr[i][j] — 두 번째 '[' 가 있으면 2차원 인덱스
+          if Cur.Kind=tkLBracket then
+          begin
+            fPos:=fPos+1;
+            var idxE2:=ParseAddSub; Expect(tkRBracket);
+            Result:=new TMatrix2DIndexExprNode(t.Text, idxE, idxE2, '');
+          end
+          else
+            Result:=new TArrayIndexExprNode(t.Text, idxE);
         end
 
         // [Stage 36] 제네릭 함수 호출: Identity<integer>(5) — 명시적 타입 인자 필요
@@ -1068,8 +1091,19 @@ type
       begin
         fPos:=fPos+1; Expect(tkLParen);
         nt:=Expect(tkIdent); Expect(tkComma);
-        sz:=ParseExpr; Expect(tkRParen);
-        Result:=new TSetLengthStmtNode(nt.Text, sz);
+        sz:=ParseExpr;
+        // [Stage 67] SetLength(arr, rows, cols) — 2차원 배열 초기화
+        if Cur.Kind=tkComma then
+        begin
+          fPos:=fPos+1;
+          var cols2:=ParseExpr; Expect(tkRParen);
+          Result:=new TSetLengthMatrix2DStmtNode(nt.Text, sz, cols2, '');
+        end
+        else
+        begin
+          Expect(tkRParen);
+          Result:=new TSetLengthStmtNode(nt.Text, sz);
+        end;
       end
 
       // [Stage 48] var x := 식; — begin...end 안에서 선언과 동시에 대입.
@@ -1242,12 +1276,24 @@ type
         else if (fCurClass<>'') and (Cur.Kind=tkSemicolon) then
           Result:=new TMethodCallStmtNode('', nt.Text)
 
-        // 배열 원소 대입
+        // 배열 원소 대입 (1차원 또는 2차원)
         else if (Cur.Kind=tkLBracket) and fArrayNames.Contains(nt.Text) then
         begin
           fPos:=fPos+1; idx:=ParseExpr; Expect(tkRBracket);
-          Expect(tkAssign); rhs:=ParseExpr;
-          Result:=new TArrayAssignStmtNode(nt.Text, idx, rhs);
+          // [Stage 67] arr[i][j] := val — 두 번째 '[' 가 있으면 2차원 대입
+          if Cur.Kind=tkLBracket then
+          begin
+            fPos:=fPos+1;
+            var idx2:=ParseExpr; Expect(tkRBracket);
+            Expect(tkAssign); rhs:=ParseExpr;
+            // 원소 타입은 CodeGen에서 스코프로 조회하므로 여기선 '' 전달
+            Result:=new TMatrix2DAssignStmtNode(nt.Text, idx, idx2, rhs, '');
+          end
+          else
+          begin
+            Expect(tkAssign); rhs:=ParseExpr;
+            Result:=new TArrayAssignStmtNode(nt.Text, idx, rhs);
+          end;
         end
 
         // 대입문 (일반 변수 또는 필드/외부 속성)
@@ -2098,7 +2144,7 @@ type
     begin
       Expect(tkVar);
       while (Cur.Kind<>tkBegin) and (Cur.Kind<>tkConst)
-        and (Cur.Kind<>tkFunction) and (Cur.Kind<>tkProcedure) do // [Stage 61] const 섹션과 교차 가능, [Stage 65] 지역 서브프로그램 앞에서 정지
+        and (Cur.Kind<>tkFunction) and (Cur.Kind<>tkProcedure) and (Cur.Kind<>tkVar) do // [Stage 61] const 섹션과 교차 가능, [Stage 65] 지역 서브프로그램 앞에서 정지, [Stage 67] 연속된 var 섹션도 정지
       begin
         ns:=new List<string>; ns.Add(Expect(tkIdent).Text);
         while Cur.Kind=tkComma do begin fPos:=fPos+1; ns.Add(Expect(tkIdent).Text); end;
@@ -2108,11 +2154,13 @@ type
         // 이미 쓰던 ParseParamTypeExt(지역클래스/인터페이스/외부타입/제네릭 모두 처리)로 통일한다.
         vt:=ParseParamTypeExt(isExt, cn);
         if (vt=vtGeneric) or (vt=vtGenericArray) then cn:=fLastGenericName; // [Stage 36/37] 제네릭 지역변수(예: var temp: T; var arr: array of T;)의 타입 매개변수 이름 보존
+        if vt=vtMatrix then cn:=fLastGenericName; // [Stage 67] 2차원 배열 원소 타입 이름 보존
         Expect(tkSemicolon);
         foreach var nm in ns do
         begin
           aList.Add(new TVarDecl(nm, vt, cn, isExt));
           if (vt=vtIntArray) or (vt=vtStrArray) or (vt=vtGenericArray) then fArrayNames.Add(nm); // [Stage 37]
+          if vt=vtMatrix then begin if not fArrayNames.Contains(nm) then fArrayNames.Add(nm); end; // [Stage 67]
         end;
       end;
     end;
@@ -2418,6 +2466,7 @@ type
             // 있어야 하는데, 이전에는 매개변수 이름이 fArrayNames에 등록되지 않아
             // 배열 인덱스 식으로 인식되지 않았다(별개 버그, 이번에 함께 수정).
             if (pt=vtIntArray) or (pt=vtStrArray) or (pt=vtGenericArray) then fArrayNames.Add(nm); // [Stage 37]
+            if pt=vtMatrix then begin if not fArrayNames.Contains(nm) then fArrayNames.Add(nm); end; // [Stage 67]
           end;
           if Cur.Kind=tkSemicolon then fPos:=fPos+1 else break;
         end;
@@ -2653,7 +2702,8 @@ type
     begin
       Expect(tkVar);
       while (Cur.Kind<>tkBegin) and (Cur.Kind<>tkFunction)
-        and (Cur.Kind<>tkProcedure) and (Cur.Kind<>tkConst) and (Cur.Kind<>tkEOF) do // [Stage 61]
+        and (Cur.Kind<>tkProcedure) and (Cur.Kind<>tkConst) and (Cur.Kind<>tkEOF)
+        and (Cur.Kind<>tkVar) do // [Stage 67] 연속된 두 번째 var 섹션도 멈춤 조건에 포함
       begin
         // [Phase 2] var 선언 한 줄이 깨져도 전체를 멈추지 않고 오류를 모은 뒤 다음 줄로 건너뛴다.
         varDeclStartPos:=fPos;
@@ -2689,15 +2739,16 @@ type
           begin
             fPos:=savedPosV;
             vt:=ParseVarType;
-            if (vt=vtEnum) or (vt=vtSet) then cn:=fLastGenericName; // [Stage 63] (vtEnum 쪽은 기존 누락도 함께 수정)
+            if (vt=vtEnum) or (vt=vtSet) or (vt=vtMatrix) then cn:=fLastGenericName; // [Stage 63/67]
           end;
         end
-        else begin vt:=ParseVarType; if (vt=vtEnum) or (vt=vtSet) then cn:=fLastGenericName; end;
+        else begin vt:=ParseVarType; if (vt=vtEnum) or (vt=vtSet) or (vt=vtMatrix) then cn:=fLastGenericName; end; // [Stage 67]
         Expect(tkSemicolon);
         foreach var nm in ns do
         begin
           aProg.VarDecls.Add(new TVarDecl(nm, vt, cn, isExt));
           if (vt=vtIntArray) or (vt=vtStrArray) then fArrayNames.Add(nm);
+          if vt=vtMatrix then begin if not fArrayNames.Contains(nm) then fArrayNames.Add(nm); end; // [Stage 67]
         end;
         end;
         except
@@ -2706,7 +2757,8 @@ type
             ParseErrors.Add(ex.Message);
             if fPos=varDeclStartPos then fPos:=fPos+1;
             while (Cur.Kind<>tkSemicolon) and (Cur.Kind<>tkBegin) and (Cur.Kind<>tkFunction)
-              and (Cur.Kind<>tkProcedure) and (Cur.Kind<>tkConst) and (Cur.Kind<>tkEOF) do // [Stage 61]
+              and (Cur.Kind<>tkProcedure) and (Cur.Kind<>tkConst) and (Cur.Kind<>tkEOF)
+              and (Cur.Kind<>tkVar) do // [Stage 67] 다음 var 섹션 선언을 삼키지 않도록
               fPos:=fPos+1;
             if Cur.Kind=tkSemicolon then fPos:=fPos+1;
           end;
