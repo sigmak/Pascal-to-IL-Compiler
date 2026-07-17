@@ -2723,25 +2723,51 @@ type
     // d.Parameters[i].ParamType/d.ReturnType을 VTC로 변환해 그대로 사용한다.
     // [Stage 31] TParamDef에 ClassName/IsExternal을 추가해 클래스/인터페이스/외부 .NET
     // 타입 매개변수도 지원한다 (ResolveTopParamClrType 사용).
-    procedure BuildStaticFunc(tb: TypeBuilder; d: TFuncDeclNode);
-    var
-      pt: array of System.Type; i: integer; mb: MethodBuilder; il: ILGenerator;
-      savedLocalScope: TScope; // [Phase 2]
-      svR: LocalBuilder; svRT: TVarType; st: TStmtNode; retClrType: System.Type;
+    // [Stage 65b] 시그니처만 먼저 등록한다 (본문은 만들지 않음).
+    // 같은 레벨의 지역 서브프로그램들이 선언 순서와 무관하게 서로를 호출할 수
+    // 있으려면, "형제 전체의 시그니처 등록"이 "형제 아무나의 본문 생성"보다
+    // 반드시 먼저 끝나 있어야 한다. 재귀적으로 자신의 지역 서브프로그램들도
+    // 시그니처만 먼저 등록해 둔다(본문은 이후 BuildStaticFunc/Proc 패스에서).
+    procedure DeclareStaticFunc(tb: TypeBuilder; d: TFuncDeclNode);
+    var pt: array of System.Type; i: integer; mb: MethodBuilder; retClrType: System.Type;
     begin
       pt:=new System.Type[d.Parameters.Count];
       for i:=0 to d.Parameters.Count-1 do pt[i]:=ResolveTopParamClrType(d.Parameters[i]);
       retClrType:=VTC(d.ReturnType, '');
       mb:=tb.DefineMethod(d.Name, MethodAttributes.Public or MethodAttributes.Static,
         retClrType, pt);
-      fMethods[d.Name]:=mb; fTopParamClrTypes[d.Name]:=pt; fFuncReturnTypes[d.Name]:=d.ReturnType; il:=mb.GetILGenerator;
+      fMethods[d.Name]:=mb; fTopParamClrTypes[d.Name]:=pt; fFuncReturnTypes[d.Name]:=d.ReturnType;
+      foreach var nf65 in d.NestedFuncs do DeclareStaticFunc(tb, nf65);
+      foreach var np65 in d.NestedProcs do DeclareStaticProc(tb, np65);
+    end;
 
-      // [Stage 65, 1차] 지역(중첩) 함수/프로시저를 먼저 별도의 static 메서드로 빌드해 둔다 —
-      // 이 함수(d) 자신의 본문을 방출하기 전에 fMethods에 등록되어 있어야 그 본문 안에서
-      // 호출할 수 있다. BuildStaticFunc/BuildStaticProc는 fLocalScope/fResultLocal 등을
-      // 자체적으로 save/restore하므로, 아직 d 자신의 로컬 스코프를 만들기 전인 지금
-      // 호출해도 안전하다. 캡처는 없다 — 지역 서브프로그램의 스코프는 전역(fGlobalScope)에서만
-      // 시작한다.
+    procedure DeclareStaticProc(tb: TypeBuilder; d: TProcDeclNode);
+    var pt: array of System.Type; i: integer; mb: MethodBuilder;
+    begin
+      pt:=new System.Type[d.Parameters.Count];
+      for i:=0 to d.Parameters.Count-1 do pt[i]:=ResolveTopParamClrType(d.Parameters[i]);
+      mb:=tb.DefineMethod(d.Name, MethodAttributes.Public or MethodAttributes.Static,
+        typeof(System.Void), pt);
+      fMethods[d.Name]:=mb; fTopParamClrTypes[d.Name]:=pt;
+      foreach var nf65 in d.NestedFuncs do DeclareStaticFunc(tb, nf65);
+      foreach var np65 in d.NestedProcs do DeclareStaticProc(tb, np65);
+    end;
+
+    procedure BuildStaticFunc(tb: TypeBuilder; d: TFuncDeclNode);
+    var
+      pt: array of System.Type; mb: MethodBuilder; il: ILGenerator;
+      savedLocalScope: TScope; // [Phase 2]
+      svR: LocalBuilder; svRT: TVarType; st: TStmtNode; retClrType: System.Type; i: integer;
+    begin
+      // [Stage 65b] 시그니처는 DeclareStaticFunc 패스에서 이미 등록되어 있다.
+      // 여기서는 등록된 MethodBuilder를 가져와 본문만 방출한다.
+      mb:=fMethods[d.Name];
+      pt:=fTopParamClrTypes[d.Name];
+      retClrType:=VTC(d.ReturnType, '');
+      il:=mb.GetILGenerator;
+
+      // [Stage 65b] 지역(중첩) 함수/프로시저의 "본문"을 만든다. 시그니처는 이미
+      // (형제 전체가) 등록되어 있으므로, 선언 순서와 무관하게 서로 호출 가능하다.
       foreach var nf65 in d.NestedFuncs do BuildStaticFunc(tb, nf65);
       foreach var np65 in d.NestedProcs do BuildStaticProc(tb, np65);
 
@@ -2798,13 +2824,12 @@ type
       savedLocalScope: TScope; // [Phase 2]
       svR: LocalBuilder; svRT: TVarType; st: TStmtNode;
     begin
-      pt:=new System.Type[d.Parameters.Count];
-      for i:=0 to d.Parameters.Count-1 do pt[i]:=ResolveTopParamClrType(d.Parameters[i]);
-      mb:=tb.DefineMethod(d.Name, MethodAttributes.Public or MethodAttributes.Static,
-        typeof(System.Void), pt);
-      fMethods[d.Name]:=mb; fTopParamClrTypes[d.Name]:=pt; il:=mb.GetILGenerator;
+      // [Stage 65b] 시그니처는 DeclareStaticProc 패스에서 이미 등록되어 있다.
+      mb:=fMethods[d.Name];
+      pt:=fTopParamClrTypes[d.Name];
+      il:=mb.GetILGenerator;
 
-      // [Stage 65, 1차] BuildStaticFunc의 동일 위치 주석 참고.
+      // [Stage 65b] BuildStaticFunc의 동일 위치 주석 참고 — 여기서는 본문만 만든다.
       foreach var nf65 in d.NestedFuncs do BuildStaticFunc(tb, nf65);
       foreach var np65 in d.NestedProcs do BuildStaticProc(tb, np65);
 
@@ -3006,6 +3031,10 @@ type
       fMainTB:=mainTB; // [Stage 64] 람다가 EmitStatement에서도 static 메서드를 여기 추가할 수 있도록
 
       // 3. 일반 static 함수/프로시저 빌드
+      // [Stage 65b] 최상위 함수/프로시저도 선언 순서와 무관하게 서로 호출할 수
+      // 있도록, 먼저 모든 시그니처를 등록한 뒤(3-1) 본문을 만든다(3-2).
+      foreach fd in fProg.FuncDecls do DeclareStaticFunc(mainTB, fd);
+      foreach pd in fProg.ProcDecls do DeclareStaticProc(mainTB, pd);
       foreach fd in fProg.FuncDecls do BuildStaticFunc(mainTB, fd);
       foreach pd in fProg.ProcDecls do BuildStaticProc(mainTB, pd);
 

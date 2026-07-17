@@ -2308,6 +2308,76 @@ type
       Result:=impl;
     end;
 
+    // [Stage 65b] 지역 서브프로그램 블록(function/procedure ... end; 연속)을 실제로 파싱하기 전에
+    // 먼저 토큰 스트림을 앞으로 훑어(pre-scan) 모든 지역 서브프로그램의 이름을 수집한다.
+    // 이렇게 하면 선언 순서와 무관하게(앞/뒤, 상호재귀) 서로 호출할 수 있다.
+    //
+    // 알고리즘:
+    //   현재 fPos가 가리키는 위치부터 (function|procedure) tkIdent ... end; 패턴을 반복한다.
+    //   각 서브프로그램 본문(begin...end)의 중첩 깊이를 추적해 올바른 end;를 찾고 건너뛴다.
+    //   var/const 섹션은 begin이 나올 때까지 토큰을 버린다.
+    //   fPos는 변경하지 않는다 — 완전한 파싱은 이후 ParseNestedFuncDecl/ParseNestedProcDecl이 수행한다.
+    procedure PreScanNestedSubprograms(enclosingName: string);
+    var scanPos: integer; localName, mangled: string; depth: integer;
+    begin
+      scanPos := fPos; // 현재 위치 기억 (복원용)
+      while (fPos < fTokens.Count) and
+            ((fTokens[fPos].Kind = tkFunction) or (fTokens[fPos].Kind = tkProcedure)) do
+      begin
+        var isFunc := (fTokens[fPos].Kind = tkFunction);
+        fPos := fPos + 1; // function/procedure 소비
+
+        // 이름 읽기
+        if (fPos < fTokens.Count) and (fTokens[fPos].Kind = tkIdent) then
+        begin
+          localName := fTokens[fPos].Text;
+          mangled := enclosingName + '$' + localName;
+          fPos := fPos + 1;
+
+          // 아직 등록되지 않은 경우에만 등록 (중복 방지)
+          if not fCurNestedAlias.ContainsKey(localName) then
+          begin
+            fCurNestedAlias[localName] := mangled;
+            if isFunc then
+            begin
+              if not fFuncNames.Contains(localName) then fFuncNames.Add(localName);
+            end
+            else
+            begin
+              if not fProcNames.Contains(localName) then fProcNames.Add(localName);
+            end;
+          end;
+        end;
+
+        // 이 서브프로그램의 나머지 토큰을 건너뛴다: ';' 뒤 ~ end; 까지
+        // 전략: begin 을 만나면 begin/end 중첩 깊이를 추적, depth=0 이 된 end 직후 ';' 까지 진행
+        // begin 이전에는 var/const 섹션 등이 있을 수 있으므로 begin을 기다린다.
+        while (fPos < fTokens.Count) and (fTokens[fPos].Kind <> tkBegin) do
+          fPos := fPos + 1;
+        // 이제 fPos 는 tkBegin
+        depth := 0;
+        while fPos < fTokens.Count do
+        begin
+          var tk := fTokens[fPos].Kind;
+          if tk = tkBegin then depth := depth + 1
+          else if tk = tkEnd then
+          begin
+            depth := depth - 1;
+            if depth = 0 then
+            begin
+              fPos := fPos + 1; // end 소비
+              // end 뒤의 ';' 소비
+              if (fPos < fTokens.Count) and (fTokens[fPos].Kind = tkSemicolon) then
+                fPos := fPos + 1;
+              break;
+            end;
+          end;
+          fPos := fPos + 1;
+        end;
+      end;
+      fPos := scanPos; // 위치 완전 복원
+    end;
+
     // [Stage 65] 식/문장에서 함수·프로시저 호출 이름을 만들 때 항상 이 함수를 거친다.
     // 그 이름이 현재 감싸는 함수/프로시저의 지역 서브프로그램이면(fCurNestedAlias에 등록됨)
     // 맹글링된 실제 이름으로 바꿔주고, 아니면(최상위/외부 이름) 그대로 돌려준다.
@@ -2389,6 +2459,9 @@ type
       // 파싱하는 동안에도 계속 유지되어야 하므로 Expect(tkEnd) 뒤에서 복원한다.
       var savedAlias4:=fCurNestedAlias;
       fCurNestedAlias:=new Dictionary<string, string>;
+      // [Stage 65b] 실제 파싱 전에 모든 지역 서브프로그램 이름을 미리 등록해
+      // 선언 순서와 무관한(순방향·역방향·상호재귀) 호출을 허용한다.
+      PreScanNestedSubprograms(d.Name);
       while (Cur.Kind=tkFunction) or (Cur.Kind=tkProcedure) do
       begin
         if Cur.Kind=tkFunction then d.NestedFuncs.Add(ParseNestedFuncDecl(d.Name))
@@ -2436,6 +2509,8 @@ type
       // [Stage 65, 1차] ParseFuncDecl과 동일한 규칙 — 자세한 설명은 그쪽 주석 참고.
       var savedAlias5:=fCurNestedAlias;
       fCurNestedAlias:=new Dictionary<string, string>;
+      // [Stage 65b] 선언 순서와 무관한 호출을 위해 미리 모든 이름을 등록한다.
+      PreScanNestedSubprograms(d.Name);
       while (Cur.Kind=tkFunction) or (Cur.Kind=tkProcedure) do
       begin
         if Cur.Kind=tkFunction then d.NestedFuncs.Add(ParseNestedFuncDecl(d.Name))
@@ -2468,8 +2543,9 @@ type
       localName:=Expect(tkIdent).Text;
       mangled:=enclosingName+'$'+localName;
       d:=new TFuncDeclNode(mangled);
-      fFuncNames.Add(localName);
-      fCurNestedAlias[localName]:=mangled;
+      // [Stage 65b] PreScanNestedSubprograms가 이미 등록했을 수 있으므로 중복 방지
+      if not fFuncNames.Contains(localName) then fFuncNames.Add(localName);
+      fCurNestedAlias[localName]:=mangled; // 덮어써도 동일한 값이므로 무해
 
       ParseParams(d.Parameters);
       Expect(tkColon); d.ReturnType:=ParseVarType;
@@ -2491,8 +2567,9 @@ type
       localName:=Expect(tkIdent).Text;
       mangled:=enclosingName+'$'+localName;
       d:=new TProcDeclNode(mangled);
-      fProcNames.Add(localName);
-      fCurNestedAlias[localName]:=mangled;
+      // [Stage 65b] PreScanNestedSubprograms가 이미 등록했을 수 있으므로 중복 방지
+      if not fProcNames.Contains(localName) then fProcNames.Add(localName);
+      fCurNestedAlias[localName]:=mangled; // 덮어써도 동일한 값이므로 무해
 
       ParseParams(d.Parameters); Expect(tkSemicolon);
       sv:=fCurFunc; fCurFunc:='';
