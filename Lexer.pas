@@ -29,6 +29,7 @@ type
     tkConstructor, // [Stage 42] constructor Create; 선언/구현
     tkLibrary, // [Stage 44] library Name; 선언 (dll 산출물, begin...end 블록 생략 가능)
     tkVirtual, tkOverride, tkAbstract, // [Stage 53] virtual/override/abstract 메서드 지시자
+    tkOperator, // [Stage 66] operator +(a, b: T): T; 연산자 오버로딩 선언
     // [Phase 1] 타입 시스템 확장
     tkReal, tkDouble, tkChar, tkInt64, // 숫자·문자 기본 타입
     tkProperty, tkRead, tkWrite,       // 프로퍼티 선언
@@ -191,6 +192,7 @@ type
       else if lw='virtual'  then Result:=new TToken(tkVirtual,  w,sl,sc) // [Stage 53]
       else if lw='override' then Result:=new TToken(tkOverride, w,sl,sc) // [Stage 53]
       else if lw='abstract' then Result:=new TToken(tkAbstract, w,sl,sc) // [Stage 53]
+      else if lw='operator' then Result:=new TToken(tkOperator, w,sl,sc) // [Stage 66]
       // [Phase 1] 타입 시스템 확장 키워드
       else if lw='real'     then Result:=new TToken(tkReal,     w,sl,sc)
       else if lw='double'   then Result:=new TToken(tkDouble,   w,sl,sc)

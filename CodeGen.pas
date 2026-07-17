@@ -72,6 +72,16 @@ type
     // 공유하지만(타입 CLR 조회 경로 재사용), 필드를 읽고/쓸 때 Ldloc(값 복사) 대신
     // Ldloca(주소)가 필요하다는 점이 다르다 — 그 분기를 위해서만 이 집합을 따로 둔다.
     fRecordNames: HashSet<string>;
+    // [Stage 66] 연산자 오버로딩 레지스트리. "기호|타입이름" → 맹글링된 최상위 함수 이름
+    // (fMethods에서 바로 찾아 Call할 수 있다), 그리고 그 맹글링된 함수 이름 → 반환 타입의
+    // 클래스/레코드 이름(함수 시그니처를 System.Object가 아니라 실제 타입으로 선언하기 위함 —
+    // 특히 레코드는 값 타입이라 System.Object로 방출하면 박싱되어 필드 접근이 깨진다).
+    fOperatorOverloadFuncs: Dictionary<string, string>;
+    fOperatorFuncRetClass:  Dictionary<string, string>;
+    // [Stage 66] 클래스/레코드명 → 필드명 → 그 필드가 vtObject일 때의 클래스/레코드 이름.
+    // TBinOpNode 피연산자가 "self.필드" 또는 "obj.필드" 형태일 때 연산자 오버로딩 대상
+    // 타입을 판별하는 데만 쓰인다 (TryGetObjClassName).
+    fFieldObjClassName: Dictionary<string, Dictionary<string, string>>;
     // [Stage 64] 익명 메서드(람다)는 'Program' 정적 메서드 컨테이너(mainTB)에 새 static 메서드로
     // 하나씩 추가된다. GenerateExe 안의 지역변수였던 mainTB를 EmitStatement에서도 쓸 수 있도록
     // 인스턴스 필드로 승격해 둔다. fLambdaCounter는 매번 다른 메서드 이름(__Lambda1, __Lambda2, ...)을
@@ -140,6 +150,65 @@ type
       if fLocalScope.Has(name) then Result:=fLocalScope.GetClassName(name)
       else if fGlobalScope.Has(name) then Result:=fGlobalScope.GetClassName(name)
       else Result:='';
+    end;
+
+    // [Stage 66] TBinOpKind → 소스에 쓰인 연산자 기호 문자열. 연산자 오버로딩 레지스트리
+    // (fOperatorOverloadFuncs)의 키를 만드는 데 쓰인다. 문자열/집합 연산 등 이미 다른 의미로
+    // 쓰이는 boAdd/boSub/boMul을 여기서는 순수하게 "소스 기호"로만 취급한다.
+    function OpKindSymbol(k: TBinOpKind): string;
+    begin
+      if k=boAdd then Result:='+'
+      else if k=boSub then Result:='-'
+      else if k=boMul then Result:='*'
+      else if k=boDiv then Result:='/'
+      else Result:='';
+    end;
+
+    // [Stage 66] 식 하나가 "연산자 오버로딩 대상이 될 수 있는 vtObject 값"이면 그 클래스/레코드
+    // 이름을 outCn에 채우고 true를 돌려준다. 지원 범위는 일부러 좁게 잡았다 — 지역변수/매개변수,
+    // self 필드(TFieldReadExprNode), obj.필드(TMethodCallExprNode 0-인자 필드읽기), 그리고
+    // 이미 연산자 오버로딩으로 해석되는 중첩 TBinOpNode(체이닝, 예: a+b+c) 네 가지뿐이다.
+    // 이 이상(임의의 메서드 호출 반환값 등)은 이 컴파일러가 애초에 값의 클래스 이름을 추적하지
+    // 않는 경우가 대부분이라(함수 반환 타입에 ClassName이 없음, Stage 66 범위 밖) 지원하지 않는다.
+    function TryGetObjClassName(ex: TExprNode; var outCn: string): boolean;
+    var _fr66: TFieldReadExprNode; _mc66: TMethodCallExprNode; _vr66: TVarRefNode; _bo66: TBinOpNode;
+        _ownerCn66, _lcn66, _rcn66, _sym66: string;
+    begin
+      outCn:='';
+      if ex is TVarRefNode then
+      begin
+        _vr66:=TVarRefNode(ex);
+        outCn:=GetVarClassName(_vr66.VarName);
+        Result:=outCn<>'';
+      end
+      else if ex is TFieldReadExprNode then
+      begin
+        _fr66:=TFieldReadExprNode(ex);
+        if fFieldObjClassName.ContainsKey(fCurClassName) and fFieldObjClassName[fCurClassName].ContainsKey(_fr66.FieldName) then
+        begin outCn:=fFieldObjClassName[fCurClassName][_fr66.FieldName]; Result:=true; end
+        else Result:=false;
+      end
+      else if (ex is TMethodCallExprNode) and (TMethodCallExprNode(ex).Args.Count=0) and (TMethodCallExprNode(ex).ObjName<>'') then
+      begin
+        _mc66:=TMethodCallExprNode(ex);
+        _ownerCn66:=GetVarClassName(_mc66.ObjName);
+        if (_ownerCn66<>'') and fFieldObjClassName.ContainsKey(_ownerCn66) and fFieldObjClassName[_ownerCn66].ContainsKey(_mc66.MethodName) then
+        begin outCn:=fFieldObjClassName[_ownerCn66][_mc66.MethodName]; Result:=true; end
+        else Result:=false;
+      end
+      else if ex is TBinOpNode then
+      begin
+        _bo66:=TBinOpNode(ex);
+        if TryGetObjClassName(_bo66.Left, _lcn66) and TryGetObjClassName(_bo66.Right, _rcn66) and (_lcn66=_rcn66) and (_lcn66<>'') then
+        begin
+          _sym66:=OpKindSymbol(_bo66.Op);
+          if fOperatorOverloadFuncs.ContainsKey(_sym66+'|'+_lcn66) then
+          begin outCn:=_lcn66; Result:=true; end
+          else Result:=false;
+        end
+        else Result:=false;
+      end
+      else Result:=false;
     end;
 
     // 클래스 계층을 따라 올라가며 필드를 정의한 (진짜 소유) 클래스의 FieldBuilder 탐색
@@ -478,8 +547,11 @@ type
       else if e is TBinOpNode then
       begin
         b:=TBinOpNode(e);
+        // [Stage 66] 두 피연산자 모두 vtObject면(연산자 오버로딩 대상) 결과도 vtObject —
+        // 실제 오버로딩이 등록되어 있는지는 EmitExpr에서 검증하고, 여기서는 타입 모양만 전달한다.
+        if (InferType(b.Left)=vtObject) and (InferType(b.Right)=vtObject) then Result:=vtObject
         // [Stage 63] 피연산자 중 하나라도 집합이면 결과도 집합 (합집합/차집합/교집합)
-        if (InferType(b.Left)=vtSet) or (InferType(b.Right)=vtSet) then Result:=vtSet
+        else if (InferType(b.Left)=vtSet) or (InferType(b.Right)=vtSet) then Result:=vtSet
         else if (InferType(b.Left)=vtString) or (InferType(b.Right)=vtString) then
           Result:=vtString
         else Result:=vtInteger;
@@ -915,7 +987,26 @@ type
       else if e is TBinOpNode then
       begin
         b:=TBinOpNode(e); lt:=InferType(b.Left); rt:=InferType(b.Right);
-        if (lt=vtSet) or (rt=vtSet) then // [Stage 63] 집합 연산: + 합집합, - 차집합, * 교집합
+        if (lt=vtObject) and (rt=vtObject) then // [Stage 66] 연산자 오버로딩
+        begin
+          var _opLcn66, _opRcn66: string;
+          if TryGetObjClassName(b.Left, _opLcn66) and TryGetObjClassName(b.Right, _opRcn66)
+             and (_opLcn66=_opRcn66) and (_opLcn66<>'') then
+          begin
+            var _opSym66:=OpKindSymbol(b.Op);
+            var _opKey66:=_opSym66+'|'+_opLcn66;
+            if fOperatorOverloadFuncs.ContainsKey(_opKey66) then
+            begin
+              EmitExpr(aIL, b.Left);
+              EmitExpr(aIL, b.Right);
+              aIL.Emit(OpCodes.Call, fMethods[fOperatorOverloadFuncs[_opKey66]]);
+            end
+            else raise new Exception('타입 "'+_opLcn66+'"에는 연산자 "'+_opSym66+'"가 정의되어 있지 않습니다 (Stage 66)');
+          end
+          else raise new Exception('연산자 오버로딩 대상 식을 판별할 수 없습니다 (Stage 66) — '
+            +'지역변수/필드, 또는 이미 오버로딩된 연산식끼리만 조합할 수 있습니다');
+        end
+        else if (lt=vtSet) or (rt=vtSet) then // [Stage 63] 집합 연산: + 합집합, - 차집합, * 교집합
         begin
           EmitExpr(aIL, b.Left);
           EmitExpr(aIL, b.Right);
@@ -2039,6 +2130,13 @@ type
         begin
           rfb:=rtb.DefineField(rfd.Name, ResolveFieldClrType(rfd), FieldAttributes.Public);
           fFieldBuilders[rd.Name][rfd.Name]:=rfb;
+          // [Stage 66] 레코드 필드도 클래스와 동일하게 연산자 오버로딩 대상 판별용으로 기록
+          if (rfd.FieldType=vtObject) and (not rfd.IsExternalType) and (rfd.ClassName<>'') then
+          begin
+            if not fFieldObjClassName.ContainsKey(rd.Name) then
+              fFieldObjClassName[rd.Name]:=new Dictionary<string, string>;
+            fFieldObjClassName[rd.Name][rfd.Name]:=rfd.ClassName;
+          end;
         end;
         fBuiltTypes[rd.Name]:=rtb.CreateType;
         fRecordNames.Add(rd.Name);
@@ -2413,6 +2511,13 @@ type
       begin
         fb:=tb.DefineField(fd.Name, ResolveFieldClrType(fd), FieldAttributes.Public);
         fFieldBuilders[cd.Name][fd.Name]:=fb;
+        // [Stage 66] self.필드/obj.필드 형태의 연산자 오버로딩 대상 판별용
+        if (fd.FieldType=vtObject) and (not fd.IsExternalType) and (fd.ClassName<>'') then
+        begin
+          if not fFieldObjClassName.ContainsKey(cd.Name) then
+            fFieldObjClassName[cd.Name]:=new Dictionary<string, string>;
+          fFieldObjClassName[cd.Name][fd.Name]:=fd.ClassName;
+        end;
       end;
 
       // [Phase 1] 프로퍼티 — CLR PropertyBuilder + get/set 메서드 쌍으로 방출
@@ -2729,11 +2834,16 @@ type
     // 반드시 먼저 끝나 있어야 한다. 재귀적으로 자신의 지역 서브프로그램들도
     // 시그니처만 먼저 등록해 둔다(본문은 이후 BuildStaticFunc/Proc 패스에서).
     procedure DeclareStaticFunc(tb: TypeBuilder; d: TFuncDeclNode);
-    var pt: array of System.Type; i: integer; mb: MethodBuilder; retClrType: System.Type;
+    var pt: array of System.Type; i: integer; mb: MethodBuilder; retClrType: System.Type; retCn66: string;
     begin
       pt:=new System.Type[d.Parameters.Count];
       for i:=0 to d.Parameters.Count-1 do pt[i]:=ResolveTopParamClrType(d.Parameters[i]);
-      retClrType:=VTC(d.ReturnType, '');
+      // [Stage 66] 연산자 오버로딩으로 맹글링된 함수는 System.Object가 아니라 실제 레코드/클래스
+      // 반환 타입으로 선언해야 한다 — 특히 레코드는 값 타입이라 System.Object로 선언하면 박싱되어
+      // 필드 접근(Ldflda 등)이 깨진다.
+      retCn66:='';
+      if fOperatorFuncRetClass.ContainsKey(d.Name) then retCn66:=fOperatorFuncRetClass[d.Name];
+      retClrType:=VTC(d.ReturnType, retCn66);
       mb:=tb.DefineMethod(d.Name, MethodAttributes.Public or MethodAttributes.Static,
         retClrType, pt);
       fMethods[d.Name]:=mb; fTopParamClrTypes[d.Name]:=pt; fFuncReturnTypes[d.Name]:=d.ReturnType;
@@ -2763,7 +2873,11 @@ type
       // 여기서는 등록된 MethodBuilder를 가져와 본문만 방출한다.
       mb:=fMethods[d.Name];
       pt:=fTopParamClrTypes[d.Name];
-      retClrType:=VTC(d.ReturnType, '');
+      // [Stage 66] DeclareStaticFunc와 동일한 이유로 연산자 오버로딩 맹글링 함수는
+      // 실제 반환 클래스/레코드 타입을 사용한다.
+      var retCn66b:='';
+      if fOperatorFuncRetClass.ContainsKey(d.Name) then retCn66b:=fOperatorFuncRetClass[d.Name];
+      retClrType:=VTC(d.ReturnType, retCn66b);
       il:=mb.GetILGenerator;
 
       // [Stage 65b] 지역(중첩) 함수/프로시저의 "본문"을 만든다. 시그니처는 이미
@@ -2902,6 +3016,16 @@ type
       fBuiltInterfaces:=new Dictionary<string, System.Type>;
       fBuiltEnums:=new Dictionary<string, System.Type>; // [Phase 1]
       fRecordNames:=new HashSet<string>; // [Stage 62]
+      // [Stage 66] 연산자 오버로딩 레지스트리를 미리 채워둔다 — DeclareStaticFunc/BuildStaticFunc가
+      // 맹글링된 함수의 반환 CLR 타입을 결정할 때(System.Object로 박싱되지 않도록) 필요하다.
+      fOperatorOverloadFuncs:=new Dictionary<string, string>;
+      fOperatorFuncRetClass:=new Dictionary<string, string>;
+      foreach var oo66 in fProg.OperatorOverloads do
+      begin
+        fOperatorOverloadFuncs[oo66.OpSymbol+'|'+oo66.TypeName]:=oo66.FuncName;
+        fOperatorFuncRetClass[oo66.FuncName]:=oo66.TypeName;
+      end;
+      fFieldObjClassName:=new Dictionary<string, Dictionary<string, string>>;
       fLambdaCounter:=0; // [Stage 64]
       fLoadedAssemblies:=new List<Assembly>;
       fClassExternalParentType:=new Dictionary<string, System.Type>;

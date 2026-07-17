@@ -81,6 +81,9 @@ type
     // (var/필드/매개변수 타입 인식 같은) 기존 "지역 클래스 이름" 인식 경로를 그대로 재사용한다 —
     // fRecordNames는 그중 "값 타입이라 new/상속이 금지된다" 같은 레코드 전용 규칙을 걸 때만 따로 확인한다.
     fRecordNames: List<string>;
+    // [Stage 66] 이미 등록된 연산자 오버로딩 조합 집합 ("기호|타입이름"). 같은 조합이 두 번
+    // 선언되는 것을 막는 용도로만 쓴다.
+    fOperatorSigs: HashSet<string>;
     // [Stage 51] 열거형 멤버 이름 → 소속 열거형 이름 / 서수. North → ('TDirection', 0) 처럼
     // 식(expression) 안에서 괄호 없는 식별자로 등장하는 열거형 값을 판별하는 데 쓰인다.
     fEnumMemberEnumName: Dictionary<string, string>;
@@ -2476,6 +2479,71 @@ type
       Result:=d;
     end;
 
+    // [Stage 66] 연산자 오버로딩: operator +(a, b: TVector): TVector; ... end; 형태의 선언.
+    // 일반 최상위 함수와 거의 똑같이 파싱하되(매개변수/지역 var·const 섹션/본문 모두 재사용),
+    // 이름 자리에 연산자 기호가 오고 매개변수 2개가 반드시 같은 레코드/클래스 타입이어야 하며
+    // 반환 타입도 그와 같은 타입이어야 한다(대칭형 +, -, *, /만 지원 — 서로 다른 타입 간
+    // 혼합 연산이나 비교 연산자(=, <>) 오버로딩은 이번 단계 범위 밖).
+    // 파싱된 본문은 맹글링된 이름(예: 'operator$add$TVector')의 평범한 최상위 함수로
+    // prog.FuncDecls에 등록하고, prog.OperatorOverloads에는 "기호+타입이름 → 맹글링된 이름"
+    // 매핑만 남긴다 — CodeGen이 TBinOpNode 방출 시 이 매핑을 참조해 산술 연산 대신
+    // 함수 호출로 대체한다.
+    procedure ParseOperatorDecl(prog: TProgramNode);
+    var
+      opTok: TToken; opSym, opWord, typeName, mangled: string;
+      d: TFuncDeclNode; c: TCompoundStmtNode; sv: string;
+      retIsExt: boolean; retCn: string; retType: TVarType; ps: List<TParamDef>;
+    begin
+      Expect(tkOperator);
+      opTok:=Cur;
+      if opTok.Kind=tkPlus then begin opSym:='+'; opWord:='add'; end
+      else if opTok.Kind=tkMinus then begin opSym:='-'; opWord:='sub'; end
+      else if opTok.Kind=tkStar then begin opSym:='*'; opWord:='mul'; end
+      else if opTok.Kind=tkSlash then begin opSym:='/'; opWord:='div'; end
+      else raise new Exception('줄 '+opTok.Line.ToString+', 열 '+opTok.Column.ToString
+        +': operator 뒤에는 +, -, *, / 중 하나가 와야 합니다 (Stage 66)');
+      fPos:=fPos+1; // 연산자 기호 토큰 소비
+
+      ps:=new List<TParamDef>;
+      ParseParams(ps);
+      if ps.Count<>2 then
+        raise new Exception('줄 '+opTok.Line.ToString+', 열 '+opTok.Column.ToString
+          +': operator '+opSym+'는 매개변수 2개(좌/우 피연산자)만 지원합니다 (Stage 66)');
+      if (ps[0].ParamType<>vtObject) or (ps[1].ParamType<>vtObject)
+         or (ps[0].ClassName<>ps[1].ClassName) or (ps[0].ClassName='') then
+        raise new Exception('줄 '+opTok.Line.ToString+', 열 '+opTok.Column.ToString
+          +': operator '+opSym+'의 두 매개변수는 같은 레코드/클래스 타입이어야 합니다 (Stage 66)');
+      typeName:=ps[0].ClassName;
+
+      Expect(tkColon);
+      retType:=ParseParamTypeExt(retIsExt, retCn);
+      if (retType<>vtObject) or (retCn<>typeName) then
+        raise new Exception('줄 '+opTok.Line.ToString+', 열 '+opTok.Column.ToString
+          +': operator '+opSym+'의 반환 타입은 피연산자와 같은 "'+typeName+'"이어야 합니다 (Stage 66)');
+      Expect(tkSemicolon);
+
+      if fOperatorSigs.Contains(opSym+'|'+typeName) then
+        raise new Exception('줄 '+opTok.Line.ToString+', 열 '+opTok.Column.ToString
+          +': 연산자 "'+opSym+'"가 타입 "'+typeName+'"에 대해 이미 정의되어 있습니다 (Stage 66)');
+      fOperatorSigs.Add(opSym+'|'+typeName);
+
+      mangled:='operator$'+opWord+'$'+typeName;
+      d:=new TFuncDeclNode(mangled);
+      d.Parameters:=ps;
+      d.ReturnType:=vtObject;
+
+      sv:=fCurFunc; fCurFunc:=mangled;
+      if (Cur.Kind=tkVar) or (Cur.Kind=tkConst) then ParseLocalDeclSections(d.LocalVars, d.ConstDecls);
+
+      Expect(tkBegin); c:=new TCompoundStmtNode;
+      ParseStatementsUntilEnd(c.Statements);
+      Expect(tkEnd); Expect(tkSemicolon);
+      fCurFunc:=sv; d.Body:=c;
+
+      prog.FuncDecls.Add(d);
+      prog.OperatorOverloads.Add(new TOperatorOverloadNode(opSym, typeName, mangled));
+    end;
+
     function ParseProcDecl: TProcDeclNode;
     var d: TProcDeclNode; c: TCompoundStmtNode; sv: string;
         genNames, genConstraints, savedGP5: List<string>;
@@ -2693,6 +2761,7 @@ type
     constructor Create(aTokens: List<TToken>);
     begin
       fTokens:=aTokens; fPos:=0; fCurFunc:=''; fCurClass:=''; fCurParams:=new List<string>;
+      fOperatorSigs:=new HashSet<string>; // [Stage 66]
       fCurMethodParamNames:=new List<string>; // [Stage 30]
       fCurNestedAlias:=nil; // [Stage 65] 최상위 함수/프로시저 밖에서는 지역 서브프로그램 별칭이 없음
       fFuncNames:=new List<string>;
@@ -2820,7 +2889,7 @@ type
       if Cur.Kind=tkType then ParseTypeSection(prog);
 
       // 클래스 메서드 구현 또는 일반 함수/프로시저
-      while (Cur.Kind=tkFunction) or (Cur.Kind=tkProcedure) or (Cur.Kind=tkConstructor) do
+      while (Cur.Kind=tkFunction) or (Cur.Kind=tkProcedure) or (Cur.Kind=tkConstructor) or (Cur.Kind=tkOperator) do
       begin
         // [Phase 2] 함수/프로시저/메서드/생성자 구현 하나가 깨져도 전체를 멈추지 않고
         // 오류를 모은 뒤 다음 구현부(또는 var/begin) 자리로 건너뛰어 계속한다.
@@ -2831,6 +2900,11 @@ type
         if Cur.Kind=tkConstructor then
         begin
           prog.ConstructorImpls.Add(ParseConstructorImpl);
+        end
+        // [Stage 66] operator +(a, b: T): T; ... end; — 항상 최상위 선언
+        else if Cur.Kind=tkOperator then
+        begin
+          ParseOperatorDecl(prog);
         end
         else
         begin
@@ -2877,7 +2951,7 @@ type
             while Cur.Kind<>tkEOF do
             begin
               if (syncDepth=0) and ((Cur.Kind=tkFunction) or (Cur.Kind=tkProcedure)
-                 or (Cur.Kind=tkConstructor) or (Cur.Kind=tkVar) or (Cur.Kind=tkConst)) then
+                 or (Cur.Kind=tkConstructor) or (Cur.Kind=tkOperator) or (Cur.Kind=tkVar) or (Cur.Kind=tkConst)) then
                 break;
               if Cur.Kind=tkBegin then syncDepth:=syncDepth+1
               else if (Cur.Kind=tkEnd) and (syncDepth>0) then syncDepth:=syncDepth-1;

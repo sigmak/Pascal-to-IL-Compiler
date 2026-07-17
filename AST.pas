@@ -698,6 +698,23 @@ type
     begin TemplateName:=tn; ConcreteName:=cnm; IsProc:=isP; ArgTypes:=ats; ArgClassNames:=acns; end;
   end;
 
+  // [Stage 66] 연산자 오버로딩: operator +(a, b: TVector): TVector; 형태의 선언 하나.
+  // Parser는 파싱한 본문을 맹글링된 이름(예: 'operator$add$TVector')의 평범한 최상위
+  // 함수로 TProgramNode.FuncDecls에도 함께 등록한다 — 이 레코드는 "연산자 기호 + 피연산자
+  // 타입 이름 → 그 맹글링된 함수 이름"이라는 매핑 하나만 담는다. CodeGen은 TBinOpNode의
+  // 양쪽 피연산자가 같은 레코드/클래스 타입이고 그 조합의 오버로드가 등록되어 있으면
+  // 산술 연산(Add/Sub/...) 대신 이 함수 호출로 대체한다.
+  // (현재는 "같은 타입끼리 연산해 같은 타입을 돌려주는" 대칭형 +, -, *, /만 지원 — 서로 다른
+  // 타입 간의 혼합 연산이나 비교 연산자(=, <>) 오버로딩은 이번 단계 범위 밖이다.)
+  TOperatorOverloadNode = class
+  public
+    OpSymbol: string; // '+', '-', '*', '/'
+    TypeName: string; // 피연산자(=반환값) 클래스/레코드 이름
+    FuncName: string; // 맹글링된 최상위 함수 이름
+    constructor Create(op, tn, fn: string);
+    begin OpSymbol:=op; TypeName:=tn; FuncName:=fn; end;
+  end;
+
 
   TProgramNode = class
   public
@@ -716,6 +733,7 @@ type
     IsLibrary: boolean; // [Stage 44] true면 "library Name;"으로 시작 — exe 대신 dll로 생성, begin...end 블록 생략 가능
     EnumDecls: List<TEnumDeclNode>; // [Phase 1] 열거형 선언 목록
     RecordDecls: List<TRecordDeclNode>; // [Stage 62] 레코드 선언 목록
+    OperatorOverloads: List<TOperatorOverloadNode>; // [Stage 66] 연산자 오버로딩 목록
     constructor Create(n: string);
     begin
       Name:=n;
@@ -733,6 +751,7 @@ type
       IsLibrary:=false;
       EnumDecls:=new List<TEnumDeclNode>; // [Phase 1]
       RecordDecls:=new List<TRecordDeclNode>; // [Stage 62]
+      OperatorOverloads:=new List<TOperatorOverloadNode>; // [Stage 66]
     end;
   end;
 

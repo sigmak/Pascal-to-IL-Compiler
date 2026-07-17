@@ -21,7 +21,8 @@ uses
 
 const
   DefaultExampleDir = 'Examples';
-  DefaultExampleFile = 'Test_stage65b.pas'; // [Stage 65b]
+  DefaultExampleFile = 'Test_stage66.pas'; // [Stage 66] 연산자 오버로딩 (operator +, 등) — 본가의 특징적 기능이지만 우선순위는 낮음.
+  //DefaultExampleFile = 'Test_stage65b.pas'; // [Stage 65b] 지역 서브프로그램끼리 선언 순서 무관 호출
   //DefaultExampleFile = 'Test_stage65.pas'; // [Stage 65] 지역(중첩) 프로시저/함수 테스트
   //DefaultExampleFile = 'Test_stage64.pas'; // [Stage 64] 익명 메서드/람다 (-> 구문) 테스트
   //DefaultExampleFile = 'Test_stage63.pas'; // [Stage 63] set of 타입과 집합 연산 (in, +, -, *) 테스트
