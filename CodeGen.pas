@@ -88,6 +88,9 @@ type
     // 만들기 위한 일련번호.
     fMainTB: TypeBuilder;
     fLambdaCounter: integer;
+    // [Stage 68] 클로저(변수 캡처) 있는 람다가 __ClosureN 클래스를 최상위 타입으로
+    // 만들 때 필요 — fMainTB처럼 GenerateExe의 지역변수였던 modB를 인스턴스 필드로 승격.
+    fModB: ModuleBuilder;
 
     // 현재 메서드 컨텍스트
     fResultLocal:  LocalBuilder;
@@ -1559,6 +1562,36 @@ type
             if emi.ReturnType<>typeof(System.Void) then aIL.Emit(OpCodes.Pop);
           end;
         end
+        else if (FindExternalAncestorType(fCurClassName)<>nil)
+                and (FindExternalAncestorType(fCurClassName).GetProperty(mcs.ObjName)<>nil) then
+        begin
+          // [Stage 68 재확인] Controls.Add(Button1); 처럼, 한정자(qualifier) 자체가
+          // 로컬변수/필드가 아니라 self가 상속받은 외부 타입(Form 등)의 프로퍼티인 경우.
+          // self를 로드하고 그 프로퍼티의 게터를 호출해 얻은 값(예: Form.Controls의
+          // ControlCollection 인스턴스)에 대고 실제 메서드(Add 등)를 호출한다.
+          extType:=FindExternalAncestorType(fCurClassName);
+          propInfo:=extType.GetProperty(mcs.ObjName);
+          aIL.Emit(OpCodes.Ldarg_0);
+          aIL.Emit(OpCodes.Callvirt, propInfo.GetGetMethod);
+          qTargetType:=propInfo.PropertyType;
+          var _getP5:=qTargetType.GetProperty(mcs.MethodName);
+          if (mcs.Args.Count=0) and (_getP5<>nil) and (_getP5.GetGetMethod<>nil) then
+          begin
+            aIL.Emit(OpCodes.Callvirt, _getP5.GetGetMethod);
+            aIL.Emit(OpCodes.Pop);
+          end
+          else
+          begin
+            emi:=ResolveMethodByArity(qTargetType, mcs.MethodName, mcs.Args, false);
+            if emi=nil then
+              raise new Exception('타입 "'+qTargetType.FullName+'"에 메서드 "'+mcs.MethodName+'"가 없습니다 (인자 '+mcs.Args.Count.ToString+'개).');
+            var _emiParams5:=emi.GetParameters;
+            for var _emiAi5:=0 to mcs.Args.Count-1 do
+              EmitArgForParamType(aIL, mcs.Args[_emiAi5], _emiParams5[_emiAi5].ParameterType);
+            aIL.Emit(OpCodes.Callvirt, emi);
+            if emi.ReturnType<>typeof(System.Void) then aIL.Emit(OpCodes.Pop);
+          end;
+        end
         else
         begin
           // 로컬/전역 변수가 아니면 System.Windows.Forms.Application.Run(f) 처럼
@@ -1632,12 +1665,25 @@ type
         // 없다(Ldnull) — Ldftn(비가상)이면 충분하고 Ldvirtftn/Ldarg_0 두 번이 필요 없다.
         if evs.Lambda<>nil then
         begin
-          var lamMB:=EmitLambdaAsStaticMethod(evs.Lambda);
+          // [Stage 68] 델리게이트 Invoke 시그니처를 먼저 조회한다 — 개수 검증뿐 아니라,
+          // 람다 매개변수에 타입 명시가 없을 때(vtInferred) 위치별 실제 CLR 타입을
+          // EmitLambdaAsStaticMethod에 넘겨 추론시키기 위해서다.
           var lamInvoke:=evInfo.EventHandlerType.GetMethod('Invoke');
           if (lamInvoke<>nil) and (lamInvoke.GetParameters.Length<>evs.Lambda.LamParams.Count) then
             raise new Exception('람다 매개변수 개수('+evs.Lambda.LamParams.Count.ToString+'개)가 이벤트 "'
               +evs.EventName+'"의 델리게이트 시그니처('+lamInvoke.GetParameters.Length.ToString+'개)와 다릅니다.');
-          aIL.Emit(OpCodes.Ldnull);
+          var lamExpectedTypes: array of System.Type;
+          if lamInvoke<>nil then
+          begin
+            var lamInvokeParams:=lamInvoke.GetParameters;
+            lamExpectedTypes:=new System.Type[lamInvokeParams.Length];
+            for var lpi:=0 to lamInvokeParams.Length-1 do lamExpectedTypes[lpi]:=lamInvokeParams[lpi].ParameterType;
+          end
+          else lamExpectedTypes:=nil;
+          // [Stage 68] EmitLambdaAsStaticMethod가 캡처 여부를 스스로 판단해 aIL에
+          // 델리게이트 target(캡처 없으면 Ldnull, 있으면 새 __ClosureN 인스턴스)까지
+          // 이미 남겨 놓으므로, 여기서는 그 뒤를 이어 Ldftn/Newobj만 하면 된다.
+          var lamMB:=EmitLambdaAsStaticMethod(aIL, evs.Lambda, lamExpectedTypes);
           aIL.Emit(OpCodes.Ldftn, lamMB);
           aIL.Emit(OpCodes.Newobj, delCtor);
         end
@@ -2111,47 +2157,376 @@ type
       else Result:=VTC(p.ParamType, '');
     end;
 
-    // [Stage 64] 람다(익명 메서드) 본문을 새 static 메서드(Program.__LambdaN)로 컴파일하고
-    // 그 MethodBuilder를 돌려준다. 클로저가 없으므로(1차 범위) 지역 스코프를 통째로 새 것
-    // (부모=fGlobalScope, 즉 전역 변수/함수는 보이지만 바깥 메서드의 지역변수는 안 보임)으로
-    // 바꿔치기한 뒤 컴파일하고 끝나면 원래대로 되돌린다 — 이렇게 하면 본문 안에서 바깥
-    // 메서드의 지역변수를 참조하려는 시도가 여기서 "선언되지 않은 변수" 오류로 자연스럽게
-    // 걸러진다(별도의 캡처 검사 코드가 필요 없다). self/inherited도 지원하지 않는다 — 정적
-    // 메서드라 인스턴스가 없으므로, 람다 본문에서 이들을 쓰면 정의되지 않은 동작이다(1차 제약).
-    function EmitLambdaAsStaticMethod(lam: TLambdaExprNode): MethodBuilder;
-    var paramTypes: array of System.Type; li: integer; lmb: MethodBuilder; lil: ILGenerator;
+    // [Stage 68] 람다 매개변수에 타입 명시가 없을 때(vtInferred), 델리게이트 Invoke 시그니처에서
+    // 가져온 실제 CLR 타입을 스코프에 태깅하기 위한 TVarType 근사값을 구한다. 이 태그는 이후
+    // 식/문 컴파일에서 "이 변수가 어떤 연산을 지원하는가"를 판단하는 용도로만 쓰이고, 실제 로컬
+    // 슬롯의 CLR 타입은 항상 델리게이트가 알려준 그대로(paramTypes[li])를 사용한다.
+    function VarTypeTagFromClrType(t: System.Type): TVarType;
+    begin
+      if t=typeof(integer) then Result:=vtInteger
+      else if t=typeof(string) then Result:=vtString
+      else if t=typeof(boolean) then Result:=vtBoolean
+      else if t=typeof(double) then Result:=vtReal
+      else if t=typeof(char) then Result:=vtChar
+      else if t=typeof(int64) then Result:=vtInt64
+      else if t.IsInterface then Result:=vtInterface
+      else Result:=vtObject; // 클래스/구조체 등 그 외 참조·값 타입은 vtObject로 취급하고
+                             // ClassName은 비워 둔 채 SetClrType으로 실제 타입을 스코프에 기록한다.
+    end;
+
+    // [Stage 68] 캡처 분석 1단계 — 식 안에 등장하는 "이름"들을 모두 names에 모은다.
+    // 여기서는 아직 그 이름이 실제로 바깥 지역변수인지 판단하지 않는다(그건 호출부에서
+    // fLocalScope.Has로 거른다) — 그냥 후보를 넓게 모으기만 한다. 존재하지 않는 노드
+    // 타입 분기는 없다(AST.pas의 모든 TExprNode 자손을 다룬다).
+    procedure CollectVarNamesInExpr(e: TExprNode; names: List<string>);
+    var i: integer;
+    begin
+      if e=nil then exit;
+      if e is TVarRefNode then names.Add(TVarRefNode(e).VarName)
+      else if e is TArrayIndexExprNode then
+      begin
+        names.Add(TArrayIndexExprNode(e).ArrName);
+        CollectVarNamesInExpr(TArrayIndexExprNode(e).Index, names);
+      end
+      else if e is TLengthExprNode then names.Add(TLengthExprNode(e).ArrName)
+      else if e is TAsCastExprNode then CollectVarNamesInExpr(TAsCastExprNode(e).Expr, names)
+      else if e is TInheritedCallExprNode then
+        for i:=0 to TInheritedCallExprNode(e).Args.Count-1 do
+          CollectVarNamesInExpr(TInheritedCallExprNode(e).Args[i], names)
+      else if e is TIntToStrNode then CollectVarNamesInExpr(TIntToStrNode(e).Arg, names)
+      else if e is TNewObjectExprNode then
+        for i:=0 to TNewObjectExprNode(e).Args.Count-1 do
+          CollectVarNamesInExpr(TNewObjectExprNode(e).Args[i], names)
+      else if e is TMethodCallExprNode then
+      begin
+        names.Add(TMethodCallExprNode(e).ObjName);
+        for i:=0 to TMethodCallExprNode(e).Args.Count-1 do
+          CollectVarNamesInExpr(TMethodCallExprNode(e).Args[i], names);
+      end
+      else if e is TBinOpNode then
+      begin
+        CollectVarNamesInExpr(TBinOpNode(e).Left, names);
+        CollectVarNamesInExpr(TBinOpNode(e).Right, names);
+      end
+      else if e is TCompareNode then
+      begin
+        CollectVarNamesInExpr(TCompareNode(e).Left, names);
+        CollectVarNamesInExpr(TCompareNode(e).Right, names);
+      end
+      else if e is TInExprNode then
+      begin
+        CollectVarNamesInExpr(TInExprNode(e).Elem, names);
+        CollectVarNamesInExpr(TInExprNode(e).SetExpr, names);
+      end
+      else if e is TNotExprNode then CollectVarNamesInExpr(TNotExprNode(e).Expr, names)
+      else if e is TFuncCallExprNode then
+      begin
+        names.Add(TFuncCallExprNode(e).FuncName); // 함수형 변수(델리게이트)일 수도 있으므로 후보에 포함
+        for i:=0 to TFuncCallExprNode(e).Args.Count-1 do
+          CollectVarNamesInExpr(TFuncCallExprNode(e).Args[i], names);
+      end
+      else if e is TMatrix2DIndexExprNode then
+      begin
+        names.Add(TMatrix2DIndexExprNode(e).ArrName);
+        CollectVarNamesInExpr(TMatrix2DIndexExprNode(e).Row, names);
+        CollectVarNamesInExpr(TMatrix2DIndexExprNode(e).Col, names);
+      end;
+      // 나머지(리터럴, self, nil, 필드읽기, 정적 멤버 등)는 바깥 지역변수를 참조할 수 없으므로 무시.
+    end;
+
+    // [Stage 68] 캡처 분석 2단계 — 문장 트리를 훑으며 참조 이름 후보(names)와, 람다
+    // 본문 "안에서" 새로 선언되는 이름(boundNames — for 루프 변수, inline var, except 변수)을
+    // 모은다. boundNames에 있는 이름은 바깥 캡처 대상에서 제외된다(자기 자신의 지역 슬롯이므로).
+    procedure CollectVarNamesInStmt(s: TStmtNode; names: List<string>; boundNames: List<string>);
+    var i: integer; branch: TCaseBranchNode; lbl: TCaseLabel;
+    begin
+      if s=nil then exit;
+      if s is TWritelnExprStmtNode then CollectVarNamesInExpr(TWritelnExprStmtNode(s).Arg, names)
+      else if s is TAssignStmtNode then
+      begin
+        names.Add(TAssignStmtNode(s).VarName);
+        CollectVarNamesInExpr(TAssignStmtNode(s).ValueExpr, names);
+      end
+      else if s is TResultAssignStmtNode then CollectVarNamesInExpr(TResultAssignStmtNode(s).ValueExpr, names)
+      else if s is TCompoundStmtNode then
+        for i:=0 to TCompoundStmtNode(s).Statements.Count-1 do
+          CollectVarNamesInStmt(TCompoundStmtNode(s).Statements[i], names, boundNames)
+      else if s is TIfStmtNode then
+      begin
+        CollectVarNamesInExpr(TIfStmtNode(s).Condition, names);
+        CollectVarNamesInStmt(TIfStmtNode(s).ThenStmt, names, boundNames);
+        CollectVarNamesInStmt(TIfStmtNode(s).ElseStmt, names, boundNames);
+      end
+      else if s is TWhileStmtNode then
+      begin
+        CollectVarNamesInExpr(TWhileStmtNode(s).Condition, names);
+        CollectVarNamesInStmt(TWhileStmtNode(s).Body, names, boundNames);
+      end
+      else if s is TForStmtNode then
+      begin
+        if not boundNames.Contains(TForStmtNode(s).VarName) then boundNames.Add(TForStmtNode(s).VarName);
+        CollectVarNamesInExpr(TForStmtNode(s).StartExpr, names);
+        CollectVarNamesInExpr(TForStmtNode(s).EndExpr, names);
+        CollectVarNamesInStmt(TForStmtNode(s).Body, names, boundNames);
+      end
+      else if s is TForInStmtNode then
+      begin
+        if not boundNames.Contains(TForInStmtNode(s).VarName) then boundNames.Add(TForInStmtNode(s).VarName);
+        CollectVarNamesInExpr(TForInStmtNode(s).CollExpr, names);
+        CollectVarNamesInStmt(TForInStmtNode(s).Body, names, boundNames);
+      end
+      else if s is TRepeatStmtNode then
+      begin
+        for i:=0 to TRepeatStmtNode(s).Statements.Count-1 do
+          CollectVarNamesInStmt(TRepeatStmtNode(s).Statements[i], names, boundNames);
+        CollectVarNamesInExpr(TRepeatStmtNode(s).Condition, names);
+      end
+      else if s is TCaseStmtNode then
+      begin
+        CollectVarNamesInExpr(TCaseStmtNode(s).Selector, names);
+        foreach branch in TCaseStmtNode(s).Branches do
+        begin
+          foreach lbl in branch.Labels do
+          begin
+            CollectVarNamesInExpr(lbl.LowExpr, names);
+            CollectVarNamesInExpr(lbl.HighExpr, names);
+          end;
+          CollectVarNamesInStmt(branch.Stmt, names, boundNames);
+        end;
+        if TCaseStmtNode(s).ElseStmts<>nil then
+          for i:=0 to TCaseStmtNode(s).ElseStmts.Count-1 do
+            CollectVarNamesInStmt(TCaseStmtNode(s).ElseStmts[i], names, boundNames);
+      end
+      else if s is TProcCallStmtNode then
+      begin
+        names.Add(TProcCallStmtNode(s).ProcName);
+        for i:=0 to TProcCallStmtNode(s).Args.Count-1 do
+          CollectVarNamesInExpr(TProcCallStmtNode(s).Args[i], names);
+      end
+      else if s is TSetLengthStmtNode then
+      begin
+        names.Add(TSetLengthStmtNode(s).ArrName);
+        CollectVarNamesInExpr(TSetLengthStmtNode(s).NewSize, names);
+      end
+      else if s is TArrayAssignStmtNode then
+      begin
+        names.Add(TArrayAssignStmtNode(s).ArrName);
+        CollectVarNamesInExpr(TArrayAssignStmtNode(s).Index, names);
+        CollectVarNamesInExpr(TArrayAssignStmtNode(s).ValueExpr, names);
+      end
+      else if s is TMatrix2DAssignStmtNode then
+      begin
+        names.Add(TMatrix2DAssignStmtNode(s).ArrName);
+        CollectVarNamesInExpr(TMatrix2DAssignStmtNode(s).Row, names);
+        CollectVarNamesInExpr(TMatrix2DAssignStmtNode(s).Col, names);
+        CollectVarNamesInExpr(TMatrix2DAssignStmtNode(s).ValueExpr, names);
+      end
+      else if s is TSetLengthMatrix2DStmtNode then
+      begin
+        names.Add(TSetLengthMatrix2DStmtNode(s).ArrName);
+        CollectVarNamesInExpr(TSetLengthMatrix2DStmtNode(s).Rows, names);
+        CollectVarNamesInExpr(TSetLengthMatrix2DStmtNode(s).Cols, names);
+      end
+      else if s is TMethodCallStmtNode then
+      begin
+        names.Add(TMethodCallStmtNode(s).ObjName);
+        for i:=0 to TMethodCallStmtNode(s).Args.Count-1 do
+          CollectVarNamesInExpr(TMethodCallStmtNode(s).Args[i], names);
+      end
+      else if s is TFieldAssignStmtNode then
+      begin
+        if TFieldAssignStmtNode(s).Qualifier<>'' then names.Add(TFieldAssignStmtNode(s).Qualifier);
+        CollectVarNamesInExpr(TFieldAssignStmtNode(s).ValueExpr, names);
+      end
+      else if s is TInlineVarStmtNode then
+      begin
+        if not boundNames.Contains(TInlineVarStmtNode(s).VarName) then boundNames.Add(TInlineVarStmtNode(s).VarName);
+        CollectVarNamesInExpr(TInlineVarStmtNode(s).ValueExpr, names);
+      end
+      else if s is TTryStmtNode then
+      begin
+        for i:=0 to TTryStmtNode(s).BodyStmts.Count-1 do
+          CollectVarNamesInStmt(TTryStmtNode(s).BodyStmts[i], names, boundNames);
+        if TTryStmtNode(s).ExVarName<>'' then
+          if not boundNames.Contains(TTryStmtNode(s).ExVarName) then boundNames.Add(TTryStmtNode(s).ExVarName);
+        if TTryStmtNode(s).ExceptStmts<>nil then
+          for i:=0 to TTryStmtNode(s).ExceptStmts.Count-1 do
+            CollectVarNamesInStmt(TTryStmtNode(s).ExceptStmts[i], names, boundNames);
+        if TTryStmtNode(s).FinallyStmts<>nil then
+          for i:=0 to TTryStmtNode(s).FinallyStmts.Count-1 do
+            CollectVarNamesInStmt(TTryStmtNode(s).FinallyStmts[i], names, boundNames);
+      end
+      else if s is TRaiseStmtNode then CollectVarNamesInExpr(TRaiseStmtNode(s).Expr, names)
+      else if s is TInheritedCallStmtNode then
+        for i:=0 to TInheritedCallStmtNode(s).Args.Count-1 do
+          CollectVarNamesInExpr(TInheritedCallStmtNode(s).Args[i], names)
+      else if s is TEventSubscribeStmtNode then
+      begin
+        if TEventSubscribeStmtNode(s).Qualifier<>'' then names.Add(TEventSubscribeStmtNode(s).Qualifier);
+        // 람다 안에 또 람다(중첩 클로저)를 구독하는 경우는 이번 단계 범위 밖 — 안쪽 람다는
+        // 여전히 "캡처 없음" 규칙(부모=fGlobalScope)으로 컴파일되어 바깥 값 참조 시 오류가 난다.
+      end;
+    end;
+
+    // [Stage 64→68] 람다(익명 메서드) 본문을 컴파일한다. 캡처하는 바깥 지역변수가 없으면
+    // 예전처럼 Program.__LambdaN이라는 static 메서드가 되고, aIL(호출부 IL)에는 Ldnull만
+    // 남긴다. 캡처하는 변수가 있으면 __ClosureN이라는 작은 클래스를 새로 만들어 캡처 변수를
+    // 그 인스턴스 필드로 담고, 람다 본문은 그 클래스의 인스턴스 메서드 Invoke가 된다 — aIL에는
+    // 그 인스턴스를 새로 만들어 캡처 값들을 필드에 채워 넣은 뒤 그 인스턴스 참조를 남긴다
+    // (곧이어 호출부가 Ldftn/Newobj로 델리게이트를 완성한다).
+    // 캡처는 "델리게이트 생성 시점의 값 복사"로 이루어진다 — Invoke 시작 시 필드값을 지역
+    // 슬롯으로 복사해 쓰고, 끝나면 다시 필드에 되돌려 쓴다. 그래서 같은 델리게이트 인스턴스가
+    // 여러 번 호출돼도(예: 버튼을 여러 번 클릭) 그 사이의 값 변화(예: 클릭 횟수 누적)는
+    // 유지되지만, 바깥 메서드의 원래 지역변수 자체와는 생성 시점에 이미 분리된 별도의
+    // 복사본이라 델리게이트 생성 "이후" 서로의 변경이 반영되지는 않는다 — 진짜 참조 캡처가
+    // 아니라 "인스턴스별로 유지되는 값 캡처"다. self/inherited는 여전히 지원하지 않는다.
+    function EmitLambdaAsStaticMethod(aIL: ILGenerator; lam: TLambdaExprNode; expectedParamTypes: array of System.Type): MethodBuilder;
+    var paramTypes: array of System.Type; effTags: array of TVarType; li: integer; lmb: MethodBuilder; lil: ILGenerator;
         savedLocalScope: TScope; lloc: LocalBuilder;
+        names, boundNames, captured: List<string>; nm: string;
+        clTB: TypeBuilder; clFields: Dictionary<string, FieldBuilder>; clCtor: ConstructorBuilder;
+        clLoc: LocalBuilder; entry: TScopeEntry; capturedLocs: Dictionary<string, LocalBuilder>;
     begin
       fLambdaCounter:=fLambdaCounter+1;
       paramTypes:=new System.Type[lam.LamParams.Count];
-      for li:=0 to lam.LamParams.Count-1 do paramTypes[li]:=ResolveTopParamClrType(lam.LamParams[li]);
-      lmb:=fMainTB.DefineMethod('__Lambda'+fLambdaCounter.ToString,
-        MethodAttributes.Public or MethodAttributes.Static, typeof(System.Void), paramTypes);
+      effTags:=new TVarType[lam.LamParams.Count];
+      for li:=0 to lam.LamParams.Count-1 do
+      begin
+        if lam.LamParams[li].ParamType=vtInferred then
+        begin
+          // [Stage 68] 타입 미표기 매개변수 — 델리게이트 Invoke 시그니처(위치별)에서 CLR 타입을 가져온다.
+          if (expectedParamTypes=nil) or (li>=expectedParamTypes.Length) then
+            raise new Exception('람다 매개변수 "'+lam.LamParams[li].Name
+              +'"의 타입을 추론할 수 없습니다 — 이벤트 구독 등 델리게이트 시그니처를 알 수 있는 문맥이 아닙니다. '
+              +'타입을 명시하세요 (예: '+lam.LamParams[li].Name+': T).');
+          paramTypes[li]:=expectedParamTypes[li];
+          effTags[li]:=VarTypeTagFromClrType(paramTypes[li]);
+        end
+        else
+        begin
+          paramTypes[li]:=ResolveTopParamClrType(lam.LamParams[li]);
+          effTags[li]:=lam.LamParams[li].ParamType;
+        end;
+      end;
+
+      // [Stage 68] 캡처 분석: 람다 매개변수도 아니고 람다 안에서 새로 선언되지도 않으면서
+      // 바깥(현재 컴파일 중인) 메서드의 지역 스코프에 실제로 존재하는 이름만 캡처 대상이다.
+      names:=new List<string>;
+      boundNames:=new List<string>;
+      for li:=0 to lam.LamParams.Count-1 do boundNames.Add(lam.LamParams[li].Name);
+      CollectVarNamesInStmt(lam.Body, names, boundNames);
+      captured:=new List<string>;
+      foreach nm in names do
+        if fLocalScope.Has(nm) and (not boundNames.Contains(nm)) and (not captured.Contains(nm)) then
+          captured.Add(nm);
+
+      if captured.Count=0 then
+      begin
+        // ---- 캡처 없음: 예전과 동일한 static 메서드 ----
+        aIL.Emit(OpCodes.Ldnull);
+        lmb:=fMainTB.DefineMethod('__Lambda'+fLambdaCounter.ToString,
+          MethodAttributes.Public or MethodAttributes.Static, typeof(System.Void), paramTypes);
+        lil:=lmb.GetILGenerator;
+
+        savedLocalScope:=fLocalScope;
+        fLocalScope:=new TScope('lambda', fGlobalScope);
+        for li:=0 to lam.LamParams.Count-1 do
+        begin
+          lloc:=lil.DeclareLocal(paramTypes[li]);
+          fLocalScope.Declare(lam.LamParams[li].Name, lloc, effTags[li]);
+          if (effTags[li]=vtObject) or (effTags[li]=vtInterface) then
+          begin
+            if fTypeBuilders.ContainsKey(lam.LamParams[li].ClassName) or fBuiltTypes.ContainsKey(lam.LamParams[li].ClassName) then
+              fLocalScope.SetClassName(lam.LamParams[li].Name, lam.LamParams[li].ClassName)
+            else
+              fLocalScope.SetClrType(lam.LamParams[li].Name, paramTypes[li]);
+          end;
+          if li=0 then lil.Emit(OpCodes.Ldarg_0) else if li=1 then lil.Emit(OpCodes.Ldarg_1)
+          else if li=2 then lil.Emit(OpCodes.Ldarg_2) else if li=3 then lil.Emit(OpCodes.Ldarg_3)
+          else lil.Emit(OpCodes.Ldarg_S, byte(li));
+          lil.Emit(OpCodes.Stloc, lloc);
+        end;
+
+        EmitStatement(lil, lam.Body);
+        lil.Emit(OpCodes.Ret);
+
+        fLocalScope:=savedLocalScope;
+        Result:=lmb;
+        exit;
+      end;
+
+      // ---- 캡처 있음: __ClosureN 클래스 생성 ----
+      clTB:=fModB.DefineType('__Closure'+fLambdaCounter.ToString, TypeAttributes.Public, typeof(System.Object));
+      clFields:=new Dictionary<string, FieldBuilder>;
+      foreach nm in captured do
+        clFields[nm]:=clTB.DefineField(nm, fLocalScope.GetLoc(nm).LocalType, FieldAttributes.Public);
+      clCtor:=clTB.DefineDefaultConstructor(MethodAttributes.Public);
+
+      // 1) 캡처 시점 — 바깥(호출부) IL에 인스턴스를 만들고 현재 지역변수 값들을 필드로 복사한다.
+      clLoc:=aIL.DeclareLocal(clTB);
+      aIL.Emit(OpCodes.Newobj, clCtor);
+      aIL.Emit(OpCodes.Stloc, clLoc);
+      foreach nm in captured do
+      begin
+        aIL.Emit(OpCodes.Ldloc, clLoc);
+        aIL.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(nm));
+        aIL.Emit(OpCodes.Stfld, clFields[nm]);
+      end;
+      aIL.Emit(OpCodes.Ldloc, clLoc); // 델리게이트 target 인자로 스택에 남겨둠 (호출부가 이어서 Ldftn/Newobj)
+
+      // 2) 인스턴스 메서드 Invoke 본문 컴파일
+      lmb:=clTB.DefineMethod('Invoke', MethodAttributes.Public, typeof(System.Void), paramTypes);
       lil:=lmb.GetILGenerator;
 
       savedLocalScope:=fLocalScope;
-      fLocalScope:=new TScope('lambda', fGlobalScope); // [Stage 64] 클로저 차단
+      fLocalScope:=new TScope('lambda', fGlobalScope);
+
+      capturedLocs:=new Dictionary<string, LocalBuilder>;
+      foreach nm in captured do
+      begin
+        entry:=nil; savedLocalScope.TryResolve(nm, entry);
+        lloc:=lil.DeclareLocal(clFields[nm].FieldType);
+        lil.Emit(OpCodes.Ldarg_0); // this
+        lil.Emit(OpCodes.Ldfld, clFields[nm]);
+        lil.Emit(OpCodes.Stloc, lloc);
+        fLocalScope.Declare(nm, lloc, entry.VType);
+        if entry.ClassName<>'' then fLocalScope.SetClassName(nm, entry.ClassName);
+        if entry.ClrType<>nil then fLocalScope.SetClrType(nm, entry.ClrType);
+        capturedLocs[nm]:=lloc;
+      end;
+
       for li:=0 to lam.LamParams.Count-1 do
       begin
         lloc:=lil.DeclareLocal(paramTypes[li]);
-        fLocalScope.Declare(lam.LamParams[li].Name, lloc, lam.LamParams[li].ParamType);
-        if (lam.LamParams[li].ParamType=vtObject) or (lam.LamParams[li].ParamType=vtInterface) then
+        fLocalScope.Declare(lam.LamParams[li].Name, lloc, effTags[li]);
+        if (effTags[li]=vtObject) or (effTags[li]=vtInterface) then
         begin
           if fTypeBuilders.ContainsKey(lam.LamParams[li].ClassName) or fBuiltTypes.ContainsKey(lam.LamParams[li].ClassName) then
             fLocalScope.SetClassName(lam.LamParams[li].Name, lam.LamParams[li].ClassName)
           else
             fLocalScope.SetClrType(lam.LamParams[li].Name, paramTypes[li]);
         end;
-        if li=0 then lil.Emit(OpCodes.Ldarg_0) else if li=1 then lil.Emit(OpCodes.Ldarg_1)
-        else if li=2 then lil.Emit(OpCodes.Ldarg_2) else if li=3 then lil.Emit(OpCodes.Ldarg_3)
-        else lil.Emit(OpCodes.Ldarg_S, byte(li));
+        // 인스턴스 메서드라 arg0=this, 실제 람다 매개변수는 arg1부터 시작한다.
+        if li=0 then lil.Emit(OpCodes.Ldarg_1) else if li=1 then lil.Emit(OpCodes.Ldarg_2)
+        else if li=2 then lil.Emit(OpCodes.Ldarg_3)
+        else lil.Emit(OpCodes.Ldarg_S, byte(li+1));
         lil.Emit(OpCodes.Stloc, lloc);
       end;
 
       EmitStatement(lil, lam.Body);
-      lil.Emit(OpCodes.Ret);
 
-      fLocalScope:=savedLocalScope; // 바깥 메서드 컴파일을 이어서 할 수 있도록 복원
+      // 3) 실행 후 지역 슬롯 값을 다시 필드에 되돌려 쓴다 — 같은 델리게이트의 다음 호출에서도 유지되도록.
+      foreach nm in captured do
+      begin
+        lil.Emit(OpCodes.Ldarg_0);
+        lil.Emit(OpCodes.Ldloc, capturedLocs[nm]);
+        lil.Emit(OpCodes.Stfld, clFields[nm]);
+      end;
+
+      lil.Emit(OpCodes.Ret);
+      fLocalScope:=savedLocalScope;
+
+      clTB.CreateType;
       Result:=lmb;
     end;
 
@@ -3216,7 +3591,7 @@ type
     // 처럼 Version/Culture/PublicKeyToken까지 포함한 정식 이름으로 재시도할 것.
     // 어떤 프레임워크를 쓸지는 호출하는 쪽(디자이너)이 결정해서 이 메서드로 등록한다.
     procedure AddReferenceAssembly(nameOrPath: string);
-    var asm: Assembly; shortName: string; loadErr: string;
+    var asm: Assembly; shortName: string; loadErr: string; candidate: string;
     begin
       asm:=nil; loadErr:='';
       if nameOrPath.ToLower.EndsWith('.dll') then
@@ -3232,6 +3607,26 @@ type
         except
           on E1: Exception do loadErr:=loadErr+'Assembly.Load("'+shortName+'"): '+E1.Message+' | ';
         end;
+
+        // [재확인] 짧은 이름 로드가 실패했는데, 이 이름이 fAutoAssemblyMap에 등록된 "기본
+        // 프레임워크"(WinForms/WPF/System.* 등)라면, {$reference} 없이 타입을 찾을 때
+        // (ResolveExternalType, Stage 51)와 똑같이 Version/Culture/PublicKeyToken까지 포함한
+        // 정식 강명 후보들로도 재시도한다. 지금까지 이 재시도 로직이 ResolveExternalType
+        // 쪽에만 있고 여기(명시적 {$reference} 경로)에는 없어서, {$reference}를 직접 쓴
+        // 소스에서는 GAC 바인딩이 실패해도 강명 재시도 없이 곧바로 LoadFrom(파일 경로)으로
+        // 넘어가 버렸다 — Avalonia 같은 진짜 로컬 dll이 아니라 System.Windows.Forms 같은
+        // GAC 어셈블리인 경우 그 경로에 파일이 있을 리 없어 결국 실패했다.
+        if (asm=nil) and fAutoAssemblyMap.ContainsKey(shortName) then
+          foreach candidate in fAutoAssemblyMap[shortName] do
+          begin
+            if asm<>nil then break;
+            try
+              asm:=Assembly.Load(candidate);
+            except
+              on E1b: Exception do loadErr:=loadErr+'Assembly.Load("'+candidate+'"): '+E1b.Message+' | ';
+            end;
+          end;
+
         if asm=nil then
         try
           asm:=Assembly.LoadFrom(nameOrPath);
@@ -3262,6 +3657,7 @@ type
       an:=new AssemblyName(fProg.Name);
       ab:=AssemblyBuilder.DefineDynamicAssembly(an, AssemblyBuilderAccess.RunAndSave);
       modB:=ab.DefineDynamicModule(fProg.Name, outName);
+      fModB:=modB; // [Stage 68] 클로저 클래스 정의에 사용
 
       // -2. [Phase 1] 열거형을 가장 먼저 빌드 (인터페이스·클래스 필드 타입으로 참조됨)
       BuildEnumTypes(modB);
@@ -3396,13 +3792,28 @@ type
 
         foreach st in fProg.Statements do EmitStatement(il, st);
 
-        rk:=typeof(Console).GetMethod('ReadKey', System.Type.EmptyTypes);
-        il.Emit(OpCodes.Call, rk); il.Emit(OpCodes.Pop); il.Emit(OpCodes.Ret);
+        // [Stage 69] windows 앱(예: WinForms)은 콘솔이 아예 없거나(콘솔창 자체를 안 만드는 경우)
+        // Application.Run이 이미 사용자 입력을 다 처리했으므로, 여기서 ReadKey로 다시
+        // 키 입력을 기다리면 창이 닫힌 뒤에도 프로세스가 멈춰있는 것처럼 보인다.
+        if fProg.AppType<>'windows' then
+        begin
+          rk:=typeof(Console).GetMethod('ReadKey', System.Type.EmptyTypes);
+          il.Emit(OpCodes.Call, rk); il.Emit(OpCodes.Pop);
+        end;
+        il.Emit(OpCodes.Ret);
       end;
 
       mainTB.CreateType;
       if not fProg.IsLibrary then
-        ab.SetEntryPoint(mm, PEFileKinds.ConsoleApplication);
+      begin
+        // [Stage 69] {$apptype windows}면 WindowApplication으로 저장 — PE 서브시스템이
+        // GUI로 표시되어 탐색기에서 실행해도 콘솔(도스) 창이 뜨지 않는다.
+        // 지시문이 없으면(기본값 'console') 기존과 동일하게 콘솔 앱으로 생성한다.
+        if fProg.AppType='windows' then
+          ab.SetEntryPoint(mm, PEFileKinds.WindowApplication)
+        else
+          ab.SetEntryPoint(mm, PEFileKinds.ConsoleApplication);
+      end;
       ab.Save(outName);
     end;
   end;

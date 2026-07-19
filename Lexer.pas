@@ -73,6 +73,8 @@ type
     // Main.pas가 컴파일 전에 이 목록을 보고 AddReferenceAssembly를 호출해줘야
     // System.Windows.Window 같은 실제 외부 어셈블리 타입을 쓸 수 있다.
     ReferenceDirectives: List<string>;
+    // [Stage 69] {$apptype windows|console} 지시문에서 뽑아낸 값. 못 만나면 '' (Main.pas가 기본값 'console'로 취급).
+    AppTypeDirective: string;
   private
 
     function CC: char;
@@ -116,8 +118,15 @@ type
             begin
               var _refName:=_dirBody.Substring('reference'.Length).Trim;
               if _refName<>'' then ReferenceDirectives.Add(_refName);
+            end
+            else if _dirBody.ToLower.StartsWith('apptype') then
+            begin
+              // [Stage 69] {$apptype windows} / {$apptype console}
+              var _appVal:=_dirBody.Substring('apptype'.Length).Trim.ToLower;
+              if (_appVal='windows') or (_appVal='console') then
+                AppTypeDirective:=_appVal;
             end;
-            // reference가 아닌 다른 지시문(apptype 등)은 지금은 그냥 무시.
+            // reference/apptype이 아닌 다른 지시문은 지금은 그냥 무시.
           end;
         end
         else if (CC='(') and (PC='*') then
@@ -273,6 +282,7 @@ type
       fChars:=src.ToCharArray; fPos:=0; fLine:=1; fCol:=1;
       LexErrors:=new List<string>;
       ReferenceDirectives:=new List<string>; // [Stage 45]
+      AppTypeDirective:=''; // [Stage 69]
     end;
 
     function Tokenize: List<TToken>;

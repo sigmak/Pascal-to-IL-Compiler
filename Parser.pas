@@ -1037,9 +1037,12 @@ type
     end;
 
     // ---- 문장 파싱 ----
-    // [Stage 64] 람다 매개변수 목록과 본문을 파싱한다. 호출 시점에 '(' 은 아직 소비되지 않은 상태.
-    // (a: T1; b: T2) -> 문장  — 문장 하나만 허용(begin...end 블록 금지, 클로저 없음).
-    // 타입은 항상 명시해야 한다(문맥 기반 타입 추론은 1차 범위 밖).
+    // [Stage 64→68] 람다 매개변수 목록과 본문을 파싱한다. 호출 시점에 '(' 은 아직 소비되지 않은 상태.
+    // (a: T1; b: T2) -> 문장  또는  (a, b) -> begin...end  모두 허용.
+    // [Stage 68] 매개변수 그룹마다 콜론+타입 표기는 선택 사항이다 — 생략하면 vtInferred로
+    // 표시해 두고, CodeGen이 델리게이트의 Invoke 시그니처에서 위치별 실제 CLR 타입을 가져와
+    // 확정한다(예: (sender, e) -> ... 의 sender/e는 이벤트 델리게이트 시그니처로부터 추론).
+    // 본문은 문장 하나 또는 begin...end 블록 모두 허용된다(ParseStatement가 둘 다 처리).
     function ParseLambdaExpr: TLambdaExprNode;
     var ps: List<TParamDef>;
     begin
@@ -1051,18 +1054,21 @@ type
         begin
           var lpNames:=new List<string>; lpNames.Add(Expect(tkIdent).Text);
           while Cur.Kind=tkComma do begin fPos:=fPos+1; lpNames.Add(Expect(tkIdent).Text); end;
-          Expect(tkColon);
-          var lpIsExt:=false; var lpCn:='';
-          var lpType:=ParseParamTypeExt(lpIsExt, lpCn);
-          foreach var lpn in lpNames do ps.Add(new TParamDef(lpn, lpType, lpCn, lpIsExt));
+          if Cur.Kind=tkColon then
+          begin
+            fPos:=fPos+1;
+            var lpIsExt:=false; var lpCn:='';
+            var lpType:=ParseParamTypeExt(lpIsExt, lpCn);
+            foreach var lpn in lpNames do ps.Add(new TParamDef(lpn, lpType, lpCn, lpIsExt));
+          end
+          else
+            // [Stage 68] 타입 미표기 — vtInferred placeholder. CodeGen이 나중에 채운다.
+            foreach var lpn in lpNames do ps.Add(new TParamDef(lpn, vtInferred, '', false));
           if Cur.Kind=tkSemicolon then fPos:=fPos+1 else break;
         end;
       end;
       Expect(tkRParen);
       Expect(tkArrow);
-      if Cur.Kind=tkBegin then
-        raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString
-          +': 람다 본문에는 begin...end 블록을 쓸 수 없습니다 — 문장 하나만 허용됩니다 (Stage 64, 1차)');
       Result:=new TLambdaExprNode(ps, ParseStatement);
     end;
 
@@ -2306,6 +2312,18 @@ type
         raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString
           +': 생성자 이름은 "Create"만 지원합니다 (Stage 42)');
       impl:=new TConstructorImplNode(cn);
+
+      // [Stage 68 재확인] 클래스 선언부 안에 "constructor Create;"라는 선언 없이,
+      // 이 실제 구현(constructor ClassName.Create; begin...end;)만 별도로 존재하는
+      // 경우에도 해당 클래스의 HasUserConstructor를 여기서 true로 표시해 둔다.
+      // 그렇지 않으면 BuildClassShell이 "사용자 생성자가 없다"고 오판해서 자동으로
+      // "부모 생성자 호출 + Ret"짜리 생성자 본문을 미리 채워 넣어 버리고, 이후
+      // BuildConstructorBody가 실제 본문(필드 초기화, Controls.Add, 이벤트 구독 등)을
+      // 그 뒤에 이어 붙여도 이미 Ret 뒤에 놓인 도달 불가능한 코드가 되어 조용히
+      // 무시된다(예외도 없이 그냥 실행되지 않음) — 폼은 뜨지만(부모 생성자는 실행됨)
+      // 버튼이 하나도 안 보이는 버그의 원인이었다.
+      foreach var _cd68 in fProg.ClassDecls do
+        if _cd68.Name=cn then begin _cd68.HasUserConstructor:=true; break; end;
 
       // [Stage 47] 매개변수 목록 파싱
       if Cur.Kind=tkLParen then

@@ -21,7 +21,8 @@ uses
 
 const
   DefaultExampleDir = 'Examples';
-  DefaultExampleFile = 'Test_stage67.pas'; // [Stage 67] 다차원 배열 (array of array)
+  DefaultExampleFile = 'Test_stage68.pas'; // [Stage 68] 
+  //DefaultExampleFile = 'Test_stage67.pas'; // [Stage 67] 다차원 배열 (array of array)
   //DefaultExampleFile = 'Test_stage66.pas'; // [Stage 66] 연산자 오버로딩 (operator +, 등) — 본가의 특징적 기능이지만 우선순위는 낮음.
   //DefaultExampleFile = 'Test_stage65b.pas'; // [Stage 65b] 지역 서브프로그램끼리 선언 순서 무관 호출
   //DefaultExampleFile = 'Test_stage65.pas'; // [Stage 65] 지역(중첩) 프로시저/함수 테스트
@@ -396,6 +397,7 @@ var
   ok: boolean;
   mergedProg: TProgramNode;
   allReferenceDirectives: List<string>;
+  entryAppType: string; // [Stage 69] {$apptype windows|console}
   seenClassNames, seenFuncNames, seenProcNames, seenIfaceNames, seenEnumNames: Dictionary<string,string>;
   totalTokenCount: integer;
   compileOrder: List<string>;
@@ -460,6 +462,7 @@ begin
     // 파일이 1개뿐이면(로컬 유닛 없음) 기존과 동일하게 동작한다.
     mergedProg := nil;
     allReferenceDirectives := new List<string>;
+    entryAppType := ''; // [Stage 69]
     seenClassNames := new Dictionary<string,string>;
     seenFuncNames := new Dictionary<string,string>;
     seenProcNames := new Dictionary<string,string>;
@@ -480,6 +483,8 @@ begin
         totalTokenCount := totalTokenCount + fileTokens.Count;
         foreach var rd in fileLexer.ReferenceDirectives do
           if not allReferenceDirectives.Contains(rd) then allReferenceDirectives.Add(rd);
+        // [Stage 69] apptype은 파일마다 다를 수 있으니 나중 파일(=entry, 목록의 마지막) 값이 우선하도록 덮어쓴다.
+        if fileLexer.AppTypeDirective<>'' then entryAppType := fileLexer.AppTypeDirective;
 
         var fileParser := new TParser(fileTokens);
         // [Stage 56] 이전 파일들(의존성 먼저 순서)이 선언한 함수/클래스/... 이름을
@@ -528,6 +533,7 @@ begin
     if ok then
     begin
       prog := mergedProg;
+      if entryAppType<>'' then prog.AppType := entryAppType; // [Stage 69]
       var mergeLabel := '';
       if compileOrder.Count > 1 then mergeLabel := '(병합)';
       Writeln('[1/4] 토큰화 완료: ' + totalTokenCount.ToString + '개 토큰 (파일 ' + compileOrder.Count.ToString + '개 합계)');

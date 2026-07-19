@@ -11,7 +11,10 @@ type
   // 변수/식 타입
   // ----------------------------------------------------------
   TVarType = (vtInteger, vtString, vtIntArray, vtStrArray, vtObject, vtInterface, vtBoolean, vtGeneric, vtGenericArray,
-              vtReal, vtChar, vtInt64, vtEnum, vtSet, vtMatrix);
+              vtReal, vtChar, vtInt64, vtEnum, vtSet, vtMatrix, vtInferred);
+  // [Stage 68] vtInferred: 람다 매개변수에 타입 명시가 없을 때(예: (sender, e) -> ...)의 임시
+  //   placeholder. 실제 CLR 타입은 CodeGen이 델리게이트의 Invoke 시그니처에서 위치별로 가져와
+  //   확정한다 — 파서 단계에서는 "타입 미정"이라는 사실만 기록해 둔다.
   // [Stage 67] vtMatrix: 2차원 배열 (array of array of <elemtype>).
   //   런타임 표현은 CLR jagged array: integer[][] / string[][] / double[][].
   //   원소 타입은 TVarDecl/TParamDef.ClassName 필드에 'integer'/'string'/'real'/'char'/'int64'로 기록된다.
@@ -759,6 +762,7 @@ type
     GenericInstantiations: List<TGenericInstantiation>; // Parser가 채우고 Monomorphize가 소비
     GenericFuncInstantiations: List<TGenericFuncInstantiation>; // [Stage 36] 함수/프로시저용, 동일한 방식
     IsLibrary: boolean; // [Stage 44] true면 "library Name;"으로 시작 — exe 대신 dll로 생성, begin...end 블록 생략 가능
+    AppType: string; // [Stage 69] {$apptype windows|console} 지시문. 기본 'console'. 'windows'면 콘솔창 없이 실행되는 PE로 생성.
     EnumDecls: List<TEnumDeclNode>; // [Phase 1] 열거형 선언 목록
     RecordDecls: List<TRecordDeclNode>; // [Stage 62] 레코드 선언 목록
     OperatorOverloads: List<TOperatorOverloadNode>; // [Stage 66] 연산자 오버로딩 목록
@@ -777,6 +781,7 @@ type
       GenericInstantiations:=new List<TGenericInstantiation>;
       GenericFuncInstantiations:=new List<TGenericFuncInstantiation>;
       IsLibrary:=false;
+      AppType:='console'; // [Stage 69]
       EnumDecls:=new List<TEnumDeclNode>; // [Phase 1]
       RecordDecls:=new List<TRecordDeclNode>; // [Stage 62]
       OperatorOverloads:=new List<TOperatorOverloadNode>; // [Stage 66]
