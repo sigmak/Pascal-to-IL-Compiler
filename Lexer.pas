@@ -36,6 +36,7 @@ type
     tkCase, // [Stage 59] case...of...else 문
     tkRepeat, tkUntil, // [Stage 60] repeat...until 루프
     tkBreak, tkContinue, // [Stage 60] break/continue
+    tkYield, tkSequence, // [Stage 69] yield / sequence of T — 시퀀스 lazy evaluation
     tkConst, // [Stage 61] const 선언 (전역/지역, 타입 추론 포함)
     tkIdent, tkString, tkIntLiteral, tkRealLiteral, tkCharLiteral,
     tkSemicolon, tkColon, tkComma, tkAssign, tkArrow, // [Stage 64] tkArrow = '->'
@@ -215,6 +216,8 @@ type
       else if lw='until'    then Result:=new TToken(tkUntil,    w,sl,sc) // [Stage 60]
       else if lw='break'    then Result:=new TToken(tkBreak,    w,sl,sc) // [Stage 60]
       else if lw='continue' then Result:=new TToken(tkContinue, w,sl,sc) // [Stage 60]
+      else if lw='yield'    then Result:=new TToken(tkYield,    w,sl,sc) // [Stage 69]
+      else if lw='sequence' then Result:=new TToken(tkSequence, w,sl,sc) // [Stage 69]
       else if lw='const'    then Result:=new TToken(tkConst,    w,sl,sc) // [Stage 61]
       else                        Result:=new TToken(tkIdent,     w,sl,sc);
     end;

@@ -21,7 +21,8 @@ uses
 
 const
   DefaultExampleDir = 'Examples';
-  DefaultExampleFile = 'Test_stage68.pas'; // [Stage 68] 
+  DefaultExampleFile = 'Test_stage69.pas'; // [Stage 69]
+  //DefaultExampleFile = 'Test_stage68.pas'; // [Stage 68] 
   //DefaultExampleFile = 'Test_stage67.pas'; // [Stage 67] 다차원 배열 (array of array)
   //DefaultExampleFile = 'Test_stage66.pas'; // [Stage 66] 연산자 오버로딩 (operator +, 등) — 본가의 특징적 기능이지만 우선순위는 낮음.
   //DefaultExampleFile = 'Test_stage65b.pas'; // [Stage 65b] 지역 서브프로그램끼리 선언 순서 무관 호출

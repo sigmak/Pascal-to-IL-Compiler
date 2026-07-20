@@ -109,6 +109,25 @@ type
     fLoopExceptDepths:   List<integer>;
     fCurExceptDepth: integer; // 현재 try/except/finally 중첩 깊이 (BeginExceptionBlock/EndExceptionBlock에서 증감)
 
+    // [Stage 69] yield / sequence of T — 함수 하나가 "__IterN"이라는 숨은 클래스로 컴파일된다.
+    // 그 클래스는 매개변수+지역변수를 전부 필드로 갖고(호출 사이 상태 보존), 상태 정수 필드
+    // (<>state)와 현재 값 필드(<>current)를 더 가진다. MoveNext는 <>state로 "어디서 멈췄는지"
+    // 판단해 그 지점으로 goto한 뒤 이어서 실행하다가 다음 yield에서 다시 멈춘다.
+    fIterCounter: integer; // __Iter1, __Iter2, ... 이름 일련번호
+    fIterTypes:  Dictionary<string, TypeBuilder>;   // 최상위 함수명 → 생성된 이터레이터 클래스
+    fIterCtors:  Dictionary<string, ConstructorBuilder>; // 최상위 함수명 → 그 클래스의 생성자(매개변수 = 원함수 매개변수)
+    fIterElemClrType: Dictionary<string, System.Type>; // 최상위 함수명 → 원소 CLR 타입
+    fIterStateFieldOf:   Dictionary<string, FieldBuilder>; // 최상위 함수명 → <>state 필드
+    fIterCurrentFieldOf: Dictionary<string, FieldBuilder>; // 최상위 함수명 → <>current 필드
+    fIterCapFieldsOf: Dictionary<string, Dictionary<string, FieldBuilder>>; // 최상위 함수명 → (매개변수/지역변수명 → 필드)
+    // 아래 4개는 "지금 빌드 중인" 이터레이터 하나에 대한 컨텍스트 — BuildIteratorMoveNext 안에서만 유효.
+    fInIterator: boolean;
+    fCurIterStateField:   FieldBuilder;
+    fCurIterCurrentField: FieldBuilder;
+    fCurIterFields: Dictionary<string, FieldBuilder>; // 캡처된 변수명(매개변수+지역변수) → 필드
+    fCurIterYieldState: Dictionary<TYieldStmtNode, integer>; // yield 문 인스턴스 → 재개 상태 번호(1부터)
+    fCurIterYieldLabel: Dictionary<integer, &Label>;          // 재개 상태 번호 → 그 지점의 IL 라벨
+
     function VTC(t: TVarType; cn: string): System.Type;
     begin
       if t=vtString then Result:=typeof(string)
@@ -2132,6 +2151,45 @@ type
         EmitInheritedCall(aIL, ihs3.MethodName, ihs3.Args, false);
       end
 
+      // [Stage 69] yield <식>; — "function ...: sequence of T;"(이터레이터) 본문의 MoveNext 안에서만
+      // 유효하다. BuildIteratorMoveNext가 이 지점의 상태번호/재개라벨을 CollectYieldPoints로 미리
+      // 배정해 두었어야 한다(try/case 안의 yield는 1차 제약으로 배정되지 않는다 — 그 경우 아래에서
+      // 명확한 오류를 낸다). 값 저장 → 지역변수를 필드로 되돌려 씀(다음 호출을 위한 상태 보존) →
+      // 상태번호 기록 → true 반환 → 다음 호출이 재개할 라벨을 바로 뒤에 표시.
+      else if s is TYieldStmtNode then
+      begin
+        var ys69:=TYieldStmtNode(s);
+        if not fInIterator then
+          raise new Exception('yield는 "function ...: sequence of T;" 본문 밖에서는 쓸 수 없습니다 (Stage 69)');
+        if not fCurIterYieldState.ContainsKey(ys69) then
+          raise new Exception('이 yield는 아직 지원하지 않는 문맥(try/case 등) 안에 있습니다 (Stage 69, 1차 제약)');
+        var yState:=fCurIterYieldState[ys69];
+        var yLabel:=fCurIterYieldLabel[yState];
+
+        aIL.Emit(OpCodes.Ldarg_0);
+        EmitArgForParamType(aIL, ys69.Expr, fCurIterCurrentField.FieldType);
+        aIL.Emit(OpCodes.Stfld, fCurIterCurrentField);
+
+        // 지금까지의 지역 슬롯 값을 전부 필드로 되돌려 쓴다 — 이 메서드 호출은 곧 return하므로
+        // (일시정지), 다음 MoveNext 호출이 이 값들을 다시 필드→지역으로 복원해 이어갈 수 있어야 한다.
+        foreach var kv69b in fCurIterFields do
+        begin
+          if fLocalScope.Has(kv69b.Key) then
+          begin
+            aIL.Emit(OpCodes.Ldarg_0);
+            aIL.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(kv69b.Key));
+            aIL.Emit(OpCodes.Stfld, kv69b.Value);
+          end;
+        end;
+
+        aIL.Emit(OpCodes.Ldarg_0);
+        aIL.Emit(OpCodes.Ldc_I4, yState);
+        aIL.Emit(OpCodes.Stfld, fCurIterStateField);
+        aIL.Emit(OpCodes.Ldc_I4_1);
+        aIL.Emit(OpCodes.Ret);
+        aIL.MarkLabel(yLabel);
+      end
+
       else raise new Exception('알 수 없는 문장 노드: '+s.GetType.Name);
     end;
 
@@ -3337,17 +3395,290 @@ type
     // 있으려면, "형제 전체의 시그니처 등록"이 "형제 아무나의 본문 생성"보다
     // 반드시 먼저 끝나 있어야 한다. 재귀적으로 자신의 지역 서브프로그램들도
     // 시그니처만 먼저 등록해 둔다(본문은 이후 BuildStaticFunc/Proc 패스에서).
+    // [Stage 69] "function Name(...): sequence of T;"의 숨은 클래스 껍데기(필드+생성자)만 먼저
+    // 만든다. 팩토리 함수(DeclareStaticFunc가 만드는, 원래 이름의 static 메서드)의 반환 타입으로
+    // 이 클래스가 필요하므로 DeclareStaticFunc보다 반드시 먼저 실행되어야 한다. 실제
+    // MoveNext/GetEnumerator/Current 등의 "본문"은 나중에 BuildIteratorMoveNext가 채운다.
+    procedure DeclareIteratorShell(fd: TFuncDeclNode);
+    var
+      clTB: TypeBuilder; elemClrType: System.Type; capFields: Dictionary<string, FieldBuilder>;
+      ienumT, ienumeratorT: System.Type; ctorParamTypes: array of System.Type; i: integer;
+      ctorB: ConstructorBuilder; stateFB, curFB: FieldBuilder;
+    begin
+      fIterCounter:=fIterCounter+1;
+      elemClrType:=VTC(fd.IterElemType, '');
+      fIterElemClrType[fd.Name]:=elemClrType;
+
+      var ienumOpenT:=System.Type.GetType('System.Collections.Generic.IEnumerable`1');
+      var ienumeratorOpenT:=System.Type.GetType('System.Collections.Generic.IEnumerator`1');
+      ienumT:=ienumOpenT.MakeGenericType(elemClrType);
+      ienumeratorT:=ienumeratorOpenT.MakeGenericType(elemClrType);
+
+      clTB:=fModB.DefineType('__Iter'+fIterCounter.ToString, TypeAttributes.Public, typeof(System.Object),
+        [typeof(System.Collections.IEnumerable), typeof(System.Collections.IEnumerator),
+         ienumT, ienumeratorT, typeof(System.IDisposable)]);
+
+      // 상태/현재값 필드. 이름을 '<>'로 시작시켜 사용자 매개변수/지역변수 이름과 절대 충돌하지 않게 한다
+      // (Pascal 식별자는 '<' '>' 를 쓸 수 없으므로 안전).
+      stateFB:=clTB.DefineField('<>state', typeof(integer), FieldAttributes.Private);
+      curFB:=clTB.DefineField('<>current', elemClrType, FieldAttributes.Private);
+
+      // 캡처 필드: 매개변수 + 지역변수 전부 — MoveNext 호출 사이에도 값이 유지되어야 하므로
+      // (Reflection.Emit의 IL 지역변수는 메서드 호출마다 새로 잡혀 이 목적에 못 씀) 인스턴스 필드로 둔다.
+      capFields:=new Dictionary<string, FieldBuilder>;
+      foreach var p69 in fd.Parameters do
+        capFields[p69.Name]:=clTB.DefineField(p69.Name, ResolveTopParamClrType(p69), FieldAttributes.Private);
+      foreach var lv69 in fd.LocalVars do
+        capFields[lv69.Name]:=clTB.DefineField(lv69.Name, ResolveLocalVarClrType(lv69), FieldAttributes.Private);
+
+      // 생성자: 매개변수를 그대로 받아 필드로 저장한다(지역변수는 CLR 기본값 0/nil/false로 시작 —
+      // 첫 MoveNext 호출에서 본문이 실행되며 채워짐). <>state는 CLR이 이미 0으로 초기화해주는데,
+      // 0은 "맨 처음부터 실행 재개"라는 뜻이라 우리가 원하는 초기값과 정확히 같다 — 따로 안 채워도 됨.
+      ctorParamTypes:=new System.Type[fd.Parameters.Count];
+      for i:=0 to fd.Parameters.Count-1 do ctorParamTypes[i]:=ResolveTopParamClrType(fd.Parameters[i]);
+      ctorB:=clTB.DefineConstructor(MethodAttributes.Public, CallingConventions.Standard, ctorParamTypes);
+      var cil:=ctorB.GetILGenerator;
+      cil.Emit(OpCodes.Ldarg_0);
+      cil.Emit(OpCodes.Call, typeof(System.Object).GetConstructor(System.Type.EmptyTypes));
+      for i:=0 to fd.Parameters.Count-1 do
+      begin
+        cil.Emit(OpCodes.Ldarg_0);
+        if i=0 then cil.Emit(OpCodes.Ldarg_1) else if i=1 then cil.Emit(OpCodes.Ldarg_2)
+        else if i=2 then cil.Emit(OpCodes.Ldarg_3) else cil.Emit(OpCodes.Ldarg_S, byte(i+1));
+        cil.Emit(OpCodes.Stfld, capFields[fd.Parameters[i].Name]);
+      end;
+      cil.Emit(OpCodes.Ret);
+
+      fIterTypes[fd.Name]:=clTB;
+      fIterCtors[fd.Name]:=ctorB;
+      fIterStateFieldOf[fd.Name]:=stateFB;
+      fIterCurrentFieldOf[fd.Name]:=curFB;
+      fIterCapFieldsOf[fd.Name]:=capFields;
+    end;
+
+    // [Stage 69] yield 지점 사전 조사 — MoveNext의 IL을 실제로 방출하기 "전에" 모든 yield 문에
+    // 재개용 상태번호(1부터)와 그 지점을 가리킬 IL 라벨을 미리 배정해 둔다. 라벨은 아직 위치가
+    // 정해지지 않아도(MarkLabel 전에도) branch 명령의 대상으로 미리 쓸 수 있으므로, 맨 위의 상태
+    // 분기표를 실제 본문보다 먼저 방출할 수 있다. try/case 안의 yield는 1차 제약으로 훑지 않는다
+    // (실행되면 EmitStatement의 TYieldStmtNode 분기가 "상태 미배정" 오류로 명확히 알려준다).
+    procedure CollectYieldPoints(s: TStmtNode; il: ILGenerator; ids: Dictionary<TYieldStmtNode, integer>;
+      labels: Dictionary<integer, &Label>; var counter: integer);
+    var branch: TCaseBranchNode;
+    begin
+      if s=nil then exit;
+      if s is TYieldStmtNode then
+      begin
+        counter:=counter+1;
+        ids[TYieldStmtNode(s)]:=counter;
+        labels[counter]:=il.DefineLabel;
+      end
+      else if s is TCompoundStmtNode then
+      begin
+        foreach var cs69 in TCompoundStmtNode(s).Statements do CollectYieldPoints(cs69, il, ids, labels, counter);
+      end
+      else if s is TIfStmtNode then
+      begin
+        CollectYieldPoints(TIfStmtNode(s).ThenStmt, il, ids, labels, counter);
+        CollectYieldPoints(TIfStmtNode(s).ElseStmt, il, ids, labels, counter);
+      end
+      else if s is TWhileStmtNode then CollectYieldPoints(TWhileStmtNode(s).Body, il, ids, labels, counter)
+      else if s is TForStmtNode then CollectYieldPoints(TForStmtNode(s).Body, il, ids, labels, counter)
+      else if s is TForInStmtNode then CollectYieldPoints(TForInStmtNode(s).Body, il, ids, labels, counter)
+      else if s is TRepeatStmtNode then
+      begin
+        foreach var rs69 in TRepeatStmtNode(s).Statements do CollectYieldPoints(rs69, il, ids, labels, counter);
+      end
+      else if s is TCaseStmtNode then
+      begin
+        // [1차 제약] case 분기 안의 yield는 아직 지원하지 않는다 — 여기서 일부러 훑지 않으므로
+        // 상태번호가 배정되지 않고, 실제로 쓰이면 EmitStatement에서 명확한 오류가 난다.
+      end;
+      // 그 외(대입/proc호출/inline var 등 leaf 문장)는 yield를 담을 수 없으므로 무시.
+    end;
+
+    // [Stage 69] 이터레이터 클래스의 실제 몸통 — MoveNext / GetEnumerator(비제네릭+제네릭 명시적 구현) /
+    // Current(비제네릭+제네릭 명시적 구현) / Reset / Dispose를 채우고 CreateType까지 마무리한다.
+    // MoveNext 본문은 원래 함수(d.Body)의 문장들을 EmitStatement로 "그대로" 컴파일한다 — if/while/
+    // for/repeat 제어 흐름은 손대지 않고 완전히 재사용하고, TYieldStmtNode만 EmitStatement 쪽에
+    // 새로 추가한 분기가 가로챈다. 그래서 yield가 어떤 깊이의 루프/분기 안에 있어도(1차 제약인
+    // try/case만 아니면) 그대로 동작한다 — 재개 라벨이 물리적으로 그 루프/분기의 IL 한가운데
+    // 위치하게 될 뿐, CLR 입장에서는 그냥 유효한 goto 대상이다(그 지점의 평가 스택이 항상
+    // 비어 있으므로 — 문장과 문장 사이는 항상 스택이 빈 상태라 이 점프가 항상 안전하다).
+    procedure BuildIteratorMoveNext(d: TFuncDeclNode);
+    var
+      clTB: TypeBuilder; elemClrType: System.Type; capFields: Dictionary<string, FieldBuilder>;
+      stateFB, curFB: FieldBuilder; mnb: MethodBuilder; il: ILGenerator;
+      savedLocalScope: TScope; savedInIter: boolean;
+      savedStateField, savedCurField: FieldBuilder; savedCapFields: Dictionary<string, FieldBuilder>;
+      savedYieldState: Dictionary<TYieldStmtNode, integer>; savedYieldLabel: Dictionary<integer, &Label>;
+      counter: integer;
+    begin
+      clTB:=fIterTypes[d.Name];
+      elemClrType:=fIterElemClrType[d.Name];
+      capFields:=fIterCapFieldsOf[d.Name];
+      stateFB:=fIterStateFieldOf[d.Name];
+      curFB:=fIterCurrentFieldOf[d.Name];
+
+      // ---- MoveNext() ----
+      mnb:=clTB.DefineMethod('MoveNext', MethodAttributes.Public or MethodAttributes.Virtual or MethodAttributes.HideBySig,
+        typeof(boolean), System.Type.EmptyTypes);
+      il:=mnb.GetILGenerator;
+
+      // 컨텍스트 저장/복원 — 이터레이터는 중첩(재진입) 지원 대상이 아니지만(파서가 sequence of를
+      // 최상위 함수 반환 자리에만 허용), 프로젝트 전반의 원칙(fResultLocal 등)을 그대로 따른다.
+      savedLocalScope:=fLocalScope; savedInIter:=fInIterator;
+      savedStateField:=fCurIterStateField; savedCurField:=fCurIterCurrentField; savedCapFields:=fCurIterFields;
+      savedYieldState:=fCurIterYieldState; savedYieldLabel:=fCurIterYieldLabel;
+
+      fInIterator:=true;
+      fCurIterStateField:=stateFB; fCurIterCurrentField:=curFB; fCurIterFields:=capFields;
+      fCurIterYieldState:=new Dictionary<TYieldStmtNode, integer>;
+      fCurIterYieldLabel:=new Dictionary<integer, &Label>;
+
+      // 1) yield 지점 사전 조사 — 라벨을 본문 방출 "전에" 미리 만들어 둬야 맨 위 상태 분기표에서 쓸 수 있다.
+      counter:=0;
+      foreach var st69 in d.Body.Statements do
+        CollectYieldPoints(st69, il, fCurIterYieldState, fCurIterYieldLabel, counter);
+
+      // 2) 지역 슬롯 준비 + 필드→지역 복사. MoveNext가 호출될 때마다(재개든 처음이든) 항상 여기서부터
+      //    시작한다 — 직전 호출이 필드에 저장해 둔 값(캡처값)을 그대로 복원해 지역 슬롯에 채워 넣는다.
+      fLocalScope:=new TScope('local(iter)', fGlobalScope);
+      foreach var pd69 in d.Parameters do
+      begin
+        var floc:=il.DeclareLocal(capFields[pd69.Name].FieldType);
+        fLocalScope.Declare(pd69.Name, floc, pd69.ParamType);
+        if (pd69.ParamType=vtObject) or (pd69.ParamType=vtInterface) then
+        begin
+          if fTypeBuilders.ContainsKey(pd69.ClassName) or fBuiltTypes.ContainsKey(pd69.ClassName) then
+            fLocalScope.SetClassName(pd69.Name, pd69.ClassName)
+          else
+            fLocalScope.SetClrType(pd69.Name, capFields[pd69.Name].FieldType);
+        end;
+        il.Emit(OpCodes.Ldarg_0); il.Emit(OpCodes.Ldfld, capFields[pd69.Name]); il.Emit(OpCodes.Stloc, floc);
+      end;
+      foreach var lv69c in d.LocalVars do
+      begin
+        var lvClrType69:=capFields[lv69c.Name].FieldType;
+        var floc2:=il.DeclareLocal(lvClrType69);
+        fLocalScope.Declare(lv69c.Name, floc2, lv69c.VarType);
+        if (lv69c.VarType=vtObject) or (lv69c.VarType=vtInterface) then
+        begin
+          if fTypeBuilders.ContainsKey(lv69c.ClassName) or fBuiltTypes.ContainsKey(lv69c.ClassName) then
+            fLocalScope.SetClassName(lv69c.Name, lv69c.ClassName)
+          else
+            fLocalScope.SetClrType(lv69c.Name, lvClrType69);
+        end;
+        if (lv69c.VarType=vtMatrix) and (lv69c.ClassName<>'') then fLocalScope.SetClassName(lv69c.Name, lv69c.ClassName);
+        il.Emit(OpCodes.Ldarg_0); il.Emit(OpCodes.Ldfld, capFields[lv69c.Name]); il.Emit(OpCodes.Stloc, floc2);
+      end;
+
+      // 3) 상태 분기표: <>state가 이미 끝(-1)이면 즉시 false. 그 외 yield 상태번호(K)와 일치하면
+      //    해당 재개 라벨로 점프. 아무 것도 안 걸리면(=0, 맨 처음) 그냥 아래로 흘러 들어가 본문을
+      //    처음부터 실행한다.
+      var contLabel:=il.DefineLabel;
+      il.Emit(OpCodes.Ldarg_0); il.Emit(OpCodes.Ldfld, stateFB);
+      il.Emit(OpCodes.Ldc_I4, -1);
+      il.Emit(OpCodes.Bne_Un, contLabel);
+      il.Emit(OpCodes.Ldc_I4_0);
+      il.Emit(OpCodes.Ret);
+      il.MarkLabel(contLabel);
+      foreach var kv69 in fCurIterYieldLabel do
+      begin
+        il.Emit(OpCodes.Ldarg_0); il.Emit(OpCodes.Ldfld, stateFB);
+        il.Emit(OpCodes.Ldc_I4, kv69.Key);
+        il.Emit(OpCodes.Beq, kv69.Value);
+      end;
+
+      // 4) 본문 — yield는 EmitStatement의 TYieldStmtNode 분기가 처리한다.
+      foreach var cd69 in d.ConstDecls do EmitConstDecl(il, fLocalScope, cd69);
+      foreach var st69b in d.Body.Statements do EmitStatement(il, st69b);
+
+      // 5) 끝까지 자연스럽게 다 실행됨 = 더 이상 값 없음.
+      il.Emit(OpCodes.Ldarg_0); il.Emit(OpCodes.Ldc_I4, -1); il.Emit(OpCodes.Stfld, stateFB);
+      il.Emit(OpCodes.Ldc_I4_0);
+      il.Emit(OpCodes.Ret);
+
+      // ---- Current: IEnumerator(비제네릭).Current — object 반환, 값 타입이면 박싱해서 돌려준다.
+      // 명시적 구현(private + DefineMethodOverride)인 이유: 같은 클래스 안에 이름은 같지만 반환
+      // 타입이 다른 "제네릭" Current(T get_Current)도 함께 둬야 해서(IL은 반환타입까지 시그니처에
+      // 포함하므로 공존 가능하지만, public으로 그냥 두 개를 만들면 어느 쪽이 어느 인터페이스용인지
+      // CLR이 모호해한다 — C# 컴파일러가 명시적 인터페이스 구현에 쓰는 것과 동일한 패턴).
+      var getCurNG:=clTB.DefineMethod('<>get_Current_NG', MethodAttributes.Private or MethodAttributes.Virtual or
+        MethodAttributes.Final or MethodAttributes.NewSlot or MethodAttributes.HideBySig or MethodAttributes.SpecialName,
+        typeof(System.Object), System.Type.EmptyTypes);
+      var ngIl:=getCurNG.GetILGenerator;
+      ngIl.Emit(OpCodes.Ldarg_0); ngIl.Emit(OpCodes.Ldfld, curFB);
+      if elemClrType.IsValueType then ngIl.Emit(OpCodes.Box, elemClrType);
+      ngIl.Emit(OpCodes.Ret);
+      clTB.DefineMethodOverride(getCurNG, typeof(System.Collections.IEnumerator).GetProperty('Current').GetGetMethod);
+
+      // ---- Current: IEnumerator<T>.Current — T 그대로 반환(박싱 없음) ----
+      var ienumeratorOpenT2:=System.Type.GetType('System.Collections.Generic.IEnumerator`1');
+      var ienumeratorT2:=ienumeratorOpenT2.MakeGenericType(elemClrType);
+      var getCurG:=clTB.DefineMethod('<>get_Current_G', MethodAttributes.Private or MethodAttributes.Virtual or
+        MethodAttributes.Final or MethodAttributes.NewSlot or MethodAttributes.HideBySig or MethodAttributes.SpecialName,
+        elemClrType, System.Type.EmptyTypes);
+      var gIl:=getCurG.GetILGenerator;
+      gIl.Emit(OpCodes.Ldarg_0); gIl.Emit(OpCodes.Ldfld, curFB); gIl.Emit(OpCodes.Ret);
+      clTB.DefineMethodOverride(getCurG, ienumeratorT2.GetProperty('Current').GetGetMethod);
+
+      // ---- GetEnumerator: IEnumerable(비제네릭) — 1차 제약: 재사용 없이 자기 자신을 그대로 돌려준다
+      // (한 번만 순회 가능 — 같은 시퀀스를 두 번 foreach하면 이미 소진된 상태를 공유한다. 다시 순회하려면
+      //  원래 함수를 다시 호출해 새 시퀀스를 만들 것. 2차에서 상태 복제/Reset으로 개선 예정).
+      var getEnumNG:=clTB.DefineMethod('<>GetEnumerator_NG', MethodAttributes.Private or MethodAttributes.Virtual or
+        MethodAttributes.Final or MethodAttributes.NewSlot or MethodAttributes.HideBySig,
+        typeof(System.Collections.IEnumerator), System.Type.EmptyTypes);
+      var geNgIl:=getEnumNG.GetILGenerator;
+      geNgIl.Emit(OpCodes.Ldarg_0); geNgIl.Emit(OpCodes.Ret);
+      clTB.DefineMethodOverride(getEnumNG, typeof(System.Collections.IEnumerable).GetMethod('GetEnumerator'));
+
+      // ---- GetEnumerator: IEnumerable<T> ----
+      var ienumOpenT2:=System.Type.GetType('System.Collections.Generic.IEnumerable`1');
+      var ienumT2:=ienumOpenT2.MakeGenericType(elemClrType);
+      var getEnumG:=clTB.DefineMethod('<>GetEnumerator_G', MethodAttributes.Private or MethodAttributes.Virtual or
+        MethodAttributes.Final or MethodAttributes.NewSlot or MethodAttributes.HideBySig,
+        ienumeratorT2, System.Type.EmptyTypes);
+      var geGIl:=getEnumG.GetILGenerator;
+      geGIl.Emit(OpCodes.Ldarg_0); geGIl.Emit(OpCodes.Ret);
+      clTB.DefineMethodOverride(getEnumG, ienumT2.GetMethod('GetEnumerator'));
+
+      // ---- Reset() — 순방향 전용 lazy 시퀀스라 지원하지 않는다(BCL의 흔한 관례와 동일) ----
+      var resetMB:=clTB.DefineMethod('Reset', MethodAttributes.Public or MethodAttributes.Virtual or MethodAttributes.HideBySig,
+        typeof(System.Void), System.Type.EmptyTypes);
+      var rIl:=resetMB.GetILGenerator;
+      rIl.Emit(OpCodes.Newobj, typeof(System.NotSupportedException).GetConstructor(System.Type.EmptyTypes));
+      rIl.Emit(OpCodes.Throw);
+
+      // ---- Dispose() — 정리할 외부 리소스가 없으므로 아무 것도 안 한다 ----
+      var disposeMB:=clTB.DefineMethod('Dispose', MethodAttributes.Public or MethodAttributes.Virtual or MethodAttributes.HideBySig,
+        typeof(System.Void), System.Type.EmptyTypes);
+      disposeMB.GetILGenerator.Emit(OpCodes.Ret);
+
+      clTB.CreateType;
+
+      fLocalScope:=savedLocalScope; fInIterator:=savedInIter;
+      fCurIterStateField:=savedStateField; fCurIterCurrentField:=savedCurField; fCurIterFields:=savedCapFields;
+      fCurIterYieldState:=savedYieldState; fCurIterYieldLabel:=savedYieldLabel;
+    end;
+
     procedure DeclareStaticFunc(tb: TypeBuilder; d: TFuncDeclNode);
     var pt: array of System.Type; i: integer; mb: MethodBuilder; retClrType: System.Type; retCn66: string;
     begin
       pt:=new System.Type[d.Parameters.Count];
       for i:=0 to d.Parameters.Count-1 do pt[i]:=ResolveTopParamClrType(d.Parameters[i]);
-      // [Stage 66] 연산자 오버로딩으로 맹글링된 함수는 System.Object가 아니라 실제 레코드/클래스
-      // 반환 타입으로 선언해야 한다 — 특히 레코드는 값 타입이라 System.Object로 선언하면 박싱되어
-      // 필드 접근(Ldflda 등)이 깨진다.
-      retCn66:='';
-      if fOperatorFuncRetClass.ContainsKey(d.Name) then retCn66:=fOperatorFuncRetClass[d.Name];
-      retClrType:=VTC(d.ReturnType, retCn66);
+      // [Stage 69] sequence of T 함수는 반환 타입이 DeclareIteratorShell이 미리 만들어 둔
+      // 숨은 이터레이터 클래스다 — 일반 VTC 경로를 타지 않는다.
+      if d.IsIterator then
+        retClrType:=fIterTypes[d.Name]
+      else
+      begin
+        // [Stage 66] 연산자 오버로딩으로 맹글링된 함수는 System.Object가 아니라 실제 레코드/클래스
+        // 반환 타입으로 선언해야 한다 — 특히 레코드는 값 타입이라 System.Object로 선언하면 박싱되어
+        // 필드 접근(Ldflda 등)이 깨진다.
+        retCn66:='';
+        if fOperatorFuncRetClass.ContainsKey(d.Name) then retCn66:=fOperatorFuncRetClass[d.Name];
+        retClrType:=VTC(d.ReturnType, retCn66);
+      end;
       mb:=tb.DefineMethod(d.Name, MethodAttributes.Public or MethodAttributes.Static,
         retClrType, pt);
       fMethods[d.Name]:=mb; fTopParamClrTypes[d.Name]:=pt; fFuncReturnTypes[d.Name]:=d.ReturnType;
@@ -3377,6 +3708,25 @@ type
       // 여기서는 등록된 MethodBuilder를 가져와 본문만 방출한다.
       mb:=fMethods[d.Name];
       pt:=fTopParamClrTypes[d.Name];
+
+      // [Stage 69] sequence of T 함수는 본문이 완전히 다르다 — 원래 함수 본문(d.Body)은 여기서
+      // 실행되지 않고(팩토리는 그냥 인스턴스만 만들어 돌려준다), 실제 로직은 BuildIteratorMoveNext가
+      // 이터레이터 클래스의 MoveNext 안에 옮겨 넣는다(그 안에서 비로소 EmitStatement로 컴파일됨).
+      if d.IsIterator then
+      begin
+        il:=mb.GetILGenerator;
+        for i:=0 to d.Parameters.Count-1 do
+        begin
+          if i=0 then il.Emit(OpCodes.Ldarg_0) else if i=1 then il.Emit(OpCodes.Ldarg_1)
+          else if i=2 then il.Emit(OpCodes.Ldarg_2) else if i=3 then il.Emit(OpCodes.Ldarg_3)
+          else il.Emit(OpCodes.Ldarg_S, byte(i));
+        end;
+        il.Emit(OpCodes.Newobj, fIterCtors[d.Name]);
+        il.Emit(OpCodes.Ret);
+        BuildIteratorMoveNext(d);
+        exit;
+      end;
+
       // [Stage 66] DeclareStaticFunc와 동일한 이유로 연산자 오버로딩 맹글링 함수는
       // 실제 반환 클래스/레코드 타입을 사용한다.
       var retCn66b:='';
@@ -3546,6 +3896,19 @@ type
       fLoopExceptDepths:=new List<integer>;
       fCurExceptDepth:=0;
 
+      // [Stage 69]
+      fIterCounter:=0;
+      fIterTypes:=new Dictionary<string, TypeBuilder>;
+      fIterCtors:=new Dictionary<string, ConstructorBuilder>;
+      fIterElemClrType:=new Dictionary<string, System.Type>;
+      fIterStateFieldOf:=new Dictionary<string, FieldBuilder>;
+      fIterCurrentFieldOf:=new Dictionary<string, FieldBuilder>;
+      fIterCapFieldsOf:=new Dictionary<string, Dictionary<string, FieldBuilder>>;
+      fInIterator:=false;
+      fCurIterFields:=nil;
+      fCurIterYieldState:=nil;
+      fCurIterYieldLabel:=nil;
+
       // [Stage 51] GAC에 항상 있다고 볼 수 있는 "기본" 프레임워크들의 네임스페이스 접두사 표.
       // 접두사는 가장 구체적인 것부터 매칭되도록 ResolveExternalType에서 길이 내림차순으로 검사한다.
       // 값은 해당 접두사의 타입이 실제로 들어있을 만한 어셈블리 이름 후보들 — 각각 "짧은 이름"을
@@ -3688,6 +4051,10 @@ type
       // 3. 일반 static 함수/프로시저 빌드
       // [Stage 65b] 최상위 함수/프로시저도 선언 순서와 무관하게 서로 호출할 수
       // 있도록, 먼저 모든 시그니처를 등록한 뒤(3-1) 본문을 만든다(3-2).
+      // [Stage 69] sequence of T 함수(이터레이터)는 팩토리 함수 자체의 반환 타입이 "숨은 클래스"이므로,
+      // 그 클래스 껍데기(필드+생성자)를 일반 함수 시그니처 등록보다 먼저 만들어 둬야 한다.
+      foreach fd in fProg.FuncDecls do
+        if fd.IsIterator then DeclareIteratorShell(fd);
       foreach fd in fProg.FuncDecls do DeclareStaticFunc(mainTB, fd);
       foreach pd in fProg.ProcDecls do DeclareStaticProc(mainTB, pd);
       foreach fd in fProg.FuncDecls do BuildStaticFunc(mainTB, fd);

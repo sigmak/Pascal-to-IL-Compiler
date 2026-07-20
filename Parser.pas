@@ -1408,6 +1408,14 @@ type
         Result:=new TContinueStmtNode;
       end
 
+      // [Stage 69] yield <식>; — sequence of T 함수 안에서만 유효(위반 시 CodeGen이 오류를 냄).
+      else if Cur.Kind=tkYield then
+      begin
+        fPos:=fPos+1;
+        var yieldExpr:=ParseExpr;
+        Result:=new TYieldStmtNode(yieldExpr);
+      end
+
       // [Stage 59] case Selector of 라벨1,라벨2..라벨3: 문장; ... [else 문장들] end
       else if Cur.Kind=tkCase then
       begin
@@ -2517,8 +2525,29 @@ type
       if d.IsGeneric then fCurGenericParams:=genNames;
 
       ParseParams(d.Parameters);
-      Expect(tkColon); d.ReturnType:=ParseVarType;
-      if (d.ReturnType=vtGeneric) or (d.ReturnType=vtGenericArray) then d.ReturnGenericName:=fLastGenericName; // [Stage 36/37]
+      Expect(tkColon);
+      // [Stage 69] function Name(...): sequence of <basictype>; — yield 기반 lazy 시퀀스.
+      // 일반 ParseVarType과는 별도 경로로 처리한다: 최상위 함수의 반환 자리에서만 인식되고
+      // (클래스 메서드/중첩 함수는 1차 제약으로 아직 미지원), 원소 타입도 기본 스칼라 타입만 허용한다.
+      if Cur.Kind=tkSequence then
+      begin
+        fPos:=fPos+1; Expect(tkOf);
+        d.IsIterator:=true;
+        if Cur.Kind=tkInteger then begin fPos:=fPos+1; d.IterElemType:=vtInteger; end
+        else if Cur.Kind=tkStringType then begin fPos:=fPos+1; d.IterElemType:=vtString; end
+        else if Cur.Kind=tkBoolean then begin fPos:=fPos+1; d.IterElemType:=vtBoolean; end
+        else if (Cur.Kind=tkReal) or (Cur.Kind=tkDouble) then begin fPos:=fPos+1; d.IterElemType:=vtReal; end
+        else if Cur.Kind=tkChar then begin fPos:=fPos+1; d.IterElemType:=vtChar; end
+        else if Cur.Kind=tkInt64 then begin fPos:=fPos+1; d.IterElemType:=vtInt64; end
+        else raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString
+          +': sequence of 뒤에는 integer/string/boolean/real/char/int64만 지원합니다 (Stage 69, 1차)');
+        d.ReturnType:=vtInteger; // 사용되지 않음(IsIterator=true면 CodeGen이 IterElemType만 봄) — 안전한 기본값만 채워둠
+      end
+      else
+      begin
+        d.ReturnType:=ParseVarType;
+        if (d.ReturnType=vtGeneric) or (d.ReturnType=vtGenericArray) then d.ReturnGenericName:=fLastGenericName; // [Stage 36/37]
+      end;
       Expect(tkSemicolon);
       sv:=fCurFunc; fCurFunc:=d.Name;
       if (Cur.Kind=tkVar) or (Cur.Kind=tkConst) then ParseLocalDeclSections(d.LocalVars, d.ConstDecls); // [Stage 61]

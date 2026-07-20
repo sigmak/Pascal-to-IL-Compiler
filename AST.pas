@@ -276,6 +276,14 @@ type
   TContinueStmtNode = class(TStmtNode)
   end;
 
+  // [Stage 69] yield <식>; — sequence 반환 함수(function ...: sequence of T) 안에서만 쓸 수 있다.
+  // MoveNext가 호출될 때마다 이 지점까지 실행하고 Expr 값을 Current로 남긴 뒤 실행을 "일시정지"한다
+  // (다음 MoveNext 호출 때 바로 다음 문장부터 이어서 실행). CodeGen이 상태 필드 기반 재개 지점으로 번역한다.
+  TYieldStmtNode = class(TStmtNode)
+  public Expr: TExprNode;
+    constructor Create(e: TExprNode); begin Expr:=e; end;
+  end;
+
   // [Stage 59] case 라벨 하나. 단일 값(예: 3, 'A', Red)이면 HighExpr=nil.
   // 범위(예: 1..5)면 LowExpr..HighExpr 둘 다 채워진다.
   // (PascalABC.NET은 named constructor를 허용하지 않아 — 오류: "Constructor can have
@@ -684,6 +692,11 @@ type
     // 캡처(클로저) 없음 — Name은 이미 파서 단계에서 "바깥이름$지역이름"으로 맹글링되어 있다.
     NestedFuncs: List<TFuncDeclNode>;
     NestedProcs: List<TProcDeclNode>;
+    // [Stage 69] "function Name(...): sequence of T;"로 선언된 함수. true면 ReturnType은 무시하고
+    // IterElemType(T)만 쓴다 — CodeGen이 이 함수를 평범한 static 메서드가 아니라 yield 상태
+    // 머신(숨은 __IterN 클래스: IEnumerable<T>/IEnumerator<T> 구현)으로 컴파일한다.
+    IsIterator: boolean;
+    IterElemType: TVarType; // integer/string/boolean/real/char/int64 중 하나만 지원 (1차 제약)
     constructor Create(n: string);
     begin
       Name:=n; Parameters:=new List<TParamDef>; LocalVars:=new List<TVarDecl>;
@@ -691,6 +704,7 @@ type
       IsGeneric:=false; GenericParamNames:=new List<string>; GenericParamConstraints:=new List<string>;
       ReturnGenericName:='';
       NestedFuncs:=new List<TFuncDeclNode>; NestedProcs:=new List<TProcDeclNode>; // [Stage 65]
+      IsIterator:=false; IterElemType:=vtInteger; // [Stage 69]
     end;
   end;
 
