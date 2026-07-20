@@ -21,8 +21,9 @@ uses
 
 const
   DefaultExampleDir = 'Examples';
-  DefaultExampleFile = 'Test_stage69.pas'; // [Stage 69]
-  //DefaultExampleFile = 'Test_stage68.pas'; // [Stage 68] 
+  DefaultExampleFile = 'Test_stage70.pas'; // [Stage 70] LINQ 스타일 확장 메서드
+  //DefaultExampleFile = 'Test_stage69.pas'; // [Stage 69] yield / IEnumerable<T> — 시퀀스 기반 lazy evaluation
+  //DefaultExampleFile = 'Test_stage68.pas'; // [Stage 68] 클로저 (변수 캡처) — Stage 64 람다는 캡처 없음
   //DefaultExampleFile = 'Test_stage67.pas'; // [Stage 67] 다차원 배열 (array of array)
   //DefaultExampleFile = 'Test_stage66.pas'; // [Stage 66] 연산자 오버로딩 (operator +, 등) — 본가의 특징적 기능이지만 우선순위는 낮음.
   //DefaultExampleFile = 'Test_stage65b.pas'; // [Stage 65b] 지역 서브프로그램끼리 선언 순서 무관 호출

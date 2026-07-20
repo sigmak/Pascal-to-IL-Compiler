@@ -119,6 +119,24 @@ type
 
     function Cur: TToken; begin Result:=fTokens[fPos]; end;
 
+    // [Stage 70] LINQ 스타일 확장 메서드 체이닝(Source.Where(...).Select(...) 등) 인식을 위해
+    // 현재 위치에서 offset만큼 앞선 토큰을 소비 없이 미리 본다. 범위를 벗어나면 마지막 토큰
+    // (항상 tkEOF여야 함 — Lexer가 토큰 스트림 끝에 EOF를 붙여 둔다는 기존 전제를 그대로 따름)을 돌려준다.
+    function PeekAt(offset: integer): TToken;
+    begin
+      if fPos+offset < fTokens.Count then Result:=fTokens[fPos+offset]
+      else Result:=fTokens[fTokens.Count-1];
+    end;
+
+    // [Stage 70] "이 토큰이 LINQ 확장 메서드 화이트리스트 이름인가" — 일반 obj.Method() 호출 파싱과
+    // 절대 충돌하지 않도록 정해진 5개 이름(Where/Select/Sum/Count/ToArray)만 인식한다.
+    function IsSeqExtMethodName(tok: TToken): boolean;
+    begin
+      Result:=(tok.Kind=tkIdent) and
+        ((tok.Text='Where') or (tok.Text='Select') or (tok.Text='Sum')
+         or (tok.Text='Count') or (tok.Text='ToArray'));
+    end;
+
     function Expect(k: TTokenKind): TToken;
     var t: TToken;
     begin
@@ -894,6 +912,33 @@ type
 
       else
         raise new Exception('줄 '+t.Line.ToString+', 열 '+t.Column.ToString+': 식이 와야 하는데 "'+t.Text+'"');
+
+      // [Stage 70] LINQ 스타일 확장 메서드 체이닝: Source.Where(...)/.Select(...)/.Sum()/.Count()/.ToArray().
+      // 화이트리스트 이름(IsSeqExtMethodName) + 바로 뒤 '(' 조합일 때만 반응하므로, 위에서 이미
+      // 처리된 일반 obj.Method(...) 호출 파싱(TMethodCallExprNode)과는 겹치지 않는다. 여러 번
+      // 체이닝 가능(Where(...).Select(...).Sum() 등) — while로 반복.
+      while (Cur.Kind=tkDot) and IsSeqExtMethodName(PeekAt(1)) and (PeekAt(2).Kind=tkLParen) do
+      begin
+        fPos:=fPos+1; // '.' 소비
+        var extName:=Cur.Text; fPos:=fPos+1; // 메서드 이름 소비
+        Expect(tkLParen);
+        var extLam: TExprLambdaNode := nil;
+        if (extName='Where') or (extName='Select') then
+        begin
+          // 매개변수 하나 -> 식  (괄호 있는 (x) -> ...  / 없는 x -> ... 둘 다 허용)
+          var extParamName: string;
+          if Cur.Kind=tkLParen then
+          begin
+            fPos:=fPos+1; extParamName:=Expect(tkIdent).Text; Expect(tkRParen);
+          end
+          else
+            extParamName:=Expect(tkIdent).Text;
+          Expect(tkArrow);
+          extLam:=new TExprLambdaNode(extParamName, ParseExpr);
+        end;
+        Expect(tkRParen);
+        Result:=new TSeqExtCallExprNode(Result, extName, extLam);
+      end;
     end;
 
     // [Stage 30] <식> as <TypeName> — Delphi에서 as는 *,/,mod와 같은 우선순위이므로

@@ -117,6 +117,11 @@ type
     fIterTypes:  Dictionary<string, TypeBuilder>;   // 최상위 함수명 → 생성된 이터레이터 클래스
     fIterCtors:  Dictionary<string, ConstructorBuilder>; // 최상위 함수명 → 그 클래스의 생성자(매개변수 = 원함수 매개변수)
     fIterElemClrType: Dictionary<string, System.Type>; // 최상위 함수명 → 원소 CLR 타입
+    // [Stage 70] fIterElemClrType과 같은 자리에서 함께 채워지는, "원소 CLR 타입"이 아니라
+    // "원소의 Pascal TVarType" 버전 — LINQ 스타일 확장 메서드(Where/Select/...)가 소스 시퀀스의
+    // 원소 타입을 CodeGen 쪽 타입 체계(TVarType)로 알아야 할 때(예: 새 로컬 선언, InferType 재귀)
+    // fIterElemClrType(System.Type)만으로는 vtInteger/vtInt64 등을 역으로 구분하기 번거로워 따로 둔다.
+    fIterElemVarType: Dictionary<string, TVarType>;
     fIterStateFieldOf:   Dictionary<string, FieldBuilder>; // 최상위 함수명 → <>state 필드
     fIterCurrentFieldOf: Dictionary<string, FieldBuilder>; // 최상위 함수명 → <>current 필드
     fIterCapFieldsOf: Dictionary<string, Dictionary<string, FieldBuilder>>; // 최상위 함수명 → (매개변수/지역변수명 → 필드)
@@ -615,7 +620,56 @@ type
         if _pc<>'' then Result:=FindMethodReturnType(_pc, _ih.MethodName)
         else Result:=vtInteger;
       end
+      // [Stage 70] LINQ 스타일 확장 메서드. Where/Select 자체(중간 결과)는 1차 제약으로 값으로
+      // 직접 저장/사용하지 않는 것이 원칙(더 체이닝하거나 for-in의 컬렉션 자리에만 씀)이라 vtObject로
+      // 폴백해 둔다. Sum/Count/ToArray는 최종(terminal) 연산이라 실제로 의미 있는 타입을 돌려준다.
+      else if e is TSeqExtCallExprNode then
+      begin
+        var _se70:=TSeqExtCallExprNode(e);
+        if _se70.MethodName='Count' then Result:=vtInteger
+        else if _se70.MethodName='Sum' then Result:=GetSeqElemType(_se70.Source)
+        else if _se70.MethodName='ToArray' then
+        begin
+          var _elemT70:=GetSeqElemType(_se70.Source);
+          if _elemT70=vtString then Result:=vtStrArray else Result:=vtIntArray;
+        end
+        else Result:=vtObject; // Where/Select 중간 결과
+      end
       else Result:=vtInteger;
+    end;
+
+    // [Stage 70] "시퀀스처럼 취급 가능한 식" e의 원소 Pascal 타입을 알아낸다.
+    // 1차 제약: e는 (a) sequence of T 함수 호출(TFuncCallExprNode, fIterElemVarType에 등록됨)이거나
+    // (b) 그 자체가 Where/Select 체인(TSeqExtCallExprNode)이어야 한다 — 지역 변수/필드에 저장된
+    // 시퀀스는 아직 지원하지 않는다(향후 단계에서 vtSequence 같은 정식 타입을 도입하면 확장 가능).
+    function GetSeqElemType(e: TExprNode): TVarType;
+    begin
+      if (e is TFuncCallExprNode) and fIterElemVarType.ContainsKey(TFuncCallExprNode(e).FuncName) then
+        Result:=fIterElemVarType[TFuncCallExprNode(e).FuncName]
+      else if e is TSeqExtCallExprNode then
+      begin
+        var _sse:=TSeqExtCallExprNode(e);
+        if _sse.MethodName='Where' then
+          Result:=GetSeqElemType(_sse.Source) // 필터는 원소 타입을 바꾸지 않는다
+        else if _sse.MethodName='Select' then
+        begin
+          // selector 본문의 결과 타입 = 이 체인의 새 원소 타입. 매개변수를 임시로 지역
+          // 스코프에 등록해 두고(실제 IL 로컬은 필요 없음 — InferType은 VType만 읽으므로
+          // Loc=nil로 안전) selector 본문을 평범한 식으로 타입 추론한다.
+          var _srcElem:=GetSeqElemType(_sse.Source);
+          var _hadEntry:=fLocalScope.Has(_sse.Lambda.ParamName);
+          fLocalScope.Declare(_sse.Lambda.ParamName, nil, _srcElem);
+          Result:=InferType(_sse.Lambda.Body);
+          if not _hadEntry then fLocalScope.Remove(_sse.Lambda.ParamName);
+        end
+        else
+          // Sum/Count/ToArray는 시퀀스가 아니라 최종 스칼라/배열 값이므로 그 위에 다시
+          // Where/Select/... 를 체이닝할 수 없다 — 파서가 걸러주지 못한 경우를 대비한 방어.
+          raise new Exception('"'+_sse.MethodName+'"의 결과에는 더 이상 시퀀스 확장 메서드를 체이닝할 수 없습니다 (Stage 70, 1차 제약)');
+      end
+      else
+        raise new Exception('시퀀스로 취급할 수 없는 식입니다: '+e.GetType.Name
+          +' (Stage 70, 1차 제약: sequence of T 함수 호출 또는 Where/Select 체인만 지원)');
     end;
 
     // [Stage 30] inherited MethodName(args) 공통 구현. 식/문장 양쪽에서 재사용.
@@ -1217,7 +1271,201 @@ type
         EmitInheritedCall(aIL, ihe.MethodName, ihe.Args, true);
       end
 
+      else if e is TSeqExtCallExprNode then // [Stage 70]
+        EmitSeqExtCall(aIL, TSeqExtCallExprNode(e))
+
       else raise new Exception('알 수 없는 식 노드: '+e.GetType.Name);
+    end;
+
+    // [Stage 70] LINQ 스타일 확장 메서드 하나(Where/Select/Sum/Count/ToArray)를 실제로 컴파일한다.
+    // 다섯 경우 모두 "소스를 IEnumerable(비제네릭)로 순회하며 원소를 하나씩 처리"하는 뼈대는
+    // Stage 54/69 for-in desugar(GetEnumerator/MoveNext/Current)와 동일하다 — 결과를 어떻게
+    // 모으는지만 다르므로 공용 추상화 대신 케이스마다 그대로 풀어 쓴다(이 파일 전반의 관례).
+    // 결과 표현: Where/Select → List<원소타입> 참조(1차 제약: 더 체이닝하거나 for-in의 컬렉션
+    // 자리에 바로 쓰는 용도로만 — 지역변수에 저장해 재사용하는 것은 아직 지원 안 함),
+    // Sum → 스칼라(원소 타입 그대로), Count → integer, ToArray → T[](정수/문자열 원소만 1차 지원).
+    procedure EmitSeqExtCall(aIL: ILGenerator; node: TSeqExtCallExprNode);
+    var
+      srcElemType: TVarType; srcElemClr, listOpenT, listT: System.Type;
+      enumLoc, elemLoc, resultLoc: LocalBuilder;
+      ckL, bdL, endL: &Label;
+      getEnumMI, getCurMI, moveNextMI: MethodInfo;
+      hadParamEntry: boolean;
+    begin
+      srcElemType:=GetSeqElemType(node.Source);
+      srcElemClr:=VTC(srcElemType, '');
+
+      // ---- 공통 준비: 소스를 순회할 (비제네릭) 이터레이터를 얻는다 ----
+      EmitExpr(aIL, node.Source);
+      getEnumMI:=typeof(System.Collections.IEnumerable).GetMethod('GetEnumerator');
+      aIL.Emit(OpCodes.Callvirt, getEnumMI);
+      enumLoc:=aIL.DeclareLocal(typeof(System.Collections.IEnumerator));
+      aIL.Emit(OpCodes.Stloc, enumLoc);
+      getCurMI:=typeof(System.Collections.IEnumerator).GetProperty('Current').GetGetMethod;
+      moveNextMI:=typeof(System.Collections.IEnumerator).GetMethod('MoveNext');
+      listOpenT:=System.Type.GetType('System.Collections.Generic.List`1');
+
+      if node.MethodName='Where' then
+      begin
+        // 원소 타입은 그대로, 조건을 만족하는 것만 새 List에 담는다.
+        listT:=listOpenT.MakeGenericType(srcElemClr);
+        resultLoc:=aIL.DeclareLocal(listT);
+        aIL.Emit(OpCodes.Newobj, listT.GetConstructor(System.Type.EmptyTypes));
+        aIL.Emit(OpCodes.Stloc, resultLoc);
+        elemLoc:=aIL.DeclareLocal(srcElemClr);
+        hadParamEntry:=fLocalScope.Has(node.Lambda.ParamName);
+        fLocalScope.Declare(node.Lambda.ParamName, elemLoc, srcElemType);
+
+        ckL:=aIL.DefineLabel; bdL:=aIL.DefineLabel; endL:=aIL.DefineLabel;
+        aIL.Emit(OpCodes.Br, ckL);
+        aIL.MarkLabel(bdL);
+        aIL.Emit(OpCodes.Ldloc, enumLoc);
+        aIL.Emit(OpCodes.Callvirt, getCurMI);
+        if srcElemClr.IsValueType then aIL.Emit(OpCodes.Unbox_Any, srcElemClr) else aIL.Emit(OpCodes.Castclass, srcElemClr);
+        aIL.Emit(OpCodes.Stloc, elemLoc);
+
+        EmitExpr(aIL, node.Lambda.Body); // predicate → 0/1 (int32)
+        var skipL:=aIL.DefineLabel;
+        aIL.Emit(OpCodes.Brfalse, skipL);
+        aIL.Emit(OpCodes.Ldloc, resultLoc);
+        aIL.Emit(OpCodes.Ldloc, elemLoc);
+        aIL.Emit(OpCodes.Callvirt, listT.GetMethod('Add'));
+        aIL.MarkLabel(skipL);
+
+        aIL.MarkLabel(ckL);
+        aIL.Emit(OpCodes.Ldloc, enumLoc);
+        aIL.Emit(OpCodes.Callvirt, moveNextMI);
+        aIL.Emit(OpCodes.Brtrue, bdL);
+        aIL.MarkLabel(endL);
+        if not hadParamEntry then fLocalScope.Remove(node.Lambda.ParamName);
+
+        aIL.Emit(OpCodes.Ldloc, resultLoc);
+      end
+
+      else if node.MethodName='Select' then
+      begin
+        elemLoc:=aIL.DeclareLocal(srcElemClr);
+        hadParamEntry:=fLocalScope.Has(node.Lambda.ParamName);
+        fLocalScope.Declare(node.Lambda.ParamName, elemLoc, srcElemType);
+        // selector 본문의 결과 타입 = 새 원소 타입 — 결과 List<T>의 T를 정하려면 루프를
+        // 열기 전에 미리 알아야 한다(InferType은 IL을 방출하지 않으므로 미리 호출해도 안전).
+        var dstElemType:=InferType(node.Lambda.Body);
+        var dstElemClr:=VTC(dstElemType, '');
+        listT:=listOpenT.MakeGenericType(dstElemClr);
+        resultLoc:=aIL.DeclareLocal(listT);
+        aIL.Emit(OpCodes.Newobj, listT.GetConstructor(System.Type.EmptyTypes));
+        aIL.Emit(OpCodes.Stloc, resultLoc);
+
+        ckL:=aIL.DefineLabel; bdL:=aIL.DefineLabel; endL:=aIL.DefineLabel;
+        aIL.Emit(OpCodes.Br, ckL);
+        aIL.MarkLabel(bdL);
+        aIL.Emit(OpCodes.Ldloc, enumLoc);
+        aIL.Emit(OpCodes.Callvirt, getCurMI);
+        if srcElemClr.IsValueType then aIL.Emit(OpCodes.Unbox_Any, srcElemClr) else aIL.Emit(OpCodes.Castclass, srcElemClr);
+        aIL.Emit(OpCodes.Stloc, elemLoc);
+
+        aIL.Emit(OpCodes.Ldloc, resultLoc);
+        EmitExpr(aIL, node.Lambda.Body); // selector 결과(dstElemClr 타입)
+        aIL.Emit(OpCodes.Callvirt, listT.GetMethod('Add'));
+
+        aIL.MarkLabel(ckL);
+        aIL.Emit(OpCodes.Ldloc, enumLoc);
+        aIL.Emit(OpCodes.Callvirt, moveNextMI);
+        aIL.Emit(OpCodes.Brtrue, bdL);
+        aIL.MarkLabel(endL);
+        if not hadParamEntry then fLocalScope.Remove(node.Lambda.ParamName);
+
+        aIL.Emit(OpCodes.Ldloc, resultLoc);
+      end
+
+      else if node.MethodName='Sum' then
+      begin
+        if (srcElemType<>vtInteger) and (srcElemType<>vtReal) and (srcElemType<>vtInt64) then
+          raise new Exception('Sum()은 integer/real/int64 원소 시퀀스에만 사용할 수 있습니다 (Stage 70, 1차 제약)');
+        resultLoc:=aIL.DeclareLocal(srcElemClr);
+        if srcElemType=vtReal then aIL.Emit(OpCodes.Ldc_R8, double(0))
+        else if srcElemType=vtInt64 then aIL.Emit(OpCodes.Ldc_I8, int64(0))
+        else aIL.Emit(OpCodes.Ldc_I4_0);
+        aIL.Emit(OpCodes.Stloc, resultLoc);
+        elemLoc:=aIL.DeclareLocal(srcElemClr);
+
+        ckL:=aIL.DefineLabel; bdL:=aIL.DefineLabel; endL:=aIL.DefineLabel;
+        aIL.Emit(OpCodes.Br, ckL);
+        aIL.MarkLabel(bdL);
+        aIL.Emit(OpCodes.Ldloc, enumLoc);
+        aIL.Emit(OpCodes.Callvirt, getCurMI);
+        if srcElemClr.IsValueType then aIL.Emit(OpCodes.Unbox_Any, srcElemClr) else aIL.Emit(OpCodes.Castclass, srcElemClr);
+        aIL.Emit(OpCodes.Stloc, elemLoc);
+        aIL.Emit(OpCodes.Ldloc, resultLoc);
+        aIL.Emit(OpCodes.Ldloc, elemLoc);
+        aIL.Emit(OpCodes.Add);
+        aIL.Emit(OpCodes.Stloc, resultLoc);
+
+        aIL.MarkLabel(ckL);
+        aIL.Emit(OpCodes.Ldloc, enumLoc);
+        aIL.Emit(OpCodes.Callvirt, moveNextMI);
+        aIL.Emit(OpCodes.Brtrue, bdL);
+        aIL.MarkLabel(endL);
+
+        aIL.Emit(OpCodes.Ldloc, resultLoc);
+      end
+
+      else if node.MethodName='Count' then
+      begin
+        resultLoc:=aIL.DeclareLocal(typeof(integer));
+        aIL.Emit(OpCodes.Ldc_I4_0);
+        aIL.Emit(OpCodes.Stloc, resultLoc);
+
+        ckL:=aIL.DefineLabel; bdL:=aIL.DefineLabel; endL:=aIL.DefineLabel;
+        aIL.Emit(OpCodes.Br, ckL);
+        aIL.MarkLabel(bdL);
+        aIL.Emit(OpCodes.Ldloc, resultLoc);
+        aIL.Emit(OpCodes.Ldc_I4_1);
+        aIL.Emit(OpCodes.Add);
+        aIL.Emit(OpCodes.Stloc, resultLoc);
+
+        aIL.MarkLabel(ckL);
+        aIL.Emit(OpCodes.Ldloc, enumLoc);
+        aIL.Emit(OpCodes.Callvirt, moveNextMI);
+        aIL.Emit(OpCodes.Brtrue, bdL);
+        aIL.MarkLabel(endL);
+
+        aIL.Emit(OpCodes.Ldloc, resultLoc);
+      end
+
+      else if node.MethodName='ToArray' then
+      begin
+        if (srcElemType<>vtInteger) and (srcElemType<>vtString) then
+          raise new Exception('ToArray()는 1차 제약으로 integer/string 원소 시퀀스만 지원합니다 (Stage 70)');
+        listT:=listOpenT.MakeGenericType(srcElemClr);
+        resultLoc:=aIL.DeclareLocal(listT);
+        aIL.Emit(OpCodes.Newobj, listT.GetConstructor(System.Type.EmptyTypes));
+        aIL.Emit(OpCodes.Stloc, resultLoc);
+        elemLoc:=aIL.DeclareLocal(srcElemClr);
+
+        ckL:=aIL.DefineLabel; bdL:=aIL.DefineLabel; endL:=aIL.DefineLabel;
+        aIL.Emit(OpCodes.Br, ckL);
+        aIL.MarkLabel(bdL);
+        aIL.Emit(OpCodes.Ldloc, enumLoc);
+        aIL.Emit(OpCodes.Callvirt, getCurMI);
+        if srcElemClr.IsValueType then aIL.Emit(OpCodes.Unbox_Any, srcElemClr) else aIL.Emit(OpCodes.Castclass, srcElemClr);
+        aIL.Emit(OpCodes.Stloc, elemLoc);
+        aIL.Emit(OpCodes.Ldloc, resultLoc);
+        aIL.Emit(OpCodes.Ldloc, elemLoc);
+        aIL.Emit(OpCodes.Callvirt, listT.GetMethod('Add'));
+
+        aIL.MarkLabel(ckL);
+        aIL.Emit(OpCodes.Ldloc, enumLoc);
+        aIL.Emit(OpCodes.Callvirt, moveNextMI);
+        aIL.Emit(OpCodes.Brtrue, bdL);
+        aIL.MarkLabel(endL);
+
+        aIL.Emit(OpCodes.Ldloc, resultLoc);
+        aIL.Emit(OpCodes.Callvirt, listT.GetMethod('ToArray'));
+      end
+
+      else
+        raise new Exception('알 수 없는 시퀀스 확장 메서드 "'+node.MethodName+'" (Stage 70)');
     end;
 
     // [Stage 60] break/continue 공용 헬퍼. isBreak=true면 가장 안쪽 루프의 탈출 라벨로,
@@ -3408,6 +3656,7 @@ type
       fIterCounter:=fIterCounter+1;
       elemClrType:=VTC(fd.IterElemType, '');
       fIterElemClrType[fd.Name]:=elemClrType;
+      fIterElemVarType[fd.Name]:=fd.IterElemType; // [Stage 70]
 
       var ienumOpenT:=System.Type.GetType('System.Collections.Generic.IEnumerable`1');
       var ienumeratorOpenT:=System.Type.GetType('System.Collections.Generic.IEnumerator`1');
@@ -3901,6 +4150,7 @@ type
       fIterTypes:=new Dictionary<string, TypeBuilder>;
       fIterCtors:=new Dictionary<string, ConstructorBuilder>;
       fIterElemClrType:=new Dictionary<string, System.Type>;
+      fIterElemVarType:=new Dictionary<string, TVarType>; // [Stage 70]
       fIterStateFieldOf:=new Dictionary<string, FieldBuilder>;
       fIterCurrentFieldOf:=new Dictionary<string, FieldBuilder>;
       fIterCapFieldsOf:=new Dictionary<string, Dictionary<string, FieldBuilder>>;

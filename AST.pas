@@ -203,6 +203,25 @@ type
     constructor Create(n: string); begin FuncName:=n; Args:=new List<TExprNode>; end;
   end;
 
+  // [Stage 70] LINQ 스타일 확장 메서드용 "식 람다": ParamName -> Body  (예: x -> x*x, x -> x mod 2 = 0).
+  // Stage 64의 TLambdaExprNode(Body: TStmtNode, 이벤트 구독 전용)와는 별개 — 이쪽은 매개변수 하나에
+  // 값을 돌려주는 "식"(TExprNode) 본문만 가진다. begin...end 블록 없이 항상 식 하나.
+  TExprLambdaNode = class
+  public ParamName: string; Body: TExprNode;
+    constructor Create(p: string; b: TExprNode); begin ParamName:=p; Body:=b; end;
+  end;
+
+  // [Stage 70] Source.MethodName(...)  형태의 LINQ 스타일 확장 메서드 호출.
+  // MethodName은 'Where'/'Select'/'Sum'/'Count'/'ToArray' 중 하나로 제한한다(1차 제약).
+  // Where/Select는 Lambda가 필수(각각 predicate/selector), Sum/Count/ToArray는 Lambda=nil(인자 없음).
+  // Source는 "시퀀스처럼 취급 가능한 식"이어야 한다 — 1차 제약: sequence of T 함수 호출 또는
+  // 이 노드 자신의 체이닝(Where/Select 결과)만 지원. 지역 변수에 저장된 시퀀스는 아직 미지원.
+  TSeqExtCallExprNode = class(TExprNode)
+  public Source: TExprNode; MethodName: string; Lambda: TExprLambdaNode;
+    constructor Create(src: TExprNode; mname: string; lam: TExprLambdaNode);
+    begin Source:=src; MethodName:=mname; Lambda:=lam; end;
+  end;
+
   // ----------------------------------------------------------
   // AST — 문장 노드
   // ----------------------------------------------------------
