@@ -337,11 +337,13 @@ end;
 // [Stage 71] 함수 템플릿 하나가 true open generic으로 남을 자격이 있는지 판정.
 // 클래스 선언부 주석(위쪽)에 판정 기준 설명 있음 — 여기서는 그대로 검사만 한다.
 function TMonomorphizer.IsFuncOpenGenericEligible(tmpl: TFuncDeclNode): boolean;
-var i: integer;
 begin
   Result:=false;
-  for i:=0 to tmpl.GenericParamConstraints.Count-1 do
-    if tmpl.GenericParamConstraints[i]<>'' then exit;
+  // [Stage 73] 예전에는 제약조건(T: class / T: TBase / T: IFoo)이 하나라도 있으면 무조건
+  // 단형화로 밀어냈다. 이제 CodeGen(DeclareStaticFunc)이 DefineGenericParameters로 만든
+  // GenericTypeParameterBuilder에 SetGenericParameterAttributes/SetBaseTypeConstraint/
+  // SetInterfaceConstraints를 직접 걸어주므로, 제약조건이 있어도 true open generic 자격을
+  // 유지한다 — 다중 타입 매개변수는 원래부터 이 함수가 개수를 따지지 않았으므로 그대로 허용됨.
   foreach var p71 in tmpl.Parameters do
     if p71.ParamType=vtGenericArray then exit;
   if tmpl.ReturnType=vtGenericArray then exit;
@@ -351,11 +353,9 @@ end;
 
 // [Stage 71] 프로시저 버전 — 반환 타입이 없다는 점만 다르다.
 function TMonomorphizer.IsProcOpenGenericEligible(tmpl: TProcDeclNode): boolean;
-var i: integer;
 begin
   Result:=false;
-  for i:=0 to tmpl.GenericParamConstraints.Count-1 do
-    if tmpl.GenericParamConstraints[i]<>'' then exit;
+  // [Stage 73] 함수 버전과 동일한 이유로 제약조건 배제 로직을 제거.
   foreach var p71 in tmpl.Parameters do
     if p71.ParamType=vtGenericArray then exit;
   if (tmpl.NestedFuncs.Count>0) or (tmpl.NestedProcs.Count>0) then exit;

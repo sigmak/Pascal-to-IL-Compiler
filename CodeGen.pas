@@ -4219,6 +4219,39 @@ type
       fCurIterYieldState:=savedYieldState; fCurIterYieldLabel:=savedYieldLabel;
     end;
 
+    // [Stage 73] DefineGenericParameters가 돌려준 GenericTypeParameterBuilder 배열에
+    // 선언부의 제약조건 문자열(''=제약없음, 'class'=참조타입 전용, 그 외=클래스/인터페이스 이름)을
+    // 실제 CLR 제약으로 건다. 이름 → 타입 해석은 fBuiltInterfaces/fInterfaceBuilders(인터페이스)
+    // 를 먼저 보고, 아니면 fBuiltTypes/fTypeBuilders(클래스)를 본다 — 이 시점(정적 함수/프로시저
+    // 선언 패스, GenerateExe 3단계)에는 인터페이스는 이미 CreateType까지 끝나 있고, 클래스는
+    // TypeBuilder만 있는 상태(아직 CreateType 전)인데, Reflection.Emit은 제약 대상으로
+    // 완성되지 않은 TypeBuilder를 참조하는 것을 허용하므로 문제없다.
+    procedure ApplyGenericParamConstraints(gpBuilders: array of GenericTypeParameterBuilder; constraints: List<string>);
+    var i73: integer; cName73: string; cType73: System.Type;
+    begin
+      for i73:=0 to constraints.Count-1 do
+      begin
+        cName73:=constraints[i73];
+        if cName73='' then continue;
+        if cName73='class' then
+          gpBuilders[i73].SetGenericParameterAttributes(GenericParameterAttributes.ReferenceTypeConstraint)
+        else if fBuiltInterfaces.ContainsKey(cName73) or fInterfaceBuilders.ContainsKey(cName73) then
+        begin
+          if fBuiltInterfaces.ContainsKey(cName73) then cType73:=fBuiltInterfaces[cName73]
+          else cType73:=fInterfaceBuilders[cName73];
+          gpBuilders[i73].SetInterfaceConstraints([cType73]);
+        end
+        else if fBuiltTypes.ContainsKey(cName73) or fTypeBuilders.ContainsKey(cName73) then
+        begin
+          if fBuiltTypes.ContainsKey(cName73) then cType73:=fBuiltTypes[cName73]
+          else cType73:=fTypeBuilders[cName73];
+          gpBuilders[i73].SetBaseTypeConstraint(cType73);
+        end
+        else
+          raise new Exception('제네릭 제약조건 "'+cName73+'"에 대응하는 클래스/인터페이스를 찾을 수 없습니다 (Stage 73)');
+      end;
+    end;
+
     procedure DeclareStaticFunc(tb: TypeBuilder; d: TFuncDeclNode);
     var pt: array of System.Type; i: integer; mb: MethodBuilder; retClrType: System.Type; retCn66: string;
     begin
@@ -4231,6 +4264,7 @@ type
       begin
         mb:=tb.DefineMethod(d.Name, MethodAttributes.Public or MethodAttributes.Static);
         var gpBuilders71:=mb.DefineGenericParameters(d.GenericParamNames.ToArray);
+        ApplyGenericParamConstraints(gpBuilders71, d.GenericParamConstraints); // [Stage 73]
         var savedSubst71:=fCurGenericSubst;
         fCurGenericSubst:=new Dictionary<string, System.Type>;
         for i:=0 to d.GenericParamNames.Count-1 do fCurGenericSubst[d.GenericParamNames[i]]:=gpBuilders71[i];
@@ -4280,6 +4314,7 @@ type
       begin
         mb:=tb.DefineMethod(d.Name, MethodAttributes.Public or MethodAttributes.Static);
         var gpBuilders71p:=mb.DefineGenericParameters(d.GenericParamNames.ToArray);
+        ApplyGenericParamConstraints(gpBuilders71p, d.GenericParamConstraints); // [Stage 73]
         var savedSubst71p:=fCurGenericSubst;
         fCurGenericSubst:=new Dictionary<string, System.Type>;
         for i:=0 to d.GenericParamNames.Count-1 do fCurGenericSubst[d.GenericParamNames[i]]:=gpBuilders71p[i];

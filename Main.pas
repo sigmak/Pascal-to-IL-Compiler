@@ -21,7 +21,8 @@ uses
 
 const
   DefaultExampleDir = 'Examples';
-  DefaultExampleFile = 'Test_stage72.pas'; // [Stage 72] PABCSystem 표준 라이브러리
+  DefaultExampleFile = 'Test_stage73.pas'; // [Stage 73] 다중 타입 매개변수 + 제약조건
+  //DefaultExampleFile = 'Test_stage72.pas'; // [Stage 72] PABCSystem 표준 라이브러리
   //DefaultExampleFile = 'Test_stage71.pas'; // [Stage 71] true open generic (CLR 수준 제네릭, 현재는 단형화로 대체)
   //DefaultExampleFile = 'Test_stage70.pas'; // [Stage 70] LINQ 스타일 확장 메서드
   //DefaultExampleFile = 'Test_stage69.pas'; // [Stage 69] yield / IEnumerable<T> — 시퀀스 기반 lazy evaluation
