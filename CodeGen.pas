@@ -38,6 +38,21 @@ type
     // 그래서 정의 시점에 이미 계산해 둔 매개변수 CLR 타입을 따로 보관해 뒀다가 그걸 쓴다.
     fTopParamClrTypes: Dictionary<string, array of System.Type>; // 함수/프로시저명 → 매개변수 CLR 타입 배열
 
+    // [Stage 71] true open generic — 몸체를 컴파일하는 동안만 유효한 "타입 매개변수 이름 → 실제
+    // GenericTypeParameterBuilder(또는 닫힌 호출부에서는 실제 CLR 타입)" 치환표. nil이면 제네릭
+    // 컨텍스트 밖(보통의 static 함수/메서드 본문)이라는 뜻 — VTC가 vtGeneric을 만나면 이 표를 본다.
+    fCurGenericSubst: Dictionary<string, System.Type>;
+    // [Stage 71] DeclareStaticFunc/Proc가 만든 "타입 매개변수 이름 → GenericTypeParameterBuilder"
+    // 치환표를 함수/프로시저 이름별로 보관해 뒀다가, BuildStaticFunc/Proc가 본문을 컴파일할 때
+    // 다시 fCurGenericSubst에 꽂아 쓴다(선언 패스와 빌드 패스가 서로 다른 시점에 실행되므로).
+    fOpenGenericSubstOf: Dictionary<string, Dictionary<string, System.Type>>;
+    // [Stage 71] Monomorphize가 단형화하지 않고 "그대로 진짜 오픈 제네릭으로 남겨 둔" 템플릿의 호출
+    // 요청들. Parser는 예전과 동일하게 맹글링된 구체 이름(예: "Identity_integer")으로 호출 노드를
+    // 만들어 두므로, fMethods에 그 이름이 없을 때(=단형화되지 않고 오픈 제네릭으로 처리된 경우)
+    // 이 표를 통해 원본 템플릿 이름 + 실제 타입 인자를 되찾아 MakeGenericMethod로 호출한다.
+    // key: 맹글링된 구체 이름(예: "Identity_integer") → 그 인스턴스화 요청 레코드.
+    fOpenGenericCallMap: Dictionary<string, TGenericFuncInstantiation>;
+
     // 클래스 관련
     fTypeBuilders: Dictionary<string, TypeBuilder>;  // 클래스명 → TypeBuilder
     fBuiltTypes:   Dictionary<string, System.Type>;  // 클래스명 → 완성된 Type
@@ -173,6 +188,16 @@ type
         if fBuiltInterfaces.ContainsKey(cn) then Result:=fBuiltInterfaces[cn]
         else Result:=typeof(System.Object);
       end
+      // [Stage 71] true open generic 함수/프로시저 본문 컴파일 중에만 의미가 있다. cn에는 타입
+      // 매개변수 이름(예: 'T')이 들어있고, fCurGenericSubst가 그 이름을 실제 GenericTypeParameterBuilder
+      // (선언부 컴파일 중) 또는 닫힌 실제 타입(호출부)으로 풀어준다. 예전처럼 vtGeneric이 여기 도달하는
+      // 경우는 전부 Monomorphize가 미리 제거했었지만, 이제 "1차 제약을 만족하는" 제네릭 함수/프로시저는
+      // 단형화되지 않고 그대로 남아 CodeGen이 직접 vtGeneric을 다뤄야 한다.
+      else if t=vtGeneric then
+      begin
+        if (fCurGenericSubst<>nil) and fCurGenericSubst.ContainsKey(cn) then Result:=fCurGenericSubst[cn]
+        else Result:=typeof(System.Object); // 방어적 폴백(정상 경로라면 도달하지 않아야 함)
+      end
       else Result:=typeof(integer);
     end;
 
@@ -188,6 +213,23 @@ type
       if fLocalScope.Has(name) then Result:=fLocalScope.GetClassName(name)
       else if fGlobalScope.Has(name) then Result:=fGlobalScope.GetClassName(name)
       else Result:='';
+    end;
+
+    // [Stage 71] vtGeneric으로 추론된 식 e의 실제 CLR 타입(현재 컴파일 중인 open generic
+    // 메서드 안에서의 GenericTypeParameterBuilder)을 알아낸다. 1차 제약: e가 변수/매개변수
+    // 참조(TVarRefNode)일 때만 정확히 찾아준다 — 그 외(예: 제네릭 함수를 호출한 결과를 다시
+    // 다른 제네릭 함수에 넘기는 식 등)는 System.Object로 방어적 폴백한다(box는 여전히 안전하게
+    // 동작하지만, 값 타입이면 이미 한 번 박싱된 상태로 다시 취급될 뿐 — 드문 경로라 1차 범위 밖).
+    function GetGenericExprClrType(e: TExprNode): System.Type;
+    var genName: string;
+    begin
+      if (e is TVarRefNode) and (fCurGenericSubst<>nil) then
+      begin
+        genName:=GetVarClassName(TVarRefNode(e).VarName);
+        if (genName<>'') and fCurGenericSubst.ContainsKey(genName) then
+        begin Result:=fCurGenericSubst[genName]; exit; end;
+      end;
+      Result:=typeof(System.Object);
     end;
 
     // [Stage 66] TBinOpKind → 소스에 쓰인 연산자 기호 문자열. 연산자 오버로딩 레지스트리
@@ -572,6 +614,10 @@ type
         // string을 반환해도 정수 변환 경로를 타 값이 깨졌다.
         var _fc4:=TFuncCallExprNode(e);
         if fFuncReturnTypes.ContainsKey(_fc4.FuncName) then Result:=fFuncReturnTypes[_fc4.FuncName]
+        // [Stage 71] 단형화되지 않고 오픈 제네릭으로 남은 템플릿의 맹글링된 호출이면
+        // fFuncReturnTypes에는 (구체 이름이 아니라) 템플릿 이름만 등록돼 있으므로 직접 계산한다.
+        else if fOpenGenericCallMap.ContainsKey(_fc4.FuncName) then
+          Result:=ResolveOpenGenericFuncReturnType(fOpenGenericCallMap[_fc4.FuncName])
         else Result:=vtInteger;
       end
       else if e is TExceptionMsgExprNode then Result:=vtString // E.Message는 항상 string
@@ -774,6 +820,43 @@ type
         end
         else if emi2.ReturnType<>typeof(System.Void) then aIL.Emit(OpCodes.Pop);
       end;
+    end;
+
+    // [Stage 71] finst.TemplateName에 해당하는, 단형화되지 않고 그대로 남은 최상위 제네릭
+    // 함수 템플릿을 찾아 이 호출식의 반환 타입을 계산한다(InferType이 이 정보를 몰라도 되게
+    // fFuncReturnTypes에는 맹글링된 구체 이름이 아니라 템플릿 이름 하나만 등록돼 있으므로).
+    // 함수 목록은 짧고 호출식마다 한 번뿐인 조회라 선형 탐색으로 충분하다.
+    function ResolveOpenGenericFuncReturnType(finst: TGenericFuncInstantiation): TVarType;
+    var tmpl71: TFuncDeclNode; i71: integer;
+    begin
+      tmpl71:=nil;
+      foreach var fd71 in fProg.FuncDecls do
+        if fd71.Name=finst.TemplateName then begin tmpl71:=fd71; break; end;
+      if tmpl71=nil then begin Result:=vtInteger; exit; end; // 방어적 폴백(정상 경로면 항상 찾음)
+      if tmpl71.ReturnType<>vtGeneric then begin Result:=tmpl71.ReturnType; exit; end;
+      Result:=vtInteger;
+      for i71:=0 to tmpl71.GenericParamNames.Count-1 do
+        if tmpl71.GenericParamNames[i71]=tmpl71.ReturnGenericName then
+        begin Result:=finst.ArgTypes[i71]; exit; end;
+    end;
+
+    // [Stage 71] true open generic으로 남은 함수/프로시저 호출 하나를 실제로 컴파일한다.
+    // finst.TemplateName으로 등록된 열린 제네릭 MethodBuilder를 실제 타입 인자로
+    // MakeGenericMethod한 뒤 Call한다. EmitArgsCoerced는 paramTypes=nil로 호출해 인자를
+    // 있는 그대로 컴파일한다 — 1차 제약: 제네릭 매개변수 자리에서 int→real 같은 자동 승격은
+    // 지원하지 않는다(호출 시 타입 인자와 정확히 같은 타입의 값을 넘겨야 함).
+    procedure EmitOpenGenericCall(aIL: ILGenerator; finst: TGenericFuncInstantiation; args: List<TExprNode>);
+    var baseMB: MethodBuilder; closedTypes: array of System.Type; i: integer; closedMI: MethodInfo;
+    begin
+      if not fMethods.ContainsKey(finst.TemplateName) then
+        raise new Exception('알 수 없는 오픈 제네릭 템플릿 "'+finst.TemplateName+'" (Stage 71)');
+      baseMB:=fMethods[finst.TemplateName];
+      closedTypes:=new System.Type[finst.ArgTypes.Count];
+      for i:=0 to finst.ArgTypes.Count-1 do
+        closedTypes[i]:=VTC(finst.ArgTypes[i], finst.ArgClassNames[i]);
+      closedMI:=baseMB.MakeGenericMethod(closedTypes);
+      EmitArgsCoerced(aIL, args, nil);
+      aIL.Emit(OpCodes.Call, closedMI);
     end;
 
     procedure EmitExpr(aIL: ILGenerator; e: TExprNode);
@@ -1190,14 +1273,22 @@ type
       else if e is TFuncCallExprNode then
       begin
         fc:=TFuncCallExprNode(e);
-        if not fMethods.ContainsKey(fc.FuncName) then
+        if fMethods.ContainsKey(fc.FuncName) then
+        begin
+          mb:=fMethods[fc.FuncName];
+          var _fcParams: array of System.Type;
+          if fTopParamClrTypes.ContainsKey(fc.FuncName) then _fcParams:=fTopParamClrTypes[fc.FuncName]
+          else _fcParams:=nil;
+          EmitArgsCoerced(aIL, fc.Args, _fcParams);
+          aIL.Emit(OpCodes.Call, mb);
+        end
+        // [Stage 71] fMethods에 없다면 단형화되지 않고 진짜 오픈 제네릭으로 남은 템플릿의
+        // 맹글링된 호출일 수 있다 — Parser는 예전과 똑같이 "Identity_integer" 같은 구체
+        // 이름으로 이 노드를 만들어 두므로, fOpenGenericCallMap으로 원본 요청을 되찾는다.
+        else if fOpenGenericCallMap.ContainsKey(fc.FuncName) then
+          EmitOpenGenericCall(aIL, fOpenGenericCallMap[fc.FuncName], fc.Args)
+        else
           raise new Exception('알 수 없는 함수 "'+fc.FuncName+'"');
-        mb:=fMethods[fc.FuncName];
-        var _fcParams: array of System.Type;
-        if fTopParamClrTypes.ContainsKey(fc.FuncName) then _fcParams:=fTopParamClrTypes[fc.FuncName]
-        else _fcParams:=nil;
-        EmitArgsCoerced(aIL, fc.Args, _fcParams);
-        aIL.Emit(OpCodes.Call, mb);
       end
 
       else if e is TBoolLiteralNode then
@@ -1537,6 +1628,17 @@ type
         begin
           EmitExpr(aIL, we.Arg);
           aIL.Emit(OpCodes.Call, typeof(Console).GetMethod('WriteLine',[typeof(int64)]));
+        end
+        // [Stage 71] Writeln(x)에서 x: T(제네릭 매개변수)이면 컴파일 시점에는 실제 타입(정수/문자열/
+        // bool 등 무엇이든)을 알 수 없다 — open generic 메서드 본문은 모든 T에 대해 딱 한 번만
+        // 컴파일되기 때문이다. box는 T가 값 타입이면 실제 박싱을, 참조 타입이면 아무 일도 하지
+        // 않는(no-op) CLR의 특별 규칙이 있어 이 상황에 정확히 들어맞는다 — box한 뒤 WriteLine(object)
+        // 오버로드를 호출하면 어떤 T가 오더라도 항상 올바르게 동작한다.
+        else if et=vtGeneric then
+        begin
+          EmitExpr(aIL, we.Arg);
+          aIL.Emit(OpCodes.Box, GetGenericExprClrType(we.Arg));
+          aIL.Emit(OpCodes.Call, typeof(Console).GetMethod('WriteLine',[typeof(System.Object)]));
         end
         else
         begin
@@ -2186,14 +2288,20 @@ type
       else if s is TProcCallStmtNode then
       begin
         pc:=TProcCallStmtNode(s);
-        if not fMethods.ContainsKey(pc.ProcName) then
+        if fMethods.ContainsKey(pc.ProcName) then
+        begin
+          mb:=fMethods[pc.ProcName];
+          var _pcParams: array of System.Type;
+          if fTopParamClrTypes.ContainsKey(pc.ProcName) then _pcParams:=fTopParamClrTypes[pc.ProcName]
+          else _pcParams:=nil;
+          EmitArgsCoerced(aIL, pc.Args, _pcParams);
+          aIL.Emit(OpCodes.Call, mb);
+        end
+        // [Stage 71] EmitExpr의 TFuncCallExprNode 분기와 동일한 이유 — 오픈 제네릭 프로시저 호출.
+        else if fOpenGenericCallMap.ContainsKey(pc.ProcName) then
+          EmitOpenGenericCall(aIL, fOpenGenericCallMap[pc.ProcName], pc.Args)
+        else
           raise new Exception('알 수 없는 프로시저 "'+pc.ProcName+'"');
-        mb:=fMethods[pc.ProcName];
-        var _pcParams: array of System.Type;
-        if fTopParamClrTypes.ContainsKey(pc.ProcName) then _pcParams:=fTopParamClrTypes[pc.ProcName]
-        else _pcParams:=nil;
-        EmitArgsCoerced(aIL, pc.Args, _pcParams);
-        aIL.Emit(OpCodes.Call, mb);
       end
 
       else if s is TForStmtNode then
@@ -2460,6 +2568,10 @@ type
       else if p.ParamType=vtObject then Result:=VTC(vtObject, p.ClassName)
       else if p.ParamType=vtInterface then Result:=VTC(vtInterface, p.ClassName)
       else if p.ParamType=vtEnum then Result:=VTC(vtEnum, p.ClassName) // [Phase 1]
+      // [Stage 71] vtGeneric일 때 p.ClassName에 타입 매개변수 이름('T' 등)이 들어있다 — 예전에는
+      // 이 분기가 없어 VTC(p.ParamType, '')로 떨어져 그 이름이 통째로 유실됐지만(당시엔 vtGeneric
+      // 매개변수가 CodeGen까지 온 적이 없어 무해했다), true open generic 지원을 위해 명시한다.
+      else if p.ParamType=vtGeneric then Result:=VTC(vtGeneric, p.ClassName)
       else Result:=VTC(p.ParamType, '');
     end;
 
@@ -3913,6 +4025,34 @@ type
     procedure DeclareStaticFunc(tb: TypeBuilder; d: TFuncDeclNode);
     var pt: array of System.Type; i: integer; mb: MethodBuilder; retClrType: System.Type; retCn66: string;
     begin
+      // [Stage 71] true open generic — Monomorphize가 1차 제약을 만족한다고 판단해 단형화하지
+      // 않고 그대로 남겨 둔 제네릭 함수는 실제 CLR 제네릭 메서드(DefineGenericParameters)로
+      // 선언한다. 일반 함수와 달리 매개변수/반환 타입을 먼저 SetParameters/SetReturnType으로
+      // 나중에 지정해야 한다 — GenericTypeParameterBuilder가 DefineGenericParameters 호출
+      // "이후"에만 존재하기 때문에 DefineMethod 시점엔 아직 그 타입들을 만들 수 없다.
+      if d.IsGeneric then
+      begin
+        mb:=tb.DefineMethod(d.Name, MethodAttributes.Public or MethodAttributes.Static);
+        var gpBuilders71:=mb.DefineGenericParameters(d.GenericParamNames.ToArray);
+        var savedSubst71:=fCurGenericSubst;
+        fCurGenericSubst:=new Dictionary<string, System.Type>;
+        for i:=0 to d.GenericParamNames.Count-1 do fCurGenericSubst[d.GenericParamNames[i]]:=gpBuilders71[i];
+
+        pt:=new System.Type[d.Parameters.Count];
+        for i:=0 to d.Parameters.Count-1 do pt[i]:=ResolveTopParamClrType(d.Parameters[i]);
+        // ReturnType=vtGeneric이면 ReturnGenericName이 그 타입 매개변수 이름 — 아니면(제네릭
+        // 함수라도 반환 타입 자체는 구체적일 수 있다, 예: function IsEmpty<T>(x: T): boolean;) 그대로 VTC.
+        if d.ReturnType=vtGeneric then retClrType:=VTC(vtGeneric, d.ReturnGenericName)
+        else retClrType:=VTC(d.ReturnType, '');
+        mb.SetParameters(pt);
+        mb.SetReturnType(retClrType);
+
+        fMethods[d.Name]:=mb; fTopParamClrTypes[d.Name]:=pt; fFuncReturnTypes[d.Name]:=d.ReturnType;
+        fOpenGenericSubstOf[d.Name]:=fCurGenericSubst; // [Stage 71] 빌드 패스가 재사용
+        fCurGenericSubst:=savedSubst71; // 선언(시그니처) 패스는 여기서 끝 — 본문은 BuildStaticFunc가 다시 설정
+        exit; // 1차 제약: 제네릭 함수는 NestedFuncs/NestedProcs를 갖지 않는다(Monomorphize가 걸러줌)
+      end;
+
       pt:=new System.Type[d.Parameters.Count];
       for i:=0 to d.Parameters.Count-1 do pt[i]:=ResolveTopParamClrType(d.Parameters[i]);
       // [Stage 69] sequence of T 함수는 반환 타입이 DeclareIteratorShell이 미리 만들어 둔
@@ -3938,6 +4078,26 @@ type
     procedure DeclareStaticProc(tb: TypeBuilder; d: TProcDeclNode);
     var pt: array of System.Type; i: integer; mb: MethodBuilder;
     begin
+      // [Stage 71] DeclareStaticFunc와 동일한 원리 — 반환 타입만 없다(항상 void).
+      if d.IsGeneric then
+      begin
+        mb:=tb.DefineMethod(d.Name, MethodAttributes.Public or MethodAttributes.Static);
+        var gpBuilders71p:=mb.DefineGenericParameters(d.GenericParamNames.ToArray);
+        var savedSubst71p:=fCurGenericSubst;
+        fCurGenericSubst:=new Dictionary<string, System.Type>;
+        for i:=0 to d.GenericParamNames.Count-1 do fCurGenericSubst[d.GenericParamNames[i]]:=gpBuilders71p[i];
+
+        pt:=new System.Type[d.Parameters.Count];
+        for i:=0 to d.Parameters.Count-1 do pt[i]:=ResolveTopParamClrType(d.Parameters[i]);
+        mb.SetParameters(pt);
+        mb.SetReturnType(typeof(System.Void));
+
+        fMethods[d.Name]:=mb; fTopParamClrTypes[d.Name]:=pt;
+        fOpenGenericSubstOf[d.Name]:=fCurGenericSubst; // [Stage 71]
+        fCurGenericSubst:=savedSubst71p;
+        exit;
+      end;
+
       pt:=new System.Type[d.Parameters.Count];
       for i:=0 to d.Parameters.Count-1 do pt[i]:=ResolveTopParamClrType(d.Parameters[i]);
       mb:=tb.DefineMethod(d.Name, MethodAttributes.Public or MethodAttributes.Static,
@@ -3952,7 +4112,15 @@ type
       pt: array of System.Type; mb: MethodBuilder; il: ILGenerator;
       savedLocalScope: TScope; // [Phase 2]
       svR: LocalBuilder; svRT: TVarType; st: TStmtNode; retClrType: System.Type; i: integer;
+      savedGenSubst71: Dictionary<string, System.Type>; // [Stage 71]
     begin
+      // [Stage 71] 이 함수가 true open generic이면(DeclareStaticFunc가 fOpenGenericSubstOf에
+      // 저장해 둔 치환표가 있으면) 본문을 컴파일하는 동안 fCurGenericSubst를 그 표로 맞춰
+      // 둬야 VTC가 vtGeneric(예: 매개변수 x: T, 지역변수, 반환 타입)을 올바르게 풀 수 있다.
+      savedGenSubst71:=fCurGenericSubst;
+      if d.IsGeneric and fOpenGenericSubstOf.ContainsKey(d.Name) then
+        fCurGenericSubst:=fOpenGenericSubstOf[d.Name];
+
       // [Stage 65b] 시그니처는 DeclareStaticFunc 패스에서 이미 등록되어 있다.
       // 여기서는 등록된 MethodBuilder를 가져와 본문만 방출한다.
       mb:=fMethods[d.Name];
@@ -3973,14 +4141,22 @@ type
         il.Emit(OpCodes.Newobj, fIterCtors[d.Name]);
         il.Emit(OpCodes.Ret);
         BuildIteratorMoveNext(d);
+        fCurGenericSubst:=savedGenSubst71; // [Stage 71]
         exit;
       end;
 
       // [Stage 66] DeclareStaticFunc와 동일한 이유로 연산자 오버로딩 맹글링 함수는
       // 실제 반환 클래스/레코드 타입을 사용한다.
+      // [Stage 71 버그 수정] d.ReturnType=vtGeneric인 경우(예: function Identity<T>(x: T): T)
+      // VTC(vtGeneric, cn)의 cn 자리에는 "타입 매개변수 이름"이 와야 하는데, 이 분기가
+      // retCn66b(연산자 오버로딩용, 대부분 '')를 그대로 넘기고 있었다 — 그러면 VTC가
+      // fCurGenericSubst['']를 찾다 못 찾아 방어적 폴백(System.Object)으로 떨어지고, Result
+      // 로컬이 실제 T가 아니라 object로 선언되어 반환값 처리가 깨진다. DeclareStaticFunc의
+      // 시그니처 계산(위 4017번째 줄 부근)과 동일하게 ReturnGenericName을 넘기도록 맞춘다.
       var retCn66b:='';
       if fOperatorFuncRetClass.ContainsKey(d.Name) then retCn66b:=fOperatorFuncRetClass[d.Name];
-      retClrType:=VTC(d.ReturnType, retCn66b);
+      if d.ReturnType=vtGeneric then retClrType:=VTC(vtGeneric, d.ReturnGenericName)
+      else retClrType:=VTC(d.ReturnType, retCn66b);
       il:=mb.GetILGenerator;
 
       // [Stage 65b] 지역(중첩) 함수/프로시저의 "본문"을 만든다. 시그니처는 이미
@@ -4005,7 +4181,12 @@ type
             fLocalScope.SetClassName(pdef.Name, pdef.ClassName)
           else
             fLocalScope.SetClrType(pdef.Name, pt[i]);
-        end;
+        end
+        // [Stage 71] vtGeneric 매개변수(x: T)도 ClassName에 타입 매개변수 이름('T' 등)을
+        // 기록해 둔다 — GetVarClassName으로 되찾아 fCurGenericSubst[genName]을 다시 조회할
+        // 수 있어야(예: Writeln(x)가 실제 T의 CLR 타입을 알아내 box하는 데) 쓸모가 있다.
+        else if pdef.ParamType=vtGeneric then
+          fLocalScope.SetClassName(pdef.Name, pdef.ClassName);
         if i=0 then il.Emit(OpCodes.Ldarg_0) else if i=1 then il.Emit(OpCodes.Ldarg_1)
         else if i=2 then il.Emit(OpCodes.Ldarg_2) else if i=3 then il.Emit(OpCodes.Ldarg_3)
         else il.Emit(OpCodes.Ldarg_S, byte(i));
@@ -4036,6 +4217,7 @@ type
       foreach st in d.Body.Statements do EmitStatement(il, st);
       il.Emit(OpCodes.Ldloc, fResultLocal); il.Emit(OpCodes.Ret);
       fLocalScope:=savedLocalScope; fResultLocal:=svR; fResultType:=svRT;
+      fCurGenericSubst:=savedGenSubst71; // [Stage 71]
     end;
 
     procedure BuildStaticProc(tb: TypeBuilder; d: TProcDeclNode);
@@ -4043,7 +4225,13 @@ type
       pt: array of System.Type; i: integer; mb: MethodBuilder; il: ILGenerator;
       savedLocalScope: TScope; // [Phase 2]
       svR: LocalBuilder; svRT: TVarType; st: TStmtNode;
+      savedGenSubst71: Dictionary<string, System.Type>; // [Stage 71]
     begin
+      // [Stage 71] BuildStaticFunc와 동일한 원리 — 자세한 설명은 그쪽 주석 참고.
+      savedGenSubst71:=fCurGenericSubst;
+      if d.IsGeneric and fOpenGenericSubstOf.ContainsKey(d.Name) then
+        fCurGenericSubst:=fOpenGenericSubstOf[d.Name];
+
       // [Stage 65b] 시그니처는 DeclareStaticProc 패스에서 이미 등록되어 있다.
       mb:=fMethods[d.Name];
       pt:=fTopParamClrTypes[d.Name];
@@ -4067,7 +4255,10 @@ type
             fLocalScope.SetClassName(pdef.Name, pdef.ClassName)
           else
             fLocalScope.SetClrType(pdef.Name, pt[i]);
-        end;
+        end
+        // [Stage 71] BuildStaticFunc와 동일한 이유 — vtGeneric 매개변수도 타입 매개변수 이름을 기록.
+        else if pdef.ParamType=vtGeneric then
+          fLocalScope.SetClassName(pdef.Name, pdef.ClassName);
         if i=0 then il.Emit(OpCodes.Ldarg_0) else if i=1 then il.Emit(OpCodes.Ldarg_1)
         else if i=2 then il.Emit(OpCodes.Ldarg_2) else if i=3 then il.Emit(OpCodes.Ldarg_3)
         else il.Emit(OpCodes.Ldarg_S, byte(i));
@@ -4099,6 +4290,7 @@ type
       foreach st in d.Body.Statements do EmitStatement(il, st);
       il.Emit(OpCodes.Ret);
       fLocalScope:=savedLocalScope; fResultLocal:=svR; fResultType:=svRT;
+      fCurGenericSubst:=savedGenSubst71; // [Stage 71]
     end;
 
   public
@@ -4110,6 +4302,13 @@ type
       fLocalScope:=new TScope('local', fGlobalScope);
       fMethods:=new Dictionary<string, MethodBuilder>;
       fTopParamClrTypes:=new Dictionary<string, array of System.Type>;
+      // [Stage 71] true open generic 호출 매핑 — Monomorphize가 단형화하지 않고 그대로 남겨 둔
+      // 제네릭 템플릿의 인스턴스화 요청들을 맹글링된 이름으로 색인해 둔다(자세한 설명은 필드 선언부 참고).
+      fCurGenericSubst:=nil;
+      fOpenGenericSubstOf:=new Dictionary<string, Dictionary<string, System.Type>>;
+      fOpenGenericCallMap:=new Dictionary<string, TGenericFuncInstantiation>;
+      foreach var finst71 in fProg.GenericFuncInstantiations do
+        fOpenGenericCallMap[finst71.ConcreteName]:=finst71;
       fFuncReturnTypes:=new Dictionary<string, TVarType>;
       fTypeBuilders:=new Dictionary<string, TypeBuilder>;
       fBuiltTypes:=new Dictionary<string, System.Type>;

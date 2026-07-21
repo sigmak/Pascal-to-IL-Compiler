@@ -57,6 +57,15 @@ type
     function BuildConcreteFunc(inst: TGenericFuncInstantiation; tmpl: TFuncDeclNode): TFuncDeclNode;
     function BuildConcreteProc(inst: TGenericFuncInstantiation; tmpl: TProcDeclNode): TProcDeclNode;
 
+    // [Stage 71] true open generic 자격 판정. 1차 제약: (a) 타입 매개변수 전부 제약조건 없음
+    // (제약이 있으면 CLR 제네릭 제약(GenericParameterAttributes/SetInterfaceConstraints 등)까지
+    // 추가로 다뤄야 해서 이번 단계 범위 밖), (b) "array of T"(vtGenericArray) 매개변수/반환 없음
+    // (배열 원소가 열린 타입 매개변수인 CLR 배열 타입 처리는 별도 작업), (c) 중첩 함수/프로시저 없음
+    // (Stage 65의 지역 서브프로그램은 이름 맹글링 전제가 open generic 본문과 아직 안 맞음).
+    // 셋 중 하나라도 걸리면 false → Run이 예전처럼 인스턴스화마다 단형화(복제)한다.
+    function IsFuncOpenGenericEligible(tmpl: TFuncDeclNode): boolean;
+    function IsProcOpenGenericEligible(tmpl: TProcDeclNode): boolean;
+
   public
     constructor Create(aProg: TProgramNode);
 
@@ -325,6 +334,34 @@ begin
   Result:=pr;
 end;
 
+// [Stage 71] 함수 템플릿 하나가 true open generic으로 남을 자격이 있는지 판정.
+// 클래스 선언부 주석(위쪽)에 판정 기준 설명 있음 — 여기서는 그대로 검사만 한다.
+function TMonomorphizer.IsFuncOpenGenericEligible(tmpl: TFuncDeclNode): boolean;
+var i: integer;
+begin
+  Result:=false;
+  for i:=0 to tmpl.GenericParamConstraints.Count-1 do
+    if tmpl.GenericParamConstraints[i]<>'' then exit;
+  foreach var p71 in tmpl.Parameters do
+    if p71.ParamType=vtGenericArray then exit;
+  if tmpl.ReturnType=vtGenericArray then exit;
+  if (tmpl.NestedFuncs.Count>0) or (tmpl.NestedProcs.Count>0) then exit;
+  Result:=true;
+end;
+
+// [Stage 71] 프로시저 버전 — 반환 타입이 없다는 점만 다르다.
+function TMonomorphizer.IsProcOpenGenericEligible(tmpl: TProcDeclNode): boolean;
+var i: integer;
+begin
+  Result:=false;
+  for i:=0 to tmpl.GenericParamConstraints.Count-1 do
+    if tmpl.GenericParamConstraints[i]<>'' then exit;
+  foreach var p71 in tmpl.Parameters do
+    if p71.ParamType=vtGenericArray then exit;
+  if (tmpl.NestedFuncs.Count>0) or (tmpl.NestedProcs.Count>0) then exit;
+  Result:=true;
+end;
+
 procedure TMonomorphizer.Run;
 var processed: List<string>; keptClasses: List<TClassDeclNode>; keptImpls: List<TMethodImplNode>;
     processedFuncs: List<string>; keptFuncs: List<TFuncDeclNode>; keptProcs: List<TProcDeclNode>;
@@ -395,26 +432,38 @@ begin
         begin
           if not fProcTemplates.ContainsKey(finst.TemplateName) then
             raise new Exception('단형화 실패: 알 수 없는 제네릭 프로시저 "'+finst.TemplateName+'"');
-          fProg.ProcDecls.Add(BuildConcreteProc(finst, fProcTemplates[finst.TemplateName]));
+          // [Stage 71] "1차 제약을 만족하는"(제약조건 없음, array of T 없음, 중첩 서브프로그램 없음)
+          // 템플릿은 더 이상 인스턴스화마다 복제하지 않는다 — CodeGen이 실제 CLR open generic
+          // 메서드 하나로 컴파일하고, 이 호출은 fProg.GenericFuncInstantiations에 남은 요청
+          // 레코드를 통해 직접 MakeGenericMethod로 처리한다(자세한 설명은 CodeGen.pas의
+          // EmitOpenGenericCall/fOpenGenericCallMap 참고). 부적격 템플릿은 예전 그대로 복제.
+          if not IsProcOpenGenericEligible(fProcTemplates[finst.TemplateName]) then
+            fProg.ProcDecls.Add(BuildConcreteProc(finst, fProcTemplates[finst.TemplateName]));
         end
         else
         begin
           if not fFuncTemplates.ContainsKey(finst.TemplateName) then
             raise new Exception('단형화 실패: 알 수 없는 제네릭 함수 "'+finst.TemplateName+'"');
-          fProg.FuncDecls.Add(BuildConcreteFunc(finst, fFuncTemplates[finst.TemplateName]));
+          if not IsFuncOpenGenericEligible(fFuncTemplates[finst.TemplateName]) then
+            fProg.FuncDecls.Add(BuildConcreteFunc(finst, fFuncTemplates[finst.TemplateName]));
         end;
       end;
     end;
 
-    // CodeGen이 이해할 수 없는 원본 제네릭 함수/프로시저 템플릿을 제거
+    // CodeGen이 이해할 수 없는 원본 제네릭 함수/프로시저 템플릿을 제거한다 — 단, [Stage 71]
+    // true open generic 자격이 있는 템플릿은 CodeGen이 직접 컴파일해야 하므로 그대로 남긴다
+    // (IsGeneric=true인 채로 fProg에 남아 있으면 CodeGen의 평범한 선언/빌드 패스가 알아서
+    // "제네릭이면 open generic 메서드로" 분기해 처리한다).
     keptFuncs:=new List<TFuncDeclNode>;
     foreach var fd2 in fProg.FuncDecls do
-      if not fFuncTemplates.ContainsKey(fd2.Name) then keptFuncs.Add(fd2);
+      if (not fFuncTemplates.ContainsKey(fd2.Name)) or IsFuncOpenGenericEligible(fFuncTemplates[fd2.Name]) then
+        keptFuncs.Add(fd2);
     fProg.FuncDecls:=keptFuncs;
 
     keptProcs:=new List<TProcDeclNode>;
     foreach var pd2 in fProg.ProcDecls do
-      if not fProcTemplates.ContainsKey(pd2.Name) then keptProcs.Add(pd2);
+      if (not fProcTemplates.ContainsKey(pd2.Name)) or IsProcOpenGenericEligible(fProcTemplates[pd2.Name]) then
+        keptProcs.Add(pd2);
     fProg.ProcDecls:=keptProcs;
   end;
 end;
