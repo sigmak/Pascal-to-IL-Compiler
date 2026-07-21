@@ -301,38 +301,46 @@ type
         else if ch='#' then toks.Add(ReadCharCode) // [Phase 1] #65 형태 문자 리터럴
         else if ch=#39 then
         begin
-          // [Phase 1] 단일 문자 리터럴 'A'와 문자열 리터럴 'hello'를 구분한다.
-          // 따옴표 사이 내용이 정확히 1글자이고 닫히면 tkCharLiteral, 그 외에는 tkString.
+          // [버그 수정] 예전에는 여는 따옴표 바로 다음이 닫는 따옴표면 무조건 "빈 문자열"로
+          // 처리했다 — 그런데 표준 Pascal에서 문자열 안의 ''는 리터럴 따옴표 한 글자를
+          // 뜻한다(예: 'it''s' = it's). 그 구분(빈 문자열 vs 이스케이프된 따옴표)은 문맥
+          // 없이는 앞글자만 봐서 알 수 없으므로, 전체를 한 번에 스캔하는 통일된 방식으로
+          // 다시 짰다: '가 나오면 다음 글자를 봐서 또 '면 이스케이프(따옴표 한 글자를 담고
+          // 계속), 아니면 진짜 닫는 따옴표. 다 읽은 뒤 담긴 글자 수가 정확히 1개면
+          // 문자 리터럴(예: 'A'), 그 외(0개 또는 2개 이상)면 문자열 리터럴로 판정한다 —
+          // 판정 기준 자체는 예전과 같고, 이스케이프 처리만 새로 생겼다.
           var _csl:=fLine; var _csc:=fCol;
           Adv; // 여는 따옴표 소비
-          if (CC<>#39) and (CC<>#0) then
+          var _sb2:=new System.Text.StringBuilder;
+          var _qcnt:=0; var _qlast:=#0;
+          while true do
           begin
-            var _ch:=CC; Adv;
+            if CC=#0 then
+              raise new Exception('줄 '+_csl.ToString+', 열 '+_csc.ToString+': 문자열 닫히지 않음');
             if CC=#39 then
             begin
-              // 'X' — 단일 문자 리터럴
-              Adv; // 닫는 따옴표
-              var _ct:=new TToken(tkCharLiteral, #39+_ch+#39, _csl, _csc);
-              _ct.CharValue:=_ch;
-              toks.Add(_ct);
+              Adv; // 따옴표 하나 소비
+              if CC=#39 then
+              begin
+                // '' — 이스케이프된 따옴표 한 글자
+                _sb2.Append(#39); _qcnt:=_qcnt+1; _qlast:=#39; Adv;
+              end
+              else
+                break; // 진짜 닫는 따옴표
             end
             else
             begin
-              // 두 글자 이상 → 문자열 리터럴로 처리. 이미 첫 글자를 소비했으므로 나머지를 읽는다.
-              var _sb2:=new System.Text.StringBuilder;
-              _sb2.Append(_ch);
-              while (CC<>#39) and (CC<>#0) do begin _sb2.Append(CC); Adv; end;
-              if CC=#39 then Adv
-              else raise new Exception('줄 '+_csl.ToString+', 열 '+_csc.ToString+': 문자열 닫히지 않음');
-              toks.Add(new TToken(tkString, _sb2.ToString, _csl, _csc));
+              _sb2.Append(CC); _qcnt:=_qcnt+1; _qlast:=CC; Adv;
             end;
+          end;
+          if _qcnt=1 then
+          begin
+            var _ct:=new TToken(tkCharLiteral, #39+_qlast+#39, _csl, _csc);
+            _ct.CharValue:=_qlast;
+            toks.Add(_ct);
           end
           else
-          begin
-            // '' — 빈 문자열
-            if CC=#39 then Adv;
-            toks.Add(new TToken(tkString, '', _csl, _csc));
-          end;
+            toks.Add(new TToken(tkString, _sb2.ToString, _csl, _csc));
         end
         else if ch=';' then begin toks.Add(new TToken(tkSemicolon,';',fLine,sc)); Adv; end
         else if ch=',' then begin toks.Add(new TToken(tkComma,',',fLine,sc)); Adv; end

@@ -198,6 +198,16 @@ type
     constructor Create(e: TExprNode); begin Expr:=e; end;
   end;
 
+  // [Stage 72] PABCSystem 표준 라이브러리 함수 호출(Abs/Sqrt/UpperCase/Copy/StrToInt/... 등).
+  // Stage 70의 TSeqExtCallExprNode와 같은 원칙 — 노드 하나 + 이름으로 CodeGen에서 분기하는
+  // 방식이라, 나중에 함수를 더 추가할 때 AST/Parser는 그대로 두고 CodeGen 쪽 분기만 늘리면 된다.
+  // Name은 항상 정규화된 표준 표기(예: 'UpperCase')로 저장한다 — Pascal은 대소문자를 구분하지
+  // 않으므로 소스에 'uppercase'/'UPPERCASE'라고 써도 여기서는 늘 같은 문자열이 된다.
+  TBuiltinCallExprNode = class(TExprNode)
+  public Name: string; Args: List<TExprNode>;
+    constructor Create(n: string); begin Name:=n; Args:=new List<TExprNode>; end;
+  end;
+
   TFuncCallExprNode = class(TExprNode)
   public FuncName: string; Args: List<TExprNode>;
     constructor Create(n: string); begin FuncName:=n; Args:=new List<TExprNode>; end;

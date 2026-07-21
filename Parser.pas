@@ -117,6 +117,34 @@ type
     // 담을 수 없는 "어느 타입 매개변수였는지" 이름을 넘겨주는 보조 채널. 호출 직후 곧바로 읽어야 한다.
     fLastGenericName: string;
 
+    // [Stage 72] PABCSystem 표준 라이브러리 함수 이름 화이트리스트. Pascal은 대소문자를
+    // 구분하지 않으므로 소스의 표기(대문자든 소문자든)와 무관하게 항상 이 표의 정규화된
+    // 표기를 돌려준다 — 화이트리스트에 없는 이름이면 빈 문자열('')을 돌려주고, 호출부는
+    // 그 경우 기존 경로(사용자 정의 함수/변수 등)로 계속 진행한다.
+    function NormalizeBuiltinFuncName(text: string): string;
+    var lw: string;
+    begin
+      lw:=text.ToLower;
+      if lw='abs' then Result:='Abs'
+      else if lw='sqr' then Result:='Sqr'
+      else if lw='sqrt' then Result:='Sqrt'
+      else if lw='round' then Result:='Round'
+      else if lw='trunc' then Result:='Trunc'
+      else if lw='random' then Result:='Random'
+      else if lw='uppercase' then Result:='UpperCase'
+      else if lw='lowercase' then Result:='LowerCase'
+      else if lw='trim' then Result:='Trim'
+      else if lw='copy' then Result:='Copy'
+      else if lw='pos' then Result:='Pos'
+      else if lw='strtoint' then Result:='StrToInt'
+      else if lw='strtofloat' then Result:='StrToFloat'
+      else if lw='floattostr' then Result:='FloatToStr'
+      else if lw='ord' then Result:='Ord'
+      else if lw='chr' then Result:='Chr'
+      else if lw='readln' then Result:='ReadLn'
+      else Result:='';
+    end;
+
     function Cur: TToken; begin Result:=fTokens[fPos]; end;
 
     // [Stage 70] LINQ 스타일 확장 메서드 체이닝(Source.Where(...).Select(...) 등) 인식을 위해
@@ -535,7 +563,19 @@ type
     begin
       t:=Cur;
 
-      if t.Kind=tkIntLiteral then
+      // [버그 수정] 단항 마이너스(-x). 예전에는 이 분기 자체가 없어서 i := -7; 처럼 식
+      // 맨 앞에 오는 '-'는 무조건 "식이 와야 하는데 -" 파싱 에러였다(이항 뺄셈은
+      // ParseAddSub에 있었지만, 단항으로 쓰는 경우는 아무도 처리하지 않았음). 0-피연산자로
+      // 접어(fold) 기존 TBinOpNode(boSub)를 그대로 재사용한다 — integer/real 승격 등
+      // 기존 이항 뺄셈의 타입 처리 전부를 공짜로 물려받는다. 가장 강하게 묶이도록(즉
+      // -x*y가 (-x)*y가 되도록) 피연산자는 재귀적으로 ParsePrimary 하나만 소비한다.
+      if t.Kind=tkMinus then
+      begin
+        fPos:=fPos+1; // '-' 소비
+        Result:=new TBinOpNode(boSub, new TIntLiteralNode(0), ParsePrimary);
+      end
+
+      else if t.Kind=tkIntLiteral then
       begin
         fPos:=fPos+1;
         // [Phase 1] int32 범위(2^31-1 = 2147483647) 초과 시 int64로 자동 승격
@@ -889,6 +929,24 @@ type
           Result:=new TLengthExprNode(ntL.Text);
         end
 
+        // [Stage 72] PABCSystem 표준 라이브러리 함수(Abs/Sqrt/UpperCase/Copy/StrToInt/... 등).
+        // fFuncNames(사용자 정의 함수)에 없을 때만 반응하므로, 혹시 사용자가 같은 이름으로
+        // 직접 함수를 정의했다면(위의 "일반 함수 호출" 분기가 먼저 걸려) 그쪽이 우선한다.
+        // 인자 개수는 여기서 검증하지 않고(0개부터 몇 개든 그대로 받아 둔다) CodeGen이
+        // EmitBuiltinCall에서 함수별로 정확한 개수를 검사해 에러 메시지를 낸다.
+        else if (Cur.Kind=tkLParen) and (NormalizeBuiltinFuncName(t.Text)<>'') and (not fFuncNames.Contains(t.Text)) then
+        begin
+          var bcn:=new TBuiltinCallExprNode(NormalizeBuiltinFuncName(t.Text));
+          fPos:=fPos+1; // '(' 소비
+          if Cur.Kind<>tkRParen then
+          begin
+            bcn.Args.Add(ParseAddSub);
+            while Cur.Kind=tkComma do begin fPos:=fPos+1; bcn.Args.Add(ParseAddSub); end;
+          end;
+          Expect(tkRParen);
+          Result:=bcn;
+        end
+
         else
         begin
           // 메서드 본문 안에서의 식별자 읽기: 매개변수 이름이면 지역 변수 참조,
@@ -907,7 +965,11 @@ type
 
       else if t.Kind=tkLParen then
       begin
-        fPos:=fPos+1; inner:=ParseAddSub; Expect(tkRParen); Result:=inner;
+        // [버그 수정] 예전엔 괄호 안을 ParseAddSub로만 파싱해서 (n >= 0) 같은 괄호로 묶인
+        // 비교식이 "예상 tkRParen 실제 tkGe" 에러가 났다(비교 연산자는 ParseExpr에만 있고
+        // ParseAddSub까지는 안 내려옴). ParseExpr는 ParseAddSub의 상위 호환(비교 연산자가
+        // 없으면 결과가 완전히 같음)이라 안전하게 바꿀 수 있다.
+        fPos:=fPos+1; inner:=ParseExpr; Expect(tkRParen); Result:=inner;
       end
 
       else

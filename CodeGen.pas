@@ -649,6 +649,13 @@ type
         else if (InferType(b.Left)=vtSet) or (InferType(b.Right)=vtSet) then Result:=vtSet
         else if (InferType(b.Left)=vtString) or (InferType(b.Right)=vtString) then
           Result:=vtString
+        // [버그 수정] 예전엔 이 분기가 없어서 real/int64가 섞인 이항연산(예: -3.7, 1.5+2)이
+        // 전부 vtInteger로 잘못 추론됐다 — 실제 IL 생성(EmitExpr의 isReal 승격 로직, 이 파일
+        // 위쪽)은 이미 올바르게 real로 처리하고 있었으니 InferType만 뒤처져 있던 것.
+        // Writeln(-3.7)처럼 InferType 결과로 어떤 WriteLine 오버로드를 호출할지 고르는
+        // 자리에서 int32 오버로드가 선택되어 스택의 double 값과 어긋나 런타임에 깨졌다.
+        else if (InferType(b.Left)=vtReal) or (InferType(b.Right)=vtReal) then Result:=vtReal
+        else if (InferType(b.Left)=vtInt64) or (InferType(b.Right)=vtInt64) then Result:=vtInt64
         else Result:=vtInteger;
       end
       else if e is TSelfExprNode then Result:=vtObject // [Stage 30]
@@ -680,6 +687,28 @@ type
           if _elemT70=vtString then Result:=vtStrArray else Result:=vtIntArray;
         end
         else Result:=vtObject; // Where/Select 중간 결과
+      end
+      // [Stage 72] PABCSystem 표준 라이브러리 함수 호출의 결과 타입.
+      else if e is TBuiltinCallExprNode then
+      begin
+        var _bc72:=TBuiltinCallExprNode(e);
+        if (_bc72.Name='Abs') or (_bc72.Name='Sqr') then
+        begin
+          if _bc72.Args.Count>0 then Result:=InferType(_bc72.Args[0]) else Result:=vtInteger;
+        end
+        else if (_bc72.Name='Sqrt') or (_bc72.Name='StrToFloat') then Result:=vtReal
+        else if (_bc72.Name='Round') or (_bc72.Name='Trunc') or (_bc72.Name='StrToInt') or (_bc72.Name='Ord') then
+          Result:=vtInteger
+        else if _bc72.Name='Random' then
+        begin
+          if _bc72.Args.Count=0 then Result:=vtReal else Result:=vtInteger;
+        end
+        else if (_bc72.Name='UpperCase') or (_bc72.Name='LowerCase') or (_bc72.Name='Trim')
+                or (_bc72.Name='Copy') or (_bc72.Name='FloatToStr') or (_bc72.Name='ReadLn') then
+          Result:=vtString
+        else if _bc72.Name='Pos' then Result:=vtInteger
+        else if _bc72.Name='Chr' then Result:=vtChar
+        else Result:=vtInteger; // 방어적 폴백(정상 경로면 도달하지 않음)
       end
       else Result:=vtInteger;
     end;
@@ -1252,7 +1281,12 @@ type
           else if b.Op=boSub then aIL.Emit(OpCodes.Sub)
           else if b.Op=boMul then aIL.Emit(OpCodes.Mul)
           else if b.Op=boDiv then aIL.Emit(OpCodes.Div)
-          else if b.Op=boMod then aIL.Emit(OpCodes.Rem);
+          else if b.Op=boMod then aIL.Emit(OpCodes.Rem)
+          // [Stage 72 버그수정] boAnd/boOr(논리 and/or)가 여기서 하나도 매칭되지 않아
+          // Left/Right를 스택에 push만 해두고 아무 명령도 방출하지 않던 버그.
+          // Pascal boolean은 0/1(int32)로 표현되므로 비트 And/Or가 논리 And/Or와 동치이다.
+          else if b.Op=boAnd then aIL.Emit(OpCodes.And)
+          else if b.Op=boOr then aIL.Emit(OpCodes.Or);
         end;
       end
 
@@ -1364,6 +1398,9 @@ type
 
       else if e is TSeqExtCallExprNode then // [Stage 70]
         EmitSeqExtCall(aIL, TSeqExtCallExprNode(e))
+
+      else if e is TBuiltinCallExprNode then // [Stage 72]
+        EmitBuiltinCall(aIL, TBuiltinCallExprNode(e))
 
       else raise new Exception('알 수 없는 식 노드: '+e.GetType.Name);
     end;
@@ -1557,6 +1594,166 @@ type
 
       else
         raise new Exception('알 수 없는 시퀀스 확장 메서드 "'+node.MethodName+'" (Stage 70)');
+    end;
+
+    // [Stage 72] PABCSystem 표준 라이브러리 함수 하나(Abs/Sqrt/UpperCase/Copy/StrToInt/...)를
+    // 실제로 컴파일한다. 함수마다 인자 개수를 직접 검사해 맞지 않으면 바로 에러를 낸다.
+    procedure EmitBuiltinCall(aIL: ILGenerator; node: TBuiltinCallExprNode);
+    var argT: TVarType; mi: MethodInfo; randCtor: ConstructorInfo;
+    begin
+      if node.Name='Abs' then
+      begin
+        if node.Args.Count<>1 then raise new Exception('Abs()는 인자가 1개 필요합니다 (Stage 72)');
+        argT:=InferType(node.Args[0]);
+        EmitExpr(aIL, node.Args[0]);
+        if argT=vtReal then mi:=typeof(System.Math).GetMethod('Abs', [typeof(double)])
+        else if argT=vtInt64 then mi:=typeof(System.Math).GetMethod('Abs', [typeof(int64)])
+        else mi:=typeof(System.Math).GetMethod('Abs', [typeof(integer)]);
+        aIL.Emit(OpCodes.Call, mi);
+      end
+
+      else if node.Name='Sqr' then
+      begin
+        // System.Math에는 Sqr가 없다 — x*x는 어떤 수치 타입에서도 Dup+Mul로 충분하다.
+        if node.Args.Count<>1 then raise new Exception('Sqr()는 인자가 1개 필요합니다 (Stage 72)');
+        EmitExpr(aIL, node.Args[0]);
+        aIL.Emit(OpCodes.Dup);
+        aIL.Emit(OpCodes.Mul);
+      end
+
+      else if node.Name='Sqrt' then
+      begin
+        if node.Args.Count<>1 then raise new Exception('Sqrt()는 인자가 1개 필요합니다 (Stage 72)');
+        argT:=InferType(node.Args[0]);
+        EmitExpr(aIL, node.Args[0]);
+        if argT<>vtReal then aIL.Emit(OpCodes.Conv_R8); // integer/int64 → double로 승격
+        aIL.Emit(OpCodes.Call, typeof(System.Math).GetMethod('Sqrt', [typeof(double)]));
+      end
+
+      else if node.Name='Round' then
+      begin
+        // Convert.ToInt32(double)는 가장 가까운 정수로 반올림한다(동률이면 짝수 쪽 — 은행가
+        // 반올림). integer 인자는 반올림할 게 없으므로 그대로 통과시킨다.
+        if node.Args.Count<>1 then raise new Exception('Round()는 인자가 1개 필요합니다 (Stage 72)');
+        argT:=InferType(node.Args[0]);
+        EmitExpr(aIL, node.Args[0]);
+        if argT=vtReal then aIL.Emit(OpCodes.Call, typeof(System.Convert).GetMethod('ToInt32', [typeof(double)]));
+      end
+
+      else if node.Name='Trunc' then
+      begin
+        // conv.i4는 0을 향해 자르므로(음수도 마찬가지) Pascal Trunc와 정확히 같다.
+        if node.Args.Count<>1 then raise new Exception('Trunc()는 인자가 1개 필요합니다 (Stage 72)');
+        argT:=InferType(node.Args[0]);
+        EmitExpr(aIL, node.Args[0]);
+        if argT=vtReal then aIL.Emit(OpCodes.Conv_I4);
+      end
+
+      else if node.Name='Random' then
+      begin
+        // [1차 제약] 호출마다 새 System.Random 인스턴스를 만든다(공유 시드 필드를 두지
+        // 않음) — 최신 .NET에서는 인스턴스 시드가 시각뿐 아니라 GUID 기반 엔트로피도
+        // 섞이므로 짧은 시간에 여러 번 불러도 실제로 문제되는 경우는 드물다.
+        randCtor:=typeof(System.Random).GetConstructor(System.Type.EmptyTypes);
+        if node.Args.Count=0 then
+        begin
+          aIL.Emit(OpCodes.Newobj, randCtor);
+          aIL.Emit(OpCodes.Callvirt, typeof(System.Random).GetMethod('NextDouble', System.Type.EmptyTypes));
+        end
+        else
+        begin
+          if node.Args.Count<>1 then raise new Exception('Random()는 인자가 0개 또는 1개여야 합니다 (Stage 72)');
+          aIL.Emit(OpCodes.Newobj, randCtor);
+          EmitExpr(aIL, node.Args[0]);
+          aIL.Emit(OpCodes.Callvirt, typeof(System.Random).GetMethod('Next', [typeof(integer)]));
+        end;
+      end
+
+      else if node.Name='UpperCase' then
+      begin
+        if node.Args.Count<>1 then raise new Exception('UpperCase()는 인자가 1개 필요합니다 (Stage 72)');
+        EmitExpr(aIL, node.Args[0]);
+        aIL.Emit(OpCodes.Callvirt, typeof(string).GetMethod('ToUpper', System.Type.EmptyTypes));
+      end
+
+      else if node.Name='LowerCase' then
+      begin
+        if node.Args.Count<>1 then raise new Exception('LowerCase()는 인자가 1개 필요합니다 (Stage 72)');
+        EmitExpr(aIL, node.Args[0]);
+        aIL.Emit(OpCodes.Callvirt, typeof(string).GetMethod('ToLower', System.Type.EmptyTypes));
+      end
+
+      else if node.Name='Trim' then
+      begin
+        if node.Args.Count<>1 then raise new Exception('Trim()는 인자가 1개 필요합니다 (Stage 72)');
+        EmitExpr(aIL, node.Args[0]);
+        aIL.Emit(OpCodes.Callvirt, typeof(string).GetMethod('Trim', System.Type.EmptyTypes));
+      end
+
+      else if node.Name='Copy' then
+      begin
+        // Pascal Copy(s, index, count) — index는 1부터. .NET Substring(startIndex, length)는
+        // 0부터이므로 index에서 1을 뺀다.
+        if node.Args.Count<>3 then raise new Exception('Copy()는 인자가 3개(s, index, count) 필요합니다 (Stage 72)');
+        EmitExpr(aIL, node.Args[0]);
+        EmitExpr(aIL, node.Args[1]);
+        aIL.Emit(OpCodes.Ldc_I4_1);
+        aIL.Emit(OpCodes.Sub);
+        EmitExpr(aIL, node.Args[2]);
+        aIL.Emit(OpCodes.Callvirt, typeof(string).GetMethod('Substring', [typeof(integer), typeof(integer)]));
+      end
+
+      else if node.Name='Pos' then
+      begin
+        // Pascal Pos(sub, s) — 1부터 시작하는 위치, 못 찾으면 0.
+        // .NET s.IndexOf(sub)는 0부터, 못 찾으면 -1 — 결과에 1을 더하면 두 경우 모두 맞는다
+        // (찾음: 0-based k → k+1. 못 찾음: -1 → 0).
+        if node.Args.Count<>2 then raise new Exception('Pos()는 인자가 2개(부분 문자열, 대상 문자열) 필요합니다 (Stage 72)');
+        EmitExpr(aIL, node.Args[1]); // s
+        EmitExpr(aIL, node.Args[0]); // sub
+        aIL.Emit(OpCodes.Callvirt, typeof(string).GetMethod('IndexOf', [typeof(string)]));
+        aIL.Emit(OpCodes.Ldc_I4_1);
+        aIL.Emit(OpCodes.Add);
+      end
+
+      else if node.Name='StrToInt' then
+      begin
+        if node.Args.Count<>1 then raise new Exception('StrToInt()는 인자가 1개 필요합니다 (Stage 72)');
+        EmitExpr(aIL, node.Args[0]);
+        aIL.Emit(OpCodes.Call, typeof(System.Convert).GetMethod('ToInt32', [typeof(string)]));
+      end
+
+      else if node.Name='StrToFloat' then
+      begin
+        if node.Args.Count<>1 then raise new Exception('StrToFloat()는 인자가 1개 필요합니다 (Stage 72)');
+        EmitExpr(aIL, node.Args[0]);
+        aIL.Emit(OpCodes.Call, typeof(System.Convert).GetMethod('ToDouble', [typeof(string)]));
+      end
+
+      else if node.Name='FloatToStr' then
+      begin
+        if node.Args.Count<>1 then raise new Exception('FloatToStr()는 인자가 1개 필요합니다 (Stage 72)');
+        EmitExpr(aIL, node.Args[0]);
+        aIL.Emit(OpCodes.Call, typeof(System.Convert).GetMethod('ToString', [typeof(double)]));
+      end
+
+      else if (node.Name='Ord') or (node.Name='Chr') then
+      begin
+        // [Stage 72] char는 이 컴파일러에서(그리고 CIL 실행 스택 자체에서도) int32와 호환되는
+        // 표현을 쓴다 — Ord(char→integer)/Chr(integer→char) 둘 다 변환 명령이 필요 없고,
+        // 값을 그대로 로드하기만 하면 목표 타입(정수/문자) 자리에 맞게 들어간다.
+        if node.Args.Count<>1 then raise new Exception(node.Name+'()는 인자가 1개 필요합니다 (Stage 72)');
+        EmitExpr(aIL, node.Args[0]);
+      end
+
+      else if node.Name='ReadLn' then
+      begin
+        if node.Args.Count<>0 then raise new Exception('ReadLn()는 인자 없이 써야 합니다 (Stage 72, 1차 제약: 변수로 직접 읽어들이는 형태는 아직 미지원)');
+        aIL.Emit(OpCodes.Call, typeof(System.Console).GetMethod('ReadLine', System.Type.EmptyTypes));
+      end
+
+      else
+        raise new Exception('알 수 없는 표준 라이브러리 함수 "'+node.Name+'" (Stage 72)');
     end;
 
     // [Stage 60] break/continue 공용 헬퍼. isBreak=true면 가장 안쪽 루프의 탈출 라벨로,
