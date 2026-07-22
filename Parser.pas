@@ -894,6 +894,16 @@ type
               Result:=mc4;
             end;
           end
+          // [Stage 75] obj.GetType.FullName / obj.GetType.Name — 3단계 체인이지만 첫 세그먼트는
+          // 변수(예: except 블록의 ex)이지 외부 타입 이름이 아니다. 아래 일반 정적-경로 분기보다
+          // 먼저 검사해야 "ex.GetType"을 존재하지 않는 타입으로 착각해 ResolveExternalType이
+          // 실패하는 것을 막는다.
+          else if (segs2.Count=3) and (segs2[1].ToLower='gettype')
+                  and ((segs2[2].ToLower='fullname') or (segs2[2].ToLower='name')) then
+          begin
+            Result:=new TRuntimeTypeNameExprNode(segs2[0], segs2[2].ToLower='fullname');
+          end
+
           else if segs2.Count>2 then
           begin
             // 괄호 없이 3단계 이상 점(.)으로 연결된 경우 = 정적 필드/속성 읽기
@@ -1250,6 +1260,23 @@ type
         if rhs is TStrLiteralNode then
           Result:=new TWritelnStringStmtNode(TStrLiteralNode(rhs).Value)
         else Result:=new TWritelnExprStmtNode(rhs);
+      end
+
+      // [Stage 75] Readln; 또는 Readln(변수);
+      // 렉서는 식별자 대소문자를 정규화하지 않고 원문 그대로 보존하므로(Writeln 등
+      // 진짜 예약어와 달리 Readln은 tkIdent로 들어온다), .ToLower로 비교해야 한다.
+      else if (Cur.Kind=tkIdent) and (Cur.Text.ToLower='readln') then
+      begin
+        fPos:=fPos+1;
+        if Cur.Kind=tkLParen then
+        begin
+          fPos:=fPos+1;
+          rhs:=ParseExpr; // 대입 대상 변수 식
+          Expect(tkRParen);
+          Result:=new TReadlnStmtNode(rhs);
+        end
+        else
+          Result:=new TReadlnStmtNode(nil); // 인자 없음 — Enter 대기
       end
 
       else if Cur.Kind=tkResult then

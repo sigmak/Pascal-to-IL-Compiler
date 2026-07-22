@@ -254,6 +254,13 @@ type
     constructor Create(t: string); begin Text:=t; end;
   end;
 
+  // [Stage 75] Readln; 또는 Readln(변수); — 콘솔에서 한 줄 입력을 기다린다.
+  // Arg=nil이면 인자 없는 Readln; (Enter 대기만). Arg<>nil이면 읽은 줄을 변수에 대입.
+  TReadlnStmtNode = class(TStmtNode)
+  public Arg: TExprNode; // nil = 인자 없음
+    constructor Create(a: TExprNode); begin Arg:=a; end;
+  end;
+
   TAssignStmtNode = class(TStmtNode)
   public VarName: string; ValueExpr: TExprNode;
     constructor Create(n: string; v: TExprNode); begin VarName:=n; ValueExpr:=v; end;
@@ -466,6 +473,16 @@ type
   TStaticMemberExprNode = class(TExprNode)
   public TypeName: string; MemberName: string;
     constructor Create(t, m: string); begin TypeName:=t; MemberName:=m; end;
+  end;
+
+  // [Stage 75] obj.GetType.FullName 또는 obj.GetType.Name — 예외 진단(ex.GetType.FullName 등)에서
+  // 흔히 쓰이는 관용구. obj는 지역/전역 변수(주로 except 블록의 예외 변수)이고, GetType은
+  // 괄호 없이 호출되는 인스턴스 메서드, 그 결과(System.Type)의 FullName 또는 Name을 읽는다.
+  // 점(.) 3단계 체인이지만 첫 세그먼트가 "타입 이름"이 아니라 변수이므로 TStaticMemberExprNode와는
+  // 다른 전용 노드로 분리했다 (파서가 obj.GetType.FullName을 정적 타입 경로로 오인하던 버그 수정).
+  TRuntimeTypeNameExprNode = class(TExprNode)
+  public VarName: string; WantFullName: boolean; // false면 .Name, true면 .FullName
+    constructor Create(v: string; full: boolean); begin VarName:=v; WantFullName:=full; end;
   end;
 
   // ----------------------------------------------------------

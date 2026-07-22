@@ -625,6 +625,7 @@ type
         else Result:=vtInteger;
       end
       else if e is TExceptionMsgExprNode then Result:=vtString // E.Message는 항상 string
+      else if e is TRuntimeTypeNameExprNode then Result:=vtString // [Stage 75] obj.GetType.FullName/.Name도 항상 string
       else if e is TStaticMemberExprNode then
       begin
         var _sm4:=TStaticMemberExprNode(e);
@@ -1370,6 +1371,24 @@ type
         aIL.Emit(OpCodes.Callvirt, getMsgMI);
       end
 
+      else if e is TRuntimeTypeNameExprNode then
+      begin
+        // [Stage 75] obj.GetType.FullName / obj.GetType.Name — 변수를 로드하고
+        // Object.GetType()을 호출한 뒤(항상 System.Type을 반환) get_FullName/get_Name으로 읽는다.
+        var rtn:=TRuntimeTypeNameExprNode(e);
+        if fLocalScope.Has(rtn.VarName) then
+          aIL.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(rtn.VarName))
+        else if fGlobalScope.Has(rtn.VarName) then
+          aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(rtn.VarName))
+        else raise new Exception('선언되지 않은 변수 "'+rtn.VarName+'"');
+        var getTypeMI:=typeof(System.Object).GetMethod('GetType', System.Type.EmptyTypes);
+        aIL.Emit(OpCodes.Callvirt, getTypeMI);
+        var typeNamePropName:='Name';
+        if rtn.WantFullName then typeNamePropName:='FullName';
+        var typeNameGetMI:=typeof(System.Type).GetProperty(typeNamePropName).GetGetMethod;
+        aIL.Emit(OpCodes.Callvirt, typeNameGetMI);
+      end
+
       else if e is TStaticMemberExprNode then
       begin
         // TypeName.MemberName — 정적 필드/속성 읽기 (예: System.EventArgs.Empty)
@@ -1807,7 +1826,30 @@ type
       setter, emi: MethodInfo; qfb: FieldBuilder; qTargetType: System.Type;
       evs: TEventSubscribeStmtNode; evInfo: EventInfo; delCtor: ConstructorInfo;
     begin
-      if s is TWritelnStringStmtNode then
+      // [Stage 75] Readln; → Console.ReadLine() 호출 후 반환값 버림.
+      // Readln(v) → Console.ReadLine() 결과를 문자열 변수 v에 대입.
+      if s is TReadlnStmtNode then
+      begin
+        var rln := TReadlnStmtNode(s);
+        var rlnM: MethodInfo := typeof(Console).GetMethod('ReadLine', System.Type.EmptyTypes);
+        aIL.Emit(OpCodes.Call, rlnM);
+        if rln.Arg = nil then
+          aIL.Emit(OpCodes.Pop) // 반환값(string) 버림 — 순수 Enter 대기
+        else if rln.Arg is TVarRefNode then
+        begin
+          var vname := TVarRefNode(rln.Arg).VarName;
+          if fLocalScope.Has(vname) then
+            aIL.Emit(OpCodes.Stloc, fLocalScope.GetLoc(vname))
+          else if fGlobalScope.Has(vname) then
+            aIL.Emit(OpCodes.Stloc, fGlobalScope.GetLoc(vname))
+          else
+            aIL.Emit(OpCodes.Pop); // 알 수 없는 변수 — 버림
+        end
+        else
+          aIL.Emit(OpCodes.Pop); // 복잡한 식 대상 — 현재는 버림
+      end
+
+      else if s is TWritelnStringStmtNode then
       begin
         ws:=TWritelnStringStmtNode(s);
         wlS:=typeof(Console).GetMethod('WriteLine',[typeof(string)]);

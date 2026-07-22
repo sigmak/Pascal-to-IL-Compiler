@@ -21,8 +21,8 @@ uses
 
 const
   DefaultExampleDir = 'Examples';
-  
-  DefaultExampleFile = 'Test_stage74.pas'; // [Stage 74] 클래스 안의 자체 제네릭 메서드
+  DefaultExampleFile = 'Test_stage75.pas'; // [Stage 75]  멀티유닛 + 외부 베이스클래스 상속(System.Windows.Forms.Form) + 프로퍼티 + 이벤트 구독을 한 번에 실전 테스트
+  //DefaultExampleFile = 'Test_stage74.pas'; // [Stage 74] 클래스 안의 자체 제네릭 메서드
   //DefaultExampleFile = 'Test_stage73.pas'; // [Stage 73] 다중 타입 매개변수 + 제약조건
   //DefaultExampleFile = 'Test_stage72.pas'; // [Stage 72] PABCSystem 표준 라이브러리
   //DefaultExampleFile = 'Test_stage71.pas'; // [Stage 71] true open generic (CLR 수준 제네릭, 현재는 단형화로 대체)
@@ -233,13 +233,48 @@ end;
 // Parser.ParseProgram이 인식하는 문법과 동일: uses Ident(.Ident)*, Ident(.Ident)*, ... ;
 // 점(.)이 포함된 이름(System.Windows.Forms 등)은 프레임워크 네임스페이스이므로
 // 첫 세그먼트만 후보로 남긴다 — 그래도 파일탐색에서 못 찾으면 어차피 무시된다.
+// [Stage 75] '{ ... }' 블록 주석/지시문({$reference ...}, {$apptype ...} 포함)과 '// ...' 줄 주석을
+// 제거한다. ExtractUsesNames는 실제 렉서를 거치지 않고 원본 텍스트에 정규식을 직접 돌리기 때문에,
+// program 선언과 uses 절 사이에 {$...} 지시문이 끼면(흔한 배치다) 정규식이 매치에 실패해
+// 로컬 유닛 의존성을 통째로 놓친다 — 문자열 리터럴 안의 '{'/'//' 는 고려하지 않는 단순 휴리스틱이지만,
+// uses 절 탐색 목적으로는 이 정도로 충분하다.
+function StripCommentsForUsesScan(sourceCode: string): string;
+var
+  sb: System.Text.StringBuilder;
+  chars: array of char;
+  i: integer;
+begin
+  sb := new System.Text.StringBuilder;
+  chars := sourceCode.ToCharArray; // [Stage 75] PascalABC 문자열은 1-based라 0-based char 배열로 다룬다 (Lexer.pas와 동일 관례)
+  i := 0;
+  while i < chars.Length do
+  begin
+    if (chars[i] = '/') and (i + 1 < chars.Length) and (chars[i + 1] = '/') then
+    begin
+      while (i < chars.Length) and (chars[i] <> #10) do i := i + 1;
+    end
+    else if chars[i] = '{' then
+    begin
+      while (i < chars.Length) and (chars[i] <> '}') do i := i + 1;
+      if i < chars.Length then i := i + 1; // '}' 소비
+    end
+    else
+    begin
+      sb.Append(chars[i]);
+      i := i + 1;
+    end;
+  end;
+  Result := sb.ToString;
+end;
+
 function ExtractUsesNames(sourceCode: string): List<string>;
 var
   m: System.Text.RegularExpressions.Match;
-  raw, nm: string; parts: array of string; p: string;
+  raw, nm: string; parts: array of string; p: string; scanSrc: string;
 begin
   Result := new List<string>;
-  m := System.Text.RegularExpressions.Regex.Match(sourceCode,
+  scanSrc := StripCommentsForUsesScan(sourceCode); // [Stage 75]
+  m := System.Text.RegularExpressions.Regex.Match(scanSrc,
     '\b(program|library)\s+\w+\s*;\s*uses\s+(.*?);',
     System.Text.RegularExpressions.RegexOptions.Singleline);
   if not m.Success then exit;
