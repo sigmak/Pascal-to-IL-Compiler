@@ -141,17 +141,14 @@ type
   TMethodCallExprNode = class(TExprNode)
   public ObjName: string; MethodName: string; Args: List<TExprNode>;
     ObjCastType: string; // ''이 아니면 ObjName을 이 타입으로 캐스트한 뒤 멤버에 접근
-    // [Stage 74] obj.Map<string>(...)처럼 메서드 자신의 제네릭 타입 인자를 명시한 호출.
-    // Parser는 호출 시점에 ObjName의 정적 클래스를 알지 못하므로(이 컴파일러는 그 정보를
-    // CodeGen의 InferType/fLocalClrTypes로 미룬다), 여기서는 원시 타입 인자 태그만 기록해
-    // 두고 실제 템플릿 매칭·MakeGenericMethod는 CodeGen이 EmitExpr에서 처리한다.
+    // [Stage 74] obj.Method<T,U>(...) 처럼 명시적 타입 인자가 주어진 제네릭 메서드 호출.
     // 비어 있으면(Count=0) 일반(비제네릭) 메서드 호출.
     GenericArgTypes: List<TVarType>;
-    GenericArgClassNames: List<string>; // GenericArgTypes[i]=vtObject일 때 그 클래스/외부타입 이름
+    GenericArgClassNames: List<string>;
     constructor Create(obj, mth: string);
     begin
       ObjName:=obj; MethodName:=mth; Args:=new List<TExprNode>; ObjCastType:='';
-      GenericArgTypes:=new List<TVarType>; GenericArgClassNames:=new List<string>; // [Stage 74]
+      GenericArgTypes:=new List<TVarType>; GenericArgClassNames:=new List<string>;
     end;
   end;
 
@@ -393,8 +390,14 @@ type
   TMethodCallStmtNode = class(TStmtNode)
   public ObjName: string; MethodName: string; Args: List<TExprNode>;
     ObjCastType: string; // ''이 아니면 ObjName을 이 타입으로 캐스트한 뒤 멤버에 접근 (예: TButton(sender).Focus)
+    // [Stage 74] 식 버전(TMethodCallExprNode)과 동일한 목적.
+    GenericArgTypes: List<TVarType>;
+    GenericArgClassNames: List<string>;
     constructor Create(obj, mth: string);
-    begin ObjName:=obj; MethodName:=mth; Args:=new List<TExprNode>; ObjCastType:=''; end;
+    begin
+      ObjName:=obj; MethodName:=mth; Args:=new List<TExprNode>; ObjCastType:='';
+      GenericArgTypes:=new List<TVarType>; GenericArgClassNames:=new List<string>;
+    end;
   end;
 
   // self.fValue := 식  (메서드 본문 안에서 필드 쓰기)
@@ -548,20 +551,18 @@ type
     IsVirtual: boolean;
     IsOverride: boolean;
     IsAbstract: boolean;
-    // [Stage 74] 메서드 자신의 제네릭 타입 매개변수: function Map<U>(...): U;
-    // 이는 클래스 자체의 제네릭 매개변수(K/V, Stage 32)와는 별개다 — 1차 범위는 "비제네릭
-    // 클래스의 제네릭 메서드"만 지원하며, ReturnGenericName/ParamClassNames[i](vtGeneric일 때)에
-    // 담기는 이름이 바로 이 GenericParamNames 중 하나를 가리키게 된다.
-    IsGenericMethod: boolean;
-    GenericParamNames: List<string>;       // 예: ['U'] 또는 ['K','V']. IsGenericMethod=false면 빈 목록.
-    GenericParamConstraints: List<string>; // GenericParamNames와 인덱스 대응. ''=제약없음, 'class'=참조타입, 그 외=클래스/인터페이스 이름
+    // [Stage 74] 제네릭 메서드: function Wrap<T>(x: T): T; — 클래스 자체의 제네릭(TStack<T>)과는
+    // 독립적인, 메서드 자신의 타입 매개변수. virtual/abstract와의 조합은 1차 제약으로 아직 미지원.
+    IsGeneric: boolean;
+    GenericParamNames: List<string>;
+    GenericParamConstraints: List<string>;
     constructor Create(n: string; isFunc: boolean; ret: TVarType);
     begin
       Name:=n; IsFunction:=isFunc; ReturnType:=ret; ReturnGenericName:='';
       ParamNames:=new List<string>; ParamTypes:=new List<TVarType>;
       ParamClassNames:=new List<string>; ParamIsExternal:=new List<boolean>;
       IsVirtual:=false; IsOverride:=false; IsAbstract:=false;
-      IsGenericMethod:=false; GenericParamNames:=new List<string>; GenericParamConstraints:=new List<string>; // [Stage 74]
+      IsGeneric:=false; GenericParamNames:=new List<string>; GenericParamConstraints:=new List<string>;
     end;
   end;
 
@@ -694,12 +695,12 @@ type
     ParamGenericNames: List<string>; // [Stage 32] ParamTypes[i]=vtGeneric일 때 그 타입 매개변수 이름, 아니면 ''
     LocalVars: List<TVarDecl>; // [Stage 28] 메서드 본문 안의 지역 변수 선언(var 섹션)
     ConstDecls: List<TConstDecl>; // [Stage 61] 메서드 본문 안의 지역 const 선언
-    Body: TCompoundStmtNode;
-    // [Stage 74] TMethodSignature와 동일한 의미 — Parser가 구현부(ClassName.MethodName<U>(...))에서도
-    // 시그니처와 같은 제네릭 매개변수 목록을 채워 넣는다(선언부와 이름이 같아야 함, 재검증은 하지 않음).
-    IsGenericMethod: boolean;
+    // [Stage 74] 메서드 자신의 제네릭 타입 매개변수(선언부 TMethodSignature.IsGeneric과 대응,
+    // 구현부에서도 "procedure TFoo.Bar<T>(...)"처럼 다시 적어줘야 한다).
+    IsGeneric: boolean;
     GenericParamNames: List<string>;
     GenericParamConstraints: List<string>;
+    Body: TCompoundStmtNode;
     constructor Create(cn, mn: string; isFunc: boolean; ret: TVarType);
     begin
       ClassName:=cn; MethodName:=mn; IsFunction:=isFunc; ReturnType:=ret; ReturnGenericName:='';
@@ -707,7 +708,7 @@ type
       ParamGenericNames:=new List<string>;
       LocalVars:=new List<TVarDecl>;
       ConstDecls:=new List<TConstDecl>; // [Stage 61]
-      IsGenericMethod:=false; GenericParamNames:=new List<string>; GenericParamConstraints:=new List<string>; // [Stage 74]
+      IsGeneric:=false; GenericParamNames:=new List<string>; GenericParamConstraints:=new List<string>;
     end;
   end;
 

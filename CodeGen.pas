@@ -52,6 +52,10 @@ type
     // 이 표를 통해 원본 템플릿 이름 + 실제 타입 인자를 되찾아 MakeGenericMethod로 호출한다.
     // key: 맹글링된 구체 이름(예: "Identity_integer") → 그 인스턴스화 요청 레코드.
     fOpenGenericCallMap: Dictionary<string, TGenericFuncInstantiation>;
+    // [Stage 74] 클래스 안의 자체 제네릭 메서드(TFoo.Bar<T>)용 치환표 — fOpenGenericSubstOf와
+    // 같은 목적이지만 key가 "ClassName.MethodName"이라는 점만 다르다(메서드는 클래스 소속이므로
+    // 이름만으로는 구분이 안 될 수 있음).
+    fMethodOpenGenericSubstOf: Dictionary<string, Dictionary<string, System.Type>>;
 
     // 클래스 관련
     fTypeBuilders: Dictionary<string, TypeBuilder>;  // 클래스명 → TypeBuilder
@@ -1123,9 +1127,22 @@ type
             else
             begin
               imb:=FindInstanceMethod(cn, mc.MethodName);
-              EmitArgsCoerced(aIL, mc.Args, FindInstanceMethodParamTypes(cn, mc.MethodName));
-              // virtual 메서드이므로 Callvirt 사용 (다형성 대비)
-              aIL.Emit(OpCodes.Callvirt, imb);
+              if mc.GenericArgTypes.Count>0 then
+              begin
+                // [Stage 74] obj.Method<T,U>(...) — 명시적 타입 인자로 닫은 뒤 그 닫힌 메서드를 호출한다.
+                var closedTypes74e:=new System.Type[mc.GenericArgTypes.Count];
+                for var gi74e:=0 to mc.GenericArgTypes.Count-1 do
+                  closedTypes74e[gi74e]:=VTC(mc.GenericArgTypes[gi74e], mc.GenericArgClassNames[gi74e]);
+                var closedMI74e:=imb.MakeGenericMethod(closedTypes74e);
+                EmitArgsCoerced(aIL, mc.Args, nil);
+                aIL.Emit(OpCodes.Callvirt, closedMI74e);
+              end
+              else
+              begin
+                EmitArgsCoerced(aIL, mc.Args, FindInstanceMethodParamTypes(cn, mc.MethodName));
+                // virtual 메서드이므로 Callvirt 사용 (다형성 대비)
+                aIL.Emit(OpCodes.Callvirt, imb);
+              end;
             end;
           end;
         end
@@ -2091,11 +2108,25 @@ type
           else
           begin
             imb:=FindInstanceMethod(cn, mcs.MethodName);
-            EmitArgsCoerced(aIL, mcs.Args, FindInstanceMethodParamTypes(cn, mcs.MethodName));
-            aIL.Emit(OpCodes.Callvirt, imb);
-            // void 메서드가 아닌 경우 반환값 버리기
-            if imb.ReturnType<>typeof(System.Void) then
-              aIL.Emit(OpCodes.Pop);
+            if mcs.GenericArgTypes.Count>0 then
+            begin
+              // [Stage 74] obj.Method<T,U>(...) — 명시적 타입 인자로 닫은 뒤 그 닫힌 메서드를 호출한다.
+              var closedTypes74s:=new System.Type[mcs.GenericArgTypes.Count];
+              for var gi74s:=0 to mcs.GenericArgTypes.Count-1 do
+                closedTypes74s[gi74s]:=VTC(mcs.GenericArgTypes[gi74s], mcs.GenericArgClassNames[gi74s]);
+              var closedMI74s:=imb.MakeGenericMethod(closedTypes74s);
+              EmitArgsCoerced(aIL, mcs.Args, nil);
+              aIL.Emit(OpCodes.Callvirt, closedMI74s);
+              if closedMI74s.ReturnType<>typeof(System.Void) then aIL.Emit(OpCodes.Pop);
+            end
+            else
+            begin
+              EmitArgsCoerced(aIL, mcs.Args, FindInstanceMethodParamTypes(cn, mcs.MethodName));
+              aIL.Emit(OpCodes.Callvirt, imb);
+              // void 메서드가 아닌 경우 반환값 버리기
+              if imb.ReturnType<>typeof(System.Void) then
+                aIL.Emit(OpCodes.Pop);
+            end;
           end;
         end
         else if TryFindFieldBuilder(fCurClassName, mcs.ObjName, qfb) then
@@ -2753,6 +2784,11 @@ type
         Result:=ResolveExternalType(sig.ParamClassNames[i])
       else if sig.ParamTypes[i]=vtObject then
         Result:=VTC(vtObject, sig.ParamClassNames[i])
+      // [Stage 74] vtGeneric(예: x: T)이면 ParamClassNames[i]에 타입 매개변수 이름('T')이
+      // 들어있다 — 예전엔 ''을 넘겨 VTC가 fCurGenericSubst를 못 찾고 조용히 System.Object로
+      // 폴백했다(제네릭 메서드가 없던 시절엔 이 분기에 도달할 일이 없어 드러나지 않던 버그).
+      else if sig.ParamTypes[i]=vtGeneric then
+        Result:=VTC(vtGeneric, sig.ParamClassNames[i])
       else
         Result:=VTC(sig.ParamTypes[i], '');
     end;
@@ -3695,30 +3731,65 @@ type
       methAttrs:=MethodAttributes.Public or MethodAttributes.Virtual or MethodAttributes.HideBySig;
       foreach sig in cd.Methods do
       begin
-        paramTypes:=new System.Type[sig.ParamNames.Count];
-        for i:=0 to sig.ParamNames.Count-1 do
-          paramTypes[i]:=ResolveParamClrType(sig, i);
-        var thisMethAttrs:=methAttrs;
-        if sig.IsAbstract then thisMethAttrs:=thisMethAttrs or MethodAttributes.Abstract;
-        if sig.IsFunction then
-          mb:=tb.DefineMethod(sig.Name, thisMethAttrs, VTC(sig.ReturnType, ''), paramTypes)
-        else
-          mb:=tb.DefineMethod(sig.Name, thisMethAttrs, typeof(System.Void), paramTypes);
-        fInstanceMethods[cd.Name][sig.Name]:=mb;
-        if not fMethodReturnTypes.ContainsKey(cd.Name) then
-          fMethodReturnTypes[cd.Name]:=new Dictionary<string, TVarType>;
-        fMethodReturnTypes[cd.Name][sig.Name]:=sig.ReturnType;
-        if not fMethodParamClrTypes.ContainsKey(cd.Name) then
-          fMethodParamClrTypes[cd.Name]:=new Dictionary<string, array of System.Type>;
-        fMethodParamClrTypes[cd.Name][sig.Name]:=paramTypes;
-        // [Stage 53] abstract 메서드는 본문이 없다 — 사용자가 실수로 구현을 작성했을 때
-        // BuildMethodBody가 GetILGenerator()를 부르면 Reflection.Emit이 알아보기 힘든
-        // 예외를 던지므로, 여기서 미리 표시해두고 BuildMethodBody 쪽에서 친절한 오류를 낸다.
-        if sig.IsAbstract then
+        // [Stage 74] 메서드 자신의 오픈 제네릭 타입 매개변수(function Foo<T>(...))가 있으면
+        // Stage71의 top-level 제네릭 함수와 같은 원리로 DefineGenericParameters 이후에야
+        // 매개변수/반환 타입을 알 수 있다 — SetParameters/SetReturnType으로 나중에 지정한다.
+        // (virtual/override/abstract와의 조합은 Parser가 이미 막아 두었다.)
+        if sig.IsGeneric then
         begin
-          if not fAbstractMethods.ContainsKey(cd.Name) then
-            fAbstractMethods[cd.Name]:=new List<string>;
-          fAbstractMethods[cd.Name].Add(sig.Name);
+          mb:=tb.DefineMethod(sig.Name, methAttrs);
+          var gpBuilders74:=mb.DefineGenericParameters(sig.GenericParamNames.ToArray);
+          ApplyGenericParamConstraints(gpBuilders74, sig.GenericParamConstraints);
+          var savedSubst74:=fCurGenericSubst;
+          fCurGenericSubst:=new Dictionary<string, System.Type>;
+          for i:=0 to sig.GenericParamNames.Count-1 do fCurGenericSubst[sig.GenericParamNames[i]]:=gpBuilders74[i];
+
+          paramTypes:=new System.Type[sig.ParamNames.Count];
+          for i:=0 to sig.ParamNames.Count-1 do paramTypes[i]:=ResolveParamClrType(sig, i);
+          var retClrType74: System.Type;
+          if sig.ReturnType=vtGeneric then retClrType74:=VTC(vtGeneric, sig.ReturnGenericName)
+          else if sig.IsFunction then retClrType74:=VTC(sig.ReturnType, '')
+          else retClrType74:=typeof(System.Void);
+          mb.SetParameters(paramTypes);
+          mb.SetReturnType(retClrType74);
+
+          fInstanceMethods[cd.Name][sig.Name]:=mb;
+          if not fMethodReturnTypes.ContainsKey(cd.Name) then
+            fMethodReturnTypes[cd.Name]:=new Dictionary<string, TVarType>;
+          fMethodReturnTypes[cd.Name][sig.Name]:=sig.ReturnType;
+          if not fMethodParamClrTypes.ContainsKey(cd.Name) then
+            fMethodParamClrTypes[cd.Name]:=new Dictionary<string, array of System.Type>;
+          fMethodParamClrTypes[cd.Name][sig.Name]:=paramTypes;
+          fMethodOpenGenericSubstOf[cd.Name+'.'+sig.Name]:=fCurGenericSubst; // [Stage 74] 빌드 패스가 재사용
+          fCurGenericSubst:=savedSubst74;
+        end
+        else
+        begin
+          paramTypes:=new System.Type[sig.ParamNames.Count];
+          for i:=0 to sig.ParamNames.Count-1 do
+            paramTypes[i]:=ResolveParamClrType(sig, i);
+          var thisMethAttrs:=methAttrs;
+          if sig.IsAbstract then thisMethAttrs:=thisMethAttrs or MethodAttributes.Abstract;
+          if sig.IsFunction then
+            mb:=tb.DefineMethod(sig.Name, thisMethAttrs, VTC(sig.ReturnType, ''), paramTypes)
+          else
+            mb:=tb.DefineMethod(sig.Name, thisMethAttrs, typeof(System.Void), paramTypes);
+          fInstanceMethods[cd.Name][sig.Name]:=mb;
+          if not fMethodReturnTypes.ContainsKey(cd.Name) then
+            fMethodReturnTypes[cd.Name]:=new Dictionary<string, TVarType>;
+          fMethodReturnTypes[cd.Name][sig.Name]:=sig.ReturnType;
+          if not fMethodParamClrTypes.ContainsKey(cd.Name) then
+            fMethodParamClrTypes[cd.Name]:=new Dictionary<string, array of System.Type>;
+          fMethodParamClrTypes[cd.Name][sig.Name]:=paramTypes;
+          // [Stage 53] abstract 메서드는 본문이 없다 — 사용자가 실수로 구현을 작성했을 때
+          // BuildMethodBody가 GetILGenerator()를 부르면 Reflection.Emit이 알아보기 힘든
+          // 예외를 던지므로, 여기서 미리 표시해두고 BuildMethodBody 쪽에서 친절한 오류를 낸다.
+          if sig.IsAbstract then
+          begin
+            if not fAbstractMethods.ContainsKey(cd.Name) then
+              fAbstractMethods[cd.Name]:=new List<string>;
+            fAbstractMethods[cd.Name].Add(sig.Name);
+          end;
         end;
       end;
 
@@ -3863,10 +3934,25 @@ type
       fLocalScope:=new TScope('local(method)', fGlobalScope);
       fCurClassName:=impl.ClassName;
 
+      // [Stage 74] 메서드 자신이 오픈 제네릭이면(BuildClassShell이 fMethodOpenGenericSubstOf에
+      // 저장해 둔 치환표가 있으면) 본문을 컴파일하는 동안 fCurGenericSubst를 그 표로 맞춰야
+      // VTC가 vtGeneric(매개변수 x: T, 지역변수, 반환 타입)을 올바르게 풀 수 있다.
+      var savedMethodGenSubst74:=fCurGenericSubst;
+      if impl.IsGeneric and fMethodOpenGenericSubstOf.ContainsKey(impl.ClassName+'.'+impl.MethodName) then
+        fCurGenericSubst:=fMethodOpenGenericSubstOf[impl.ClassName+'.'+impl.MethodName]
+      else
+        fCurGenericSubst:=nil;
+
       if impl.IsFunction then
       begin
         fResultType:=impl.ReturnType;
-        fResultLocal:=il.DeclareLocal(VTC(impl.ReturnType, ''));
+        // [Stage 74] 반환 타입이 vtGeneric(예: T)이면 ReturnGenericName을 넘겨야 fCurGenericSubst
+        // 조회가 성공한다 — ''을 넘기면 조용히 System.Object로 폴백해버린다(ResolveParamClrType의
+        // 예전 버그와 같은 종류).
+        if impl.ReturnType=vtGeneric then
+          fResultLocal:=il.DeclareLocal(VTC(vtGeneric, impl.ReturnGenericName))
+        else
+          fResultLocal:=il.DeclareLocal(VTC(impl.ReturnType, ''));
       end
       else
       begin
@@ -3892,6 +3978,12 @@ type
         if i<impl.ParamTypes.Count then fLocalScope.Declare(p, loc, impl.ParamTypes[i])
         else fLocalScope.Declare(p, loc, vtInteger);
         if pClrType<>typeof(integer) then fLocalScope.SetClrType(p, pClrType);
+        // [Stage 74] vtGeneric 매개변수(x: T)도 ClassName에 타입 매개변수 이름을 기록해 둔다 —
+        // GetVarClassName으로 되찾아 fCurGenericSubst[genName]을 다시 조회할 수 있어야
+        // (예: Writeln(x)가 실제 T의 CLR 타입을 알아내 box하는 데) 쓸모가 있다.
+        // (top-level 제네릭 함수의 BuildStaticFunc와 동일한 원리, Stage 71 참고)
+        if (i<impl.ParamTypes.Count) and (impl.ParamTypes[i]=vtGeneric) and (i<impl.ParamGenericNames.Count) then
+          fLocalScope.SetClassName(p, impl.ParamGenericNames[i]);
         // self=Ldarg_0 이므로 매개변수는 Ldarg_1부터
         if i=0 then il.Emit(OpCodes.Ldarg_1)
         else if i=1 then il.Emit(OpCodes.Ldarg_2)
@@ -3938,6 +4030,7 @@ type
       fLocalScope:=savedLocalScope;
       fResultLocal:=svResult; fResultType:=svResultType;
       fCurClassName:=svCurClass;
+      fCurGenericSubst:=savedMethodGenSubst74; // [Stage 74]
     end;
 
     // [Stage 27] 이전에는 최상위 함수/프로시저의 모든 매개변수·반환값을 무조건
@@ -4538,6 +4631,7 @@ type
       // 제네릭 템플릿의 인스턴스화 요청들을 맹글링된 이름으로 색인해 둔다(자세한 설명은 필드 선언부 참고).
       fCurGenericSubst:=nil;
       fOpenGenericSubstOf:=new Dictionary<string, Dictionary<string, System.Type>>;
+      fMethodOpenGenericSubstOf:=new Dictionary<string, Dictionary<string, System.Type>>; // [Stage 74]
       fOpenGenericCallMap:=new Dictionary<string, TGenericFuncInstantiation>;
       foreach var finst71 in fProg.GenericFuncInstantiations do
         fOpenGenericCallMap[finst71.ConcreteName]:=finst71;

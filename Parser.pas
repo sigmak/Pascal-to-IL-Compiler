@@ -111,6 +111,12 @@ type
     fGenericFuncNames, fGenericProcNames: List<string>; // 제네릭 템플릿으로 선언된 함수/프로시저 이름
     fFuncGenericParam, fProcGenericParam: Dictionary<string, List<string>>;      // 템플릿 이름 → 타입 매개변수 이름 목록
     fFuncGenericConstraint, fProcGenericConstraint: Dictionary<string, List<string>>; // 템플릿 이름 → 제약조건 목록(같은 인덱스)
+    // [Stage 74] 클래스 안의 자체 제네릭 메서드(TFoo.Bar<T>). 1차 제약: 클래스와 무관하게
+    // "메서드 이름"만으로 색인한다(같은 이름의 제네릭 메서드가 서로 다른 두 클래스에 있으면
+    // 충돌 — 호출부(obj.Method<T>(...))에서 obj의 정적 클래스를 파서가 추적하지 않기 때문).
+    fGenericMethodNames: List<string>;
+    fMethodGenericParam: Dictionary<string, List<string>>;      // 메서드 이름 → 타입 매개변수 이름 목록
+    fMethodGenericConstraint: Dictionary<string, List<string>>; // 메서드 이름 → 제약조건 목록(같은 인덱스)
     // [Stage 32] 현재 파싱 중인 제네릭 클래스 본문/메서드구현에서 유효한 타입 매개변수 이름들 (빈 목록이면 제네릭 문맥 아님)
     fCurGenericParams: List<string>;
     // [Stage 32] ParseVarType/ParseParamTypeExt가 vtGeneric을 반환했을 때, 그 자리에서 바로 리턴값에
@@ -555,6 +561,50 @@ type
       Result:=concreteName;
     end;
 
+    // [Stage 74] obj.Method<T,U>(...) 형태의 제네릭 메서드 호출에서 '<' 이후 타입 인자 목록을
+    // 파싱한다. ResolveGenericFuncInstantiation(최상위 제네릭 함수/프로시저용)과 같은 문법·제약
+    // 검증 로직을 쓰지만, 메서드 호출은 이름을 맹글링하지 않고(대상 클래스를 파서가 모르므로)
+    // 타입 인자를 AST 노드(GenericArgTypes/GenericArgClassNames)에 그대로 실어 CodeGen에 넘긴다.
+    procedure ParseMethodCallGenericArgs(methodName: string; var argTypes: List<TVarType>; var argClassNames: List<string>);
+    var
+      oneType: TVarType; oneClassName, oneTag: string;
+      paramNames, constraintList: List<string>;
+    begin
+      Expect(tkLt);
+      paramNames:=nil; constraintList:=nil;
+      if fMethodGenericParam.ContainsKey(methodName) then paramNames:=fMethodGenericParam[methodName];
+      if fMethodGenericConstraint.ContainsKey(methodName) then constraintList:=fMethodGenericConstraint[methodName];
+
+      argTypes:=new List<TVarType>; argClassNames:=new List<string>;
+      while true do
+      begin
+        oneClassName:='';
+        if Cur.Kind=tkInteger then begin fPos:=fPos+1; oneType:=vtInteger; oneTag:='integer'; end
+        else if Cur.Kind=tkStringType then begin fPos:=fPos+1; oneType:=vtString; oneTag:='string'; end
+        else if Cur.Kind=tkBoolean then begin fPos:=fPos+1; oneType:=vtBoolean; oneTag:='boolean'; end
+        else if (Cur.Kind=tkIdent) and fClassNames.Contains(Cur.Text) then
+          begin oneClassName:=Cur.Text; oneType:=vtObject; oneTag:=Cur.Text; fPos:=fPos+1; end
+        else
+          raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': 제네릭 메서드 "'+methodName
+            +'"의 타입 인자로 지원되지 않는 타입 ("'+Cur.Text+'") — integer/string/boolean 또는 일반 클래스만 가능합니다 (Stage 74)');
+
+        if (constraintList<>nil) and (argTypes.Count<constraintList.Count) and (constraintList[argTypes.Count]<>'') then
+        begin
+          if (oneType<>vtObject) or (not SatisfiesConstraint(oneClassName, constraintList[argTypes.Count])) then
+            raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': 제네릭 메서드 "'+methodName
+              +'"의 타입 인자 "'+oneTag+'"는 제약조건 "'+constraintList[argTypes.Count]+'"을(를) 만족하지 않습니다');
+        end;
+
+        argTypes.Add(oneType); argClassNames.Add(oneClassName);
+        if Cur.Kind=tkComma then fPos:=fPos+1 else break;
+      end;
+      Expect(tkGt);
+
+      if (paramNames<>nil) and (paramNames.Count<>argTypes.Count) then
+        raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': 제네릭 메서드 "'+methodName+'"는 타입 매개변수 '
+          +paramNames.Count.ToString+'개가 필요한데 '+argTypes.Count.ToString+'개가 주어졌습니다');
+    end;
+
     // ---- 식 파싱 (ParsePrimary 안에서는 ParseAddSub만 호출) ----
 
     function ParsePrimary: TExprNode;
@@ -864,6 +914,14 @@ type
             else
             begin
               mc:=new TMethodCallExprNode(t.Text, mname2);
+              // [Stage 74] obj.Method<T>(...) — mname2가 등록된 제네릭 메서드 이름일 때만 '<'를
+              // 타입 인자 시작으로 해석한다(그렇지 않으면 obj.Value < 10 같은 비교식과 충돌).
+              if (Cur.Kind=tkLt) and fGenericMethodNames.Contains(mname2) then
+              begin
+                var mcArgTypes74: List<TVarType>; var mcArgClassNames74: List<string>;
+                ParseMethodCallGenericArgs(mname2, mcArgTypes74, mcArgClassNames74);
+                mc.GenericArgTypes:=mcArgTypes74; mc.GenericArgClassNames:=mcArgClassNames74;
+              end;
               if Cur.Kind=tkLParen then
               begin
                 fPos:=fPos+1;
@@ -1277,6 +1335,12 @@ type
           end
           else
           begin
+            // [Stage 74] obj.Method<T>(...) — mname이 등록된 제네릭 메서드 이름일 때만 '<'를
+            // 타입 인자 시작으로 해석한다.
+            var mcsArgTypes74: List<TVarType>:=nil; var mcsArgClassNames74: List<string>:=nil;
+            if (Cur.Kind=tkLt) and fGenericMethodNames.Contains(mname) then
+              ParseMethodCallGenericArgs(mname, mcsArgTypes74, mcsArgClassNames74);
+
             // 괄호를 먼저 파싱해본다 — 정적 호출의 인자일 수도, 캐스트 대상(단일 인자)일 수도 있다.
             var callArgs:=new List<TExprNode>; var hadParen:=false;
             if Cur.Kind=tkLParen then
@@ -1340,6 +1404,8 @@ type
               // 기존처럼: 정적 호출 또는 필드/변수 경유 메서드 호출
               mcs:=new TMethodCallStmtNode(qualifier, mname);
               foreach var a5 in callArgs do mcs.Args.Add(a5);
+              if mcsArgTypes74<>nil then
+              begin mcs.GenericArgTypes:=mcsArgTypes74; mcs.GenericArgClassNames:=mcsArgClassNames74; end;
               Result:=mcs;
             end;
           end;
@@ -2112,6 +2178,25 @@ type
               // 매개변수 목록 (선택)
               pnames:=new List<string>;
               sig:=new TMethodSignature(mname, isFunc, retType);
+
+              // [Stage 74] 메서드 자신의 제네릭 타입 매개변수: function Wrap<T>(x: T): T;
+              // 클래스 자체의 제네릭(TStack<T>)과는 독립적 — 이 클래스가 제네릭이 아니어도 된다.
+              var savedGP74sig:=fCurGenericParams;
+              var mGenNames74, mGenConstraints74: List<string>;
+              ParseCallableGenericParams(mGenNames74, mGenConstraints74);
+              if mGenNames74.Count>0 then
+              begin
+                sig.IsGeneric:=true; sig.GenericParamNames:=mGenNames74; sig.GenericParamConstraints:=mGenConstraints74;
+                // 매개변수/반환 타입 파싱 동안 T 등을 vtGeneric으로 인식시킨다. 클래스 자체가
+                // 이미 제네릭이면(fCurGenericParams가 그 T들로 설정돼 있으면) 메서드 자신의
+                // 타입 매개변수를 덧붙인다 — 이름이 겹치면 메서드 쪽이 가려버릴 수 있으므로
+                // 겹치지 않게 쓰는 것을 권장(1차 제약, 별도 검증은 하지 않음).
+                var combinedGP74:=new List<string>;
+                foreach var g74 in fCurGenericParams do combinedGP74.Add(g74);
+                foreach var g74b in mGenNames74 do combinedGP74.Add(g74b);
+                fCurGenericParams:=combinedGP74;
+              end;
+
               if Cur.Kind=tkLParen then
               begin
                 fPos:=fPos+1;
@@ -2141,6 +2226,7 @@ type
                 Expect(tkColon); sig.ReturnType:=ParseVarType;
                 if (sig.ReturnType=vtGeneric) or (sig.ReturnType=vtGenericArray) then sig.ReturnGenericName:=fLastGenericName; // [Stage 32/37]
               end;
+              fCurGenericParams:=savedGP74sig; // [Stage 74]
               Expect(tkSemicolon);
               // [Stage 53] 메서드 지시자: virtual;/override;/abstract; — 순서·조합 무관하게 여러 개 허용
               // (예: "procedure Foo; virtual; abstract;"). 지시자마다 세미콜론이 따라온다.
@@ -2152,8 +2238,19 @@ type
                 fPos:=fPos+1;
                 Expect(tkSemicolon);
               end;
+              // [Stage 74] 1차 제약: 제네릭 메서드는 virtual/override/abstract와 조합하지 않는다
+              // (CLR 제네릭 가상 메서드의 override 슬롯 매칭까지는 아직 다루지 않음).
+              if sig.IsGeneric and (sig.IsVirtual or sig.IsOverride or sig.IsAbstract) then
+                raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': 제네릭 메서드 "'+mname
+                  +'"는 virtual/override/abstract와 함께 쓸 수 없습니다 (Stage 74, 1차 제약)');
               cd.Methods.Add(sig);
               fClassMethods[cn][mname]:=isFunc;
+              if sig.IsGeneric then
+              begin
+                if not fGenericMethodNames.Contains(mname) then fGenericMethodNames.Add(mname);
+                fMethodGenericParam[mname]:=sig.GenericParamNames;
+                fMethodGenericConstraint[mname]:=sig.GenericParamConstraints;
+              end;
             end
 
             // 필드 선언: fname1, fname2, ... : type;
@@ -2337,11 +2434,25 @@ type
       retType:=vtInteger;
       impl:=new TMethodImplNode(cn, mn, isFunc, retType);
 
+      // [Stage 74] 메서드 자신이 제네릭이면(선언부와 동일하게) 구현부에도 <T>를 다시 적어야 한다.
+      if Cur.Kind=tkLt then
+      begin
+        var implGenNames74, implGenConstraints74: List<string>;
+        ParseCallableGenericParams(implGenNames74, implGenConstraints74);
+        impl.IsGeneric:=true;
+        impl.GenericParamNames:=implGenNames74;
+        impl.GenericParamConstraints:=implGenConstraints74;
+      end;
+
       // 제네릭 클래스(TStack<T>, [Stage 32] TPair<K,V> 등)의 메서드 구현이면, 본문의 매개변수/반환
       // 타입에서 T/K/V 등을 인식할 수 있도록 fCurGenericParams를 설정해 둔다.
+      // [Stage 74] 메서드 자신의 제네릭 타입 매개변수도 (클래스 제네릭과 함께, 또는 단독으로) 더한다.
       var savedGP3:=fCurGenericParams;
-      if fClassGenericParam.ContainsKey(cn) then fCurGenericParams:=fClassGenericParam[cn]
-      else fCurGenericParams:=new List<string>;
+      fCurGenericParams:=new List<string>;
+      if fClassGenericParam.ContainsKey(cn) then
+        foreach var gp74c in fClassGenericParam[cn] do fCurGenericParams.Add(gp74c);
+      if impl.IsGeneric then
+        foreach var gp74m in impl.GenericParamNames do fCurGenericParams.Add(gp74m);
 
       // 매개변수
       if Cur.Kind=tkLParen then
@@ -2994,6 +3105,9 @@ type
       fProcGenericParam:=new Dictionary<string, List<string>>; // [Stage 36]
       fFuncGenericConstraint:=new Dictionary<string, List<string>>; // [Stage 36]
       fProcGenericConstraint:=new Dictionary<string, List<string>>; // [Stage 36]
+      fGenericMethodNames:=new List<string>; // [Stage 74]
+      fMethodGenericParam:=new Dictionary<string, List<string>>; // [Stage 74]
+      fMethodGenericConstraint:=new Dictionary<string, List<string>>; // [Stage 74]
       fCurGenericParams:=new List<string>;
       fLastGenericName:='';
     end;
