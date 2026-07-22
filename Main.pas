@@ -21,6 +21,8 @@ uses
 
 const
   DefaultExampleDir = 'Examples';
+                                           // [Stage 73b] TMethodSignature, TMethodImplNode에 IsGenericMethod / GenericParamNames / GenericParamConstraints를 추가
+                                           //기존의 ReturnGenericName/ParamGenericNames(vtGeneric 인프라)는 그대로 재사용합니다 — 지금까지 "클래스의 K/V"만 표현하던 자리를 "메서드 자신의 U"로도 채울 수 있는 구조라 CodeGen 쪽 변경 범위를 크게 줄여줍니다.
   DefaultExampleFile = 'Test_stage73.pas'; // [Stage 73] 다중 타입 매개변수 + 제약조건
   //DefaultExampleFile = 'Test_stage72.pas'; // [Stage 72] PABCSystem 표준 라이브러리
   //DefaultExampleFile = 'Test_stage71.pas'; // [Stage 71] true open generic (CLR 수준 제네릭, 현재는 단형화로 대체)
