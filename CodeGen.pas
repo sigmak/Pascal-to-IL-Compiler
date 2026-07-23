@@ -3873,6 +3873,83 @@ type
       end;
     end;
 
+    // [설계 개선] 사용자가 직접 작성한 생성자 본문에 "inherited Create(...)" 호출이
+    // 하나라도 있는지 검사한다. if/while/for/repeat/case/try 등 중첩된 문장 블록
+    // 안에 있어도 찾아낸다(사용자가 조건부로 부모 생성자를 호출하는 드문 패턴도
+    // 있을 수 있으므로). TInheritedCallStmtNode.MethodName='Create'인 경우만 인정한다
+    // — inherited SomeOtherMethod(...)는 부모 생성자 호출이 아니므로 무시한다.
+    // [주의] 재귀 대신 명시적 워크리스트(work: List<TStmtNode>)로 순회한다 — PascalABC.NET은
+    // 지역 함수 안에 또 다른 지역 함수를 중첩 선언하는 것을 허용하지 않으므로("Found
+    // 'function' but expected identifier"), 서로를 호출하는 두 개의 지역 함수 대신
+    // 단일 함수 + 반복문 형태로 작성했다.
+    function StmtListHasInheritedCtorCall(stmts: List<TStmtNode>): boolean;
+    var
+      work: List<TStmtNode>;
+      idx: integer; st99: TStmtNode;
+    begin
+      Result:=false;
+      work:=new List<TStmtNode>;
+      if stmts<>nil then work.AddRange(stmts);
+      idx:=0;
+      while idx<work.Count do
+      begin
+        st99:=work[idx];
+        idx:=idx+1;
+        if st99=nil then continue;
+        if st99 is TInheritedCallStmtNode then
+        begin
+          if TInheritedCallStmtNode(st99).MethodName='Create' then begin Result:=true; exit; end;
+          continue;
+        end;
+        if st99 is TCompoundStmtNode then
+        begin
+          if TCompoundStmtNode(st99).Statements<>nil then work.AddRange(TCompoundStmtNode(st99).Statements);
+          continue;
+        end;
+        if st99 is TIfStmtNode then
+        begin
+          work.Add(TIfStmtNode(st99).ThenStmt);
+          work.Add(TIfStmtNode(st99).ElseStmt);
+          continue;
+        end;
+        if st99 is TWhileStmtNode then
+        begin
+          work.Add(TWhileStmtNode(st99).Body);
+          continue;
+        end;
+        if st99 is TForStmtNode then
+        begin
+          work.Add(TForStmtNode(st99).Body);
+          continue;
+        end;
+        if st99 is TForInStmtNode then
+        begin
+          work.Add(TForInStmtNode(st99).Body);
+          continue;
+        end;
+        if st99 is TRepeatStmtNode then
+        begin
+          if TRepeatStmtNode(st99).Statements<>nil then work.AddRange(TRepeatStmtNode(st99).Statements);
+          continue;
+        end;
+        if st99 is TCaseStmtNode then
+        begin
+          var cs99:=TCaseStmtNode(st99);
+          foreach var br99 in cs99.Branches do work.Add(br99.Stmt);
+          if cs99.ElseStmts<>nil then work.AddRange(cs99.ElseStmts);
+          continue;
+        end;
+        if st99 is TTryStmtNode then
+        begin
+          var ts99:=TTryStmtNode(st99);
+          if ts99.BodyStmts<>nil then work.AddRange(ts99.BodyStmts);
+          if ts99.ExceptStmts<>nil then work.AddRange(ts99.ExceptStmts);
+          if ts99.FinallyStmts<>nil then work.AddRange(ts99.FinallyStmts);
+          continue;
+        end;
+      end;
+    end;
+
     // [Stage 42] 사용자가 작성한 생성자 본문(constructor ClassName.Create; begin...end;)을
     // BuildClassShell이 미리 만들어 둔 ConstructorBuilder에 채워 넣는다. BuildMethodBody와
     // 거의 같은 구조이지만 매개변수/Result가 없고, 몸체 끝에 항상 Ret로 마무리한다.
@@ -3934,6 +4011,30 @@ type
         // [Stage 67] vtMatrix의 원소 타입 이름을 ClassName에 보존 (GetVarClassName이 참조)
         if (lv.VarType=vtMatrix) and (lv.ClassName<>'') then
           fLocalScope.SetClassName(lv.Name, lv.ClassName);
+      end;
+
+      // [설계 개선] 사용자가 작성한 생성자 본문 어디에도 "inherited Create(...)"가 없으면
+      // 부모(로컬 클래스 또는 System.Windows.Forms.Form 같은 외부 CLR 타입)의 생성자가
+      // 전혀 실행되지 않는다. 예를 들어 Form을 상속한 클래스에서 이 호출을 빠뜨리면,
+      // Control 내부 상태가 초기화되지 않아 Text 등의 프로퍼티 접근에서
+      // NullReferenceException이 발생한다(생성자 실행 자체는 성공했으므로 원인 추적이 어렵다).
+      // 부모가 선언돼 있는데(=fClassParents에 등록된 부모명이 있는데) 명시적 inherited Create
+      // 호출이 하나도 없으면, 인자 없는 부모 생성자 호출을 본문 맨 앞에 자동으로 삽입한다.
+      // 부모 생성자가 인자를 요구하면(EmitInheritedCtorCall이 예외를 던지면) 자동 삽입으로는
+      // 해결할 수 없으므로, 사용자가 알아볼 수 있는 안내 메시지로 바꿔서 다시 던진다.
+      if fClassParents.ContainsKey(impl.ClassName) and (fClassParents[impl.ClassName]<>'')
+         and not StmtListHasInheritedCtorCall(impl.Body.Statements) then
+      begin
+        try
+          EmitInheritedCtorCall(il, new List<TExprNode>);
+        except
+          on ex: Exception do
+            raise new Exception(
+              '생성자 "'+impl.ClassName+'.Create"에 "inherited Create(...)" 호출이 없습니다. '+
+              '부모 클래스/타입 "'+fClassParents[impl.ClassName]+'"의 생성자가 인자를 요구하는 것으로 보이므로 '+
+              '자동으로 채울 수 없습니다 — 생성자 본문 맨 앞에 필요한 인자를 담아 '+
+              '"inherited Create(...);"를 직접 작성해 주세요. (원본 오류: '+ex.Message+')');
+        end;
       end;
 
       // [Stage 61] 생성자 본문의 지역 const 선언 처리
