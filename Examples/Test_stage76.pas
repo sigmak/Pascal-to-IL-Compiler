@@ -8,9 +8,10 @@
 // ============================================================
 program Test_stage76_debug2;
 
-{$apptype console}
+{$apptype console} //  windows
 {$reference System.Windows.Forms.dll}
 {$reference System.Drawing.dll}
+
 
 type
   TMainForm = class(System.Windows.Forms.Form)
@@ -28,6 +29,7 @@ type
     constructor Create;
     procedure Form_Shown;
     procedure NewMenuItem_Click;
+    procedure MainMenu_Paint(sender: System.Object; e: System.Windows.Forms.PaintEventArgs);
     procedure ExitMenuItem_Click;
     procedure NewToolButton_Click;
   end;
@@ -61,7 +63,18 @@ begin
   Writeln('[Font 진단] MainMenu 상속 폰트 이름 = "' + MainMenu.Font.Name + '", 크기=' + MainMenu.Font.Size.ToString);
 
   FileMenu := new System.Windows.Forms.ToolStripMenuItem;
-  FileMenu.Text := '파일';
+  FileMenu.Text := 'File'; //파일
+  // [신규] ToolStripItem 내부 페인트 파이프라인이 이 값들 때문에 그리기를
+  // 스킵하고 있을 가능성을 배제하기 위해 전부 명시적으로 강제 지정.
+  FileMenu.DisplayStyle := System.Windows.Forms.ToolStripItemDisplayStyle.Text;
+  FileMenu.AutoSize := true;
+  FileMenu.Available := true;
+  FileMenu.Enabled := true;
+  FileMenu.Visible := true;
+  Writeln('[신규진단] FileMenu.DisplayStyle=' + FileMenu.DisplayStyle.ToString
+    + ' Available=' + BoolToStr(FileMenu.Available)
+    + ' Enabled=' + BoolToStr(FileMenu.Enabled)
+    + ' Visible=' + BoolToStr(FileMenu.Visible));
 
   NewMenuItem := new System.Windows.Forms.ToolStripMenuItem;
   NewMenuItem.Text := '새로 만들기';
@@ -80,11 +93,15 @@ begin
   Writeln('[진단] 파일 메뉴 하위 항목 구성 완료');
 
   MainMenu.Items.Add(FileMenu);
+
+  MainMenu.Paint += MainMenu_Paint;
   MainMenu.Dock := System.Windows.Forms.DockStyle.Top;
-  // [debug2] RenderMode.System 제거 — 기본 렌더러로 테스트
-  // MainMenu.RenderMode := System.Windows.Forms.ToolStripRenderMode.System;
+  // [신규] RenderMode.System(네이티브 Win32 메뉴 룩)으로 완전히 다른 렌더러를 테스트
+  MainMenu.RenderMode := System.Windows.Forms.ToolStripRenderMode.System;
   Controls.Add(MainMenu);
   MainMenuStrip := MainMenu;
+  Writeln('[신규진단2] Items.Add 이후 FileMenu.Visible=' + BoolToStr(FileMenu.Visible)
+    + ' Available=' + BoolToStr(FileMenu.Available));
   Writeln('[진단] 메뉴바 구성 완료');
   FileMenu.ForeColor := System.Drawing.Color.Red;
   MainMenu.BackColor := System.Drawing.Color.Yellow;
@@ -95,14 +112,14 @@ begin
   MainToolbar := new System.Windows.Forms.ToolStrip;
 
   NewToolButton := new System.Windows.Forms.ToolStripButton;
-  NewToolButton.Text := '새로 만들기';
+  NewToolButton.Text := 'New Create'; //새로 만들기
   NewToolButton.Click += NewToolButton_Click;
   NewToolButton.ForeColor := System.Drawing.Color.Red;
 
   MainToolbar.Items.Add(NewToolButton);
   MainToolbar.Dock := System.Windows.Forms.DockStyle.Top;
-  // [debug2] RenderMode.System 제거 — 기본 렌더러로 테스트
-  // MainToolbar.RenderMode := System.Windows.Forms.ToolStripRenderMode.System;
+  // [신규] 툴바도 동일하게 네이티브 렌더러로 테스트
+  MainToolbar.RenderMode := System.Windows.Forms.ToolStripRenderMode.System;
   Controls.Add(MainToolbar);
   Writeln('[진단] 툴바 구성 완료');
 
@@ -110,7 +127,7 @@ begin
   MainStatusBar := new System.Windows.Forms.StatusStrip;
 
   StatusLabel := new System.Windows.Forms.ToolStripStatusLabel;
-  StatusLabel.Text := '준비';
+  StatusLabel.Text := 'Ready';//준비
 
   MainStatusBar.Items.Add(StatusLabel);
   MainStatusBar.Dock := System.Windows.Forms.DockStyle.Bottom;
@@ -148,11 +165,33 @@ begin
   Writeln('[Shown 진단] Form.ClientSize.Width=' + IntToStr(ClientSize.Width));
   Writeln('[Shown 진단] MainMenu.Parent is nil? ' + BoolToStr(MainMenu.Parent = nil));
   Writeln('[Shown 진단] MainMenu.IsHandleCreated=' + BoolToStr(MainMenu.IsHandleCreated));
+  Writeln('[신규진단3] Shown 이후 FileMenu.Visible=' + BoolToStr(FileMenu.Visible)
+    + ' Available=' + BoolToStr(FileMenu.Available)
+    + ' Width=' + IntToStr(FileMenu.Width) + ' Height=' + IntToStr(FileMenu.Height));
+  Writeln('[신규진단4] FileMenu.Owner is nil? ' + BoolToStr(FileMenu.Owner = nil));
+  Writeln('[신규진단4] FileMenu.GetCurrentParent() is nil? ' + BoolToStr(FileMenu.GetCurrentParent() = nil));
 end;
 
 procedure TMainForm.NewMenuItem_Click;
 begin
   StatusLabel.Text := '새로 만들기(메뉴) 클릭됨';
+end;
+
+procedure TMainForm.MainMenu_Paint(sender: System.Object; e: System.Windows.Forms.PaintEventArgs);
+begin
+  e.Graphics.DrawString('수동그리기-파일(GDI+)', new System.Drawing.Font('맑은 고딕', 10),
+    System.Drawing.Brushes.Black, new System.Drawing.PointF(100, 2));
+
+  System.Windows.Forms.TextRenderer.DrawText(e.Graphics, 'GDI테스트',
+    new System.Drawing.Font('맑은 고딕', 10), new System.Drawing.Point(300, 2),
+    System.Drawing.Color.Black);
+
+  // [수정] y좌표를 메뉴바 높이(24px) 안으로 — 가로로 나란히 배치
+  e.Graphics.DrawString('FileMenu폰트-GDI+', FileMenu.Font,
+    System.Drawing.Brushes.Black, new System.Drawing.PointF(450, 2));
+
+  System.Windows.Forms.TextRenderer.DrawText(e.Graphics, 'FileMenu폰트-GDI',
+    FileMenu.Font, new System.Drawing.Point(650, 2), System.Drawing.Color.Black);
 end;
 
 procedure TMainForm.ExitMenuItem_Click;
@@ -170,7 +209,9 @@ var
 begin
   try
     Writeln('[진단] main 시작');
-    System.Windows.Forms.Application.EnableVisualStyles;
+    System.Windows.Forms.Application.EnableVisualStyles();
+    // ↓ 이 줄을 반드시 넣어야 ToolStrip 계열 텍스트가 렌더링된다
+    System.Windows.Forms.Application.SetCompatibleTextRenderingDefault(false);
     // [debug2] SetCompatibleTextRenderingDefault(false) 제거 — GDI+ 기본 경로로 테스트
     // System.Windows.Forms.Application.SetCompatibleTextRenderingDefault(false);
     f := new TMainForm;

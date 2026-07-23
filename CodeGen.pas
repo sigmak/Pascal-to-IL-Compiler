@@ -3829,6 +3829,57 @@ type
           end;
         end;
       end
+      else if e is TFieldReadExprNode then
+      begin
+        // [Stage 76 버그수정 #2] "MainMenu.Items.Add(FileMenu)"처럼 인자가 한정자 없는
+        // 필드 이름 하나("FileMenu")면, Parser는 이걸 TVarRefNode가 아니라
+        // TFieldReadExprNode로 만든다(메서드 본문에서 매개변수/지역변수가 아닌 식별자는
+        // 전부 이 노드가 됨 — Parser.pas 1039줄 참고). 그런데 바로 위 TVarRefNode 분기에
+        // 있던 "Self 필드면 FieldBuilder.FieldType을 찾는다" 수정은 TVarRefNode만 처리해서
+        // 실제로 필드 인자가 오는 이 경로(TFieldReadExprNode)는 여전히 못 잡고 있었다 —
+        // 그 결과 InferType 폴백(vtString/vtBoolean/vtInteger 외엔 전부 nil=중립)으로
+        // 떨어져 오버로드가 전부 동점 처리되고, GetMethods() 나열 순서상 우연히 먼저 나온
+        // Add(string)이 선택돼 FileMenu가 실제로는 MainMenu.Items에 들어가지 않는 문제가
+        // 있었다(FileMenu.Owner/GetCurrentParent가 계속 nil로 남음). 여기서 실제
+        // FieldBuilder.FieldType을 찾아 정확한 타입을 돌려준다.
+        var argFb52: FieldBuilder;
+        var fn52:=TFieldReadExprNode(e).FieldName;
+        if (fCurClassName<>'') and TryFindFieldBuilder(fCurClassName, fn52, argFb52) then
+          Result:=argFb52.FieldType
+        else
+        begin
+          // Self 필드가 아니면(예: 외부 상속 타입의 프로퍼티) 그 프로퍼티 타입도 확인해본다.
+          var extSelf52:=FindExternalAncestorType(fCurClassName);
+          if (extSelf52<>nil) and (extSelf52.GetProperty(fn52)<>nil) then
+            Result:=extSelf52.GetProperty(fn52).PropertyType
+          else
+          begin
+            vt:=InferType(e);
+            case vt of
+              vtString: Result:=typeof(string);
+              vtBoolean: Result:=typeof(boolean);
+              vtInteger: Result:=typeof(integer);
+            end;
+          end;
+        end;
+      end
+      else if (e is TNewObjectExprNode) and TNewObjectExprNode(e).IsExternalType then
+      begin
+        // [Stage 76 버그수정] "new System.Drawing.PointF(...)" 같은 외부 타입 생성자 호출이
+        // 인자로 쓰이면 그동안 이 함수가 nil(중립)을 돌려줬다. 그 결과 인자 개수는 같지만
+        // 해당 자리 매개변수 타입이 다른 오버로드들(예: Graphics.DrawString의 PointF 버전과
+        // RectangleF 버전)이 전부 동점 처리되어, GetMethods() 나열 순서상 우연히 먼저 나온
+        // (때로는 값형식 레이아웃이 다른, 즉 호환 안 되는) 오버로드가 선택될 수 있었다.
+        // 이 경우 스택에는 실제로 작은 구조체(PointF, 8바이트)만 쌓였는데 큰 구조체
+        // (RectangleF, 16바이트)를 받는 메서드가 호출되어 인자 레이아웃이 어긋나
+        // AccessViolationException으로 이어졌다. 생성자가 가리키는 실제 CLR 타입을
+        // 정확히 돌려줘서 오버로드 점수 계산이 이 자리를 더 이상 중립으로 보지 않게 한다.
+        try
+          Result:=ResolveExternalType(TNewObjectExprNode(e).ClassName);
+        except
+          Result:=nil; // 타입을 못 찾아도 기존과 동일하게 중립 폴백
+        end;
+      end
       else
       begin
         vt:=InferType(e);
@@ -5231,6 +5282,29 @@ type
       ab:=AssemblyBuilder.DefineDynamicAssembly(an, AssemblyBuilderAccess.RunAndSave);
       modB:=ab.DefineDynamicModule(fProg.Name, outName);
       fModB:=modB; // [Stage 68] 클로저 클래스 정의에 사용
+
+      // [Stage 76 버그수정] 생성된 어셈블리에 TargetFrameworkAttribute가 없으면
+      // .NET Framework가 이를 legacy(.NET 4.0 이전) 어셈블리로 간주해 프로세스 전체에
+      // 구버전 호환성 퀵스 모드를 적용한다. 이 모드에서는 순수 관리 코드(프로퍼티 설정,
+      // GDI+ 배경 채우기 등)는 정상 동작하지만, WinForms ToolStrip/MenuStrip/StatusStrip류의
+      // 오너드로우 텍스트 렌더링 경로가 깨져 텍스트만 그려지지 않는 증상이 발생한다.
+      // 컴파일러 자신을 실행 중인 CLR에 붙어있는 TargetFrameworkAttribute를 그대로 복사해서
+      // 생성 어셈블리에도 부여함으로써, 실제 설치된 .NET Framework 버전과 항상 일치시킨다.
+      try
+        var tfaCtor:=typeof(System.Runtime.Versioning.TargetFrameworkAttribute).GetConstructor([typeof(string)]);
+        var tfaVersionString: string:='.NETFramework,Version=v4.7.2'; // 폴백값
+        var selfTfa:=System.Reflection.Assembly.GetExecutingAssembly().GetCustomAttribute(
+          typeof(System.Runtime.Versioning.TargetFrameworkAttribute))
+          as System.Runtime.Versioning.TargetFrameworkAttribute;
+        if selfTfa<>nil then
+          tfaVersionString:=selfTfa.FrameworkName;
+        var tfaArgs: array of object:=new object[1];
+        tfaArgs[0]:=tfaVersionString;
+        ab.SetCustomAttribute(new CustomAttributeBuilder(tfaCtor, tfaArgs));
+      except
+        on ETfa: Exception do
+          Writeln('[경고] TargetFrameworkAttribute 부여 실패 (무시하고 계속): '+ETfa.Message);
+      end;
 
       // -2. [Phase 1] 열거형을 가장 먼저 빌드 (인터페이스·클래스 필드 타입으로 참조됨)
       BuildEnumTypes(modB);
