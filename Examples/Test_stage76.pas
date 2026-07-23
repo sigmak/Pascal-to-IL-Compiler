@@ -1,8 +1,12 @@
 // ============================================================
-// Test_stage76_debug.pas — [Stage 76] 메인 셸 윈도우(TMainForm) 진단용 버전.
-// 메뉴바 + 툴바 + 상태바만 있는 껍데기. 도킹/여러 창 연동은 이후 단계.
+// Test_stage76_debug2.pas — [Stage 76] 텍스트 미표시 원인 격리용 2차 진단 버전.
+// 변경점(원본 대비):
+//  1) MainMenu.RenderMode / MainToolbar.RenderMode := ToolStripRenderMode.System 두 줄 제거
+//     (기본 렌더러(ManagerRenderMode/Professional)로 그리게 함)
+//  2) Application.SetCompatibleTextRenderingDefault(false) 호출 제거
+//  나머지 로직/진단 Writeln은 원본과 동일하게 유지.
 // ============================================================
-program Test_stage76_debug;
+program Test_stage76_debug2;
 
 {$apptype console}
 {$reference System.Windows.Forms.dll}
@@ -22,7 +26,7 @@ type
     StatusLabel: System.Windows.Forms.ToolStripStatusLabel;
   public
     constructor Create;
-    procedure Form_Shown;   // ← 추가
+    procedure Form_Shown;
     procedure NewMenuItem_Click;
     procedure ExitMenuItem_Click;
     procedure NewToolButton_Click;
@@ -33,7 +37,7 @@ begin
   inherited Create;
   Writeln('[진단] TMainForm.Create 시작');
 
-  Text := 'Stage 76 — Main Shell';
+  Text := 'Stage 76 — Main Shell (debug2: RenderMode 제거)';
   Width := 640;
   Height := 400;
   Writeln('[진단] Text/Width/Height 설정 완료');
@@ -52,10 +56,8 @@ begin
 
   // ---- 메뉴바 ----
   MainMenu := new System.Windows.Forms.MenuStrip;
-  
+
   Writeln('[Font 진단] Form.Font is nil? ' + BoolToStr(Font = nil));
-  // [진단] '맑은 고딕' 지정 폰트가 텍스트 미표시의 원인인지 격리하기 위해 일단 빼고
-  // 기본 상속 폰트가 뭔지 확인한다.
   Writeln('[Font 진단] MainMenu 상속 폰트 이름 = "' + MainMenu.Font.Name + '", 크기=' + MainMenu.Font.Size.ToString);
 
   FileMenu := new System.Windows.Forms.ToolStripMenuItem;
@@ -79,7 +81,8 @@ begin
 
   MainMenu.Items.Add(FileMenu);
   MainMenu.Dock := System.Windows.Forms.DockStyle.Top;
-  MainMenu.RenderMode := System.Windows.Forms.ToolStripRenderMode.System;
+  // [debug2] RenderMode.System 제거 — 기본 렌더러로 테스트
+  // MainMenu.RenderMode := System.Windows.Forms.ToolStripRenderMode.System;
   Controls.Add(MainMenu);
   MainMenuStrip := MainMenu;
   Writeln('[진단] 메뉴바 구성 완료');
@@ -98,7 +101,8 @@ begin
 
   MainToolbar.Items.Add(NewToolButton);
   MainToolbar.Dock := System.Windows.Forms.DockStyle.Top;
-  MainToolbar.RenderMode := System.Windows.Forms.ToolStripRenderMode.System;
+  // [debug2] RenderMode.System 제거 — 기본 렌더러로 테스트
+  // MainToolbar.RenderMode := System.Windows.Forms.ToolStripRenderMode.System;
   Controls.Add(MainToolbar);
   Writeln('[진단] 툴바 구성 완료');
 
@@ -113,22 +117,27 @@ begin
   Controls.Add(MainStatusBar);
   Writeln('[진단] 상태바 구성 완료');
 
-  Shown += Form_Shown;      // ← 생성자 끝부분에 추가 (Controls.Add 다 끝난 뒤)
+  Shown += Form_Shown;
   Writeln('[진단] TMainForm.Create 끝');
-  
+
   Writeln('[Text 진단] FileMenu.Text = "' + FileMenu.Text + '"');
   Writeln('[Text 진단] MainMenu.Items.Count = ' + MainMenu.Items.Count.ToString);
   Writeln('[Text 진단] FileMenu.DropDownItems.Count = ' + FileMenu.DropDownItems.Count.ToString);
-  Writeln('[Text 진단] MainToolbar.Items.Count = ' + MainToolbar.Items.Count.ToString);  
-  
-  // TMainForm.Create 끝 부분에 추가
+  Writeln('[Text 진단] MainToolbar.Items.Count = ' + MainToolbar.Items.Count.ToString);
+
   Writeln('[GUI 진단] Controls.Count = ' + IntToStr(Controls.Count));
-  Writeln('[GUI 진단] MainMenu is nil? ' + BoolToStr(MainMenu = nil));  
-  
+  Writeln('[GUI 진단] MainMenu is nil? ' + BoolToStr(MainMenu = nil));
+
   Writeln('[레이아웃 진단] MainMenu.Dock = ' + MainMenu.Dock.ToString);
   Writeln('[레이아웃 진단] MainMenu.Width=' + IntToStr(MainMenu.Width) + ' Height=' + IntToStr(MainMenu.Height));
   Writeln('[레이아웃 진단] MainToolbar.Dock = ' + MainToolbar.Dock.ToString);
-  Writeln('[레이아웃 진단] MainStatusBar.Dock = ' + MainStatusBar.Dock.ToString);  
+  Writeln('[레이아웃 진단] MainStatusBar.Dock = ' + MainStatusBar.Dock.ToString);
+
+  // [debug2] 렌더러 상태 자체를 직접 출력 (System.Windows.Forms.ToolStripManager.VisualStylesEnabled)
+  Writeln('[렌더러 진단] ToolStripManager.VisualStylesEnabled = ' + BoolToStr(System.Windows.Forms.ToolStripManager.VisualStylesEnabled));
+  Writeln('[렌더러 진단] MainMenu.RenderMode = ' + MainMenu.RenderMode.ToString);
+  Writeln('[렌더러 진단] MainToolbar.RenderMode = ' + MainToolbar.RenderMode.ToString);
+  Writeln('[렌더러 진단] MainStatusBar.RenderMode = ' + MainStatusBar.RenderMode.ToString);
 end;
 
 procedure TMainForm.Form_Shown;
@@ -162,7 +171,8 @@ begin
   try
     Writeln('[진단] main 시작');
     System.Windows.Forms.Application.EnableVisualStyles;
-    System.Windows.Forms.Application.SetCompatibleTextRenderingDefault(false);
+    // [debug2] SetCompatibleTextRenderingDefault(false) 제거 — GDI+ 기본 경로로 테스트
+    // System.Windows.Forms.Application.SetCompatibleTextRenderingDefault(false);
     f := new TMainForm;
     Writeln('[진단] new TMainForm 완료 — Application.Run 호출 직전');
     System.Windows.Forms.Application.Run(f);

@@ -3807,11 +3807,25 @@ type
         end
         else
         begin
-          vt:=InferType(e);
-          case vt of
-            vtString: Result:=typeof(string);
-            vtBoolean: Result:=typeof(boolean);
-            vtInteger: Result:=typeof(integer);
+          // [버그 수정] vn50이 지역/전역 변수가 아니라 Self(현재 클래스)의 필드인 경우 —
+          // 기존엔 여기서 바로 vtString/vtBoolean/vtInteger 셋만 보고 나머지(예: 외부 CLR
+          // 타입 필드)는 전부 nil로 떨어졌다. nil은 ScoreParamMatch에서 "중립(0점)"으로
+          // 처리되므로, 오버로드가 여러 개인 외부 메서드(예: ToolStripItemCollection.Add:
+          // Add(string)/Add(Image)/Add(ToolStripItem))에 필드를 인자로 넘기면 모든 후보가
+          // 동점이 되어 t.GetMethods() 나열 순서상 우연히 먼저 나온(엉뚱한) 오버로드가
+          // 선택되는 문제가 있었다. Self 필드의 실제 FieldBuilder.FieldType을 먼저 확인해서
+          // 이 경로로 정확한 타입을 돌려준다.
+          var argFb50: FieldBuilder;
+          if (fCurClassName<>'') and TryFindFieldBuilder(fCurClassName, vn50, argFb50) then
+            Result:=argFb50.FieldType
+          else
+          begin
+            vt:=InferType(e);
+            case vt of
+              vtString: Result:=typeof(string);
+              vtBoolean: Result:=typeof(boolean);
+              vtInteger: Result:=typeof(integer);
+            end;
           end;
         end;
       end
