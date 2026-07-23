@@ -120,6 +120,11 @@ type
     constructor Create(a: TExprNode); begin Arg:=a; end;
   end;
 
+  TBoolToStrNode = class(TExprNode)
+  public Arg: TExprNode;
+    constructor Create(a: TExprNode); begin Arg:=a; end;
+  end;
+
   TArrayIndexExprNode = class(TExprNode)
   public ArrName: string; Index: TExprNode;
     constructor Create(n: string; i: TExprNode); begin ArrName:=n; Index:=i; end;

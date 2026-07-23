@@ -22,7 +22,7 @@ type
     tkAnd, tkOr, tkNot, tkBoolean, tkTrue, tkFalse,
     tkTry, tkExcept, tkFinally, tkRaise, tkOn,
     tkFunction, tkProcedure, tkResult,
-    tkIntToStr, tkSetLength, tkLength,
+    tkIntToStr, tkBoolToStr, tkSetLength, tkLength,
     tkUses, tkNil, // [Stage 29] uses 절, nil 리터럴
     tkSelf, tkAs, tkInherited, // [Stage 30] self 키워드, as 캐스트, inherited 호출
     tkNew, // [Stage 40] new TypeName(args) 객체 생성 구문
@@ -189,6 +189,7 @@ type
       else if lw='procedure' then Result:=new TToken(tkProcedure, w,sl,sc)
       else if lw='result'    then Result:=new TToken(tkResult,    w,sl,sc)
       else if lw='inttostr'  then Result:=new TToken(tkIntToStr,  w,sl,sc)
+      else if lw='booltostr' then Result:=new TToken(tkBoolToStr, w,sl,sc)
       else if lw='setlength' then Result:=new TToken(tkSetLength, w,sl,sc)
       else if lw='length'    then Result:=new TToken(tkLength,    w,sl,sc)
       else if lw='uses'      then Result:=new TToken(tkUses,      w,sl,sc)

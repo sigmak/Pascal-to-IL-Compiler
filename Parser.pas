@@ -771,6 +771,15 @@ type
         Result:=new TIntToStrNode(argE);
       end
 
+      // [Stage 76] BoolToStr(expr) — boolean 식을 'True'/'False' 문자열로 변환.
+      // 인자에 비교식(= 등)이 올 수 있으므로 ParseAddSub가 아닌 ParseExpr로 파싱한다.
+      else if t.Kind=tkBoolToStr then
+      begin
+        fPos:=fPos+1; Expect(tkLParen);
+        argE:=ParseExpr; Expect(tkRParen);
+        Result:=new TBoolToStrNode(argE);
+      end
+
       // [Stage 52] Length(x) — Lexer가 'length'를 tkIdent가 아니라 tkLength 키워드 토큰으로
       // 분류하기 때문에(줄 174, Lexer.pas), 아래 tkIdent 분기 안의 'length' 특수 처리(712번째 줄)까지
       // 내려가지 못하고 매칭 실패로 떨어지던 문제. .Length 멤버 접근(arr.Length)은 ExpectMemberName이
@@ -906,12 +915,17 @@ type
 
           else if segs2.Count>2 then
           begin
-            // 괄호 없이 3단계 이상 점(.)으로 연결된 경우 = 정적 필드/속성 읽기
-            // (예: System.EventArgs.Empty). 지역 변수/필드 이름에는 점이 없으므로
-            // 2단계(obj.Member)와 명확히 구분된다.
-            var staticType:=string.Join('.', segs2.GetRange(0, segs2.Count-1));
-            var staticMember:=segs2[segs2.Count-1];
-            Result:=new TStaticMemberExprNode(staticType, staticMember);
+            // [Stage 76 확장] 괄호 없이 3단계 이상 점(.)으로 연결된 경우, 예전에는 무조건
+            // "정적 필드/속성 읽기"(예: System.EventArgs.Empty)로만 취급해 TStaticMemberExprNode를
+            // 만들었다. 하지만 "MainMenu.Items.Count.ToString"처럼 첫 세그먼트가 실제
+            // 필드/변수인 체인도 겉보기엔 똑같아서 파서 단계에서는 둘을 구분할 수 없다
+            // (그건 필드/지역변수 테이블을 가진 CodeGen만 안다). 그래서 정적 타입 경로인지
+            // 변수 체인인지의 판별 자체를 CodeGen으로 미루고, 여기서는 이미 있는
+            // TMethodCallExprNode(한정자 전체, 마지막 세그먼트)로 통일해서 넘긴다 —
+            // CodeGen의 InferType/EmitExpr이 IsChainStartSegment로 실제 판별한다.
+            var staticQualifier2:=string.Join('.', segs2.GetRange(0, segs2.Count-1));
+            var staticMname2:=segs2[segs2.Count-1];
+            Result:=new TMethodCallExprNode(staticQualifier2, staticMname2);
           end
           else
           begin

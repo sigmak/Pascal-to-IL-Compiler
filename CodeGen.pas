@@ -340,6 +340,142 @@ type
       Result:=nil;
     end;
 
+    // [Stage 76] 한정자 체인의 "첫 세그먼트"가 실제로 필드/지역변수/전역변수/self가 상속한
+    // 외부 타입의 프로퍼티인지만 미리 판별한다(아무것도 방출하지 않음). "System.Windows.Forms.
+    // Application.Run(f)"처럼 첫 세그먼트가 완전정규화된 외부 정적 타입의 네임스페이스 일부인
+    // 경우와, "MainMenu.Items.Add(x)"처럼 진짜 변수로 시작하는 체인을 구분하기 위한 용도 —
+    // 이 판별 없이는 전자를 후자로 오인해 EmitQualifierChainLoad가 "System"을 변수로 찾다가
+    // 실패한다.
+    function IsChainStartSegment(first: string): boolean;
+    var dummyFb: FieldBuilder;
+    begin
+      if TryFindFieldBuilder(fCurClassName, first, dummyFb) then begin Result:=true; exit; end;
+      if (fLocalScope.Has(first) or fGlobalScope.Has(first))
+         and (fLocalScope.HasClrType(first) or fGlobalScope.HasClrType(first)) then
+      begin Result:=true; exit; end;
+      if (FindExternalAncestorType(fCurClassName)<>nil)
+         and (FindExternalAncestorType(fCurClassName).GetProperty(first)<>nil) then
+      begin Result:=true; exit; end;
+      Result:=false;
+    end;
+
+    // [Stage 76] "MainMenu.Items.Add(x)" 같은 문장에서 파서는 마지막 세그먼트(Add)를 제외한
+    // 나머지("MainMenu.Items")를 점(.)으로 이어붙인 문자열 하나로 넘겨준다. 여기서 그 문자열을
+    // 다시 세그먼트 목록으로 쪼갠다. (이 파일은 실제 완전한 PascalABC.NET/.NET으로 컴파일되므로
+    // string.IndexOf/Substring 같은 표준 API를 그대로 쓸 수 있다 — 우리가 만드는 컴파일러의
+    // 기능 제약과는 무관하다.)
+    function SplitByDot(s: string): List<string>;
+    var idx: integer; rest: string;
+    begin
+      Result:=new List<string>;
+      rest:=s;
+      idx:=rest.IndexOf('.');
+      while idx>=0 do
+      begin
+        Result.Add(rest.Substring(0, idx));
+        rest:=rest.Substring(idx+1);
+        idx:=rest.IndexOf('.');
+      end;
+      Result.Add(rest);
+    end;
+
+    // [Stage 76] 점(.)으로 연결된 한정자 체인("MainMenu.Items", "FileMenu.DropDownItems" 등)을
+    // 첫 세그먼트부터 차례로 로드한다. 첫 세그먼트는 기존 단일 세그먼트 판별 순서(필드 →
+    // 지역/전역 변수(외부 CLR 타입) → self가 상속한 외부 타입의 프로퍼티)를 그대로 따르고,
+    // 이후 세그먼트들은 직전 결과 타입 위에서 프로퍼티(우선) 또는 필드를 순서대로 읽어
+    // 내려간다. 끝나고 나면 스택엔 마지막 세그먼트가 가리키는 값이 남고, finalType은 그 값의
+    // 실제 CLR 타입이다 — 호출부는 이 타입 위에서 메서드/프로퍼티를 마저 찾으면 된다.
+    procedure EmitQualifierChainLoad(aIL: ILGenerator; segs: List<string>; var finalType: System.Type);
+    var i: integer; curType: System.Type; pi: PropertyInfo; fi: System.Reflection.FieldInfo;
+        firstFb: FieldBuilder; first: string; extSelf: System.Type;
+    begin
+      first:=segs[0];
+      if TryFindFieldBuilder(fCurClassName, first, firstFb) then
+      begin
+        aIL.Emit(OpCodes.Ldarg_0);
+        aIL.Emit(OpCodes.Ldfld, firstFb);
+        curType:=firstFb.FieldType;
+      end
+      else if (fLocalScope.Has(first) or fGlobalScope.Has(first))
+              and (fLocalScope.HasClrType(first) or fGlobalScope.HasClrType(first)) then
+      begin
+        if fLocalScope.Has(first) then aIL.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(first))
+        else aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(first));
+        if fLocalScope.HasClrType(first) then curType:=fLocalScope.GetClrType(first)
+        else curType:=fGlobalScope.GetClrType(first);
+      end
+      else
+      begin
+        extSelf:=FindExternalAncestorType(fCurClassName);
+        if (extSelf<>nil) and (extSelf.GetProperty(first)<>nil) then
+        begin
+          aIL.Emit(OpCodes.Ldarg_0);
+          pi:=extSelf.GetProperty(first);
+          aIL.Emit(OpCodes.Callvirt, pi.GetGetMethod);
+          curType:=pi.PropertyType;
+        end
+        else
+          raise new Exception('알 수 없는 한정자 "'+first+'" (연쇄 속성 접근의 시작점을 찾을 수 없습니다)');
+      end;
+
+      for i:=1 to segs.Count-1 do
+      begin
+        pi:=curType.GetProperty(segs[i]);
+        if pi<>nil then
+        begin
+          aIL.Emit(OpCodes.Callvirt, pi.GetGetMethod);
+          curType:=pi.PropertyType;
+        end
+        else
+        begin
+          fi:=curType.GetField(segs[i]);
+          if fi=nil then
+            raise new Exception('타입 "'+curType.FullName+'"에 속성/필드 "'+segs[i]+'"가 없습니다 (연쇄 접근 중 — 경로: '+string.Join('.', segs)+')');
+          aIL.Emit(OpCodes.Ldfld, fi);
+          curType:=fi.FieldType;
+        end;
+      end;
+      finalType:=curType;
+    end;
+
+    // [Stage 76 확장] EmitQualifierChainLoad와 완전히 같은 판별 순서를 따르되, IL을 전혀 방출하지
+    // 않고 최종 타입만 계산한다. InferType은 aIL을 받지 않으므로(방출 시점이 아니라 타입 추론
+    // 시점이므로) IL을 섞어 넣으면 명령 스트림이 깨진다 — 그래서 별도 함수로 분리했다.
+    function InferQualifierChainType(segs: List<string>): System.Type;
+    var i: integer; curType: System.Type; pi: PropertyInfo; fi: System.Reflection.FieldInfo;
+        firstFb: FieldBuilder; first: string; extSelf: System.Type;
+    begin
+      first:=segs[0];
+      if TryFindFieldBuilder(fCurClassName, first, firstFb) then curType:=firstFb.FieldType
+      else if (fLocalScope.Has(first) or fGlobalScope.Has(first))
+              and (fLocalScope.HasClrType(first) or fGlobalScope.HasClrType(first)) then
+      begin
+        if fLocalScope.HasClrType(first) then curType:=fLocalScope.GetClrType(first)
+        else curType:=fGlobalScope.GetClrType(first);
+      end
+      else
+      begin
+        extSelf:=FindExternalAncestorType(fCurClassName);
+        if (extSelf<>nil) and (extSelf.GetProperty(first)<>nil) then curType:=extSelf.GetProperty(first).PropertyType
+        else raise new Exception('알 수 없는 한정자 "'+first+'" (연쇄 속성 접근의 시작점을 찾을 수 없습니다)');
+      end;
+
+      for i:=1 to segs.Count-1 do
+      begin
+        pi:=curType.GetProperty(segs[i]);
+        if pi<>nil then curType:=pi.PropertyType
+        else
+        begin
+          fi:=curType.GetField(segs[i]);
+          if fi=nil then
+            raise new Exception('타입 "'+curType.FullName+'"에 속성/필드 "'+segs[i]+'"가 없습니다 (연쇄 접근 중 — 경로: '+string.Join('.', segs)+')');
+          curType:=fi.FieldType;
+        end;
+      end;
+      Result:=curType;
+    end;
+
+
     // 클래스 계층을 따라 올라가며 메서드를 정의한 (진짜 소유/override) 클래스의 MethodBuilder 탐색
     function FindInstanceMethod(startClass, mname: string): MethodBuilder;
     var c: string;
@@ -436,6 +572,7 @@ type
       else if e is TNilLiteralNode then Result:=vtObject // [Stage 29]
       else if e is TStrLiteralNode then Result:=vtString
       else if e is TIntToStrNode then Result:=vtString
+      else if e is TBoolToStrNode then Result:=vtString
       else if e is TLengthExprNode then Result:=vtInteger
       else if e is TResultRefNode then Result:=fResultType
       else if e is TNewObjectExprNode then Result:=vtObject
@@ -484,7 +621,41 @@ type
       else if e is TMethodCallExprNode then
       begin
         var _mc4:=TMethodCallExprNode(e); var _qfb4: FieldBuilder;
-        if _mc4.ObjName='' then // [Stage 30] Self.Method(...) / 암시적 self 호출 — 지역 메서드 우선, 없으면 외부 조상 타입
+        // [Stage 76 확장] ObjName 자체가 점(.)으로 연결된 체인이면(예: "MainMenu.Items.Count")
+        // 아래의 단일 세그먼트 판별 분기들보다 먼저 처리한다 — 안 그러면 마지막 else의
+        // "외부 정적 타입"으로 오인되어 존재하지 않는 타입 조회로 실패한다(Stage 76 실전 버그).
+        if (_mc4.ObjName<>'') and (_mc4.ObjName.IndexOf('.')>=0) and (_mc4.ObjCastType='') then
+        begin
+          var _chainSegs4:=SplitByDot(_mc4.ObjName);
+          if IsChainStartSegment(_chainSegs4[0]) then
+          begin
+            // 첫 세그먼트가 실제 필드/변수/self 상속 프로퍼티 — 체인을 끝까지 타입만 추적한다.
+            var _chainType4:=InferQualifierChainType(_chainSegs4);
+            var _cpi4:=_chainType4.GetProperty(_mc4.MethodName);
+            if (_cpi4<>nil) and (_cpi4.PropertyType=typeof(string)) then Result:=vtString
+            else
+            begin
+              var _cmi4:=ResolveMethodByArity(_chainType4, _mc4.MethodName, _mc4.Args, false);
+              if (_cmi4<>nil) and (_cmi4.ReturnType=typeof(string)) then Result:=vtString
+              else Result:=vtInteger;
+            end;
+          end
+          else
+          begin
+            // 첫 세그먼트가 진짜 외부 네임스페이스/타입 경로 — 기존 TStaticMemberExprNode와
+            // 동일한 방식으로 정적 필드/프로퍼티를 조회한다 (예: System.EventArgs.Empty).
+            var _staticT4:=ResolveExternalType(_mc4.ObjName);
+            var _spi4:=_staticT4.GetProperty(_mc4.MethodName);
+            if (_spi4<>nil) and (_spi4.PropertyType=typeof(string)) then Result:=vtString
+            else
+            begin
+              var _sfi4:=_staticT4.GetField(_mc4.MethodName);
+              if (_sfi4<>nil) and (_sfi4.FieldType=typeof(string)) then Result:=vtString
+              else Result:=vtInteger;
+            end;
+          end;
+        end
+        else if _mc4.ObjName='' then // [Stage 30] Self.Method(...) / 암시적 self 호출 — 지역 메서드 우선, 없으면 외부 조상 타입
         begin
           if fMethodReturnTypes.ContainsKey(fCurClassName) and fMethodReturnTypes[fCurClassName].ContainsKey(_mc4.MethodName) then
             Result:=FindMethodReturnType(fCurClassName, _mc4.MethodName)
@@ -897,7 +1068,7 @@ type
     var
       lit: TIntLiteralNode; slit: TStrLiteralNode; vr: TVarRefNode;
       b: TBinOpNode; cmp: TCompareNode; fc: TFuncCallExprNode;
-      its: TIntToStrNode; ai: TArrayIndexExprNode; le: TLengthExprNode;
+      its: TIntToStrNode; bts: TBoolToStrNode; ai: TArrayIndexExprNode; le: TLengthExprNode;
       neo: TNewObjectExprNode; mc: TMethodCallExprNode; fr: TFieldReadExprNode;
       loc: LocalBuilder; mb: MethodBuilder; imb: MethodBuilder;
       ae: TExprNode; ts, cat: MethodInfo; lt, rt, at2: TVarType;
@@ -939,6 +1110,22 @@ type
         its:=TIntToStrNode(e); EmitExpr(aIL, its.Arg);
         ts:=typeof(System.Convert).GetMethod('ToString', [typeof(integer)]);
         aIL.Emit(OpCodes.Call, ts);
+      end
+
+      // [Stage 76] BoolToStr(expr): boolean -> 'True'/'False' 문자열
+      // boolean은 int32(0/1)로 표현되다 — 0이면 'False', 1(또는 비영)이면 'True'.
+      // IL: 파스칼 boolean 스택값은 int32 0/1 — Convert.ToBoolean(int32)로 bool로 올린 뒤
+      // bool.ToString()으로 "True"/"False"를 얻는다.
+      else if e is TBoolToStrNode then
+      begin
+        bts:=TBoolToStrNode(e);
+        EmitExpr(aIL, bts.Arg);
+        // int32(0/1) -> bool
+        var _toBool:=typeof(System.Convert).GetMethod('ToBoolean', [typeof(integer)]);
+        aIL.Emit(OpCodes.Call, _toBool);
+        // bool.ToString() -> "True"/"False"
+        var _boolToStr:=typeof(boolean).GetMethod('ToString', new System.Type[0]);
+        aIL.Emit(OpCodes.Call, _boolToStr);
       end
 
       else if e is TLengthExprNode then
@@ -1032,7 +1219,92 @@ type
       begin
         // c.GetValue → Ldloc c + Call TCounter::GetValue
         mc:=TMethodCallExprNode(e);
-        if (fLocalScope.Has(mc.ObjName) or fGlobalScope.Has(mc.ObjName))
+        // [Stage 76 확장] ObjName 자체가 점(.)으로 연결된 체인이면(예: "MainMenu.Items.Count")
+        // 아래의 단일 세그먼트 판별 분기들보다 먼저 처리한다 — EmitStatement의 TMethodCallStmtNode
+        // 처리(Stage 76)와 동일한 원리를 식(expression) 자리에도 적용한 것.
+        if (mc.ObjName<>'') and (mc.ObjName.IndexOf('.')>=0) and (mc.ObjCastType='') then
+        begin
+          var _chainSegsE:=SplitByDot(mc.ObjName);
+          if IsChainStartSegment(_chainSegsE[0]) then
+          begin
+            var _chainTypeE: System.Type;
+            EmitQualifierChainLoad(aIL, _chainSegsE, _chainTypeE);
+            // [버그 수정] chainTypeE가 값 타입(예: Count가 반환하는 int32)이면 이후 Callvirt는
+            // 박싱된 참조를 요구한다 — Box 없이 그대로 Callvirt하면 스택에 있는 값 타입의
+            // 원시값(정수)을 객체 참조로 오인해 실행 시 잘못된 메모리를 역참조한다
+            // (MainMenu.Items.Count.ToString에서 실제로 NullReferenceException으로 재현됨).
+            // 참조 타입이면 Box는 그대로 통과되므로 항상 걸어도 안전하다.
+            // [Stage 76 수정] 값 타입이면 Box 후 스택은 System.Object 참조가 된다.
+            // 이 상태에서 원래 값 타입(_chainTypeE)의 MethodInfo로 Callvirt하면
+            // vtable 슬롯이 달라 쓰레기값이 나온다(Count=127611752 등).
+            // Box 후에는 반드시 typeof(System.Object) 기준으로 메서드를 탐색해야 한다.
+            // 참조 타입이면 Box 없이 _chainTypeE에서 그대로 탐색한다.
+            if _chainTypeE.IsValueType then
+            begin
+              aIL.Emit(OpCodes.Box, _chainTypeE);
+              // Box 후 스택 타입은 object — object의 가상 메서드로 Callvirt해야 올바르다.
+              var _objTypeE := typeof(System.Object);
+              var _cmiBoxedE := ResolveMethodByArity(_objTypeE, mc.MethodName, mc.Args, false);
+              if _cmiBoxedE = nil then
+                raise new Exception('System.Object에 메서드 "'+mc.MethodName+'"가 없습니다 (값 타입 Box 후 경로: '+mc.ObjName+'.'+mc.MethodName+')');
+              var _cmiBoxedEParams := _cmiBoxedE.GetParameters;
+              for var _cmiBAi := 0 to mc.Args.Count-1 do
+                EmitArgForParamType(aIL, mc.Args[_cmiBAi], _cmiBoxedEParams[_cmiBAi].ParameterType);
+              aIL.Emit(OpCodes.Callvirt, _cmiBoxedE);
+            end
+            else
+            begin
+              var _cpiE:=_chainTypeE.GetProperty(mc.MethodName);
+              if (mc.Args.Count=0) and (_cpiE<>nil) and (_cpiE.GetGetMethod<>nil) then
+                aIL.Emit(OpCodes.Callvirt, _cpiE.GetGetMethod)
+              else
+              begin
+                var _cmiE:=ResolveMethodByArity(_chainTypeE, mc.MethodName, mc.Args, false);
+                if _cmiE=nil then
+                  raise new Exception('타입 "'+_chainTypeE.FullName+'"에 메서드 "'+mc.MethodName+'"가 없습니다 (인자 '+mc.Args.Count.ToString+'개, 경로: '+mc.ObjName+'.'+mc.MethodName+')');
+                var _cmiEParams:=_cmiE.GetParameters;
+                for var _cmiEAi:=0 to mc.Args.Count-1 do
+                  EmitArgForParamType(aIL, mc.Args[_cmiEAi], _cmiEParams[_cmiEAi].ParameterType);
+                aIL.Emit(OpCodes.Callvirt, _cmiE);
+              end;
+            end;
+          end
+          else
+          begin
+            // 첫 세그먼트가 진짜 외부 정적 타입 경로 — 기존 TStaticMemberExprNode와 동일한 동작.
+            var _staticTE:=ResolveExternalType(mc.ObjName);
+            var _spiE:=_staticTE.GetProperty(mc.MethodName);
+            if (mc.Args.Count=0) and (_spiE<>nil) and (_spiE.GetGetMethod<>nil) then
+              aIL.Emit(OpCodes.Call, _spiE.GetGetMethod)
+            else
+            begin
+              var _sfiE:=_staticTE.GetField(mc.MethodName);
+              if (mc.Args.Count=0) and (_sfiE<>nil) then
+              begin
+                // [Stage 76] enum 멤버(예: DockStyle.Top)는 실제로는 컴파일타임 상수(literal)
+                // 필드라 런타임 저장 공간이 없다 — Ldsfld를 쓰면 MissingFieldException이 난다.
+                // 리터럴 필드는 GetRawConstantValue로 실제 정수값을 꺼내 Ldc_I4로 직접 올려야 한다.
+                // (기존 TStaticMemberExprNode 경로에 있던 처리를 여기로 옮겨왔다 — 이전 패치에서
+                // TMethodCallExprNode로 통합하면서 이 부분을 빠뜨렸던 회귀 버그.)
+                if _sfiE.IsLiteral then
+                  aIL.Emit(OpCodes.Ldc_I4, System.Convert.ToInt32(_sfiE.GetRawConstantValue))
+                else
+                  aIL.Emit(OpCodes.Ldsfld, _sfiE);
+              end
+              else
+              begin
+                var _smiE:=ResolveMethodByArity(_staticTE, mc.MethodName, mc.Args, false);
+                if _smiE=nil then
+                  raise new Exception('외부 타입 "'+_staticTE.FullName+'"에 정적 멤버 "'+mc.MethodName+'"가 없습니다.');
+                var _smiEParams:=_smiE.GetParameters;
+                for var _smiEAi:=0 to mc.Args.Count-1 do
+                  EmitArgForParamType(aIL, mc.Args[_smiEAi], _smiEParams[_smiEAi].ParameterType);
+                aIL.Emit(OpCodes.Call, _smiE);
+              end;
+            end;
+          end;
+        end
+        else if (fLocalScope.Has(mc.ObjName) or fGlobalScope.Has(mc.ObjName))
            and (fLocalScope.HasClrType(mc.ObjName) or fGlobalScope.HasClrType(mc.ObjName)) then
         begin
           // sender/e 같은, 외부(또는 객체) 타입 매개변수/지역변수를 통한 접근.
@@ -1402,7 +1674,13 @@ type
           var smFi:=smType.GetField(sm.MemberName);
           if smFi=nil then
             raise new Exception('타입 "'+smType.FullName+'"에 정적 필드/속성 "'+sm.MemberName+'"가 없습니다.');
-          aIL.Emit(OpCodes.Ldsfld, smFi); // 정적 필드는 Ldsfld
+          // [Stage 76] enum 멤버(예: DockStyle.Top)는 실제로는 컴파일타임 상수(literal) 필드라
+          // 런타임 저장 공간이 없다 — Ldsfld를 쓰면 MissingFieldException이 난다. 리터럴 필드는
+          // GetRawConstantValue로 실제 정수값을 꺼내 Ldc_I4로 직접 스택에 올려야 한다.
+          if smFi.IsLiteral then
+            aIL.Emit(OpCodes.Ldc_I4, System.Convert.ToInt32(smFi.GetRawConstantValue))
+          else
+            aIL.Emit(OpCodes.Ldsfld, smFi); // 진짜 정적 필드(저장 공간 있음)는 기존처럼 Ldsfld
         end;
       end
 
@@ -2071,7 +2349,35 @@ type
       else if s is TMethodCallStmtNode then
       begin
         mcs:=TMethodCallStmtNode(s);
-        if mcs.ObjName='' then
+        // [Stage 76] "MainMenu.Items.Add(x)" 처럼 한정자 자체가 점(.)으로 연결된 체인이면
+        // (지역변수/필드.프로퍼티.프로퍼티...) 아래의 단일 세그먼트 판별 분기들보다 먼저
+        // 처리한다 — 안 그러면 마지막 else의 "외부 정적 타입"으로 오인되어
+        // ResolveExternalType("MainMenu.Items") 같은 존재하지 않는 타입 조회로 실패한다.
+        if (mcs.ObjName<>'') and (mcs.ObjName.IndexOf('.')>=0) and (mcs.ObjCastType='')
+           and IsChainStartSegment(SplitByDot(mcs.ObjName)[0]) then
+        begin
+          var chainSegs:=SplitByDot(mcs.ObjName);
+          var chainType: System.Type;
+          EmitQualifierChainLoad(aIL, chainSegs, chainType);
+          var _getPC:=chainType.GetProperty(mcs.MethodName);
+          if (mcs.Args.Count=0) and (_getPC<>nil) and (_getPC.GetGetMethod<>nil) then
+          begin
+            aIL.Emit(OpCodes.Callvirt, _getPC.GetGetMethod);
+            aIL.Emit(OpCodes.Pop);
+          end
+          else
+          begin
+            var _emiC:=ResolveMethodByArity(chainType, mcs.MethodName, mcs.Args, false);
+            if _emiC=nil then
+              raise new Exception('타입 "'+chainType.FullName+'"에 메서드 "'+mcs.MethodName+'"가 없습니다 (인자 '+mcs.Args.Count.ToString+'개, 경로: '+mcs.ObjName+'.'+mcs.MethodName+')');
+            var _emiCParams:=_emiC.GetParameters;
+            for var _emiCAi:=0 to mcs.Args.Count-1 do
+              EmitArgForParamType(aIL, mcs.Args[_emiCAi], _emiCParams[_emiCAi].ParameterType);
+            aIL.Emit(OpCodes.Callvirt, _emiC);
+            if _emiC.ReturnType<>typeof(System.Void) then aIL.Emit(OpCodes.Pop);
+          end;
+        end
+        else if mcs.ObjName='' then
         begin
           // 암시적 self 호출: Show; Close(); 등 — 지역 메서드 우선, 없으면 외부 상속 타입에서 탐색
           aIL.Emit(OpCodes.Ldarg_0); // self
@@ -2887,6 +3193,7 @@ type
         for i:=0 to TInheritedCallExprNode(e).Args.Count-1 do
           CollectVarNamesInExpr(TInheritedCallExprNode(e).Args[i], names)
       else if e is TIntToStrNode then CollectVarNamesInExpr(TIntToStrNode(e).Arg, names)
+      else if e is TBoolToStrNode then CollectVarNamesInExpr(TBoolToStrNode(e).Arg, names)
       else if e is TNewObjectExprNode then
         for i:=0 to TNewObjectExprNode(e).Args.Count-1 do
           CollectVarNamesInExpr(TNewObjectExprNode(e).Args[i], names)
@@ -3873,83 +4180,6 @@ type
       end;
     end;
 
-    // [설계 개선] 사용자가 직접 작성한 생성자 본문에 "inherited Create(...)" 호출이
-    // 하나라도 있는지 검사한다. if/while/for/repeat/case/try 등 중첩된 문장 블록
-    // 안에 있어도 찾아낸다(사용자가 조건부로 부모 생성자를 호출하는 드문 패턴도
-    // 있을 수 있으므로). TInheritedCallStmtNode.MethodName='Create'인 경우만 인정한다
-    // — inherited SomeOtherMethod(...)는 부모 생성자 호출이 아니므로 무시한다.
-    // [주의] 재귀 대신 명시적 워크리스트(work: List<TStmtNode>)로 순회한다 — PascalABC.NET은
-    // 지역 함수 안에 또 다른 지역 함수를 중첩 선언하는 것을 허용하지 않으므로("Found
-    // 'function' but expected identifier"), 서로를 호출하는 두 개의 지역 함수 대신
-    // 단일 함수 + 반복문 형태로 작성했다.
-    function StmtListHasInheritedCtorCall(stmts: List<TStmtNode>): boolean;
-    var
-      work: List<TStmtNode>;
-      idx: integer; st99: TStmtNode;
-    begin
-      Result:=false;
-      work:=new List<TStmtNode>;
-      if stmts<>nil then work.AddRange(stmts);
-      idx:=0;
-      while idx<work.Count do
-      begin
-        st99:=work[idx];
-        idx:=idx+1;
-        if st99=nil then continue;
-        if st99 is TInheritedCallStmtNode then
-        begin
-          if TInheritedCallStmtNode(st99).MethodName='Create' then begin Result:=true; exit; end;
-          continue;
-        end;
-        if st99 is TCompoundStmtNode then
-        begin
-          if TCompoundStmtNode(st99).Statements<>nil then work.AddRange(TCompoundStmtNode(st99).Statements);
-          continue;
-        end;
-        if st99 is TIfStmtNode then
-        begin
-          work.Add(TIfStmtNode(st99).ThenStmt);
-          work.Add(TIfStmtNode(st99).ElseStmt);
-          continue;
-        end;
-        if st99 is TWhileStmtNode then
-        begin
-          work.Add(TWhileStmtNode(st99).Body);
-          continue;
-        end;
-        if st99 is TForStmtNode then
-        begin
-          work.Add(TForStmtNode(st99).Body);
-          continue;
-        end;
-        if st99 is TForInStmtNode then
-        begin
-          work.Add(TForInStmtNode(st99).Body);
-          continue;
-        end;
-        if st99 is TRepeatStmtNode then
-        begin
-          if TRepeatStmtNode(st99).Statements<>nil then work.AddRange(TRepeatStmtNode(st99).Statements);
-          continue;
-        end;
-        if st99 is TCaseStmtNode then
-        begin
-          var cs99:=TCaseStmtNode(st99);
-          foreach var br99 in cs99.Branches do work.Add(br99.Stmt);
-          if cs99.ElseStmts<>nil then work.AddRange(cs99.ElseStmts);
-          continue;
-        end;
-        if st99 is TTryStmtNode then
-        begin
-          var ts99:=TTryStmtNode(st99);
-          if ts99.BodyStmts<>nil then work.AddRange(ts99.BodyStmts);
-          if ts99.ExceptStmts<>nil then work.AddRange(ts99.ExceptStmts);
-          if ts99.FinallyStmts<>nil then work.AddRange(ts99.FinallyStmts);
-          continue;
-        end;
-      end;
-    end;
-
     // [Stage 42] 사용자가 작성한 생성자 본문(constructor ClassName.Create; begin...end;)을
     // BuildClassShell이 미리 만들어 둔 ConstructorBuilder에 채워 넣는다. BuildMethodBody와
     // 거의 같은 구조이지만 매개변수/Result가 없고, 몸체 끝에 항상 Ret로 마무리한다.
@@ -4011,30 +4241,6 @@ type
         // [Stage 67] vtMatrix의 원소 타입 이름을 ClassName에 보존 (GetVarClassName이 참조)
         if (lv.VarType=vtMatrix) and (lv.ClassName<>'') then
           fLocalScope.SetClassName(lv.Name, lv.ClassName);
-      end;
-
-      // [설계 개선] 사용자가 작성한 생성자 본문 어디에도 "inherited Create(...)"가 없으면
-      // 부모(로컬 클래스 또는 System.Windows.Forms.Form 같은 외부 CLR 타입)의 생성자가
-      // 전혀 실행되지 않는다. 예를 들어 Form을 상속한 클래스에서 이 호출을 빠뜨리면,
-      // Control 내부 상태가 초기화되지 않아 Text 등의 프로퍼티 접근에서
-      // NullReferenceException이 발생한다(생성자 실행 자체는 성공했으므로 원인 추적이 어렵다).
-      // 부모가 선언돼 있는데(=fClassParents에 등록된 부모명이 있는데) 명시적 inherited Create
-      // 호출이 하나도 없으면, 인자 없는 부모 생성자 호출을 본문 맨 앞에 자동으로 삽입한다.
-      // 부모 생성자가 인자를 요구하면(EmitInheritedCtorCall이 예외를 던지면) 자동 삽입으로는
-      // 해결할 수 없으므로, 사용자가 알아볼 수 있는 안내 메시지로 바꿔서 다시 던진다.
-      if fClassParents.ContainsKey(impl.ClassName) and (fClassParents[impl.ClassName]<>'')
-         and not StmtListHasInheritedCtorCall(impl.Body.Statements) then
-      begin
-        try
-          EmitInheritedCtorCall(il, new List<TExprNode>);
-        except
-          on ex: Exception do
-            raise new Exception(
-              '생성자 "'+impl.ClassName+'.Create"에 "inherited Create(...)" 호출이 없습니다. '+
-              '부모 클래스/타입 "'+fClassParents[impl.ClassName]+'"의 생성자가 인자를 요구하는 것으로 보이므로 '+
-              '자동으로 채울 수 없습니다 — 생성자 본문 맨 앞에 필요한 인자를 담아 '+
-              '"inherited Create(...);"를 직접 작성해 주세요. (원본 오류: '+ex.Message+')');
-        end;
       end;
 
       // [Stage 61] 생성자 본문의 지역 const 선언 처리
