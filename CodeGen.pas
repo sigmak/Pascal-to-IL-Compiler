@@ -1113,18 +1113,16 @@ type
       end
 
       // [Stage 76] BoolToStr(expr): boolean -> 'True'/'False' 문자열
-      // boolean은 int32(0/1)로 표현되다 — 0이면 'False', 1(또는 비영)이면 'True'.
-      // IL: 파스칼 boolean 스택값은 int32 0/1 — Convert.ToBoolean(int32)로 bool로 올린 뒤
-      // bool.ToString()으로 "True"/"False"를 얻는다.
+      // [버그 수정] boolean은 값 타입(struct)이라 bool.ToString()을 인스턴스 메서드로
+      // Call하려면 스택에 "값의 주소"가 있어야 하는데, 이전 코드는 값(int32 0/1) 자체를
+      // 스택에 둔 채 Call했다 — CLR이 그 int32를 this 포인터로 오인해 역참조하면서
+      // NullReferenceException 발생. IntToStr과 동일하게 정적 메서드
+      // Convert.ToString(Boolean)을 쓰면 값 그대로(파스칼 bool의 IL 표현 = int32) 넘겨도 안전하다.
       else if e is TBoolToStrNode then
       begin
         bts:=TBoolToStrNode(e);
         EmitExpr(aIL, bts.Arg);
-        // int32(0/1) -> bool
-        var _toBool:=typeof(System.Convert).GetMethod('ToBoolean', [typeof(integer)]);
-        aIL.Emit(OpCodes.Call, _toBool);
-        // bool.ToString() -> "True"/"False"
-        var _boolToStr:=typeof(boolean).GetMethod('ToString', new System.Type[0]);
+        var _boolToStr:=typeof(System.Convert).GetMethod('ToString', [typeof(boolean)]);
         aIL.Emit(OpCodes.Call, _boolToStr);
       end
 
@@ -1442,6 +1440,61 @@ type
             for var _emi5Ai:=0 to mc.Args.Count-1 do
               EmitArgForParamType(aIL, mc.Args[_emi5Ai], _emi5Params[_emi5Ai].ParameterType);
             aIL.Emit(OpCodes.Callvirt, _emi5);
+          end;
+        end
+        else if (FindExternalAncestorType(fCurClassName)<>nil)
+                and (FindExternalAncestorType(fCurClassName).GetProperty(mc.ObjName)<>nil) then
+        begin
+          // [버그 수정] Controls.Count 처럼, 한정자(qualifier) 자체가 로컬변수/필드가 아니라
+          // self가 상속받은 외부 타입(Form 등)의 프로퍼티이고, 그 결과를 값으로 쓰는 경우
+          // (statement 위치의 Controls.Add(...)는 이미 별도 분기에서 처리되고 있었으나,
+          // 식 위치에서 값을 리턴받는 이 경로가 빠져 있었다).
+          var _extAnc7:=FindExternalAncestorType(fCurClassName);
+          var _extPi7:=_extAnc7.GetProperty(mc.ObjName);
+          aIL.Emit(OpCodes.Ldarg_0);
+          aIL.Emit(OpCodes.Callvirt, _extPi7.GetGetMethod);
+          var _qType7:=_extPi7.PropertyType;
+          // [버그 수정] ClientSize.Width 처럼 중간 결과(_qType7)가 값 타입(struct, 예:
+          // System.Drawing.Size)이면, 방금 스택에 올라온 건 "값 자체"라 그 위에 바로
+          // Callvirt로 하위 멤버(Width 등)를 부르면 안 된다 — 값 타입 인스턴스 호출은
+          // this로 "그 값의 주소"가 필요하다. 로컬 변수에 저장한 뒤 Ldloca로 주소를 얻고,
+          // 값 타입 인스턴스 호출이므로 Callvirt가 아니라 Call을 써야 한다
+          // (Callvirt는 object 참조를 요구해 검증에서 걸리거나, 여기처럼 값을 그대로
+          // this로 써서 AccessViolationException/메모리 손상을 일으킨다).
+          if _qType7.IsValueType then
+          begin
+            var _tmpLoc7:=aIL.DeclareLocal(_qType7);
+            aIL.Emit(OpCodes.Stloc, _tmpLoc7);
+            aIL.Emit(OpCodes.Ldloca, _tmpLoc7);
+            var _pi7v:=_qType7.GetProperty(mc.MethodName);
+            if (mc.Args.Count=0) and (_pi7v<>nil) and (_pi7v.GetGetMethod<>nil) then
+              aIL.Emit(OpCodes.Call, _pi7v.GetGetMethod)
+            else
+            begin
+              var _emi7v:=ResolveMethodByArity(_qType7, mc.MethodName, mc.Args, false);
+              if _emi7v=nil then
+                raise new Exception('타입 "'+_qType7.FullName+'"에 메서드 "'+mc.MethodName+'"가 없습니다 (인자 '+mc.Args.Count.ToString+'개).');
+              var _emi7vParams:=_emi7v.GetParameters;
+              for var _emi7vAi:=0 to mc.Args.Count-1 do
+                EmitArgForParamType(aIL, mc.Args[_emi7vAi], _emi7vParams[_emi7vAi].ParameterType);
+              aIL.Emit(OpCodes.Call, _emi7v);
+            end;
+          end
+          else
+          begin
+            var _pi7:=_qType7.GetProperty(mc.MethodName);
+            if (mc.Args.Count=0) and (_pi7<>nil) and (_pi7.GetGetMethod<>nil) then
+              aIL.Emit(OpCodes.Callvirt, _pi7.GetGetMethod)
+            else
+            begin
+              var _emi7:=ResolveMethodByArity(_qType7, mc.MethodName, mc.Args, false);
+              if _emi7=nil then
+                raise new Exception('타입 "'+_qType7.FullName+'"에 메서드 "'+mc.MethodName+'"가 없습니다 (인자 '+mc.Args.Count.ToString+'개).');
+              var _emi7Params:=_emi7.GetParameters;
+              for var _emi7Ai:=0 to mc.Args.Count-1 do
+                EmitArgForParamType(aIL, mc.Args[_emi7Ai], _emi7Params[_emi7Ai].ParameterType);
+              aIL.Emit(OpCodes.Callvirt, _emi7);
+            end;
           end;
         end
         else raise new Exception('알 수 없는 변수 "'+mc.ObjName+'"');
@@ -3897,6 +3950,25 @@ type
           aIL.Emit(OpCodes.Newobj, _delCtor48);
           exit;
         end;
+      end;
+      // [Stage 76] emSize처럼 매개변수가 System.Single/Double(부동소수)인데 인자가 정수
+      // 리터럴/식(vtInteger)이거나 실수 리터럴(vtReal, 항상 Ldc_R8로 8바이트로 실린다)이면
+      // 폭 변환 없이 그대로 스택에 얹었었다 — 정수 4바이트를 그대로 float 슬롯으로 읽어버려
+      // (예: new Font('맑은 고딕', 9) → emSize가 9가 아니라 사실상 0으로 들어감) 값이 깨졌다.
+      // Conv_R4/Conv_R8로 명시적으로 변환해야 한다.
+      if paramType=typeof(System.Single) then
+      begin
+        var _argVt76:=InferType(argExpr);
+        EmitExpr(aIL, argExpr);
+        if (_argVt76=vtInteger) or (_argVt76=vtReal) then aIL.Emit(OpCodes.Conv_R4);
+        exit;
+      end;
+      if paramType=typeof(System.Double) then
+      begin
+        var _argVt76b:=InferType(argExpr);
+        EmitExpr(aIL, argExpr);
+        if _argVt76b=vtInteger then aIL.Emit(OpCodes.Conv_R8);
+        exit;
       end;
       EmitExpr(aIL, argExpr);
     end;

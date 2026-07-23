@@ -1516,6 +1516,27 @@ type
           end;
         end
 
+        // [버그 수정] 암시적 self 이벤트 구독 (self. 접두사 없음): 예) Shown += Form_Shown;
+        // self.Xxx += Handler; 형태는 아래쪽 tkSelf 분기에서 이미 지원되고 있었지만,
+        // self. 를 생략한 형태(Text := ... 처럼 암시적 필드 대입은 되면서 암시적 이벤트
+        // 구독만 빠져 있었다)는 처리가 안 되어 있어 tkAssign을 기대하다가 tkPlusAssign을
+        // 만나 파싱 에러가 났다.
+        else if (fCurClass<>'') and (Cur.Kind=tkPlusAssign) then
+        begin
+          fPos:=fPos+1;
+          if Cur.Kind=tkLParen then // [Stage 64] 람다 핸들러
+          begin
+            var evsLam4:=new TEventSubscribeStmtNode('', nt.Text, ''); // Qualifier='' → self가 이벤트 소유자
+            evsLam4.Lambda:=ParseLambdaExpr;
+            Result:=evsLam4;
+          end
+          else
+          begin
+            var handlerName4:=Expect(tkIdent).Text;
+            Result:=new TEventSubscribeStmtNode('', nt.Text, handlerName4); // Qualifier='' → self가 이벤트 소유자
+          end;
+        end
+
         // 대입문 (일반 변수 또는 필드/외부 속성)
         else
         begin
