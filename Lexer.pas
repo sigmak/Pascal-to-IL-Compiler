@@ -36,6 +36,7 @@ type
     tkCase, // [Stage 59] case...of...else 문
     tkRepeat, tkUntil, // [Stage 60] repeat...until 루프
     tkBreak, tkContinue, // [Stage 60] break/continue
+    tkExit, // [Stage 78] exit — 현재 프로시저/함수/메서드를 즉시 빠져나감(외부 메서드 호출로 오인되지 않도록 전용 키워드 토큰으로 인식)
     tkYield, tkSequence, // [Stage 69] yield / sequence of T — 시퀀스 lazy evaluation
     tkConst, // [Stage 61] const 선언 (전역/지역, 타입 추론 포함)
     tkIdent, tkString, tkIntLiteral, tkRealLiteral, tkCharLiteral,
@@ -217,6 +218,7 @@ type
       else if lw='until'    then Result:=new TToken(tkUntil,    w,sl,sc) // [Stage 60]
       else if lw='break'    then Result:=new TToken(tkBreak,    w,sl,sc) // [Stage 60]
       else if lw='continue' then Result:=new TToken(tkContinue, w,sl,sc) // [Stage 60]
+      else if lw='exit'     then Result:=new TToken(tkExit,     w,sl,sc) // [Stage 78]
       else if lw='yield'    then Result:=new TToken(tkYield,    w,sl,sc) // [Stage 69]
       else if lw='sequence' then Result:=new TToken(tkSequence, w,sl,sc) // [Stage 69]
       else if lw='const'    then Result:=new TToken(tkConst,    w,sl,sc) // [Stage 61]

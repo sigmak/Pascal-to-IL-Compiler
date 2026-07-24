@@ -128,6 +128,14 @@ type
     fLoopExceptDepths:   List<integer>;
     fCurExceptDepth: integer; // 현재 try/except/finally 중첩 깊이 (BeginExceptionBlock/EndExceptionBlock에서 증감)
 
+    // [Stage 78] exit — 현재 컴파일 중인 프로시저/함수/메서드/생성자의 "몸체 끝" 라벨.
+    // break/continue의 fLoopBreakLabels와 같은 원리이지만 루프가 아니라 서브프로그램
+    // 단위이므로 스택이 아니라 단일 필드로 충분하다(중첩 함수/프로시저 본문은 재귀 호출이
+    // 완전히 끝난 뒤에야 바깥쪽 본문 방출로 돌아오므로 저장/복원만으로 정확함 — fResultLocal과
+    // 동일한 패턴). exit 문은 이 라벨로 Br(또는 try/except/finally 블록 안이면 fCurExceptDepth>0
+    // 이므로 Leave)한다. 라벨이 가리키는 지점에서 함수면 Result를 로드하고 Ret한다(정상 종료와 동일).
+    fMethodExitLabel: &Label;
+
     // [Stage 69] yield / sequence of T — 함수 하나가 "__IterN"이라는 숨은 클래스로 컴파일된다.
     // 그 클래스는 매개변수+지역변수를 전부 필드로 갖고(호출 사이 상태 보존), 상태 정수 필드
     // (<>state)와 현재 값 필드(<>current)를 더 가진다. MoveNext는 <>state로 "어디서 멈췄는지"
@@ -1307,11 +1315,29 @@ type
         begin
           // sender/e 같은, 외부(또는 객체) 타입 매개변수/지역변수를 통한 접근.
           // 우리가 만든 클래스가 아니라 Reflection으로 속성/메서드를 찾는다.
-          if fLocalScope.Has(mc.ObjName) then aIL.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(mc.ObjName))
-          else aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(mc.ObjName)); // [전역 var 버그 수정] 항상 fLocals만 읽던 문제
           var _qType2: System.Type;
           if fLocalScope.HasClrType(mc.ObjName) then _qType2:=fLocalScope.GetClrType(mc.ObjName)
           else _qType2:=fGlobalScope.GetClrType(mc.ObjName);
+          // [버그 수정 - Stage 77] _qType2가 값 타입(예: ShowDialog가 돌려주는 DialogResult
+          // 같은 enum, Point/Size 같은 구조체)이면 Ldloc으로 값 자체를 스택에 올린 뒤
+          // Callvirt하면 안 된다 — Callvirt는 객체 참조를 요구하는데 여기 올라간 건 원시 값
+          // (예: enum 밑바탕의 int32)이라, 그 값을 객체 포인터로 오인해 잘못된 메모리를
+          // 역참조한다(작은 정수값이면 특히 NullReferenceException으로 나타난다 — 실제로
+          // "var res := dlg.ShowDialog; ... res.ToString"에서 재현됨: DialogResult.None=0이
+          // "this" 자리에 그대로 올라가 널 참조 예외가 됨). 값 타입이면 Ldloca로 그 지역
+          // 슬롯의 "주소"를 올리고 Call(관리 포인터를 this로 받는 비가상 호출)을 쓴다 —
+          // C# 컴파일러가 구조체 인스턴스 메서드를 부를 때 쓰는 것과 동일한 패턴.
+          var _isValType2:=(mc.ObjCastType='') and _qType2.IsValueType;
+          if _isValType2 then
+          begin
+            if fLocalScope.Has(mc.ObjName) then aIL.Emit(OpCodes.Ldloca, fLocalScope.GetLoc(mc.ObjName))
+            else aIL.Emit(OpCodes.Ldloca, fGlobalScope.GetLoc(mc.ObjName));
+          end
+          else
+          begin
+            if fLocalScope.Has(mc.ObjName) then aIL.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(mc.ObjName))
+            else aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(mc.ObjName)); // [전역 var 버그 수정] 항상 fLocals만 읽던 문제
+          end;
           if mc.ObjCastType<>'' then
           begin
             _qType2:=ResolveExternalType(mc.ObjCastType);
@@ -1319,7 +1345,10 @@ type
           end;
           var _pi6:=_qType2.GetProperty(mc.MethodName);
           if (mc.Args.Count=0) and (_pi6<>nil) and (_pi6.GetGetMethod<>nil) then
-            aIL.Emit(OpCodes.Callvirt, _pi6.GetGetMethod)
+          begin
+            if _isValType2 then aIL.Emit(OpCodes.Call, _pi6.GetGetMethod)
+            else aIL.Emit(OpCodes.Callvirt, _pi6.GetGetMethod);
+          end
           else
           begin
             var _emi6:=ResolveMethodByArity(_qType2, mc.MethodName, mc.Args, false);
@@ -1328,7 +1357,8 @@ type
             var _emi6Params:=_emi6.GetParameters;
             for var _emi6Ai:=0 to mc.Args.Count-1 do
               EmitArgForParamType(aIL, mc.Args[_emi6Ai], _emi6Params[_emi6Ai].ParameterType);
-            aIL.Emit(OpCodes.Callvirt, _emi6);
+            if _isValType2 then aIL.Emit(OpCodes.Call, _emi6)
+            else aIL.Emit(OpCodes.Callvirt, _emi6);
           end;
         end
         else if fLocalScope.Has(mc.ObjName) or fGlobalScope.Has(mc.ObjName) then
@@ -1378,9 +1408,19 @@ type
               else
               begin
                 var _extFi:=_extAnc.GetField(mc.MethodName);
-                if _extFi=nil then
-                  raise new Exception('외부 타입 "'+_extAnc.FullName+'"에 필드/속성 "'+mc.MethodName+'"가 없습니다.');
-                aIL.Emit(OpCodes.Ldfld, _extFi);
+                if _extFi<>nil then
+                  aIL.Emit(OpCodes.Ldfld, _extFi)
+                else
+                begin
+                  // [Stage 77] ShowDialog()처럼 인자 없는 "진짜 메서드"(프로퍼티도 필드도 아님)를
+                  // 상속받은 외부 조상 타입에서 호출하는 경우 — 지금까지는 GetProperty/GetField만
+                  // 시도하고 둘 다 실패하면 곧장 "필드/속성 없음" 예외를 던져서 이런 호출 자체가
+                  // 불가능했다. 마지막으로 인자 0개 메서드를 시도한다.
+                  var _extMi77:=_extAnc.GetMethod(mc.MethodName, System.Type.EmptyTypes);
+                  if _extMi77=nil then
+                    raise new Exception('외부 타입 "'+_extAnc.FullName+'"에 필드/속성/메서드 "'+mc.MethodName+'"가 없습니다.');
+                  aIL.Emit(OpCodes.Callvirt, _extMi77);
+                end;
               end;
             end;
           end
@@ -2142,6 +2182,15 @@ type
       else aIL.Emit(OpCodes.Br, targetLbl);
     end;
 
+    // [Stage 78] exit — 현재 서브프로그램의 몸체 끝(fMethodExitLabel)으로 점프한다.
+    // try/except/finally 블록 "안"에서 그 블록을 벗어나 점프해야 하면(fCurExceptDepth>0)
+    // EmitLoopExit과 동일한 이유로 Br이 아니라 Leave를 써야 한다.
+    procedure EmitMethodExit(aIL: ILGenerator);
+    begin
+      if fCurExceptDepth>0 then aIL.Emit(OpCodes.Leave, fMethodExitLabel)
+      else aIL.Emit(OpCodes.Br, fMethodExitLabel);
+    end;
+
     procedure EmitStatement(aIL: ILGenerator; s: TStmtNode);
     var
       we: TWritelnExprStmtNode; ws: TWritelnStringStmtNode;
@@ -2478,10 +2527,22 @@ type
                 and (fLocalScope.HasClrType(mcs.ObjName) or fGlobalScope.HasClrType(mcs.ObjName)) then
         begin
           // sender.Focus(); 같은, 외부(객체) 타입 매개변수/지역변수를 통한 호출.
-          if fLocalScope.Has(mcs.ObjName) then aIL.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(mcs.ObjName))
-          else aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(mcs.ObjName)); // [전역 var 버그 수정]
           if fLocalScope.HasClrType(mcs.ObjName) then qTargetType:=fLocalScope.GetClrType(mcs.ObjName)
           else qTargetType:=fGlobalScope.GetClrType(mcs.ObjName);
+          // [버그 수정 - Stage 77] EmitExpr의 TMethodCallExprNode 쪽과 동일한 이유 —
+          // qTargetType이 값 타입이면 Ldloc(값)+Callvirt 대신 Ldloca(주소)+Call을 써야
+          // NullReferenceException(값의 원시 비트를 객체 포인터로 오인)을 피한다.
+          var _isValTypeS:=(mcs.ObjCastType='') and qTargetType.IsValueType;
+          if _isValTypeS then
+          begin
+            if fLocalScope.Has(mcs.ObjName) then aIL.Emit(OpCodes.Ldloca, fLocalScope.GetLoc(mcs.ObjName))
+            else aIL.Emit(OpCodes.Ldloca, fGlobalScope.GetLoc(mcs.ObjName));
+          end
+          else
+          begin
+            if fLocalScope.Has(mcs.ObjName) then aIL.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(mcs.ObjName))
+            else aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(mcs.ObjName)); // [전역 var 버그 수정]
+          end;
           if mcs.ObjCastType<>'' then
           begin
             qTargetType:=ResolveExternalType(mcs.ObjCastType);
@@ -2490,7 +2551,8 @@ type
           var _getP2:=qTargetType.GetProperty(mcs.MethodName);
           if (mcs.Args.Count=0) and (_getP2<>nil) and (_getP2.GetGetMethod<>nil) then
           begin
-            aIL.Emit(OpCodes.Callvirt, _getP2.GetGetMethod);
+            if _isValTypeS then aIL.Emit(OpCodes.Call, _getP2.GetGetMethod)
+            else aIL.Emit(OpCodes.Callvirt, _getP2.GetGetMethod);
             aIL.Emit(OpCodes.Pop);
           end
           else
@@ -2501,7 +2563,8 @@ type
             var _emiParams2:=emi.GetParameters;
             for var _emiAi2:=0 to mcs.Args.Count-1 do
               EmitArgForParamType(aIL, mcs.Args[_emiAi2], _emiParams2[_emiAi2].ParameterType);
-            aIL.Emit(OpCodes.Callvirt, emi);
+            if _isValTypeS then aIL.Emit(OpCodes.Call, emi)
+            else aIL.Emit(OpCodes.Callvirt, emi);
             if emi.ReturnType<>typeof(System.Void) then aIL.Emit(OpCodes.Pop);
           end;
         end
@@ -3086,6 +3149,9 @@ type
 
       else if s is TContinueStmtNode then
         EmitLoopExit(aIL, false)
+
+      else if s is TExitStmtNode then
+        EmitMethodExit(aIL) // [Stage 78]
 
       else if s is TTryStmtNode then
       begin
@@ -4022,6 +4088,17 @@ type
           qType:=fGlobalScope.GetClrType(mc.ObjName)
         else if (fCurClassName<>'') and TryFindFieldBuilder(fCurClassName, mc.ObjName, fb52) then
           qType:=fb52.FieldType
+        // [Stage 77] "var dlg := new TNewProjectDialog;" 처럼 사용자 정의 클래스의 인스턴스는
+        // ClrType이 아니라 ClassName으로만 스코프에 기록된다(TypeBuilder는 CreateType() 전엔
+        // GetMethods/GetProperty가 온전히 동작하지 않으므로). 그래서 "var res := dlg.ShowDialog;"
+        // 처럼 그 위에서 상속받은 외부 메서드(Form.ShowDialog 등)를 호출한 결과를 담을 때는
+        // 이 함수가 무조건 nil로 빠져 잘못된 기본 타입(vtInteger→Int32)으로 지역 변수가
+        // 선언됐다. 사용자 클래스의 외부 조상 타입(FindExternalAncestorType, 이미 완성된
+        // 진짜 reflection Type이라 TypeBuilder 제약이 없다)에서 대신 찾는다.
+        else if fLocalScope.Has(mc.ObjName) and fLocalScope.HasClassName(mc.ObjName) then
+          qType:=FindExternalAncestorType(fLocalScope.GetClassName(mc.ObjName))
+        else if fGlobalScope.Has(mc.ObjName) and fGlobalScope.HasClassName(mc.ObjName) then
+          qType:=FindExternalAncestorType(fGlobalScope.GetClassName(mc.ObjName))
         else
           exit;
 
@@ -4410,6 +4487,7 @@ type
       savedLocalScope: TScope; // [Phase 2] 예전의 sv4종 Dictionary를 스코프 객체 하나로
       svResult: LocalBuilder; svResultType: TVarType;
       svCurClass: string;
+      svExitLabel78: &Label; // [Stage 78]
     begin
       if not fCtorBuilders.ContainsKey(impl.ClassName) then
         raise new Exception('생성자를 찾을 수 없음: '+impl.ClassName+'.Create');
@@ -4419,10 +4497,12 @@ type
       savedLocalScope:=fLocalScope;
       svResult:=fResultLocal; svResultType:=fResultType;
       svCurClass:=fCurClassName;
+      svExitLabel78:=fMethodExitLabel; // [Stage 78]
 
       fLocalScope:=new TScope('local(ctor)', fGlobalScope);
       fResultLocal:=nil; // 생성자는 반환값이 없음
       fCurClassName:=impl.ClassName;
+      fMethodExitLabel:=il.DefineLabel; // [Stage 78] exit는 이 라벨로 점프
 
       // [Stage 47] 생성자 매개변수를 로컬 슬롯에 복사 (Ldarg_1, Ldarg_2, ... — Ldarg_0은 self).
       // BuildMethodBody의 매개변수 바인딩과 동일한 패턴. CLR 타입은 BuildClassShell이
@@ -4468,11 +4548,13 @@ type
       foreach var cd61 in impl.ConstDecls do EmitConstDecl(il, fLocalScope, cd61);
 
       foreach st in impl.Body.Statements do EmitStatement(il, st);
+      il.MarkLabel(fMethodExitLabel); // [Stage 78] exit 문의 착지점
       il.Emit(OpCodes.Ret);
 
       fLocalScope:=savedLocalScope;
       fResultLocal:=svResult; fResultType:=svResultType;
       fCurClassName:=svCurClass;
+      fMethodExitLabel:=svExitLabel78; // [Stage 78]
     end;
 
     // 클래스 메서드 본문 IL 생성
@@ -4483,6 +4565,7 @@ type
       savedLocalScope: TScope; // [Phase 2]
       svResult: LocalBuilder; svResultType: TVarType;
       svCurClass: string; st: TStmtNode;
+      svExitLabel78: &Label; // [Stage 78]
     begin
       if not (fInstanceMethods.ContainsKey(impl.ClassName)
         and fInstanceMethods[impl.ClassName].ContainsKey(impl.MethodName)) then
@@ -4500,9 +4583,11 @@ type
       savedLocalScope:=fLocalScope;
       svResult:=fResultLocal; svResultType:=fResultType;
       svCurClass:=fCurClassName;
+      svExitLabel78:=fMethodExitLabel; // [Stage 78]
 
       fLocalScope:=new TScope('local(method)', fGlobalScope);
       fCurClassName:=impl.ClassName;
+      fMethodExitLabel:=il.DefineLabel; // [Stage 78] exit는 이 라벨로 점프
 
       // [Stage 74] 메서드 자신이 오픈 제네릭이면(BuildClassShell이 fMethodOpenGenericSubstOf에
       // 저장해 둔 치환표가 있으면) 본문을 컴파일하는 동안 fCurGenericSubst를 그 표로 맞춰야
@@ -4591,6 +4676,7 @@ type
 
       foreach st in impl.Body.Statements do EmitStatement(il, st);
 
+      il.MarkLabel(fMethodExitLabel); // [Stage 78] exit 문의 착지점 — 정상 종료와 동일하게 처리
       if impl.IsFunction then
       begin
         il.Emit(OpCodes.Ldloc, fResultLocal);
@@ -4600,6 +4686,7 @@ type
       fLocalScope:=savedLocalScope;
       fResultLocal:=svResult; fResultType:=svResultType;
       fCurClassName:=svCurClass;
+      fMethodExitLabel:=svExitLabel78; // [Stage 78]
       fCurGenericSubst:=savedMethodGenSubst74; // [Stage 74]
     end;
 
@@ -5008,6 +5095,7 @@ type
       savedLocalScope: TScope; // [Phase 2]
       svR: LocalBuilder; svRT: TVarType; st: TStmtNode; retClrType: System.Type; i: integer;
       savedGenSubst71: Dictionary<string, System.Type>; // [Stage 71]
+      svExitLabel78: &Label; // [Stage 78]
     begin
       // [Stage 71] 이 함수가 true open generic이면(DeclareStaticFunc가 fOpenGenericSubstOf에
       // 저장해 둔 치환표가 있으면) 본문을 컴파일하는 동안 fCurGenericSubst를 그 표로 맞춰
@@ -5053,6 +5141,8 @@ type
       if d.ReturnType=vtGeneric then retClrType:=VTC(vtGeneric, d.ReturnGenericName)
       else retClrType:=VTC(d.ReturnType, retCn66b);
       il:=mb.GetILGenerator;
+      svExitLabel78:=fMethodExitLabel; // [Stage 78] (중첩 함수 재귀 호출 전에 미리 저장/전환)
+      fMethodExitLabel:=il.DefineLabel;
 
       // [Stage 65b] 지역(중첩) 함수/프로시저의 "본문"을 만든다. 시그니처는 이미
       // (형제 전체가) 등록되어 있으므로, 선언 순서와 무관하게 서로 호출 가능하다.
@@ -5110,8 +5200,10 @@ type
       // [Stage 61] 함수 본문의 지역 const 선언 처리
       foreach var cd61 in d.ConstDecls do EmitConstDecl(il, fLocalScope, cd61);
       foreach st in d.Body.Statements do EmitStatement(il, st);
+      il.MarkLabel(fMethodExitLabel); // [Stage 78] exit 문의 착지점
       il.Emit(OpCodes.Ldloc, fResultLocal); il.Emit(OpCodes.Ret);
       fLocalScope:=savedLocalScope; fResultLocal:=svR; fResultType:=svRT;
+      fMethodExitLabel:=svExitLabel78; // [Stage 78]
       fCurGenericSubst:=savedGenSubst71; // [Stage 71]
     end;
 
@@ -5121,6 +5213,7 @@ type
       savedLocalScope: TScope; // [Phase 2]
       svR: LocalBuilder; svRT: TVarType; st: TStmtNode;
       savedGenSubst71: Dictionary<string, System.Type>; // [Stage 71]
+      svExitLabel78: &Label; // [Stage 78]
     begin
       // [Stage 71] BuildStaticFunc와 동일한 원리 — 자세한 설명은 그쪽 주석 참고.
       savedGenSubst71:=fCurGenericSubst;
@@ -5131,6 +5224,8 @@ type
       mb:=fMethods[d.Name];
       pt:=fTopParamClrTypes[d.Name];
       il:=mb.GetILGenerator;
+      svExitLabel78:=fMethodExitLabel; // [Stage 78]
+      fMethodExitLabel:=il.DefineLabel;
 
       // [Stage 65b] BuildStaticFunc의 동일 위치 주석 참고 — 여기서는 본문만 만든다.
       foreach var nf65 in d.NestedFuncs do BuildStaticFunc(tb, nf65);
@@ -5183,8 +5278,10 @@ type
       // [Stage 61] 프로시저 본문의 지역 const 선언 처리
       foreach var cd61 in d.ConstDecls do EmitConstDecl(il, fLocalScope, cd61);
       foreach st in d.Body.Statements do EmitStatement(il, st);
+      il.MarkLabel(fMethodExitLabel); // [Stage 78] exit 문의 착지점
       il.Emit(OpCodes.Ret);
       fLocalScope:=savedLocalScope; fResultLocal:=svR; fResultType:=svRT;
+      fMethodExitLabel:=svExitLabel78; // [Stage 78]
       fCurGenericSubst:=savedGenSubst71; // [Stage 71]
     end;
 

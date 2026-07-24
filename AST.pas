@@ -324,6 +324,14 @@ type
   TContinueStmtNode = class(TStmtNode)
   end;
 
+  // [Stage 78] exit — 현재 프로시저/함수/메서드(생성자 포함)를 즉시 빠져나간다.
+  // break/continue가 "가장 안쪽 루프"를 대상으로 하는 것과 달리, exit은 항상 현재
+  // 실행 중인 서브프로그램 전체를 대상으로 한다. 파서 이전에는 이 토큰이 그냥 식별자로
+  // 취급되어 CodeGen이 "exit"를 (self 위의) 외부 메서드 호출로 오인해 오류를 냈다
+  // ("외부 타입에 메서드 exit가 없습니다") — tkExit 전용 토큰과 이 노드로 그 문제를 해결한다.
+  TExitStmtNode = class(TStmtNode)
+  end;
+
   // [Stage 69] yield <식>; — sequence 반환 함수(function ...: sequence of T) 안에서만 쓸 수 있다.
   // MoveNext가 호출될 때마다 이 지점까지 실행하고 Expr 값을 Current로 남긴 뒤 실행을 "일시정지"한다
   // (다음 MoveNext 호출 때 바로 다음 문장부터 이어서 실행). CodeGen이 상태 필드 기반 재개 지점으로 번역한다.

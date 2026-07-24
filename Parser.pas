@@ -1643,6 +1643,17 @@ type
         Result:=new TContinueStmtNode;
       end
 
+      // [Stage 78] exit — 현재 프로시저/함수/메서드/생성자를 즉시 빠져나감.
+      // 예전에는 'exit'가 그냥 식별자(tkIdent)로 렉싱되어 "인자 없는 메서드 호출"
+      // 문장으로 파싱됐고, self가 외부 타입(예: System.Windows.Forms.Form)을 상속한
+      // 메서드 안에서는 CodeGen이 그 외부 타입 위에서 "exit"라는 메서드를 찾다가 실패했다.
+      // 이제 전용 키워드 토큰(tkExit)으로 렉싱되므로 여기서 바로 처리한다.
+      else if Cur.Kind=tkExit then
+      begin
+        fPos:=fPos+1;
+        Result:=new TExitStmtNode;
+      end
+
       // [Stage 69] yield <식>; — sequence of T 함수 안에서만 유효(위반 시 CodeGen이 오류를 냄).
       else if Cur.Kind=tkYield then
       begin

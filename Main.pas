@@ -21,7 +21,8 @@ uses
 
 const
   DefaultExampleDir = 'Examples';
-  DefaultExampleFile = 'Test_stage76f.pas'; // [Stage 76f] 
+  DefaultExampleFile = 'Test_stage77.pas'; // [Stage 77]
+  //DefaultExampleFile = 'Test_stage76f.pas'; // [Stage 76f] 
   //DefaultExampleFile = 'Test_stage76e.pas'; // [Stage 76e] 
   //DefaultExampleFile = 'Test_minimenu.pas'; // [Stage 76c] 이것도 마찬가지로 실패함... 
   //DefaultExampleFile = 'Test_stage76.pas'; // [Stage 76] TMainForm — 메뉴바 + 툴바 + 상태바. <- 현재 테스트 실패함
