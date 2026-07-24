@@ -21,7 +21,8 @@ uses
 
 const
   DefaultExampleDir = 'Examples';
-  DefaultExampleFile = 'Test_stage77.pas'; // [Stage 77]
+  DefaultExampleFile = 'Test_stage78.pas'; // [Stage 78]
+  //DefaultExampleFile = 'Test_stage77.pas'; // [Stage 77]
   //DefaultExampleFile = 'Test_stage76f.pas'; // [Stage 76f] 
   //DefaultExampleFile = 'Test_stage76e.pas'; // [Stage 76e] 
   //DefaultExampleFile = 'Test_minimenu.pas'; // [Stage 76c] 이것도 마찬가지로 실패함... 

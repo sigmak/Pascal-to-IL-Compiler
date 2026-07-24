@@ -926,6 +926,15 @@ type
             var staticQualifier2:=string.Join('.', segs2.GetRange(0, segs2.Count-1));
             var staticMname2:=segs2[segs2.Count-1];
             Result:=new TMethodCallExprNode(staticQualifier2, staticMname2);
+            // [Stage 78] 3단계 이상 체인 뒤에 '['가 오는 경우도 외부 컬렉션 인덱서로
+            // 재해석한다 (예: Self.Tree.Nodes[0]).
+            if Cur.Kind=tkLBracket then
+            begin
+              fPos:=fPos+1;
+              var idxE78b:=ParseAddSub;
+              Expect(tkRBracket);
+              Result:=new TExternalIndexExprNode(staticQualifier2+'.'+staticMname2, idxE78b);
+            end;
           end
           else
           begin
@@ -957,6 +966,15 @@ type
                 Expect(tkRParen);
               end;
               Result:=mc;
+              // [Stage 78] obj.Member[i] — 방금 만든 2단계 체인 뒤에 '['가 오면 외부
+              // 컬렉션 인덱서(예: Tree.Nodes[0])로 재해석한다.
+              if Cur.Kind=tkLBracket then
+              begin
+                fPos:=fPos+1;
+                var idxE78a:=ParseAddSub;
+                Expect(tkRBracket);
+                Result:=new TExternalIndexExprNode(t.Text+'.'+mname2, idxE78a);
+              end;
             end;
           end;
         end

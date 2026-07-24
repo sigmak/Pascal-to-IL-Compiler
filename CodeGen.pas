@@ -396,6 +396,7 @@ type
     procedure EmitQualifierChainLoad(aIL: ILGenerator; segs: List<string>; var finalType: System.Type);
     var i: integer; curType: System.Type; pi: PropertyInfo; fi: System.Reflection.FieldInfo;
         firstFb: FieldBuilder; first: string; extSelf: System.Type;
+        localClsName78: string; tbKvp78: System.Collections.Generic.KeyValuePair<string, TypeBuilder>;
     begin
       first:=segs[0];
       if TryFindFieldBuilder(fCurClassName, first, firstFb) then
@@ -428,19 +429,40 @@ type
 
       for i:=1 to segs.Count-1 do
       begin
-        pi:=curType.GetProperty(segs[i]);
-        if pi<>nil then
+        // [Stage 78 수정] curType이 아직 CreateType되지 않은 로컬 TypeBuilder이면
+        // GetProperty/GetField가 NotSupportedException을 던진다.
+        // fTypeBuilders를 역방향으로 조회해 클래스명을 찾고, fFieldBuilders에서 직접 FieldBuilder를 가져온다.
+        localClsName78:='';
+        if curType is TypeBuilder then
+          foreach tbKvp78 in fTypeBuilders do
+            if tbKvp78.Value = TypeBuilder(curType) then
+            begin localClsName78:=tbKvp78.Key; break; end;
+
+        if (localClsName78<>'') and fFieldBuilders.ContainsKey(localClsName78)
+           and fFieldBuilders[localClsName78].ContainsKey(segs[i]) then
         begin
-          aIL.Emit(OpCodes.Callvirt, pi.GetGetMethod);
-          curType:=pi.PropertyType;
+          // 로컬 클래스의 필드 — FieldBuilder로 Ldfld (private 접근도 같은 어셈블리 안에서 IL 수준으로는 허용)
+          var localFb78: FieldBuilder := fFieldBuilders[localClsName78][segs[i]];
+          aIL.Emit(OpCodes.Ldfld, localFb78);
+          curType:=localFb78.FieldType;
         end
         else
         begin
-          fi:=curType.GetField(segs[i]);
-          if fi=nil then
-            raise new Exception('타입 "'+curType.FullName+'"에 속성/필드 "'+segs[i]+'"가 없습니다 (연쇄 접근 중 — 경로: '+string.Join('.', segs)+')');
-          aIL.Emit(OpCodes.Ldfld, fi);
-          curType:=fi.FieldType;
+          // 외부 CLR 타입(TreeView 등) — 기존 GetProperty/GetField 경로
+          pi:=curType.GetProperty(segs[i]);
+          if pi<>nil then
+          begin
+            aIL.Emit(OpCodes.Callvirt, pi.GetGetMethod);
+            curType:=pi.PropertyType;
+          end
+          else
+          begin
+            fi:=curType.GetField(segs[i]);
+            if fi=nil then
+              raise new Exception('타입 "'+curType.FullName+'"에 속성/필드 "'+segs[i]+'"가 없습니다 (연쇄 접근 중 — 경로: '+string.Join('.', segs)+')');
+            aIL.Emit(OpCodes.Ldfld, fi);
+            curType:=fi.FieldType;
+          end;
         end;
       end;
       finalType:=curType;
@@ -452,6 +474,7 @@ type
     function InferQualifierChainType(segs: List<string>): System.Type;
     var i: integer; curType: System.Type; pi: PropertyInfo; fi: System.Reflection.FieldInfo;
         firstFb: FieldBuilder; first: string; extSelf: System.Type;
+        localClsName78: string; tbKvp78: System.Collections.Generic.KeyValuePair<string, TypeBuilder>;
     begin
       first:=segs[0];
       if TryFindFieldBuilder(fCurClassName, first, firstFb) then curType:=firstFb.FieldType
@@ -470,14 +493,30 @@ type
 
       for i:=1 to segs.Count-1 do
       begin
-        pi:=curType.GetProperty(segs[i]);
-        if pi<>nil then curType:=pi.PropertyType
+        // [Stage 78 수정] curType이 아직 CreateType되지 않은 로컬 TypeBuilder이면
+        // GetProperty/GetField가 NotSupportedException을 던진다.
+        // fTypeBuilders를 역방향으로 조회해 클래스명을 찾고, fFieldBuilders에서 직접 타입을 가져온다.
+        localClsName78:='';
+        if curType is TypeBuilder then
+          foreach tbKvp78 in fTypeBuilders do
+            if tbKvp78.Value = TypeBuilder(curType) then
+            begin localClsName78:=tbKvp78.Key; break; end;
+
+        if (localClsName78<>'') and fFieldBuilders.ContainsKey(localClsName78)
+           and fFieldBuilders[localClsName78].ContainsKey(segs[i]) then
+          curType:=fFieldBuilders[localClsName78][segs[i]].FieldType
         else
         begin
-          fi:=curType.GetField(segs[i]);
-          if fi=nil then
-            raise new Exception('타입 "'+curType.FullName+'"에 속성/필드 "'+segs[i]+'"가 없습니다 (연쇄 접근 중 — 경로: '+string.Join('.', segs)+')');
-          curType:=fi.FieldType;
+          // 외부 CLR 타입 — 기존 GetProperty/GetField 경로
+          pi:=curType.GetProperty(segs[i]);
+          if pi<>nil then curType:=pi.PropertyType
+          else
+          begin
+            fi:=curType.GetField(segs[i]);
+            if fi=nil then
+              raise new Exception('타입 "'+curType.FullName+'"에 속성/필드 "'+segs[i]+'"가 없습니다 (연쇄 접근 중 — 경로: '+string.Join('.', segs)+')');
+            curType:=fi.FieldType;
+          end;
         end;
       end;
       Result:=curType;
@@ -1538,6 +1577,41 @@ type
           end;
         end
         else raise new Exception('알 수 없는 변수 "'+mc.ObjName+'"');
+      end
+
+      else if e is TExternalIndexExprNode then
+      begin
+        // [Stage 78] obj[i] — 대부분의 .NET 컬렉션이 따르는 관례(기본 인덱서 = "Item"
+        // 프로퍼티, TreeNodeCollection 포함)를 리플렉션으로 찾아 get_Item(i)을 호출한다.
+        // Qualifier(예: "Tree.Nodes")는 기존 체인 로딩 메커니즘을 그대로 재사용한다.
+        var eiN:=TExternalIndexExprNode(e);
+        var eiSegs:=SplitByDot(eiN.Qualifier);
+        var eiBaseType: System.Type;
+        if not IsChainStartSegment(eiSegs[0]) then
+          raise new Exception('알 수 없는 인덱서 대상 "'+eiN.Qualifier+'"');
+        EmitQualifierChainLoad(aIL, eiSegs, eiBaseType);
+        // [버그 수정] TreeNodeCollection처럼 "Item" 인덱서가 여러 개 오버로드(Item[int],
+        // Item[string] 등)로 존재하는 타입은 GetProperty('Item')이 이름만으로 어느 것인지
+        // 정하지 못해 AmbiguousMatchException을 던진다. 실제 인덱스 식의 타입을 보고
+        // 파라미터가 가장 잘 맞는 오버로드를 직접 골라야 한다 (ResolveMethodByArity와
+        // 같은 원리, ScoreParamMatch/InferArgClrType 재사용).
+        var eiIdxArgType:=InferArgClrType(eiN.IndexExpr);
+        var eiItemProp: PropertyInfo := nil;
+        var eiBestScore:=System.Int32.MinValue;
+        foreach var eiCand in eiBaseType.GetProperties(BindingFlags.Public or BindingFlags.Instance) do
+        begin
+          if (eiCand.Name='Item') and (eiCand.GetIndexParameters.Length=1) and (eiCand.GetGetMethod<>nil) then
+          begin
+            var eiScore:=ScoreParamMatch(eiCand.GetIndexParameters()[0].ParameterType, eiIdxArgType);
+            if (eiItemProp=nil) or (eiScore>eiBestScore) then
+            begin eiBestScore:=eiScore; eiItemProp:=eiCand; end;
+          end;
+        end;
+        if eiItemProp=nil then
+          raise new Exception('타입 "'+eiBaseType.FullName+'"에는 인덱서(Item)가 없습니다.');
+        var eiIdxParams:=eiItemProp.GetIndexParameters();
+        EmitArgForParamType(aIL, eiN.IndexExpr, eiIdxParams[0].ParameterType);
+        aIL.Emit(OpCodes.Callvirt, eiItemProp.GetGetMethod);
       end
 
       else if e is TArrayIndexExprNode then
@@ -2624,22 +2698,55 @@ type
             qTargetType:=ResolveExternalType(mcs.ObjCastType);
             aIL.Emit(OpCodes.Castclass, qTargetType);
           end;
-          var _getP:=qTargetType.GetProperty(mcs.MethodName);
-          if (mcs.Args.Count=0) and (_getP<>nil) and (_getP.GetGetMethod<>nil) then
+          // [Stage 78 수정] qTargetType이 로컬(사용자 정의) 클래스의 TypeBuilder이면
+          // 아직 CreateType() 전이라 GetProperty가 NotSupportedException을 던진다
+          // (예: Explorer: TProjectExplorer 필드에 대해 Explorer.LoadFolder(...) 호출).
+          // fTypeBuilders를 역방향 조회해 클래스명을 찾고, 그 경우엔 Reflection
+          // (GetProperty/ResolveMethodByArity) 대신 메타데이터 기반 경로
+          // (FindInstanceMethod/FindInstanceMethodParamTypes)로 처리한다.
+          var localClsNameFB:string:='';
+          if qTargetType is TypeBuilder then
+            foreach var tbKvpFB in fTypeBuilders do
+              if tbKvpFB.Value = TypeBuilder(qTargetType) then
+              begin localClsNameFB:=tbKvpFB.Key; break; end;
+
+          if localClsNameFB<>'' then
           begin
-            aIL.Emit(OpCodes.Callvirt, _getP.GetGetMethod);
-            aIL.Emit(OpCodes.Pop);
+            var imbFB:=FindInstanceMethod(localClsNameFB, mcs.MethodName);
+            if imbFB<>nil then
+            begin
+              EmitArgsCoerced(aIL, mcs.Args, FindInstanceMethodParamTypes(localClsNameFB, mcs.MethodName));
+              aIL.Emit(OpCodes.Callvirt, imbFB);
+              if imbFB.ReturnType<>typeof(System.Void) then aIL.Emit(OpCodes.Pop);
+            end
+            else if fFieldBuilders.ContainsKey(localClsNameFB) and fFieldBuilders[localClsNameFB].ContainsKey(mcs.MethodName) then
+            begin
+              // 인자 없는 필드 읽기 (문장 위치이므로 결과값은 버림)
+              aIL.Emit(OpCodes.Ldfld, fFieldBuilders[localClsNameFB][mcs.MethodName]);
+              aIL.Emit(OpCodes.Pop);
+            end
+            else
+              raise new Exception('로컬 클래스 "'+localClsNameFB+'"에 메서드/필드 "'+mcs.MethodName+'"가 없습니다.');
           end
           else
           begin
-            emi:=ResolveMethodByArity(qTargetType, mcs.MethodName, mcs.Args, false);
-            if emi=nil then
-              raise new Exception('타입 "'+qTargetType.FullName+'"에 메서드 "'+mcs.MethodName+'"가 없습니다 (인자 '+mcs.Args.Count.ToString+'개).');
-            var _emiParams3:=emi.GetParameters;
-            for var _emiAi3:=0 to mcs.Args.Count-1 do
-              EmitArgForParamType(aIL, mcs.Args[_emiAi3], _emiParams3[_emiAi3].ParameterType);
-            aIL.Emit(OpCodes.Callvirt, emi);
-            if emi.ReturnType<>typeof(System.Void) then aIL.Emit(OpCodes.Pop);
+            var _getP:=qTargetType.GetProperty(mcs.MethodName);
+            if (mcs.Args.Count=0) and (_getP<>nil) and (_getP.GetGetMethod<>nil) then
+            begin
+              aIL.Emit(OpCodes.Callvirt, _getP.GetGetMethod);
+              aIL.Emit(OpCodes.Pop);
+            end
+            else
+            begin
+              emi:=ResolveMethodByArity(qTargetType, mcs.MethodName, mcs.Args, false);
+              if emi=nil then
+                raise new Exception('타입 "'+qTargetType.FullName+'"에 메서드 "'+mcs.MethodName+'"가 없습니다 (인자 '+mcs.Args.Count.ToString+'개).');
+              var _emiParams3:=emi.GetParameters;
+              for var _emiAi3:=0 to mcs.Args.Count-1 do
+                EmitArgForParamType(aIL, mcs.Args[_emiAi3], _emiParams3[_emiAi3].ParameterType);
+              aIL.Emit(OpCodes.Callvirt, emi);
+              if emi.ReturnType<>typeof(System.Void) then aIL.Emit(OpCodes.Pop);
+            end;
           end;
         end
         else if (FindExternalAncestorType(fCurClassName)<>nil)
@@ -2722,6 +2829,12 @@ type
             else if fTypeBuilders.ContainsKey(cn) then qTargetType:=fTypeBuilders[cn]
             else raise new Exception('알 수 없는 타입 "'+cn+'" (변수 "'+evs.Qualifier+'")');
           end;
+        end
+        else if (evs.Qualifier.IndexOf('.')>=0) and IsChainStartSegment(SplitByDot(evs.Qualifier)[0]) then
+        begin
+          // [Stage 78] "Explorer.Tree.DoubleClick += Handler;"처럼 필드/변수 체인을 통해
+          // 자식 객체가 소유한 외부 컨트롤의 이벤트를 구독하는 경우 대응.
+          EmitQualifierChainLoad(aIL, SplitByDot(evs.Qualifier), qTargetType);
         end
         else
           raise new Exception('알 수 없는 대상 "'+evs.Qualifier+'" — 필드/지역변수/전역변수가 아닙니다.');

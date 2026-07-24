@@ -130,6 +130,13 @@ type
     constructor Create(n: string; i: TExprNode); begin ArrName:=n; Index:=i; end;
   end;
 
+  // [Stage 78] 외부 컬렉션 인덱서: obj[i]. Qualifier는 점(.)으로 연결된 한정자 체인
+  // 문자열(예: "Tree.Nodes") — TMethodCallExprNode의 ObjName과 같은 관례를 따른다.
+  TExternalIndexExprNode = class(TExprNode)
+  public Qualifier: string; IndexExpr: TExprNode;
+    constructor Create(q: string; i: TExprNode); begin Qualifier:=q; IndexExpr:=i; end;
+  end;
+
   TLengthExprNode = class(TExprNode)
   public ArrName: string;
     constructor Create(n: string); begin ArrName:=n; end;
