@@ -21,8 +21,9 @@ uses
 
 const
   DefaultExampleDir = 'Examples';
+  DefaultExampleFile = 'Test_stage76e.pas'; // [Stage 76e] 
   //DefaultExampleFile = 'Test_minimenu.pas'; // [Stage 76c] 이것도 마찬가지로 실패함... 
-  DefaultExampleFile = 'Test_stage76.pas'; // [Stage 76] TMainForm — 메뉴바 + 툴바 + 상태바. <- 현재 테스트 실패함
+  //DefaultExampleFile = 'Test_stage76.pas'; // [Stage 76] TMainForm — 메뉴바 + 툴바 + 상태바. <- 현재 테스트 실패함
   //DefaultExampleFile = 'Test_stage75.pas'; // [Stage 75]  멀티유닛 + 외부 베이스클래스 상속(System.Windows.Forms.Form) + 프로퍼티 + 이벤트 구독을 한 번에 실전 테스트
   //DefaultExampleFile = 'Test_stage74.pas'; // [Stage 74] 클래스 안의 자체 제네릭 메서드
   //DefaultExampleFile = 'Test_stage73.pas'; // [Stage 73] 다중 타입 매개변수 + 제약조건

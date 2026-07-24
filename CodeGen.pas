@@ -1291,7 +1291,7 @@ type
               end
               else
               begin
-                var _smiE:=ResolveMethodByArity(_staticTE, mc.MethodName, mc.Args, false);
+                var _smiE:=ResolveMethodByArity(_staticTE, mc.MethodName, mc.Args, true);
                 if _smiE=nil then
                   raise new Exception('외부 타입 "'+_staticTE.FullName+'"에 정적 멤버 "'+mc.MethodName+'"가 없습니다.');
                 var _smiEParams:=_smiE.GetParameters;
@@ -2363,6 +2363,25 @@ type
           else if fBuiltTypes.ContainsKey(ivClassName) then ivClrType:=fBuiltTypes[ivClassName]
           else if fTypeBuilders.ContainsKey(ivClassName) then ivClrType:=fTypeBuilders[ivClassName]
           else ivClrType:=typeof(System.Object);
+        end
+        else if ivs.ValueExpr is TMethodCallExprNode then
+        begin
+          // [Stage 76 버그수정 #3] 외부 메서드 호출(예: Image.FromFile) 결과를 담는 지역
+          // 변수는, 실제 반환 타입을 찾을 수 있으면 그 타입으로, 못 찾으면(예: 우리가 만든
+          // 클래스의 메서드거나 판별 불가) 기존과 동일하게 VTC 폴백을 쓴다.
+          var ivResolvedT:=TryResolveMethodCallClrType(TMethodCallExprNode(ivs.ValueExpr));
+          if ivResolvedT<>nil then
+          begin
+            ivClrType:=ivResolvedT; ivIsExternal:=true;
+            // InferType(TMethodCallExprNode)는 string/bool/real/char/int64 외엔 항상
+            // vtInteger를 돌려주도록 되어 있어(설계상 스칼라 판별용), 여기서 바로잡지
+            // 않으면 아래의 "ivVt=vtObject일 때만 SetClrType" 게이트를 못 넘고, 이 변수가
+            // 나중에 다른 외부 메서드의 인자로 오버로드 판별에 쓰일 때 정수로 오인된다.
+            // 지역 슬롯 자체는 이미 ivClrType(정확한 타입)으로 선언되므로 값 자체는
+            // 안전하지만, 타입 태그를 실제(vtObject)로 맞춰줘야 이후 조회들이 일관된다.
+            ivVt:=vtObject;
+          end
+          else ivClrType:=VTC(ivVt, '');
         end
         else
           ivClrType:=VTC(ivVt, '');
@@ -3967,6 +3986,56 @@ type
       Result:=bestCi;
     end;
 
+    // [Stage 76 버그수정 #3] "var img := System.Drawing.Image.FromFile(path);"처럼 외부
+    // static/instance 메서드 호출 결과를 지역 변수에 담을 때, 그동안 TInlineVarStmtNode
+    // 처리부는 이 경우(ValueExpr이 TNewObjectExprNode가 아닌 TMethodCallExprNode)를
+    // 별도로 보지 않고 VTC(vtObject, '') 폴백으로 무조건 System.Object 타입 지역 변수를
+    // 만들었다. 그러면 IL 지역 슬롯의 선언 타입이 System.Object로 굳어져서, 이후
+    // "NewToolButton.Image := img;"처럼 더 구체적인 타입(System.Drawing.Image)을 기대하는
+    // 자리에 Ldloc으로 그 값을 올리면 검증기가 보는 스택 타입은 여전히 System.Object라
+    // 명시적 Castclass 없이는 대입이 안 맞아 실행 시 InvalidProgramException으로 이어질
+    // 수 있었다(아이콘 로드처럼 객체를 반환하는 외부 메서드 호출을 변수에 담아 재사용하는
+    // 패턴에서 특히 발생하기 쉬움). 여기서 실제 반환 타입을 리플렉션으로 미리 찾아준다.
+    // 흔한 경로(외부 정적 타입.메서드, 필드/지역변수.메서드)만 다루고, 판별 불가능한
+    // 경우엔 기존과 동일하게 nil을 돌려줘 호출부가 기존 폴백을 쓰도록 한다.
+    function TryResolveMethodCallClrType(mc: TMethodCallExprNode): System.Type;
+    var qType: System.Type; pi: PropertyInfo; mi: MethodInfo; fb52: FieldBuilder;
+    begin
+      Result:=nil;
+      try
+        if mc.ObjCastType<>'' then
+        begin
+          qType:=ResolveExternalType(mc.ObjCastType);
+        end
+        else if (mc.ObjName<>'') and (mc.ObjName.IndexOf('.')>=0) then
+        begin
+          var chainSegs52:=SplitByDot(mc.ObjName);
+          if IsChainStartSegment(chainSegs52[0]) then
+            exit // 체인(예: MainMenu.Items.xxx)은 미리 계산하려면 IL을 실제로 방출해야
+                 // 하므로(EmitQualifierChainLoad) 여기서는 다루지 않고 기존 폴백에 맡긴다.
+          else
+            qType:=ResolveExternalType(mc.ObjName); // 외부 정적 타입 경로 (예: System.Drawing.Image)
+        end
+        else if fLocalScope.Has(mc.ObjName) and fLocalScope.HasClrType(mc.ObjName) then
+          qType:=fLocalScope.GetClrType(mc.ObjName)
+        else if fGlobalScope.Has(mc.ObjName) and fGlobalScope.HasClrType(mc.ObjName) then
+          qType:=fGlobalScope.GetClrType(mc.ObjName)
+        else if (fCurClassName<>'') and TryFindFieldBuilder(fCurClassName, mc.ObjName, fb52) then
+          qType:=fb52.FieldType
+        else
+          exit;
+
+        if qType=nil then exit;
+        pi:=qType.GetProperty(mc.MethodName);
+        if (mc.Args.Count=0) and (pi<>nil) and (pi.GetGetMethod<>nil) then
+        begin Result:=pi.PropertyType; exit; end;
+        mi:=ResolveMethodByArity(qType, mc.MethodName, mc.Args, mc.ObjName.IndexOf('.')>=0);
+        if mi<>nil then Result:=mi.ReturnType;
+      except
+        Result:=nil; // 무엇이든 실패하면 조용히 중립 폴백(기존 동작 유지)
+      end;
+    end;
+
     // [Stage 48] 외부 생성자/메서드에 인자를 하나씩 넣을 때, 기대하는 매개변수 타입이
     // 델리게이트(예: System.Threading.ThreadStart)이고 실제 인자가 최상위 프로시저
     // 이름 하나뿐이면(예: "new System.Threading.Thread(RunApp)") 그 이름을 호출하는 게
@@ -4036,6 +4105,21 @@ type
         exit;
       end;
       EmitExpr(aIL, argExpr);
+      // [Stage 76 버그수정 #4] 방어적 안전망: 우리가 추적하는 인자의 CLR 타입(InferArgClrType)이
+      // 목표 매개변수 타입보다 더 막연하면(nil이거나 System.Object로만 알고 있는 경우 — 예:
+      // 아직 타입을 정확히 못 뒤쫓는 표현식 경로), 방금 스택에 올라간 값의 검증기 타입은
+      // 실제로 System.Object로 남는다. 이 상태에서 목표가 더 구체적인 참조 타입이면(예:
+      // System.Drawing.Image) Castclass 없이 그대로 Call/Callvirt에 넘길 경우 실행 시
+      // InvalidProgramException으로 이어질 수 있다. paramType이 값형식/byref/제네릭
+      // 매개변수/System.Object 자체가 아니고, 인자가 nil 리터럴도 아닐 때만 안전하게
+      // Castclass를 끼워 넣는다 — 이미 정확한 타입이면 이 캐스트는 그냥 통과(무해)한다.
+      if (not paramType.IsValueType) and (not paramType.IsByRef) and (not paramType.IsGenericParameter)
+         and (paramType<>typeof(System.Object)) and (not (argExpr is TNilLiteralNode)) then
+      begin
+        var _knownArgT80:=InferArgClrType(argExpr);
+        if (_knownArgT80=nil) or (_knownArgT80=typeof(System.Object)) then
+          aIL.Emit(OpCodes.Castclass, paramType);
+      end;
     end;
 
     // aIL 스택에 target 참조가 이미 로드되어 있다고 가정하고, 그 위에
