@@ -1416,7 +1416,34 @@ type
             if fRecordNames.Contains(cn) then aIL.Emit(OpCodes.Ldloca, fGlobalScope.GetLoc(mc.ObjName))
             else aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(mc.ObjName));
           end;
-          if cn='' then raise new Exception('알 수 없는 메서드 "'+cn+'.'+mc.MethodName+'"');
+          if cn='' then
+          begin
+            // [Stage 79 수정] cn이 빈 문자열이면 사용자 정의 클래스가 아니라 내장 원시
+            // 타입(예: string) 지역/전역 변수다 — 예: content.Length (content: string).
+            // 이전에는 곧장 "알 수 없는 메서드" 예외를 던졌는데, string은 참조 타입이라
+            // 이미 스택에 로드된 참조(위 Ldloc) 그대로 typeof(string) 기준 Reflection
+            // 경로(프로퍼티/메서드)로 처리할 수 있다. (정수/불린 등 값 타입은 Callvirt에
+            // Box 또는 Ldloca+Call이 추가로 필요해 이번 수정 범위에서는 제외한다.)
+            if vtVar=vtString then
+            begin
+              var _strPi79:=typeof(string).GetProperty(mc.MethodName);
+              if (mc.Args.Count=0) and (_strPi79<>nil) and (_strPi79.GetGetMethod<>nil) then
+                aIL.Emit(OpCodes.Callvirt, _strPi79.GetGetMethod)
+              else
+              begin
+                var _strMi79:=ResolveMethodByArity(typeof(string), mc.MethodName, mc.Args, false);
+                if _strMi79=nil then
+                  raise new Exception('타입 "System.String"에 메서드 "'+mc.MethodName+'"가 없습니다 (인자 '+mc.Args.Count.ToString+'개).');
+                var _strMiParams79:=_strMi79.GetParameters;
+                for var _strAi79:=0 to mc.Args.Count-1 do
+                  EmitArgForParamType(aIL, mc.Args[_strAi79], _strMiParams79[_strAi79].ParameterType);
+                aIL.Emit(OpCodes.Callvirt, _strMi79);
+              end;
+            end
+            else
+              raise new Exception('알 수 없는 메서드 "'+cn+'.'+mc.MethodName+'"');
+          end
+          else
           // [버그 수정] obj.FieldName(괄호 없음, 인자 없음)은 메서드가 아니라 필드/속성 읽기일
           // 수도 있다 — 이전에는 무조건 FindInstanceMethod로 보내서 실제로는 필드인데
           // "알 수 없는 메서드"로 오인했다 (예: Writeln(app.Label1) — app이 전역/지역 변수인 경우).
@@ -2554,22 +2581,53 @@ type
           var chainSegs:=SplitByDot(mcs.ObjName);
           var chainType: System.Type;
           EmitQualifierChainLoad(aIL, chainSegs, chainType);
-          var _getPC:=chainType.GetProperty(mcs.MethodName);
-          if (mcs.Args.Count=0) and (_getPC<>nil) and (_getPC.GetGetMethod<>nil) then
+
+          // [Stage 79 수정] chainType이 아직 CreateType() 전인 로컬 클래스의 TypeBuilder이면
+          // GetProperty가 NotSupportedException을 던진다 (예: f.Editor.OpenFile(...)에서
+          // Editor 필드 타입 TCodeEditorPanel이 로컬 클래스인 경우). 2689번째 줄 근처의
+          // 단일 필드 분기에 적용한 것과 동일한 우회를 여기(다중 세그먼트 체인)에도 적용한다.
+          var chainLocalCls:string:='';
+          if chainType is TypeBuilder then
+            foreach var tbKvpChain in fTypeBuilders do
+              if tbKvpChain.Value = TypeBuilder(chainType) then
+              begin chainLocalCls:=tbKvpChain.Key; break; end;
+
+          if chainLocalCls<>'' then
           begin
-            aIL.Emit(OpCodes.Callvirt, _getPC.GetGetMethod);
-            aIL.Emit(OpCodes.Pop);
+            var imbChain:=FindInstanceMethod(chainLocalCls, mcs.MethodName);
+            if imbChain<>nil then
+            begin
+              EmitArgsCoerced(aIL, mcs.Args, FindInstanceMethodParamTypes(chainLocalCls, mcs.MethodName));
+              aIL.Emit(OpCodes.Callvirt, imbChain);
+              if imbChain.ReturnType<>typeof(System.Void) then aIL.Emit(OpCodes.Pop);
+            end
+            else if fFieldBuilders.ContainsKey(chainLocalCls) and fFieldBuilders[chainLocalCls].ContainsKey(mcs.MethodName) then
+            begin
+              aIL.Emit(OpCodes.Ldfld, fFieldBuilders[chainLocalCls][mcs.MethodName]);
+              aIL.Emit(OpCodes.Pop);
+            end
+            else
+              raise new Exception('로컬 클래스 "'+chainLocalCls+'"에 메서드/필드 "'+mcs.MethodName+'"가 없습니다 (경로: '+mcs.ObjName+'.'+mcs.MethodName+')');
           end
           else
           begin
-            var _emiC:=ResolveMethodByArity(chainType, mcs.MethodName, mcs.Args, false);
-            if _emiC=nil then
-              raise new Exception('타입 "'+chainType.FullName+'"에 메서드 "'+mcs.MethodName+'"가 없습니다 (인자 '+mcs.Args.Count.ToString+'개, 경로: '+mcs.ObjName+'.'+mcs.MethodName+')');
-            var _emiCParams:=_emiC.GetParameters;
-            for var _emiCAi:=0 to mcs.Args.Count-1 do
-              EmitArgForParamType(aIL, mcs.Args[_emiCAi], _emiCParams[_emiCAi].ParameterType);
-            aIL.Emit(OpCodes.Callvirt, _emiC);
-            if _emiC.ReturnType<>typeof(System.Void) then aIL.Emit(OpCodes.Pop);
+            var _getPC:=chainType.GetProperty(mcs.MethodName);
+            if (mcs.Args.Count=0) and (_getPC<>nil) and (_getPC.GetGetMethod<>nil) then
+            begin
+              aIL.Emit(OpCodes.Callvirt, _getPC.GetGetMethod);
+              aIL.Emit(OpCodes.Pop);
+            end
+            else
+            begin
+              var _emiC:=ResolveMethodByArity(chainType, mcs.MethodName, mcs.Args, false);
+              if _emiC=nil then
+                raise new Exception('타입 "'+chainType.FullName+'"에 메서드 "'+mcs.MethodName+'"가 없습니다 (인자 '+mcs.Args.Count.ToString+'개, 경로: '+mcs.ObjName+'.'+mcs.MethodName+')');
+              var _emiCParams:=_emiC.GetParameters;
+              for var _emiCAi:=0 to mcs.Args.Count-1 do
+                EmitArgForParamType(aIL, mcs.Args[_emiCAi], _emiCParams[_emiCAi].ParameterType);
+              aIL.Emit(OpCodes.Callvirt, _emiC);
+              if _emiC.ReturnType<>typeof(System.Void) then aIL.Emit(OpCodes.Pop);
+            end;
           end;
         end
         else if mcs.ObjName='' then
