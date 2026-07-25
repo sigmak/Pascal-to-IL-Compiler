@@ -808,6 +808,17 @@ type
             else Result:=vtInteger;
           end;
         end
+        // [버그 수정] 지역/전역 원시 타입 변수(integer, real, boolean 등)의 .ToString() 호출.
+        // 예: sum.ToString (sum: integer) — ObjName이 fLocalScope/fGlobalScope에 있고
+        // MethodName이 'ToString'이면 결과는 항상 string이다.
+        // 이전에는 이 케이스가 아래의 else Result:=vtInteger로 폴백되어, 문자열 연결식
+        // ('Add(3,4) = ' + sum.ToString)에서 rt=vtInteger로 오판되고, 실제로는 string이
+        // 스택에 올라와 있는데도 Convert.ToString(int32)가 다시 호출되어 string 참조값을
+        // 정수로 읽어 쓰레기값(메모리 주소)이 출력됐다.
+        else if (fLocalScope.Has(_mc4.ObjName) or fGlobalScope.Has(_mc4.ObjName))
+                and (_mc4.Args.Count=0) and (_mc4.ObjCastType='')
+                and (_mc4.MethodName.ToLower='tostring') then
+          Result:=vtString
         else Result:=vtInteger;
       end
       // [Stage 37 버그 수정] 이전에는 배열이 실제로 array of string이어도 무조건 vtInteger로
@@ -1439,6 +1450,24 @@ type
                   EmitArgForParamType(aIL, mc.Args[_strAi79], _strMiParams79[_strAi79].ParameterType);
                 aIL.Emit(OpCodes.Callvirt, _strMi79);
               end;
+            end
+            else if (mc.Args.Count=0) and (mc.MethodName='ToString')
+                    and ((vtVar=vtInteger) or (vtVar=vtInt64) or (vtVar=vtReal) or (vtVar=vtBoolean) or (vtVar=vtChar)) then
+            begin
+              // [버그 수정] 정수/int64/실수/불린/문자 같은 원시 값 타입의 지역/전역 변수에
+              // 명시적으로 .ToString()을 호출하는 경우(예: "sum.ToString", sum: integer)를
+              // 이전에는 처리하지 않고 곧장 "알 수 없는 메서드"로 던졌다. 위에서 이미
+              // Ldloc으로 그 변수의 값 자체를 스택에 올려둔 상태이므로, IntToStr/BoolToStr가
+              // 쓰는 것과 동일하게 Convert.ToString(T) 정적 메서드를 그대로 호출하면 된다
+              // (박싱/Ldloca 불필요 — 값 그대로 정적 메서드 인자로 전달 가능).
+              var _valToStrType: System.Type;
+              if vtVar=vtInteger then _valToStrType:=typeof(integer)
+              else if vtVar=vtInt64 then _valToStrType:=typeof(int64)
+              else if vtVar=vtReal then _valToStrType:=typeof(double)
+              else if vtVar=vtBoolean then _valToStrType:=typeof(boolean)
+              else _valToStrType:=typeof(char);
+              var _valToStr:=typeof(System.Convert).GetMethod('ToString', [_valToStrType]);
+              aIL.Emit(OpCodes.Call, _valToStr);
             end
             else
               raise new Exception('알 수 없는 메서드 "'+cn+'.'+mc.MethodName+'"');

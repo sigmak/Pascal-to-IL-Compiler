@@ -21,7 +21,8 @@ uses
 
 const
   DefaultExampleDir = 'Examples';
-  DefaultExampleFile = 'Test_stage81.pas'; // [Stage 81]
+  DefaultExampleFile = 'Test_stage82.pas'; // [Stage 82] 진짜 멀티 파일 — uses가 실제 유닛 파일을 찾아 공개(interface) 심볼만 링크
+  //DefaultExampleFile = 'Test_stage81.pas'; // [Stage 81]
   //DefaultExampleFile = 'Test_stage80.pas'; // [Stage 80]
   //DefaultExampleFile = 'Test_stage79.pas'; // [Stage 79]
   //DefaultExampleFile = 'Test_stage78.pas'; // [Stage 78]
@@ -283,8 +284,12 @@ var
 begin
   Result := new List<string>;
   scanSrc := StripCommentsForUsesScan(sourceCode); // [Stage 75]
+  // [Stage 82] unit 파일도 의존성 탐색 대상이 되어야 한다(유닛이 또 다른 유닛을 uses하는
+  // 경우 = 진짜 다중 파일 링크의 기본 시나리오). unit은 "unit Name; interface uses ...;"
+  // 형태라 program/library와 달리 ';' 대신 'interface' 키워드가 uses 앞에 낀다 — 있어도
+  // 없어도 매치되도록 선택적으로 허용한다.
   m := System.Text.RegularExpressions.Regex.Match(scanSrc,
-    '\b(program|library)\s+\w+\s*;\s*uses\s+(.*?);',
+    '\b(program|library|unit)\s+\w+\s*;\s*(?:interface\s+)?uses\s+(.*?);',
     System.Text.RegularExpressions.RegexOptions.Singleline);
   if not m.Success then exit;
   raw := m.Groups[2].Value;
@@ -440,6 +445,63 @@ begin
   target.GenericFuncInstantiations.AddRange(src.GenericFuncInstantiations);
 end;
 
+// ------------------------------------------------------------
+// [Stage 82] "진짜" 유닛 링크: uses한 유닛의 공개(interface) 심볼만 다음 파일에 넘긴다
+// ------------------------------------------------------------
+// Stage 55/56은 "파일 탐색 + 하나의 AST로 병합"까지만 했다 — 이름이 어느 섹션(interface
+// vs implementation)에서 왔는지는 구분하지 않고 그 파일이 아는 이름을 전부 다음 파일에
+// 넘겼다(기존 program/library 스타일 의존 파일은 애초에 interface/implementation 구분이
+// 없으니 이 동작이 맞다 — 지금도 그대로 유지한다, 하위호환).
+//
+// 진짜 unit(IsUnit=true) 파일은 다르다: exported(방금 그 파일을 다 파싱한 뒤의 전체 이름
+// 테이블)에서, "이전 파일들로부터 이미 넘어온 이름"(prior*)은 그대로 통과시키고, 이 파일
+// 자신이 새로 선언한 함수/프로시저는 fileProg.PublicFuncNames/PublicProcNames(=interface에
+// 시그니처가 있던 것)에 있는 것만 통과시킨다. implementation에만 있는 이름(비공개 헬퍼)은
+// 걸러지므로, 다음 파일(uses하는 쪽)의 파서는 그 이름 자체를 모른다 — Parser.pas의 호출
+// 인식이 fFuncNames/fProcNames.Contains 여부로만 판단하기 때문에(Parser.pas 상단 주석
+// 참고), 이 필터링만으로 "비공개는 링크 안 됨"이 자연스럽게 강제된다.
+//
+// 타입(클래스/인터페이스/열거형/레코드)은 필터링하지 않는다 — 이 컴파일러의 문법상
+// unit의 type 섹션은 항상 interface 안에서만 올 수 있으므로(implementation에는 type
+// 섹션이 없다), 유닛이 아는 타입 이름은 애초에 전부 공개 API다.
+function FilterPublicSymbols(exported: TParserExternalSymbols; fileProg: TProgramNode;
+  priorFuncNames, priorProcNames: HashSet<string>): TParserExternalSymbols;
+begin
+  Result := new TParserExternalSymbols;
+  Result.ClassNames.AddRange(exported.ClassNames);
+  Result.InterfaceNames.AddRange(exported.InterfaceNames);
+  Result.EnumNames.AddRange(exported.EnumNames);
+  Result.RecordNames.AddRange(exported.RecordNames);
+  Result.GenericClassNames.AddRange(exported.GenericClassNames);
+  Result.GenericFuncNames.AddRange(exported.GenericFuncNames);
+  Result.GenericProcNames.AddRange(exported.GenericProcNames);
+  foreach var k in exported.ClassFields.Keys do Result.ClassFields.Add(k, exported.ClassFields[k]);
+  foreach var k in exported.ClassMethods.Keys do Result.ClassMethods.Add(k, exported.ClassMethods[k]);
+  foreach var k in exported.ClassParent.Keys do Result.ClassParent.Add(k, exported.ClassParent[k]);
+  foreach var k in exported.ClassInterface.Keys do Result.ClassInterface.Add(k, exported.ClassInterface[k]);
+  foreach var k in exported.ClassGenericParam.Keys do Result.ClassGenericParam.Add(k, exported.ClassGenericParam[k]);
+  foreach var k in exported.ClassGenericConstraint.Keys do Result.ClassGenericConstraint.Add(k, exported.ClassGenericConstraint[k]);
+  foreach var k in exported.FuncGenericParam.Keys do Result.FuncGenericParam.Add(k, exported.FuncGenericParam[k]);
+  foreach var k in exported.ProcGenericParam.Keys do Result.ProcGenericParam.Add(k, exported.ProcGenericParam[k]);
+  foreach var k in exported.FuncGenericConstraint.Keys do Result.FuncGenericConstraint.Add(k, exported.FuncGenericConstraint[k]);
+  foreach var k in exported.ProcGenericConstraint.Keys do Result.ProcGenericConstraint.Add(k, exported.ProcGenericConstraint[k]);
+  foreach var k in exported.EnumMemberEnumName.Keys do Result.EnumMemberEnumName.Add(k, exported.EnumMemberEnumName[k]);
+  foreach var k in exported.EnumMemberOrdinal.Keys do Result.EnumMemberOrdinal.Add(k, exported.EnumMemberOrdinal[k]);
+
+  if not fileProg.IsUnit then
+  begin
+    // 기존(Stage 55/56) 동작 그대로 — program/library 의존 파일은 아는 이름을 전부 공개한다.
+    Result.FuncNames.AddRange(exported.FuncNames);
+    Result.ProcNames.AddRange(exported.ProcNames);
+    exit;
+  end;
+
+  foreach var fn in exported.FuncNames do
+    if priorFuncNames.Contains(fn) or fileProg.PublicFuncNames.Contains(fn) then Result.FuncNames.Add(fn);
+  foreach var pn in exported.ProcNames do
+    if priorProcNames.Contains(pn) or fileProg.PublicProcNames.Contains(pn) then Result.ProcNames.Add(pn);
+end;
+
 var
   inputPath, sourceCode, outputName: string;
   prog: TProgramNode;
@@ -538,12 +600,34 @@ begin
         if fileLexer.AppTypeDirective<>'' then entryAppType := fileLexer.AppTypeDirective;
 
         var fileParser := new TParser(fileTokens);
+        // [Stage 82] 필터링 전/후를 비교하려면 "이 파일 파싱 전에 이미 알고 있던 이름"이
+        // 필요하다 — ImportExternalSymbols가 fFuncNames/fProcNames를 건드리기 전에 미리
+        // 스냅샷을 떠 둔다(symbolAccumulator 자체는 여기서 바뀌지 않으니 순서 문제 없음).
+        var priorFuncNames := new HashSet<string>;
+        var priorProcNames := new HashSet<string>;
+        if symbolAccumulator<>nil then
+        begin
+          foreach var s in symbolAccumulator.FuncNames do priorFuncNames.Add(s);
+          foreach var s in symbolAccumulator.ProcNames do priorProcNames.Add(s);
+        end;
         // [Stage 56] 이전 파일들(의존성 먼저 순서)이 선언한 함수/클래스/... 이름을
         // 이 파서에 미리 알려준다 — 안 그러면 다른 파일에서 선언된 함수를 호출하는
         // 문장을 파싱할 때 "알 수 없는 문장"으로 오인해 실패한다.
         fileParser.ImportExternalSymbols(symbolAccumulator);
         fileProg := fileParser.ParseProgram;
-        symbolAccumulator := fileParser.ExportSymbols;
+        // [Stage 82] 다음 파일에 넘길 이름 테이블은 "전체"가 아니라 "공개된 것만" —
+        // FilterPublicSymbols 참고. unit이 아닌 파일은 기존 동작(전체 공개) 그대로다.
+        var exportedNow := fileParser.ExportSymbols;
+        symbolAccumulator := FilterPublicSymbols(exportedNow, fileProg, priorFuncNames, priorProcNames);
+        if fileProg.IsUnit and (compileOrder.Count>1) then
+        begin
+          var hiddenFuncs := exportedNow.FuncNames.Count - symbolAccumulator.FuncNames.Count;
+          var hiddenProcs := exportedNow.ProcNames.Count - symbolAccumulator.ProcNames.Count;
+          if (hiddenFuncs>0) or (hiddenProcs>0) then
+            Writeln('  [유닛링크] "' + fileLabel + '": 공개 함수 ' + fileProg.PublicFuncNames.Count.ToString
+              + '개/공개 프로시저 ' + fileProg.PublicProcNames.Count.ToString
+              + '개만 다른 파일에 공개 — 비공개(구현부 전용) ' + (hiddenFuncs + hiddenProcs).ToString + '개는 숨김');
+        end;
       except
         on E: Exception do
         begin

@@ -872,6 +872,12 @@ type
     EnumDecls: List<TEnumDeclNode>; // [Phase 1] 열거형 선언 목록
     RecordDecls: List<TRecordDeclNode>; // [Stage 62] 레코드 선언 목록
     OperatorOverloads: List<TOperatorOverloadNode>; // [Stage 66] 연산자 오버로딩 목록
+    // [Stage 82] IsUnit=true인 파일에서만 의미 있음 — interface 섹션에 "본문 없는"
+    // 시그니처로 선언된 함수/프로시저 이름 목록(= 이 유닛의 공개 API). Main.pas가 다른
+    // 파일이 이 유닛을 uses할 때 이 목록만 그쪽 파서에 넘겨, implementation에만 있는
+    // 이름(비공개 헬퍼)은 자연스럽게 "모르는 이름"이 되게 한다.
+    PublicFuncNames: List<string>;
+    PublicProcNames: List<string>;
     constructor Create(n: string);
     begin
       Name:=n;
@@ -892,6 +898,8 @@ type
       EnumDecls:=new List<TEnumDeclNode>; // [Phase 1]
       RecordDecls:=new List<TRecordDeclNode>; // [Stage 62]
       OperatorOverloads:=new List<TOperatorOverloadNode>; // [Stage 66]
+      PublicFuncNames:=new List<string>; // [Stage 82]
+      PublicProcNames:=new List<string>; // [Stage 82]
     end;
   end;
 

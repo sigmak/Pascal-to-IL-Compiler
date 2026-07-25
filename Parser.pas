@@ -2827,7 +2827,9 @@ type
         fFuncGenericConstraint[d.Name]:=genConstraints;
       end
       else
-        fFuncNames.Add(d.Name);
+        // [Stage 82] unit의 interface 섹션에서 이 이름이 이미 시그니처로 등록됐을 수
+        // 있으므로(ParseInterfaceHeaderDecl) 중복 추가를 막는다.
+        if not fFuncNames.Contains(d.Name) then fFuncNames.Add(d.Name);
 
       // (본문/매개변수/반환타입 파싱 동안 fCurGenericParams를 설정해 T 등의 참조를 vtGeneric으로 인식시킨다)
       savedGP4:=fCurGenericParams;
@@ -2970,7 +2972,8 @@ type
         fProcGenericConstraint[d.Name]:=genConstraints;
       end
       else
-        fProcNames.Add(d.Name);
+        // [Stage 82] unit의 interface 섹션에서 이미 시그니처로 등록됐을 수 있으므로 중복 방지.
+        if not fProcNames.Contains(d.Name) then fProcNames.Add(d.Name);
 
       savedGP5:=fCurGenericParams;
       if d.IsGeneric then fCurGenericParams:=genNames;
@@ -3284,6 +3287,40 @@ type
       Expect(tkSemicolon);
     end;
 
+    // [Stage 82] unit의 interface 섹션에 오는 "본문 없는" 함수/프로시저 시그니처.
+    //   function Name(params): RetType;   또는   procedure Name(params);
+    // 로 끝난다 — begin...end 본문이 없다. 실제 본문은 뒤따르는 implementation 섹션에
+    // 같은 이름으로 다시 나온다(그건 기존 ParseFuncDecl/ParseProcDecl 경로를 그대로 탄다).
+    // 여기서는 TFuncDeclNode/TProcDeclNode를 만들지 않는다(본문이 없어 만들 수 없다) —
+    // 대신 이름을 (1) fFuncNames/fProcNames에 등록해 이후 문장 파싱에서 호출 문법으로
+    // 인식되게 하고, (2) prog.PublicFuncNames/PublicProcNames(이 유닛의 공개 API 목록)에
+    // 등록한다. Main.pas는 다른 파일이 이 유닛을 uses할 때 이 공개 API 목록만 넘겨준다 —
+    // implementation에만 있는(=이 목록에 없는) 이름은 다른 파일 쪽 파서에 전달되지 않으므로
+    // 자연스럽게 "모르는 이름"이 되어 접근이 막힌다.
+    procedure ParseInterfaceHeaderDecl(prog: TProgramNode);
+    var isFunc: boolean; name: string; ps: List<TParamDef>; rt: TVarType;
+    begin
+      isFunc:=(Cur.Kind=tkFunction);
+      fPos:=fPos+1; // 'function'/'procedure' 소비
+      name:=Expect(tkIdent).Text;
+      ps:=new List<TParamDef>;
+      ParseParams(ps);
+      if isFunc then
+      begin
+        Expect(tkColon);
+        rt:=ParseVarType; // 반환 타입은 지금은 검증 없이 소비만 함(구현부 쪽 반환타입이 최종 진실)
+        Expect(tkSemicolon);
+        if not fFuncNames.Contains(name) then fFuncNames.Add(name);
+        if not prog.PublicFuncNames.Contains(name) then prog.PublicFuncNames.Add(name);
+      end
+      else
+      begin
+        Expect(tkSemicolon);
+        if not fProcNames.Contains(name) then fProcNames.Add(name);
+        if not prog.PublicProcNames.Contains(name) then prog.PublicProcNames.Add(name);
+      end;
+    end;
+
     function ParseProgram: TProgramNode;
     var prog: TProgramNode; t: TToken;
     begin
@@ -3317,6 +3354,13 @@ type
 
       // type 섹션
       if Cur.Kind=tkType then ParseTypeSection(prog);
+
+      // [Stage 82] unit이면 type 섹션 다음에 함수/프로시저 "시그니처만" 있는 선언이
+      // 0개 이상 올 수 있다(본문 없는 forward 선언 — 실제 본문은 implementation에
+      // 같은 이름으로 다시 나온다). 여기 나열된 이름들이 이 유닛의 공개 API가 된다.
+      if prog.IsUnit then
+        while (Cur.Kind=tkFunction) or (Cur.Kind=tkProcedure) do
+          ParseInterfaceHeaderDecl(prog);
 
       // [Stage 81] unit이면 여기서 'implementation' 키워드, 그리고 그 섹션 전용 uses도
       // 올 수 있다. 이후의 메서드 구현부/var/const 파싱은 program/library와 완전히 동일한
@@ -3426,6 +3470,29 @@ type
       // 줄마다 따로 소스 문맥을 보여줄 수 있게 한다 — Main.pas는 손댈 필요가 없다.)
       if ParseErrors.Count>0 then
         raise new Exception('구문 분석 오류 '+ParseErrors.Count.ToString+'건 발견:'#10+string.Join(#10, ParseErrors));
+
+      // [Stage 82] interface에 시그니처만 선언해놓고 implementation에 본문을 안 준 경우를
+      // 여기서 바로 잡아낸다 — 안 그러면 "링크할 실체가 없는 빈 공개 API"가 되어, 나중에
+      // 이 유닛을 uses하는 다른 파일에서 정체불명의 CodeGen 오류로 튀어나오게 된다.
+      if prog.IsUnit then
+      begin
+        foreach var pubFn in prog.PublicFuncNames do
+        begin
+          var implFound:=false;
+          foreach var fd in prog.FuncDecls do if fd.Name=pubFn then begin implFound:=true; break; end;
+          if not implFound then
+            raise new Exception('유닛 "'+prog.Name+'"의 interface에 선언된 함수 "'+pubFn
+              +'"의 구현이 implementation 섹션에 없습니다 (Stage 82)');
+        end;
+        foreach var pubPn in prog.PublicProcNames do
+        begin
+          var implFound2:=false;
+          foreach var pd in prog.ProcDecls do if pd.Name=pubPn then begin implFound2:=true; break; end;
+          if not implFound2 then
+            raise new Exception('유닛 "'+prog.Name+'"의 interface에 선언된 프로시저 "'+pubPn
+              +'"의 구현이 implementation 섹션에 없습니다 (Stage 82)');
+        end;
+      end;
 
       Result:=prog;
     end;
