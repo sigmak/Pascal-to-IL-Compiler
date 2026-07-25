@@ -21,7 +21,8 @@ uses
 
 const
   DefaultExampleDir = 'Examples';
-  DefaultExampleFile = 'Test_stage79.pas'; // [Stage 79]
+  DefaultExampleFile = 'Test_stage80.pas'; // [Stage 80]
+  //DefaultExampleFile = 'Test_stage79.pas'; // [Stage 79]
   //DefaultExampleFile = 'Test_stage78.pas'; // [Stage 78]
   //DefaultExampleFile = 'Test_stage77.pas'; // [Stage 77]
   //DefaultExampleFile = 'Test_stage76f.pas'; // [Stage 76f] 
