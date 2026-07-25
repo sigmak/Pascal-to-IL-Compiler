@@ -867,6 +867,7 @@ type
     GenericInstantiations: List<TGenericInstantiation>; // Parser가 채우고 Monomorphize가 소비
     GenericFuncInstantiations: List<TGenericFuncInstantiation>; // [Stage 36] 함수/프로시저용, 동일한 방식
     IsLibrary: boolean; // [Stage 44] true면 "library Name;"으로 시작 — exe 대신 dll로 생성, begin...end 블록 생략 가능
+    IsUnit: boolean; // [Stage 81] true면 "unit Name; interface ... implementation ... end."로 시작 (IsLibrary도 항상 true로 같이 설정됨)
     AppType: string; // [Stage 69] {$apptype windows|console} 지시문. 기본 'console'. 'windows'면 콘솔창 없이 실행되는 PE로 생성.
     EnumDecls: List<TEnumDeclNode>; // [Phase 1] 열거형 선언 목록
     RecordDecls: List<TRecordDeclNode>; // [Stage 62] 레코드 선언 목록
@@ -886,6 +887,7 @@ type
       GenericInstantiations:=new List<TGenericInstantiation>;
       GenericFuncInstantiations:=new List<TGenericFuncInstantiation>;
       IsLibrary:=false;
+      IsUnit:=false; // [Stage 81]
       AppType:='console'; // [Stage 69]
       EnumDecls:=new List<TEnumDeclNode>; // [Phase 1]
       RecordDecls:=new List<TRecordDeclNode>; // [Stage 62]

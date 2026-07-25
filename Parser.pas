@@ -3264,13 +3264,45 @@ type
       foreach var k in fEnumMemberOrdinal.Keys do Result.EnumMemberOrdinal.Add(k, fEnumMemberOrdinal[k]);
     end;
 
+    // [Stage 81] uses 절: uses UnitA, UnitB.SubUnit, ...;
+    // 지금은 이름을 소비만 하고 버린다 — 외부 타입은 이미 완전한 점(.) 경로 이름으로
+    // 참조되므로(예: System.Windows.Forms.Button) uses 목록 자체가 CodeGen에 영향을 주지 않는다.
+    // WPF 디자이너가 생성하는 파일 헤더를 그대로 통과시키는 것이 목적. [Stage 81]에서
+    // unit의 interface/implementation 섹션에도 각각 uses가 올 수 있어 재사용 가능하게 뽑아냄
+    // (실제 다른 유닛과의 링크는 Stage 82에서 다룬다 — 지금은 여전히 이름만 버린다).
+    procedure ParseAndDiscardUsesClause;
+    begin
+      fPos:=fPos+1; // 'uses' 소비
+      Expect(tkIdent);
+      while Cur.Kind=tkDot do begin fPos:=fPos+1; Expect(tkIdent); end;
+      while Cur.Kind=tkComma do
+      begin
+        fPos:=fPos+1;
+        Expect(tkIdent);
+        while Cur.Kind=tkDot do begin fPos:=fPos+1; Expect(tkIdent); end;
+      end;
+      Expect(tkSemicolon);
+    end;
+
     function ParseProgram: TProgramNode;
     var prog: TProgramNode; t: TToken;
     begin
       // [Stage 44] library Name; (dll 산출물) 또는 program Name; (exe 산출물) 둘 다 허용.
+      // [Stage 81] unit Name; interface ... implementation ... end. 도 허용 — 유닛도
+      // 실행 진입점(begin...end)이 없으므로 library와 동일하게 IsLibrary:=true로 취급해
+      // 기존 DLL 산출 경로를 그대로 재사용한다. (다른 유닛에서 실제로 uses해서 링크하는
+      // 것은 아직 안 됨 — 이 파일 하나만 단독으로 파싱/코드생성하는 것까지가 Stage 81 범위.)
       if Cur.Kind=tkLibrary then
       begin
         fPos:=fPos+1; prog:=new TProgramNode(Expect(tkIdent).Text); prog.IsLibrary:=true; Expect(tkSemicolon);
+      end
+      else if Cur.Kind=tkUnit then
+      begin
+        fPos:=fPos+1; // 'unit' 소비
+        prog:=new TProgramNode(Expect(tkIdent).Text);
+        prog.IsLibrary:=true;
+        prog.IsUnit:=true;
+        Expect(tkSemicolon);
       end
       else
       begin
@@ -3278,26 +3310,22 @@ type
       end;
       fProg:=prog; // 깊이 상관없이(식/타입 파싱 도중) GenericInstantiations에 접근하기 위함
 
-      // [Stage 29] uses 절: uses UnitA, UnitB.SubUnit, ...;
-      // 지금은 이름을 소비만 하고 버린다 — 외부 타입은 이미 완전한 점(.) 경로 이름으로
-      // 참조되므로(예: System.Windows.Forms.Button) uses 목록 자체가 CodeGen에 영향을 주지 않는다.
-      // WPF 디자이너가 생성하는 파일 헤더를 그대로 통과시키는 것이 목적.
-      if Cur.Kind=tkUses then
-      begin
-        fPos:=fPos+1; // 'uses' 소비
-        Expect(tkIdent);
-        while Cur.Kind=tkDot do begin fPos:=fPos+1; Expect(tkIdent); end;
-        while Cur.Kind=tkComma do
-        begin
-          fPos:=fPos+1;
-          Expect(tkIdent);
-          while Cur.Kind=tkDot do begin fPos:=fPos+1; Expect(tkIdent); end;
-        end;
-        Expect(tkSemicolon);
-      end;
+      // [Stage 81] unit이면 type 섹션 앞에 'interface' 키워드가 와야 한다.
+      if prog.IsUnit then Expect(tkInterface);
+
+      if Cur.Kind=tkUses then ParseAndDiscardUsesClause;
 
       // type 섹션
       if Cur.Kind=tkType then ParseTypeSection(prog);
+
+      // [Stage 81] unit이면 여기서 'implementation' 키워드, 그리고 그 섹션 전용 uses도
+      // 올 수 있다. 이후의 메서드 구현부/var/const 파싱은 program/library와 완전히 동일한
+      // 문법이라 아래 기존 코드를 그대로 재사용한다.
+      if prog.IsUnit then
+      begin
+        Expect(tkImplementation);
+        if Cur.Kind=tkUses then ParseAndDiscardUsesClause;
+      end;
 
       // 클래스 메서드 구현 또는 일반 함수/프로시저
       while (Cur.Kind=tkFunction) or (Cur.Kind=tkProcedure) or (Cur.Kind=tkConstructor) or (Cur.Kind=tkOperator) do

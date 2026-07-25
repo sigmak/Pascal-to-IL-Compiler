@@ -28,6 +28,7 @@ type
     tkNew, // [Stage 40] new TypeName(args) 객체 생성 구문
     tkConstructor, // [Stage 42] constructor Create; 선언/구현
     tkLibrary, // [Stage 44] library Name; 선언 (dll 산출물, begin...end 블록 생략 가능)
+    tkUnit, tkImplementation, // [Stage 81] unit Name; interface ... implementation ... end. 구조
     tkVirtual, tkOverride, tkAbstract, // [Stage 53] virtual/override/abstract 메서드 지시자
     tkOperator, // [Stage 66] operator +(a, b: T): T; 연산자 오버로딩 선언
     // [Phase 1] 타입 시스템 확장
@@ -222,6 +223,8 @@ type
       else if lw='yield'    then Result:=new TToken(tkYield,    w,sl,sc) // [Stage 69]
       else if lw='sequence' then Result:=new TToken(tkSequence, w,sl,sc) // [Stage 69]
       else if lw='const'    then Result:=new TToken(tkConst,    w,sl,sc) // [Stage 61]
+      else if lw='unit'     then Result:=new TToken(tkUnit,     w,sl,sc) // [Stage 81]
+      else if lw='implementation' then Result:=new TToken(tkImplementation, w,sl,sc) // [Stage 81]
       else                        Result:=new TToken(tkIdent,     w,sl,sc);
     end;
 
