@@ -2399,17 +2399,19 @@ type
                 fldType:=ParseVarType;
                 if fldType=vtGenericArray then fldCn:=fLastGenericName;
               end;
-              // [Stage 83] 클래스 필드 인라인 기본값 초기화: "Name: type = 식;"
+              // [Stage 83] 클래스 필드 인라인 기본값 초기화: "Name: type = 식;" 또는 "Name: type := 식;"
+              // (실제 PascalABC.net_imitate 소스는 ":=" 표기를 씀 — 예: uRunProcessOptions.pas의
+              // "Process: System.Diagnostics.Process := nil;" — 두 표기 모두 허용한다.)
               // 쉼표로 묶인 여러 필드 이름에 동시에 붙이는 것은 의미가 모호하므로
               // (예: "X, Y: integer = 0;"이 두 필드 모두에 적용되는지 불분명) 허용하지 않고
               // 이름이 하나일 때만 허용한다.
               var fldDefaultExpr: TExprNode:=nil;
-              if Cur.Kind=tkEq then
+              if (Cur.Kind=tkEq) or (Cur.Kind=tkAssign) then
               begin
                 if fnames.Count<>1 then
                   raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString
-                    +': 인라인 기본값 초기화는 필드 하나씩만 지원합니다 (예: "'+fnames[0]+': 타입 = 값;")');
-                fPos:=fPos+1; // '=' 소비
+                    +': 인라인 기본값 초기화는 필드 하나씩만 지원합니다 (예: "'+fnames[0]+': 타입 := 값;")');
+                fPos:=fPos+1; // '=' 또는 ':=' 소비
                 fldDefaultExpr:=ParseExpr;
               end;
               Expect(tkSemicolon);

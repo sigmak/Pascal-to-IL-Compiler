@@ -5617,6 +5617,12 @@ type
         ['System','System, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'];
       fAutoAssemblyMap['System.Xaml']:=
         ['System.Xaml','System.Xaml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'];
+      // [Stage 84] System.Diagnostics.Process 등 — .NET(Core 이후)에서는 별도 어셈블리
+      // "System.Diagnostics.Process"로 분리돼 있고, .NET Framework에서는 "System"에 들어있으므로
+      // 둘 다 후보로 넣어 둘 중 실제로 로드되는 쪽을 쓴다.
+      fAutoAssemblyMap['System.Diagnostics']:=
+        ['System.Diagnostics.Process','System.Diagnostics.Process, Version=4.0.0.0, Culture=neutral, PublicKeyToken=cc7b13ffcd2ddd51',
+         'System','System, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'];
       // WPF: 네임스페이스 System.Windows.* 가 PresentationFramework/PresentationCore/WindowsBase에 흩어져 있음.
       // WPF 계열 GAC 어셈블리는 PublicKeyToken이 BCL과 다르다(31bf3856ad364e35).
       fAutoAssemblyMap['System.Windows']:=
