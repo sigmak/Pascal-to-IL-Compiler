@@ -21,7 +21,9 @@ uses
 
 const
   DefaultExampleDir = 'Examples';
-  DefaultExampleFile = 'Test_stage86.pas'; // [Stage 86]
+  DefaultExampleFile = 'uFileMonitoring.pas'; // [Stage 87]
+  //DefaultExampleFile = 'Test_stage87.pas'; // [Stage 86]
+  //DefaultExampleFile = 'Test_stage86.pas'; // [Stage 86]
   //DefaultExampleFile = 'Test_stage85.pas'; // [Stage 85]
   //DefaultExampleFile = 'Test_stage84.pas'; // [Stage 84] 실제 repo 첫 파일(uRunProcessOptions.pas) 링크 컴파일
   //DefaultExampleFile = 'Test_stage83.pas'; // [Stage 83] 클래스 필드 인라인 기본값 초기화 문법

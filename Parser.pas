@@ -351,6 +351,13 @@ type
             +'"의 멤버가 32개를 넘어 집합으로 표현할 수 없습니다 (Stage 63은 32비트 비트마스크 사용)');
         cn:=Cur.Text; fLastGenericName:=cn; fPos:=fPos+1; Result:=vtSet; exit;
       end;
+      // [Stage 87] object — .NET System.Object 매개변수/필드 타입
+      // (WinForms 이벤트 핸들러의 "sender: object" 관용구 — uFileMonitoring.pas의
+      // OnFileChangedEvent(sender: object; e: ...)에서 처음 필요해짐)
+      if (Cur.Kind=tkIdent) and (Cur.Text.ToLower='object') and (not fClassNames.Contains(Cur.Text)) then
+      begin
+        fPos:=fPos+1; cn:='System.Object'; isExt:=true; Result:=vtObject; exit;
+      end;
       if (Cur.Kind=tkIdent) and fClassNames.Contains(Cur.Text) then
       begin
         cn:=Cur.Text; fPos:=fPos+1; Result:=vtObject;
@@ -3514,7 +3521,8 @@ type
             while Cur.Kind<>tkEOF do
             begin
               if (syncDepth=0) and ((Cur.Kind=tkFunction) or (Cur.Kind=tkProcedure)
-                 or (Cur.Kind=tkConstructor) or (Cur.Kind=tkOperator) or (Cur.Kind=tkVar) or (Cur.Kind=tkConst)) then
+                 or (Cur.Kind=tkConstructor) or (Cur.Kind=tkOperator) or (Cur.Kind=tkVar) or (Cur.Kind=tkConst)
+                 or (Cur.Kind=tkEnd)) then // [Stage 87] 마지막 구현부가 깨져도 유닛의 최종 end.는 삼키지 않음
                 break;
               if Cur.Kind=tkBegin then syncDepth:=syncDepth+1
               else if (Cur.Kind=tkEnd) and (syncDepth>0) then syncDepth:=syncDepth-1;

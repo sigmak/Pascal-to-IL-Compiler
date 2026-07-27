@@ -5933,6 +5933,11 @@ type
         ['System','System, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'];
       fAutoAssemblyMap['System.Timers']:=
         ['System','System, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'];
+      // [Stage 87] System.IO.FileSystemWatcher/FileSystemEventArgs 등 — System.IO 네임스페이스의
+      // 대부분(Path/File/Directory)은 mscorlib에 있어 1단계에서 바로 찾히지만, FileSystemWatcher는
+      // System.ComponentModel.Component를 상속하는 컴포넌트라 System.dll(짧은 이름 "System")에 있다.
+      fAutoAssemblyMap['System.IO']:=
+        ['System','System, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'];
       fAutoAssemblyMap['System.Xaml']:=
         ['System.Xaml','System.Xaml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'];
       // [Stage 84] System.Diagnostics.Process 등 — .NET(Core 이후)에서는 별도 어셈블리
