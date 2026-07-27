@@ -361,6 +361,15 @@ type
       if (fLocalScope.Has(first) or fGlobalScope.Has(first))
          and (fLocalScope.HasClrType(first) or fGlobalScope.HasClrType(first)) then
       begin Result:=true; exit; end;
+      // [Stage 85 후속 수정] "c.Value.ToString" (c: Counter, Counter는 로컬에서 정의한 클래스)에서
+      // "c.Value" 부분이 점(.)을 포함한 ObjName으로 넘어오면 InferType의 체인 분기가 이 함수로
+      // 첫 세그먼트("c")가 체인 시작점인지 묻는다. 그런데 "c"는 외부 CLR 타입이 아니라 로컬에서
+      // 정의한 클래스(Counter)의 인스턴스라 HasClrType은 false를 반환한다 — GetVarClassName으로
+      // 로컬 클래스 인스턴스 변수인지도 확인해야 한다. 이게 없으면 "c"가 체인 시작점이 아니라고
+      // 오판되어, "c.Value"를 통째로 외부 네임스페이스/타입 경로로 오인해 ResolveExternalType이
+      // 호출되고 "외부 타입 'c.Value'을(를) 찾을 수 없습니다" 예외가 난다.
+      if (fLocalScope.Has(first) or fGlobalScope.Has(first)) and (GetVarClassName(first)<>'') then
+      begin Result:=true; exit; end;
       if (FindExternalAncestorType(fCurClassName)<>nil)
          and (FindExternalAncestorType(fCurClassName).GetProperty(first)<>nil) then
       begin Result:=true; exit; end;
@@ -413,6 +422,18 @@ type
         if fLocalScope.HasClrType(first) then curType:=fLocalScope.GetClrType(first)
         else curType:=fGlobalScope.GetClrType(first);
       end
+      // [Stage 85 후속 수정] first가 외부 CLR 타입(HasClrType)이 아니라 로컬에서 정의한
+      // 클래스의 인스턴스 변수(예: c: Counter)일 수 있다 — GetVarClassName으로 확인하고
+      // fTypeBuilders에서 그 클래스의 TypeBuilder를 curType으로 쓴다. 이게 없으면
+      // "c.Value" 같은 체인의 첫 세그먼트가 이도저도 아니라고 오판돼 아래 else의
+      // "self가 상속한 외부 타입" 경로로 빠지고 결국 알 수 없는 한정자 예외가 난다.
+      else if (fLocalScope.Has(first) or fGlobalScope.Has(first))
+              and (GetVarClassName(first)<>'') and fTypeBuilders.ContainsKey(GetVarClassName(first)) then
+      begin
+        if fLocalScope.Has(first) then aIL.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(first))
+        else aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(first));
+        curType:=fTypeBuilders[GetVarClassName(first)];
+      end
       else
       begin
         extSelf:=FindExternalAncestorType(fCurClassName);
@@ -438,7 +459,16 @@ type
             if tbKvp78.Value = TypeBuilder(curType) then
             begin localClsName78:=tbKvp78.Key; break; end;
 
-        if (localClsName78<>'') and fFieldBuilders.ContainsKey(localClsName78)
+        if (localClsName78<>'') and fInstanceMethods.ContainsKey(localClsName78)
+           and fInstanceMethods[localClsName78].ContainsKey('get_'+segs[i]) then
+        begin
+          // [Stage 85] 로컬 클래스의 프로퍼티 getter (필드가 아니라 read 접근자 메서드를
+          // 호출해야 하는 경우, 예: property Enabled: boolean read FEnabled write SetEnabled;)
+          var localGetM85: MethodBuilder := fInstanceMethods[localClsName78]['get_'+segs[i]];
+          aIL.Emit(OpCodes.Callvirt, localGetM85);
+          curType:=localGetM85.ReturnType;
+        end
+        else if (localClsName78<>'') and fFieldBuilders.ContainsKey(localClsName78)
            and fFieldBuilders[localClsName78].ContainsKey(segs[i]) then
         begin
           // 로컬 클래스의 필드 — FieldBuilder로 Ldfld (private 접근도 같은 어셈블리 안에서 IL 수준으로는 허용)
@@ -484,6 +514,11 @@ type
         if fLocalScope.HasClrType(first) then curType:=fLocalScope.GetClrType(first)
         else curType:=fGlobalScope.GetClrType(first);
       end
+      // [Stage 85 후속 수정] EmitQualifierChainLoad와 동일한 사유 — first가 로컬 클래스
+      // 인스턴스 변수일 수 있으므로 GetVarClassName/fTypeBuilders로도 확인한다.
+      else if (fLocalScope.Has(first) or fGlobalScope.Has(first))
+              and (GetVarClassName(first)<>'') and fTypeBuilders.ContainsKey(GetVarClassName(first)) then
+        curType:=fTypeBuilders[GetVarClassName(first)]
       else
       begin
         extSelf:=FindExternalAncestorType(fCurClassName);
@@ -502,7 +537,11 @@ type
             if tbKvp78.Value = TypeBuilder(curType) then
             begin localClsName78:=tbKvp78.Key; break; end;
 
-        if (localClsName78<>'') and fFieldBuilders.ContainsKey(localClsName78)
+        if (localClsName78<>'') and fInstanceMethods.ContainsKey(localClsName78)
+           and fInstanceMethods[localClsName78].ContainsKey('get_'+segs[i]) then
+          // [Stage 85] 로컬 클래스의 프로퍼티 getter
+          curType:=fInstanceMethods[localClsName78]['get_'+segs[i]].ReturnType
+        else if (localClsName78<>'') and fFieldBuilders.ContainsKey(localClsName78)
            and fFieldBuilders[localClsName78].ContainsKey(segs[i]) then
           curType:=fFieldBuilders[localClsName78][segs[i]].FieldType
         else
@@ -4403,25 +4442,64 @@ type
     // targetType의 memberName 속성(setter)이나 필드에 valueExpr 값을 설정한다.
     procedure EmitPropertyOrFieldSet(aIL: ILGenerator; targetType: System.Type; memberName: string; valueExpr: TExprNode);
     var pi: PropertyInfo; fi: System.Reflection.FieldInfo; setr: MethodInfo;
+        localClsName85: string; tbKvp85: System.Collections.Generic.KeyValuePair<string, TypeBuilder>;
     begin
       // [Stage 57] Button1.Text := 'a'; 같은 Qualifier.Field 대입 경로. 목표 속성/필드의
       // 실제 CLR 타입을 이미 알고 있으므로 EmitArgForParamType으로 char→string 승격.
-      pi:=targetType.GetProperty(memberName);
-      if pi<>nil then
+      //
+      // [Stage 85 수정] targetType이 아직 CreateType되지 않은 로컬 TypeBuilder(예:
+      // fcw.Enabled := false; 에서 fcw: FileChangeWatcher — 사용자가 직접 정의한 클래스)이면
+      // targetType.GetProperty/GetField가 NotSupportedException("Type has not been created.")을
+      // 던진다. Stage 78에서 EmitQualifierChainLoad/InferQualifierChainType 두 곳은 이미
+      // fTypeBuilders 역방향 조회로 고쳤지만, 여기(대입 경로)는 그대로 남아있던 알려진 취약점이다.
+      // 같은 패턴으로: fTypeBuilders를 역방향 조회해 클래스명을 찾고, 프로퍼티 setter
+      // (set_MemberName)나 일반 필드를 fInstanceMethods/fFieldBuilders에서 직접 찾는다.
+      localClsName85:='';
+      if targetType is TypeBuilder then
+        foreach tbKvp85 in fTypeBuilders do
+          if tbKvp85.Value = TypeBuilder(targetType) then
+          begin localClsName85:=tbKvp85.Key; break; end;
+
+      if (localClsName85<>'') and fInstanceMethods.ContainsKey(localClsName85)
+         and fInstanceMethods[localClsName85].ContainsKey('set_'+memberName) then
       begin
-        setr:=pi.GetSetMethod;
-        if setr=nil then
-          raise new Exception('속성 "'+targetType.FullName+'.'+memberName+'"에 setter가 없습니다 (읽기 전용).');
-        EmitArgForParamType(aIL, valueExpr, pi.PropertyType);
-        aIL.Emit(OpCodes.Callvirt, setr);
+        // 로컬 클래스의 프로퍼티 setter (필드가 아니라 write 접근자 메서드를 호출해야 하는 경우)
+        var localSetM85: MethodBuilder := fInstanceMethods[localClsName85]['set_'+memberName];
+        var localSetParamType85: System.Type := typeof(System.Object);
+        if fMethodParamClrTypes.ContainsKey(localClsName85)
+           and fMethodParamClrTypes[localClsName85].ContainsKey('set_'+memberName) then
+          localSetParamType85:=fMethodParamClrTypes[localClsName85]['set_'+memberName][0];
+        EmitArgForParamType(aIL, valueExpr, localSetParamType85);
+        aIL.Emit(OpCodes.Callvirt, localSetM85);
+      end
+      else if (localClsName85<>'') and fFieldBuilders.ContainsKey(localClsName85)
+         and fFieldBuilders[localClsName85].ContainsKey(memberName) then
+      begin
+        // 로컬 클래스의 (프로퍼티가 아닌) 공개 필드에 직접 대입하는 경우
+        var localFb85: FieldBuilder := fFieldBuilders[localClsName85][memberName];
+        EmitArgForParamType(aIL, valueExpr, localFb85.FieldType);
+        aIL.Emit(OpCodes.Stfld, localFb85);
       end
       else
       begin
-        fi:=targetType.GetField(memberName);
-        if fi=nil then
-          raise new Exception('타입 "'+targetType.FullName+'"에 필드/속성 "'+memberName+'"가 없습니다.');
-        EmitArgForParamType(aIL, valueExpr, fi.FieldType);
-        aIL.Emit(OpCodes.Stfld, fi);
+        // 기존 경로: 외부 CLR 타입, 또는 이미 CreateType된 타입
+        pi:=targetType.GetProperty(memberName);
+        if pi<>nil then
+        begin
+          setr:=pi.GetSetMethod;
+          if setr=nil then
+            raise new Exception('속성 "'+targetType.FullName+'.'+memberName+'"에 setter가 없습니다 (읽기 전용).');
+          EmitArgForParamType(aIL, valueExpr, pi.PropertyType);
+          aIL.Emit(OpCodes.Callvirt, setr);
+        end
+        else
+        begin
+          fi:=targetType.GetField(memberName);
+          if fi=nil then
+            raise new Exception('타입 "'+targetType.FullName+'"에 필드/속성 "'+memberName+'"가 없습니다.');
+          EmitArgForParamType(aIL, valueExpr, fi.FieldType);
+          aIL.Emit(OpCodes.Stfld, fi);
+        end;
       end;
     end;
 
@@ -4541,59 +4619,11 @@ type
         end;
       end;
 
-      // [Phase 1] 프로퍼티 — CLR PropertyBuilder + get/set 메서드 쌍으로 방출
-      foreach var ps in cd.Properties do
-      begin
-        var propClrType: System.Type;
-        if (ps.PropType=vtObject) and ps.IsExternalType then
-          propClrType:=ResolveExternalType(ps.PropClassName)
-        else
-          propClrType:=VTC(ps.PropType, ps.PropClassName);
-
-        var pb:=tb.DefineProperty(ps.Name, PropertyAttributes.None, propClrType, nil);
-
-        // getter
-        if ps.ReadName<>'' then
-        begin
-          var getM:=tb.DefineMethod('get_'+ps.Name,
-            MethodAttributes.Public or MethodAttributes.SpecialName or
-            MethodAttributes.HideBySig or MethodAttributes.Virtual,
-            propClrType, System.Type.EmptyTypes);
-          var gIL:=getM.GetILGenerator;
-          // ReadName은 반드시 같은 클래스에 선언된 필드 이름이어야 한다.
-          if fFieldBuilders.ContainsKey(cd.Name) and fFieldBuilders[cd.Name].ContainsKey(ps.ReadName) then
-          begin
-            gIL.Emit(OpCodes.Ldarg_0);
-            gIL.Emit(OpCodes.Ldfld, fFieldBuilders[cd.Name][ps.ReadName]);
-          end
-          else
-            raise new Exception('프로퍼티 "'+cd.Name+'.'+ps.Name+'" getter: 필드 "'+ps.ReadName+'"을 찾을 수 없습니다');
-          gIL.Emit(OpCodes.Ret);
-          pb.SetGetMethod(getM);
-          fInstanceMethods[cd.Name]['get_'+ps.Name]:=getM;
-        end;
-
-        // setter
-        if ps.WriteName<>'' then
-        begin
-          var setM:=tb.DefineMethod('set_'+ps.Name,
-            MethodAttributes.Public or MethodAttributes.SpecialName or
-            MethodAttributes.HideBySig or MethodAttributes.Virtual,
-            typeof(System.Void), [propClrType]);
-          var sIL:=setM.GetILGenerator;
-          if fFieldBuilders.ContainsKey(cd.Name) and fFieldBuilders[cd.Name].ContainsKey(ps.WriteName) then
-          begin
-            sIL.Emit(OpCodes.Ldarg_0);
-            sIL.Emit(OpCodes.Ldarg_1);
-            sIL.Emit(OpCodes.Stfld, fFieldBuilders[cd.Name][ps.WriteName]);
-          end
-          else
-            raise new Exception('프로퍼티 "'+cd.Name+'.'+ps.Name+'" setter: 필드 "'+ps.WriteName+'"을 찾을 수 없습니다');
-          sIL.Emit(OpCodes.Ret);
-          pb.SetSetMethod(setM);
-          fInstanceMethods[cd.Name]['set_'+ps.Name]:=setM;
-        end;
-      end;
+      // [Stage 85] 프로퍼티(PropertyBuilder) 방출은 메서드 시그니처가 모두 정의된
+      // 다음으로 옮겼다 — read/write 접근자가 필드가 아니라 메서드를 가리키는 경우
+      // (예: property Enabled: boolean read FEnabled write SetEnabled;) 그 메서드의
+      // MethodBuilder가 이미 존재해야 get/set 프로퍼티 메서드 본문에서 호출(Callvirt)할
+      // 수 있기 때문이다. 실제 방출 코드는 아래 "메서드 시그니처만 정의" 블록 다음에 있다.
 
       // 메서드 시그니처만 정의
       // 모두 Virtual + HideBySig로 정의: 자식 클래스에서 같은 이름/시그니처의
@@ -4662,6 +4692,86 @@ type
               fAbstractMethods[cd.Name]:=new List<string>;
             fAbstractMethods[cd.Name].Add(sig.Name);
           end;
+        end;
+      end;
+
+      // [Phase 1, Stage 85 확장] 프로퍼티 — CLR PropertyBuilder + get/set 메서드 쌍으로 방출.
+      // 메서드 시그니처 정의가 끝난 뒤에 처리하므로, read/write가 필드가 아니라
+      // 메서드 이름을 가리키는 경우(예: property Enabled: boolean read FEnabled
+      // write SetEnabled;)에도 그 메서드의 MethodBuilder를 이미 찾을 수 있다.
+      foreach var ps in cd.Properties do
+      begin
+        var propClrType: System.Type;
+        if (ps.PropType=vtObject) and ps.IsExternalType then
+          propClrType:=ResolveExternalType(ps.PropClassName)
+        else
+          propClrType:=VTC(ps.PropType, ps.PropClassName);
+
+        var pb:=tb.DefineProperty(ps.Name, PropertyAttributes.None, propClrType, nil);
+
+        // getter
+        if ps.ReadName<>'' then
+        begin
+          var getM:=tb.DefineMethod('get_'+ps.Name,
+            MethodAttributes.Public or MethodAttributes.SpecialName or
+            MethodAttributes.HideBySig or MethodAttributes.Virtual,
+            propClrType, System.Type.EmptyTypes);
+          var gIL:=getM.GetILGenerator;
+          if fFieldBuilders.ContainsKey(cd.Name) and fFieldBuilders[cd.Name].ContainsKey(ps.ReadName) then
+          begin
+            // ReadName이 같은 클래스에 선언된 필드 이름인 경우 (기존 동작)
+            gIL.Emit(OpCodes.Ldarg_0);
+            gIL.Emit(OpCodes.Ldfld, fFieldBuilders[cd.Name][ps.ReadName]);
+          end
+          else if fInstanceMethods.ContainsKey(cd.Name) and fInstanceMethods[cd.Name].ContainsKey(ps.ReadName) then
+          begin
+            // [Stage 85] ReadName이 필드가 아니라 매개변수 없는 메서드(getter 함수)를
+            // 가리키는 경우 — 그 메서드를 호출한 결과를 그대로 반환한다.
+            gIL.Emit(OpCodes.Ldarg_0);
+            gIL.Emit(OpCodes.Callvirt, fInstanceMethods[cd.Name][ps.ReadName]);
+          end
+          else
+            raise new Exception('프로퍼티 "'+cd.Name+'.'+ps.Name+'" getter: 필드/메서드 "'+ps.ReadName+'"을 찾을 수 없습니다 (Stage 85)');
+          gIL.Emit(OpCodes.Ret);
+          pb.SetGetMethod(getM);
+          fInstanceMethods[cd.Name]['get_'+ps.Name]:=getM;
+        end;
+
+        // setter
+        if ps.WriteName<>'' then
+        begin
+          var setM:=tb.DefineMethod('set_'+ps.Name,
+            MethodAttributes.Public or MethodAttributes.SpecialName or
+            MethodAttributes.HideBySig or MethodAttributes.Virtual,
+            typeof(System.Void), [propClrType]);
+          var sIL:=setM.GetILGenerator;
+          if fFieldBuilders.ContainsKey(cd.Name) and fFieldBuilders[cd.Name].ContainsKey(ps.WriteName) then
+          begin
+            // WriteName이 같은 클래스에 선언된 필드 이름인 경우 (기존 동작)
+            sIL.Emit(OpCodes.Ldarg_0);
+            sIL.Emit(OpCodes.Ldarg_1);
+            sIL.Emit(OpCodes.Stfld, fFieldBuilders[cd.Name][ps.WriteName]);
+          end
+          else if fInstanceMethods.ContainsKey(cd.Name) and fInstanceMethods[cd.Name].ContainsKey(ps.WriteName) then
+          begin
+            // [Stage 85] WriteName이 필드가 아니라 매개변수 1개짜리 메서드(setter 메서드)를
+            // 가리키는 경우 (예: property Enabled: boolean read FEnabled write SetEnabled;)
+            // — 대입되는 값을 그대로 그 메서드에 넘겨 호출한다.
+            sIL.Emit(OpCodes.Ldarg_0);
+            sIL.Emit(OpCodes.Ldarg_1);
+            sIL.Emit(OpCodes.Callvirt, fInstanceMethods[cd.Name][ps.WriteName]);
+          end
+          else
+            raise new Exception('프로퍼티 "'+cd.Name+'.'+ps.Name+'" setter: 필드/메서드 "'+ps.WriteName+'"을 찾을 수 없습니다 (Stage 85)');
+          sIL.Emit(OpCodes.Ret);
+          pb.SetSetMethod(setM);
+          fInstanceMethods[cd.Name]['set_'+ps.Name]:=setM;
+          // [Stage 85] EmitPropertyOrFieldSet이 obj.Prop := val 대입 시 setter의 매개변수
+          // CLR 타입을 알아야 하는데, MethodBuilder는 아직 CreateType 전이라 GetParameters가
+          // 믿을 수 없다 — 여기서 미리 계산해 둔 propClrType을 등록해 재사용한다.
+          if not fMethodParamClrTypes.ContainsKey(cd.Name) then
+            fMethodParamClrTypes[cd.Name]:=new Dictionary<string, array of System.Type>;
+          fMethodParamClrTypes[cd.Name]['set_'+ps.Name]:=[propClrType];
         end;
       end;
 
