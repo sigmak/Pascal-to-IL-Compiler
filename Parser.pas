@@ -208,6 +208,59 @@ type
            or (k=tkDouble) or (k=tkChar) or (k=tkInt64);
     end;
 
+    // [Stage 86] 외부(.NET) 제네릭 타입의 타입 인자 하나를 파싱한다.
+    // 기본 타입 키워드, 로컬 클래스/열거형 이름, 점(.)으로 연결된 외부 타입 이름,
+    // 또는 중첩된 외부 제네릭 타입(예: List<string>)을 허용한다.
+    // 사용자 정의 제네릭 클래스(TStack<T> 등)를 타입 인자 자리에 쓰는 경우는
+    // ResolveGenericInstantiation 쪽 기존 경로를 그대로 재사용한다.
+    function ParseExternalGenericTypeArg: string;
+    var argName: string; nestedArgs: List<string>;
+    begin
+      if Cur.Kind=tkInteger then begin fPos:=fPos+1; Result:='integer'; exit; end;
+      if Cur.Kind=tkStringType then begin fPos:=fPos+1; Result:='string'; exit; end;
+      if Cur.Kind=tkBoolean then begin fPos:=fPos+1; Result:='boolean'; exit; end;
+      if (Cur.Kind=tkReal) or (Cur.Kind=tkDouble) then begin fPos:=fPos+1; Result:='real'; exit; end;
+      if Cur.Kind=tkChar then begin fPos:=fPos+1; Result:='char'; exit; end;
+      if Cur.Kind=tkInt64 then begin fPos:=fPos+1; Result:='int64'; exit; end;
+      if Cur.Kind=tkIdent then
+      begin
+        argName:=Cur.Text; fPos:=fPos+1;
+        // 사용자 정의 제네릭 클래스가 타입 인자로 쓰인 경우(중첩 제네릭): 기존 단형화 경로로 위임
+        if (Cur.Kind=tkLt) and fGenericClassNames.Contains(argName) then
+        begin
+          argName:=ResolveGenericInstantiation(argName);
+          Result:=argName; exit;
+        end;
+        while Cur.Kind=tkDot do begin fPos:=fPos+1; argName:=argName+'.'+Expect(tkIdent).Text; end;
+        if Cur.Kind=tkLt then // 중첩된 외부 제네릭 타입 인자 (예: Dictionary<string, List<string>>)
+        begin
+          fPos:=fPos+1;
+          nestedArgs:=new List<string>;
+          nestedArgs.Add(ParseExternalGenericTypeArg);
+          while Cur.Kind=tkComma do begin fPos:=fPos+1; nestedArgs.Add(ParseExternalGenericTypeArg); end;
+          Expect(tkGt);
+          argName:=argName+'<'+string.Join(',', nestedArgs.ToArray)+'>';
+        end;
+        Result:=argName;
+      end
+      else raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString
+        +': 제네릭 타입 인자로 지원되지 않는 타입 ("'+Cur.Text+'")');
+    end;
+
+    // [Stage 86] 외부(.NET) 제네릭 타입 이름 전체를 파싱한다. 호출 시점에 baseName(예: "Dictionary")은
+    // 이미 소비된 상태이고 Cur='<' 이어야 한다. 결과는 "Dictionary<string,FileChangeWatcher>" 형태의
+    // 문자열 — CodeGen.ResolveExternalType이 이 표기를 그대로 인식해 재귀적으로 CLR 타입을 조립한다.
+    function ParseExternalGenericType(baseName: string): string;
+    var args: List<string>;
+    begin
+      Expect(tkLt);
+      args:=new List<string>;
+      args.Add(ParseExternalGenericTypeArg);
+      while Cur.Kind=tkComma do begin fPos:=fPos+1; args.Add(ParseExternalGenericTypeArg); end;
+      Expect(tkGt);
+      Result:=baseName+'<'+string.Join(',', args.ToArray)+'>';
+    end;
+
     function ParseVarType: TVarType;
     begin
       fLastGenericName:='';
@@ -741,7 +794,9 @@ type
         fPos:=fPos+1; // 'new' 소비
         var newTn:=Expect(tkIdent).Text;
         if (Cur.Kind=tkLt) and fGenericClassNames.Contains(newTn) then
-          newTn:=ResolveGenericInstantiation(newTn);
+          newTn:=ResolveGenericInstantiation(newTn)
+        else if Cur.Kind=tkLt then // [Stage 86] new Dictionary<string, FileChangeWatcher> 같은 외부 제네릭 타입 생성
+          newTn:=ParseExternalGenericType(newTn);
         while Cur.Kind=tkDot do begin fPos:=fPos+1; newTn:=newTn+'.'+Expect(tkIdent).Text; end;
         if fRecordNames.Contains(newTn) then // [Stage 62]
           raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': 레코드 "'+newTn
@@ -2376,6 +2431,15 @@ type
               else if (Cur.Kind=tkIdent) and fEnumNames.Contains(Cur.Text) then
               begin
                 fldType:=vtEnum; fldCn:=Cur.Text; fPos:=fPos+1; // [Phase 1]
+              end
+              // [Stage 86] 외부 제네릭 컬렉션 필드: Dictionary<string, FileChangeWatcher> 같은
+              // .NET 제네릭 타입 — 로컬 클래스명도 아니고 현재 제네릭 클래스의 타입 매개변수도
+              // 아니지만 바로 뒤에 '<'가 오는 경우.
+              else if (Cur.Kind=tkIdent) and (PeekAt(1).Kind=tkLt) then
+              begin
+                var extGenBase:=Cur.Text; fPos:=fPos+1;
+                fldCn:=ParseExternalGenericType(extGenBase);
+                fldType:=vtObject; fldIsExt:=true;
               end
               else if Cur.Kind=tkIdent then
               begin

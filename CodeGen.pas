@@ -81,6 +81,11 @@ type
     // 클래스명 → 그 클래스가 직접 상속한 "외부" 부모의 실제 System.Type
     // (외부 타입 자신의 조상 체인은 Reflection이 알아서 다 검색해주므로 1단계만 기록하면 충분)
     fClassExternalParentType: Dictionary<string, System.Type>;
+    // [Stage 86] class(IDisposable)처럼 괄호 안 이름이 실제로는 클래스가 아니라 외부(.NET)
+    // "인터페이스"였던 경우 — 클래스명 → 그 인터페이스의 실제 System.Type.
+    // TypeBuilder.DefineType의 parent 자리에는 넣을 수 없으므로(인터페이스면 예외) 따로 보관해뒀다가
+    // AddInterfaceImplementation으로 등록한다.
+    fClassExternalInterfaceType: Dictionary<string, System.Type>;
 
     // 인터페이스 관련 (클래스보다 먼저 완전히 빌드됨)
     fInterfaceBuilders: Dictionary<string, TypeBuilder>;  // 인터페이스명 → TypeBuilder
@@ -717,7 +722,7 @@ type
           begin
             // 첫 세그먼트가 실제 필드/변수/self 상속 프로퍼티 — 체인을 끝까지 타입만 추적한다.
             var _chainType4:=InferQualifierChainType(_chainSegs4);
-            var _cpi4:=_chainType4.GetProperty(_mc4.MethodName);
+            var _cpi4:=SafeGetProperty(_chainType4, _mc4.MethodName);
             if (_cpi4<>nil) and (_cpi4.PropertyType=typeof(string)) then Result:=vtString
             else
             begin
@@ -750,7 +755,7 @@ type
             var _extSelf:=FindExternalAncestorType(fCurClassName);
             if _extSelf<>nil then
             begin
-              var _pi4c:=_extSelf.GetProperty(_mc4.MethodName);
+              var _pi4c:=SafeGetProperty(_extSelf, _mc4.MethodName);
               if (_pi4c<>nil) and (_pi4c.PropertyType=typeof(string)) then Result:=vtString
               else
               begin
@@ -768,7 +773,7 @@ type
           if fLocalScope.HasClrType(_mc4.ObjName) then _effType4:=fLocalScope.GetClrType(_mc4.ObjName)
           else _effType4:=fGlobalScope.GetClrType(_mc4.ObjName);
           if _mc4.ObjCastType<>'' then _effType4:=ResolveExternalType(_mc4.ObjCastType);
-          var _pi4b:=_effType4.GetProperty(_mc4.MethodName);
+          var _pi4b:=SafeGetProperty(_effType4, _mc4.MethodName);
           if (_pi4b<>nil) and (_pi4b.PropertyType=typeof(string)) then Result:=vtString
           else
           begin
@@ -838,7 +843,7 @@ type
         begin
           var _effType4b:=_qfb4.FieldType;
           if _mc4.ObjCastType<>'' then _effType4b:=ResolveExternalType(_mc4.ObjCastType);
-          var _pi4:=_effType4b.GetProperty(_mc4.MethodName);
+          var _pi4:=SafeGetProperty(_effType4b, _mc4.MethodName);
           if (_pi4<>nil) and (_pi4.PropertyType=typeof(string)) then Result:=vtString
           else
           begin
@@ -1275,7 +1280,7 @@ type
           var _extCtorType:=ResolveExternalType(neo.ClassName);
           if neo.Args.Count=0 then
           begin
-            var _extCtor:=_extCtorType.GetConstructor(System.Type.EmptyTypes);
+            var _extCtor:=SafeGetConstructor(_extCtorType, System.Type.EmptyTypes);
             if _extCtor=nil then
               raise new Exception('외부 타입 "'+_extCtorType.FullName+'"에 매개변수 없는 public 생성자가 없습니다.');
             aIL.Emit(OpCodes.Newobj, _extCtor);
@@ -1349,7 +1354,7 @@ type
             end
             else
             begin
-              var _cpiE:=_chainTypeE.GetProperty(mc.MethodName);
+              var _cpiE:=SafeGetProperty(_chainTypeE, mc.MethodName);
               if (mc.Args.Count=0) and (_cpiE<>nil) and (_cpiE.GetGetMethod<>nil) then
                 aIL.Emit(OpCodes.Callvirt, _cpiE.GetGetMethod)
               else
@@ -1432,7 +1437,7 @@ type
             _qType2:=ResolveExternalType(mc.ObjCastType);
             aIL.Emit(OpCodes.Castclass, _qType2);
           end;
-          var _pi6:=_qType2.GetProperty(mc.MethodName);
+          var _pi6:=SafeGetProperty(_qType2, mc.MethodName);
           if (mc.Args.Count=0) and (_pi6<>nil) and (_pi6.GetGetMethod<>nil) then
           begin
             if _isValType2 then aIL.Emit(OpCodes.Call, _pi6.GetGetMethod)
@@ -1602,7 +1607,7 @@ type
             _qType:=ResolveExternalType(mc.ObjCastType);
             aIL.Emit(OpCodes.Castclass, _qType);
           end;
-          var _pi5:=_qType.GetProperty(mc.MethodName);
+          var _pi5:=SafeGetProperty(_qType, mc.MethodName);
           if (mc.Args.Count=0) and (_pi5<>nil) and (_pi5.GetGetMethod<>nil) then
             aIL.Emit(OpCodes.Callvirt, _pi5.GetGetMethod)
           else
@@ -1640,7 +1645,7 @@ type
             var _tmpLoc7:=aIL.DeclareLocal(_qType7);
             aIL.Emit(OpCodes.Stloc, _tmpLoc7);
             aIL.Emit(OpCodes.Ldloca, _tmpLoc7);
-            var _pi7v:=_qType7.GetProperty(mc.MethodName);
+            var _pi7v:=SafeGetProperty(_qType7, mc.MethodName);
             if (mc.Args.Count=0) and (_pi7v<>nil) and (_pi7v.GetGetMethod<>nil) then
               aIL.Emit(OpCodes.Call, _pi7v.GetGetMethod)
             else
@@ -1656,7 +1661,7 @@ type
           end
           else
           begin
-            var _pi7:=_qType7.GetProperty(mc.MethodName);
+            var _pi7:=SafeGetProperty(_qType7, mc.MethodName);
             if (mc.Args.Count=0) and (_pi7<>nil) and (_pi7.GetGetMethod<>nil) then
               aIL.Emit(OpCodes.Callvirt, _pi7.GetGetMethod)
             else
@@ -2679,7 +2684,7 @@ type
           end
           else
           begin
-            var _getPC:=chainType.GetProperty(mcs.MethodName);
+            var _getPC:=SafeGetProperty(chainType, mcs.MethodName);
             if (mcs.Args.Count=0) and (_getPC<>nil) and (_getPC.GetGetMethod<>nil) then
             begin
               aIL.Emit(OpCodes.Callvirt, _getPC.GetGetMethod);
@@ -2748,7 +2753,7 @@ type
             qTargetType:=ResolveExternalType(mcs.ObjCastType);
             aIL.Emit(OpCodes.Castclass, qTargetType);
           end;
-          var _getP2:=qTargetType.GetProperty(mcs.MethodName);
+          var _getP2:=SafeGetProperty(qTargetType, mcs.MethodName);
           if (mcs.Args.Count=0) and (_getP2<>nil) and (_getP2.GetGetMethod<>nil) then
           begin
             if _isValTypeS then aIL.Emit(OpCodes.Call, _getP2.GetGetMethod)
@@ -2856,7 +2861,7 @@ type
           end
           else
           begin
-            var _getP:=qTargetType.GetProperty(mcs.MethodName);
+            var _getP:=SafeGetProperty(qTargetType, mcs.MethodName);
             if (mcs.Args.Count=0) and (_getP<>nil) and (_getP.GetGetMethod<>nil) then
             begin
               aIL.Emit(OpCodes.Callvirt, _getP.GetGetMethod);
@@ -2887,7 +2892,7 @@ type
           aIL.Emit(OpCodes.Ldarg_0);
           aIL.Emit(OpCodes.Callvirt, propInfo.GetGetMethod);
           qTargetType:=propInfo.PropertyType;
-          var _getP5:=qTargetType.GetProperty(mcs.MethodName);
+          var _getP5:=SafeGetProperty(qTargetType, mcs.MethodName);
           if (mcs.Args.Count=0) and (_getP5<>nil) and (_getP5.GetGetMethod<>nil) then
           begin
             aIL.Emit(OpCodes.Callvirt, _getP5.GetGetMethod);
@@ -4056,9 +4061,31 @@ type
 
     // 외부 어셈블리(WPF/WinForm/Avalonia 등)에서 dottedName(예: System.Windows.Window)에
     // 해당하는 Type을 찾는다. AddReferenceAssembly로 미리 등록된 어셈블리만 검색한다.
+    // [Stage 86] class(IDisposable)처럼 네임스페이스 없이 짧게 쓴 이름 — 실제 레포 코드가
+    // 흔히 쓰는 몇몇 기본 BCL 인터페이스/타입만 화이트리스트로 완전한 이름으로 바꿔준다.
+    // 목록에 없으면 원래 이름 그대로 돌려주고(변화 없음), 이후 단계에서 필요해지면 추가한다.
+    function ResolveWellKnownShortName(name: string): string;
+    begin
+      if name='IDisposable' then Result:='System.IDisposable'
+      else if name='IComparable' then Result:='System.IComparable'
+      else if name='ICloneable' then Result:='System.ICloneable'
+      else if name='IFormattable' then Result:='System.IFormattable'
+      else if name='IEnumerable' then Result:='System.Collections.IEnumerable'
+      else if name='IEnumerator' then Result:='System.Collections.IEnumerator'
+      else Result:=name;
+    end;
+
     function ResolveExternalType(dottedName: string): System.Type;
     var asm: Assembly; t: System.Type; prefix, candidate: string; candidates: array of string;
     begin
+      // [Stage 86] "Dictionary<string,FileChangeWatcher>" 같은 외부 제네릭 타입 이름은
+      // 별도 함수(ResolveExternalGenericType)에서 베이스 이름 + 타입 인자로 나눠 재귀적으로 조립한다.
+      if dottedName.Contains('<') then begin Result:=ResolveExternalGenericType(dottedName); exit; end;
+
+      // [Stage 86] 점(.)이 없는 이름이면 먼저 잘 알려진 짧은 이름 표에서 찾아본다.
+      if not dottedName.Contains('.') then
+        dottedName:=ResolveWellKnownShortName(dottedName);
+
       // 1) 어셈블리 지정 없이 바로 찾히는 경우 (mscorlib/coreLib에 있는 타입 등)
       t:=System.Type.GetType(dottedName);
       if t<>nil then begin Result:=t; exit; end;
@@ -4098,6 +4125,93 @@ type
       raise new Exception('외부 타입 "'+dottedName+'"을(를) 찾을 수 없습니다. '+
         '기본 프레임워크(WinForms/WPF/System.*)가 아니라면 {$reference 어셈블리명.dll} 지시문으로 '+
         '해당 타입이 들어있는 어셈블리를 먼저 등록했는지 확인하세요.');
+    end;
+
+    // [Stage 86] "Dictionary" 처럼 네임스페이스 없이 쓴 이름을 CLR 제네릭 오픈 타입의
+    // 정식 이름(예: "System.Collections.Generic.Dictionary`2")으로 바꿔 ResolveExternalType으로
+    // 찾는다. 이미 점(.)이 포함된 이름(예: "My.Custom.Namespace.Foo")은 그대로 arity만 붙인다.
+    function ResolveExternalOpenGenericType(baseName: string; arity: integer): System.Type;
+    var fq: string;
+    begin
+      if baseName.Contains('.') then
+        fq:=baseName+'`'+arity.ToString
+      else
+      begin
+        var _isWellKnownGenericColl:=
+          (baseName='List') or (baseName='Queue') or (baseName='Stack') or (baseName='HashSet')
+          or (baseName='LinkedList') or (baseName='SortedSet')
+          or (baseName='IEnumerable') or (baseName='IEnumerator') or (baseName='IList')
+          or (baseName='ICollection') or (baseName='IReadOnlyList') or (baseName='IReadOnlyCollection')
+          or (baseName='Comparer') or (baseName='EqualityComparer')
+          or (baseName='Dictionary') or (baseName='SortedList') or (baseName='SortedDictionary')
+          or (baseName='KeyValuePair') or (baseName='IDictionary') or (baseName='IReadOnlyDictionary');
+        if baseName='Nullable' then
+          fq:='System.Nullable`'+arity.ToString
+        else if _isWellKnownGenericColl then
+          fq:='System.Collections.Generic.'+baseName+'`'+arity.ToString
+        else
+          // 알려진 짧은 이름이 아니면 mscorlib/coreLib에 바로 있을 가능성에 기대어
+          // 이름 그대로 arity만 붙여 시도한다 (실패하면 ResolveExternalType이 명확한 오류를 낸다).
+          fq:=baseName+'`'+arity.ToString;
+      end;
+      Result:=ResolveExternalType(fq);
+    end;
+
+    // [Stage 86] 제네릭 타입 인자 문자열 하나(예: "string", "FileChangeWatcher",
+    // "System.Diagnostics.Process", 또는 중첩 제네릭 "List<string>")를 실제 CLR 타입으로 해석한다.
+    function ResolveGenericArgClrType(tag: string): System.Type;
+    begin
+      tag:=tag.Trim;
+      if tag.Contains('<') then begin Result:=ResolveExternalGenericType(tag); exit; end;
+      if tag='integer' then Result:=typeof(integer)
+      else if tag='string' then Result:=typeof(string)
+      else if tag='boolean' then Result:=typeof(boolean)
+      else if (tag='real') or (tag='double') then Result:=typeof(double)
+      else if tag='char' then Result:=typeof(char)
+      else if tag='int64' then Result:=typeof(int64)
+      else
+      begin
+        // 로컬(사용자 정의) 클래스 — 아직 CreateType 전이라도 TypeBuilder를 제네릭 타입 인자로
+        // 쓸 수 있으므로(Reflection.Emit이 허용) 완성된 타입을 우선하고, 없으면 TypeBuilder를 쓴다.
+        if fBuiltTypes.ContainsKey(tag) then Result:=fBuiltTypes[tag]
+        else if fTypeBuilders.ContainsKey(tag) then Result:=fTypeBuilders[tag]
+        else Result:=ResolveExternalType(tag); // 외부 타입 이름 (기본/짧은 이름/점으로 연결된 이름)
+      end;
+    end;
+
+    // [Stage 86] "Dictionary<string,FileChangeWatcher>" 같은 표기를 베이스 이름과 콤마로 구분된
+    // 타입 인자 목록으로 나눈다 — 인자 자신이 중첩 제네릭(예: List<string>)일 수 있으므로
+    // 괄호(<,>) 깊이를 추적해 최상위 콤마에서만 나눈다.
+    function ResolveExternalGenericType(genericName: string): System.Type;
+    var ltPos, gtPos, depth, i: integer; baseName, argsStr, curArg: string;
+        argNames: List<string>; argTypes: array of System.Type; openType: System.Type;
+    begin
+      ltPos:=genericName.IndexOf('<');
+      gtPos:=genericName.LastIndexOf('>');
+      if (ltPos<0) or (gtPos<0) or (gtPos<ltPos) then
+        raise new Exception('제네릭 타입 이름 형식이 올바르지 않습니다: "'+genericName+'"');
+      baseName:=genericName.Substring(0, ltPos);
+      argsStr:=genericName.Substring(ltPos+1, gtPos-ltPos-1);
+
+      argNames:=new List<string>;
+      curArg:=''; depth:=0;
+      var argsChars:=argsStr.ToCharArray; // [주의] 문자열 s[i]는 1-based라 0-based 배열로 변환 후 순회 (Lexer.pas와 동일한 관례)
+      for i:=0 to argsChars.Length-1 do
+      begin
+        if argsChars[i]='<' then begin depth:=depth+1; curArg:=curArg+argsChars[i].ToString; end
+        else if argsChars[i]='>' then begin depth:=depth-1; curArg:=curArg+argsChars[i].ToString; end
+        else if (argsChars[i]=',') and (depth=0) then
+        begin argNames.Add(curArg); curArg:=''; end
+        else curArg:=curArg+argsChars[i].ToString;
+      end;
+      if curArg.Trim<>'' then argNames.Add(curArg);
+
+      argTypes:=new System.Type[argNames.Count];
+      for i:=0 to argNames.Count-1 do
+        argTypes[i]:=ResolveGenericArgClrType(argNames[i]);
+
+      openType:=ResolveExternalOpenGenericType(baseName, argNames.Count);
+      Result:=openType.MakeGenericType(argTypes);
     end;
 
     // [Stage 50] 인자 식(expr)이 런타임에 어떤 CLR 타입일지 최대한 추정한다.
@@ -4239,6 +4353,81 @@ type
     // 가장 궁합이 좋은 오버로드를 고른다(예: Show(string)과 Show(Window) 중 문자열 인자면 전자를 선택).
     // 타입을 전혀 추정할 수 없는 경우(예: 인자 없음, 혹은 모든 인자가 nil)에는 개수만 맞는
     // 첫 번째 후보를 그대로 쓰는 기존 동작과 동일하게 동작한다.
+    // ---------------------------------------------------------------
+    // [Stage 86] TypeBuilderInstantiation 안전 래퍼
+    //
+    // TypeBuilderInstantiation(예: Dictionary<Box,Box>)은 .NET Reflection.Emit의
+    // internal 타입으로, GetProperty/GetMethods/GetConstructor/GetConstructors 등
+    // 대부분의 리플렉션 메서드를 NotSupportedException으로 막아 놓는다.
+    // 열린 제네릭 정의(GetGenericTypeDefinition())에서 멤버를 찾은 뒤
+    // TypeBuilder.GetMethod / TypeBuilder.GetConstructor 로 닫힌 버전을 얻는 것이
+    // .NET이 공식으로 제공하는 우회 방법이다.
+    //
+    // DeclaringType 필터 이유:
+    //   TypeBuilder.GetMethod/GetConstructor의 제약 —
+    //   method/ctor의 DeclaringType이 반드시 열린 제네릭 타입 정의 자체여야 한다.
+    //   Object 등 상위 클래스에서 상속된 멤버는 DeclaringType이 다르므로 건너뜀.
+    // ---------------------------------------------------------------
+    function SafeGetProperty(t: System.Type; name: string): PropertyInfo;
+    begin
+      if t.GetType().Name = 'TypeBuilderInstantiation' then
+        Result := nil
+      else
+        Result := t.GetProperty(name);
+    end;
+
+    function SafeGetMethods(t: System.Type; flags: BindingFlags): array of MethodInfo;
+    begin
+      if t.GetType().Name = 'TypeBuilderInstantiation' then
+      begin
+        var openT := t.GetGenericTypeDefinition();
+        var openMis := openT.GetMethods(flags);
+        var bound := new System.Collections.Generic.List<MethodInfo>();
+        for var i86 := 0 to openMis.Length-1 do
+          if openMis[i86].DeclaringType = openT then
+            bound.Add(TypeBuilder.GetMethod(t, openMis[i86]));
+        Result := bound.ToArray();
+      end
+      else
+        Result := t.GetMethods(flags);
+    end;
+
+    // GetConstructor(Type[]) 대용 — 인자 타입 배열로 생성자를 찾는다.
+    function SafeGetConstructor(t: System.Type; paramTypes: array of System.Type): ConstructorInfo;
+    begin
+      if t.GetType().Name = 'TypeBuilderInstantiation' then
+      begin
+        var openT := t.GetGenericTypeDefinition();
+        var openCtors := openT.GetConstructors(BindingFlags.Public or BindingFlags.Instance);
+        for var ic := 0 to openCtors.Length-1 do
+          if (openCtors[ic].DeclaringType = openT) and (openCtors[ic].GetParameters.Length = paramTypes.Length) then
+          begin
+            Result := TypeBuilder.GetConstructor(t, openCtors[ic]);
+            exit;
+          end;
+        Result := nil;
+      end
+      else
+        Result := t.GetConstructor(paramTypes);
+    end;
+
+    // GetConstructors 대용 — 모든 public 인스턴스 생성자를 반환한다.
+    function SafeGetConstructors(t: System.Type): array of ConstructorInfo;
+    begin
+      if t.GetType().Name = 'TypeBuilderInstantiation' then
+      begin
+        var openT := t.GetGenericTypeDefinition();
+        var openCtors := openT.GetConstructors(BindingFlags.Public or BindingFlags.Instance);
+        var bound := new System.Collections.Generic.List<ConstructorInfo>();
+        for var ic := 0 to openCtors.Length-1 do
+          if openCtors[ic].DeclaringType = openT then
+            bound.Add(TypeBuilder.GetConstructor(t, openCtors[ic]));
+        Result := bound.ToArray();
+      end
+      else
+        Result := t.GetConstructors(BindingFlags.Public or BindingFlags.Instance);
+    end;
+
     function ResolveMethodByArity(t: System.Type; mname: string; args: List<TExprNode>; isStatic: boolean): MethodInfo;
     var flags: BindingFlags; mi: MethodInfo; argCount: integer;
       bestScore: integer; bestMi: MethodInfo; found: boolean;
@@ -4247,7 +4436,7 @@ type
       else flags:=BindingFlags.Public or BindingFlags.Instance;
       argCount:=args.Count;
       bestScore:=System.Int32.MinValue; bestMi:=nil; found:=false;
-      foreach mi in t.GetMethods(flags) do
+      foreach mi in SafeGetMethods(t, flags) do
         if (mi.Name=mname) and (mi.GetParameters.Length=argCount) then
         begin
           var ps50:=mi.GetParameters;
@@ -4273,7 +4462,7 @@ type
     begin
       argCount:=args.Count;
       bestScore:=System.Int32.MinValue; bestCi:=nil; found:=false;
-      foreach ci in t.GetConstructors(BindingFlags.Public or BindingFlags.Instance) do
+      foreach ci in SafeGetConstructors(t) do
         if ci.GetParameters.Length=argCount then
         begin
           var ps51:=ci.GetParameters;
@@ -4576,7 +4765,19 @@ type
       else if (cd.ParentName<>'') and cd.IsExternalParent then
       begin
         parentType:=ResolveExternalType(cd.ParentName);
-        fClassExternalParentType[cd.Name]:=parentType;
+        // [Stage 86] class(IDisposable) 같은 표기 — Parser는 "로컬 클래스도 로컬
+        // 인터페이스도 아닌 이름"을 모두 IsExternalParent로 뭉뚱그리므로, 실제로 외부
+        // 타입이 인터페이스인지 클래스인지는 여기서 리플렉션으로 갈라야 한다.
+        // TypeBuilder.DefineType의 parent 인자에 인터페이스를 넣으면 예외가 나므로
+        // (인터페이스는 상속이 아니라 "구현"), 그 경우 실제 부모는 System.Object로 두고
+        // AddInterfaceImplementation으로 별도 등록한다(아래, tb 생성 직후).
+        if parentType.IsInterface then
+        begin
+          fClassExternalInterfaceType[cd.Name]:=parentType;
+          parentType:=typeof(System.Object);
+        end
+        else
+          fClassExternalParentType[cd.Name]:=parentType;
       end
       else
         parentType:=typeof(System.Object);
@@ -4604,6 +4805,12 @@ type
           raise new Exception('알 수 없는 인터페이스 "'+cd.InterfaceName+'"');
         tb.AddInterfaceImplementation(fBuiltInterfaces[cd.InterfaceName]);
       end;
+      // [Stage 86] class(IDisposable)처럼 외부 인터페이스를 구현하는 경우 — 위에서
+      // parentType 대신 별도로 보관해 둔 인터페이스 Type을 여기서 등록한다. 이 클래스가
+      // (예: procedure Dispose;처럼) 이름/시그니처가 일치하는 public 메서드를 두면
+      // CLR이 이름/시그니처로 자동 매칭해 암시적으로 구현한다 — 로컬 인터페이스와 동일한 방식.
+      if fClassExternalInterfaceType.ContainsKey(cd.Name) then
+        tb.AddInterfaceImplementation(fClassExternalInterfaceType[cd.Name]);
 
       // 필드
       foreach fd in cd.Fields do
@@ -5679,6 +5886,7 @@ type
       fLambdaCounter:=0; // [Stage 64]
       fLoadedAssemblies:=new List<Assembly>;
       fClassExternalParentType:=new Dictionary<string, System.Type>;
+      fClassExternalInterfaceType:=new Dictionary<string, System.Type>;
       fResultLocal:=nil; fResultType:=vtInteger; fCurClassName:='';
       // [Stage 60]
       fLoopBreakLabels:=new List<&Label>;
