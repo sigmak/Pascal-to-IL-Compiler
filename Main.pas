@@ -21,7 +21,8 @@ uses
 
 const
   DefaultExampleDir = 'Examples';
-  DefaultExampleFile = 'Test_stage82.pas'; // [Stage 82] 진짜 멀티 파일 — uses가 실제 유닛 파일을 찾아 공개(interface) 심볼만 링크
+  DefaultExampleFile = 'Test_stage83.pas'; // [Stage 83] 클래스 필드 인라인 기본값 초기화 문법
+  //DefaultExampleFile = 'Test_stage82.pas'; // [Stage 82] 진짜 멀티 파일 — uses가 실제 유닛 파일을 찾아 공개(interface) 심볼만 링크
   //DefaultExampleFile = 'Test_stage81.pas'; // [Stage 81]
   //DefaultExampleFile = 'Test_stage80.pas'; // [Stage 80]
   //DefaultExampleFile = 'Test_stage79.pas'; // [Stage 79]

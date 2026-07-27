@@ -564,8 +564,12 @@ type
     // FieldType=vtGeneric일 때: [Stage 32] 이 필드가 참조하는 타입 매개변수 이름 (예: 'K'/'V').
     ClassName: string;
     IsExternalType: boolean; // true면 ClassName이 외부 .NET 어셈블리의 타입 (예: System.Windows.Forms.Button)
+    // [Stage 83] 클래스 필드 인라인 기본값 초기화: "Count: integer = 100;" 처럼 필드 선언에
+    // 바로 붙은 초기값 식. nil이면 기본값 없음(기존과 동일하게 CLR 기본값 0/nil/false로 남음).
+    // 생성자 IL 앞부분에서 이 식을 필드에 대입하는 코드로 방출된다.
+    DefaultValueExpr: TExprNode;
     constructor Create(n: string; t: TVarType);
-    begin Name:=n; FieldType:=t; ClassName:=''; IsExternalType:=false; end;
+    begin Name:=n; FieldType:=t; ClassName:=''; IsExternalType:=false; DefaultValueExpr:=nil; end;
   end;
 
   TMethodSignature = class

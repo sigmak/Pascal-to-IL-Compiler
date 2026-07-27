@@ -4457,6 +4457,31 @@ type
         Result:=VTC(fd.FieldType, fd.ClassName);
     end;
 
+    // [Stage 83] 클래스 필드 인라인 기본값 초기화: className의 각 필드 중 DefaultValueExpr가
+    // 있는 것들을 선언 순서대로 "Ldarg_0; <식>; Stfld"로 방출한다. 생성자 IL의 맨 앞부분에서
+    // 호출되며(사용자 생성자가 있든 없든 동일), 필드 선언 순서를 그대로 대입 순서로 쓴다.
+    // 1차 제약: 이 식이 실행되는 시점은 항상 생성자 본문의 맨 처음이다 — 사용자가 작성한
+    // "inherited Create(...)" 호출이 본문 중간/끝에 있어도 그보다 먼저 실행된다(대부분의
+    // 실제 코드는 inherited를 맨 앞에 두므로 실무상 차이가 없지만, 정확한 필드 초기화
+    // 순서가 base 생성자 부작용에 의존하는 드문 경우는 1차 제약으로 남겨둔다).
+    procedure EmitClassFieldDefaults(il: ILGenerator; className: string);
+    var cd83: TClassDeclNode; fd83: TFieldDeclNode; fb83: FieldBuilder;
+    begin
+      cd83:=nil;
+      foreach var c83 in fProg.ClassDecls do
+        if c83.Name=className then begin cd83:=c83; break; end;
+      if cd83=nil then exit; // 로컬 클래스가 아니면(있을 수 없지만 방어적으로) 그냥 무시
+      foreach fd83 in cd83.Fields do
+      begin
+        if fd83.DefaultValueExpr=nil then continue;
+        if not TryFindFieldBuilder(className, fd83.Name, fb83) then
+          raise new Exception('필드를 찾을 수 없음(내부 오류): '+className+'.'+fd83.Name);
+        il.Emit(OpCodes.Ldarg_0); // self
+        EmitArgForParamType(il, fd83.DefaultValueExpr, fb83.FieldType);
+        il.Emit(OpCodes.Stfld, fb83);
+      end;
+    end;
+
     // 클래스 TypeBuilder 생성 (필드 + 메서드 정의만, 본문은 아직)
     procedure BuildClassShell(modBuilder: ModuleBuilder; cd: TClassDeclNode);
     var
@@ -4674,6 +4699,15 @@ type
             raise new Exception('부모 타입 "'+parentType.FullName+'"에 매개변수 없는 public 생성자가 없습니다.');
         end;
         ctorIL.Emit(OpCodes.Call, parentCtor);
+        // [Stage 83] 사용자 생성자가 없는 클래스도 필드 인라인 기본값은 적용돼야 한다.
+        // 이 시점(클래스 껍데기 빌드 단계)에는 아직 fLocalScope가 만들어져 있지 않으므로
+        // (메서드/생성자 본문 빌드 때만 생성됨) EmitArgForParamType이 혹시라도 지역 스코프를
+        // 참조할 경우를 대비해 임시로 빈 스코프를 만들어 준다.
+        var svCurClass83:=fCurClassName; fCurClassName:=cd.Name;
+        var svLocalScope83:=fLocalScope; fLocalScope:=new TScope('local(field-defaults)', fGlobalScope);
+        EmitClassFieldDefaults(ctorIL, cd.Name);
+        fLocalScope:=svLocalScope83;
+        fCurClassName:=svCurClass83;
         ctorIL.Emit(OpCodes.Ret);
       end;
     end;
@@ -4746,6 +4780,11 @@ type
 
       // [Stage 61] 생성자 본문의 지역 const 선언 처리
       foreach var cd61 in impl.ConstDecls do EmitConstDecl(il, fLocalScope, cd61);
+
+      // [Stage 83] 필드 인라인 기본값 초기화를 사용자 본문 실행 전에 대입한다.
+      // (본문 안의 "inherited Create(...)"가 이보다 먼저 실행돼야 하는 드문 경우는
+      // 위 EmitClassFieldDefaults 주석에 적어둔 1차 제약으로 남겨둔다.)
+      EmitClassFieldDefaults(il, impl.ClassName);
 
       foreach st in impl.Body.Statements do EmitStatement(il, st);
       il.MarkLabel(fMethodExitLabel); // [Stage 78] exit 문의 착지점
