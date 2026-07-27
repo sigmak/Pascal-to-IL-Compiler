@@ -1596,6 +1596,24 @@ type
           end;
         end
 
+        // [Stage 88] 외부 컬렉션 인덱서 대입: watchers[s] := new FileChangeWatcher(...); 처럼
+        // 로컬 Pascal 배열이 아닌 필드/변수에 대괄호 대입이 오는 경우. Dictionary<K,V> 등
+        // 외부 제네릭 컬렉션의 인덱서 setter는 CLR에서 컴파일러가 자동 생성하는 "set_Item(key, value)"
+        // 메서드라서, 이미 검증된 일반 외부 메서드 호출 경로(TMethodCallStmtNode)로 그대로 위임한다 —
+        // CodeGen을 새로 손댈 필요 없이 리플렉션 기반 오버로드 해석을 재사용.
+        else if Cur.Kind=tkLBracket then
+        begin
+          fPos:=fPos+1;
+          var idxKey88:=ParseExpr;
+          Expect(tkRBracket);
+          Expect(tkAssign);
+          var valExpr88:=ParseExpr;
+          var setItemCall88:=new TMethodCallStmtNode(nt.Text, 'set_Item');
+          setItemCall88.Args.Add(idxKey88);
+          setItemCall88.Args.Add(valExpr88);
+          Result:=setItemCall88;
+        end
+
         // [버그 수정] 암시적 self 이벤트 구독 (self. 접두사 없음): 예) Shown += Form_Shown;
         // self.Xxx += Handler; 형태는 아래쪽 tkSelf 분기에서 이미 지원되고 있었지만,
         // self. 를 생략한 형태(Text := ... 처럼 암시적 필드 대입은 되면서 암시적 이벤트
