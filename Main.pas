@@ -22,7 +22,8 @@ uses
 const
   DefaultExampleDir = 'Examples';
   
-  DefaultExampleFile = 'uVisualStates.pas'; // [Stage 88b]
+  DefaultExampleFile = 'Test_stage88c.pas'; // [Stage 88c]
+  //DefaultExampleFile = 'uVisualStates.pas'; // [Stage 88b]
   //DefaultExampleFile = 'uFSWatcherService.pas'; // [Stage 88]
   //DefaultExampleFile = 'uFileMonitoring.pas'; // [Stage 87]
   //DefaultExampleFile = 'Test_stage87.pas'; // [Stage 86]
@@ -257,6 +258,96 @@ end;
 // program 선언과 uses 절 사이에 {$...} 지시문이 끼면(흔한 배치다) 정규식이 매치에 실패해
 // 로컬 유닛 의존성을 통째로 놓친다 — 문자열 리터럴 안의 '{'/'//' 는 고려하지 않는 단순 휴리스틱이지만,
 // uses 절 탐색 목적으로는 이 정도로 충분하다.
+// [Stage 88c] {$include uTest.Form1.inc} 처럼 디자이너가 별도 .inc 파일로 뽑아둔
+// InitializeComponent 본문 등을 실제로 그 자리에 텍스트로 끌어온다. 예전에는 Lexer가
+// {$reference}/{$apptype} 말고는 전부 "그냥 주석"으로 무시했기 때문에 {$include}의 내용이
+// 통째로 사라졌었다.
+//
+// StripCommentsForUsesScan과 마찬가지로 문자열 리터럴 안의 '{'는 별도로 가려내지 않는다
+// (이 프로젝트의 실제 소스에는 등장하지 않는 패턴이라 지금은 범위 밖으로 둔다).
+// 재귀적으로 중첩 include도 처리하며, 순환 include는 depth 제한으로 막는다.
+function ExpandIncludes(sourceCode: string; baseDir: string; depth: integer): string;
+var
+  sb: System.Text.StringBuilder;
+  chars: array of char;
+  i, j, startI: integer;
+  dirSb: System.Text.StringBuilder;
+  dirText, dirBody, incName, incPath, incSrc: string;
+begin
+  if depth > 20 then
+    raise new Exception('{$include} 중첩이 너무 깊습니다 (순환 참조가 있는지 확인하세요)');
+  sb := new System.Text.StringBuilder;
+  chars := sourceCode.ToCharArray;
+  i := 0;
+  while i < chars.Length do
+  begin
+    // [Stage 88c 수정] // 줄 주석 안에 등장하는 "{$include ...}" 같은 텍스트(예: 이 프로젝트
+    // 소스 자체의 설명용 주석)를 진짜 지시문으로 오인해 전개해버리는 버그가 있었다 —
+    // 줄 끝까지는 그대로 통과시키고 '{' 스캔을 하지 않는다.
+    if (chars[i] = '/') and (i + 1 < chars.Length) and (chars[i + 1] = '/') then
+    begin
+      while (i < chars.Length) and (chars[i] <> #10) do
+      begin
+        sb.Append(chars[i]);
+        i := i + 1;
+      end;
+      continue;
+    end;
+    if chars[i] = '{' then
+    begin
+      startI := i;
+      j := i + 1;
+      dirSb := new System.Text.StringBuilder;
+      while (j < chars.Length) and (chars[j] <> '}') do
+      begin
+        dirSb.Append(chars[j]);
+        j := j + 1;
+      end;
+      dirText := dirSb.ToString.Trim;
+      if dirText.StartsWith('$') then
+      begin
+        dirBody := dirText.Substring(1).Trim;
+        // [Stage 88c 수정] 예전엔 dirBody.Substring('include'.Length)로 "include" 접두어를
+        // 잘라냈는데, 실제 실행에서 incName이 빈 문자열로 나오는 문제가 있었다(원인 불명 —
+        // Substring 인자 처리 쪽 문제로 추정). 인덱스 계산에 의존하지 않도록 정규식으로
+        // 다시 짰다: "include" 다음에 공백 하나 이상, 그 뒤 나머지 전부를 파일명으로 캡처.
+        var inclMatch := System.Text.RegularExpressions.Regex.Match(
+          dirBody, '(?i)^include\s+(.+)$');
+        if inclMatch.Success then
+        begin
+          incName := inclMatch.Groups[1].Value.Trim;
+          // 따옴표로 감싸져 있으면($include 'x.inc') 벗겨낸다 — 안 감싸도(그냥 파일명만) 허용.
+          if (incName.Length >= 2) and incName.StartsWith('''') and incName.EndsWith('''') then
+            incName := incName.Substring(1, incName.Length - 2);
+          incPath := System.IO.Path.Combine(baseDir, incName);
+          if not System.IO.File.Exists(incPath) then
+            raise new Exception('{$include ' + incName + '} — 파일을 찾을 수 없습니다: ' + incPath);
+          incSrc := System.IO.File.ReadAllText(incPath, Encoding.UTF8);
+          sb.Append(ExpandIncludes(incSrc, baseDir, depth + 1));
+          if j < chars.Length then i := j + 1 else i := j; // '}' 다음으로 이동
+          continue;
+        end;
+      end;
+      // include가 아닌 다른 {...}(주석, {$reference}, {$apptype} 등)는 원문 그대로 통과시켜
+      // Lexer.SkipWS가 예전처럼 처리하게 둔다.
+      if j < chars.Length then
+      begin
+        sb.Append(sourceCode.Substring(startI, j - startI + 1));
+        i := j + 1;
+      end
+      else
+      begin
+        sb.Append(sourceCode.Substring(startI)); // 닫는 '}' 없이 EOF — Lexer가 알아서 처리
+        i := j;
+      end;
+      continue;
+    end;
+    sb.Append(chars[i]);
+    i := i + 1;
+  end;
+  Result := sb.ToString;
+end;
+
 function StripCommentsForUsesScan(sourceCode: string): string;
 var
   sb: System.Text.StringBuilder;
@@ -599,6 +690,8 @@ begin
       var filePath := compileOrder[fi];
       var fileLabel := System.IO.Path.GetFileName(filePath);
       var fileSrc := System.IO.File.ReadAllText(filePath, Encoding.UTF8);
+      // [Stage 88c] {$include x.inc} 전개 — 그 파일과 같은 디렉터리에서 찾는다.
+      fileSrc := ExpandIncludes(fileSrc, System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(filePath)), 0);
       try
         var fileLexer := new TLexer(fileSrc);
         var fileTokens := fileLexer.Tokenize;

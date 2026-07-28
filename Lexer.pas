@@ -15,6 +15,7 @@ uses
 type
   TTokenKind = (
     tkProgram, tkType, tkClass, tkRecord, tkInterface, tkPrivate, tkPublic,
+    tkInternal, // [Stage 88c] internal 가시성 지정자 — 지금은 public과 동일하게 취급(접근 제어 미시행)
     tkVar, tkInteger, tkStringType, tkArray, tkOf, tkSet, // [Stage 63] tkSet
     tkBegin, tkEnd, tkWriteln,
     tkIf, tkThen, tkElse, tkWhile, tkDo, tkMod,
@@ -145,11 +146,16 @@ type
     end;
 
     function ReadIdent: TToken;
-    var sl, sc: integer; sb: StringBuilder; w, lw: string;
+    var sl, sc: integer; sb: StringBuilder; w, lw: string; wasEscaped: boolean;
     begin
       sl:=fLine; sc:=fCol; sb:=new StringBuilder;
+      // [Stage 88c] &Label — 맨 앞의 &는 "다음 이름을 예약어로 보지 말고 무조건 평범한
+      // 식별자로 취급하라"는 표시일 뿐, 식별자 텍스트 자체에는 포함되지 않는다.
+      wasEscaped:=false;
+      if CC='&' then begin wasEscaped:=true; Adv; end;
       while Char.IsLetterOrDigit(CC) or (CC='_') do begin sb.Append(CC); Adv; end;
       w:=sb.ToString; lw:=w.ToLower;
+      if wasEscaped then begin Result:=new TToken(tkIdent, w,sl,sc); exit; end;
       if      lw='program'   then Result:=new TToken(tkProgram,   w,sl,sc)
       else if lw='type'      then Result:=new TToken(tkType,      w,sl,sc)
       else if lw='class'     then Result:=new TToken(tkClass,     w,sl,sc)
@@ -157,6 +163,7 @@ type
       else if lw='interface' then Result:=new TToken(tkInterface, w,sl,sc)
       else if lw='private'   then Result:=new TToken(tkPrivate,   w,sl,sc)
       else if lw='public'    then Result:=new TToken(tkPublic,    w,sl,sc)
+      else if lw='internal'  then Result:=new TToken(tkInternal,  w,sl,sc) // [Stage 88c]
       else if lw='var'       then Result:=new TToken(tkVar,       w,sl,sc)
       else if lw='integer'   then Result:=new TToken(tkInteger,   w,sl,sc)
       else if lw='string'    then Result:=new TToken(tkStringType,w,sl,sc)
@@ -303,6 +310,10 @@ type
         SkipWS; ch:=CC; sc:=fCol;
         if ch=#0 then begin toks.Add(new TToken(tkEOF,'',fLine,fCol)); break; end
         else if Char.IsLetter(ch) or (ch='_') then toks.Add(ReadIdent)
+        // [Stage 88c] &Label 같은 이스케이프된 식별자 — Label처럼 예약어와 충돌하는
+        // 이름을 강제로 "그냥 식별자"로 쓰겠다는 표시. & 다음에 글자/밑줄이 와야 진짜
+        // 이스케이프고, 그렇지 않으면(예: 접근 연산자 등으로 쓰일 가능성 대비) 그냥 통과.
+        else if (ch='&') and (Char.IsLetter(PC) or (PC='_')) then toks.Add(ReadIdent)
         else if Char.IsDigit(ch) then toks.Add(ReadNum)
         else if ch='#' then toks.Add(ReadCharCode) // [Phase 1] #65 형태 문자 리터럴
         else if ch=#39 then

@@ -2269,8 +2269,8 @@ type
             var memberStartPos:=fPos;
             try
             begin
-            // private / public 키워드는 건너뜀
-            if (Cur.Kind=tkPrivate) or (Cur.Kind=tkPublic) then
+            // private / public / internal 키워드는 건너뜀 [Stage 88c: internal 추가]
+            if (Cur.Kind=tkPrivate) or (Cur.Kind=tkPublic) or (Cur.Kind=tkInternal) then
             begin
               fPos:=fPos+1;
             end
@@ -2398,7 +2398,71 @@ type
                 if (sig.ReturnType=vtGeneric) or (sig.ReturnType=vtGenericArray) then sig.ReturnGenericName:=fLastGenericName; // [Stage 32/37]
               end;
               fCurGenericParams:=savedGP74sig; // [Stage 74]
+
+              // [Stage 88c] {$include uTest.Form1.inc} 같은 지시문이 클래스 선언 "내부"에서
+              // 전개되면, 시그니처(세미콜론까지 포함해서 "procedure Name;")뒤에 곧바로
+              // 본문(begin...end)이 온다 — 디자이너가 만드는 InitializeComponent가 대표적인 예.
+              // [버그 수정] 처음 구현에서는 세미콜론을 소비하기 "전"에 Cur.Kind=tkBegin을
+              // 검사했는데, 실제 문법은 "procedure InitializeIt; begin ... end;"처럼 시그니처와
+              // begin 사이에 세미콜론이 항상 있으므로 그 시점의 Cur는 절대 tkBegin이 될 수 없었다
+              // (항상 else 쪽의 "시그니처만" 경로로 빠졌다 — 그 뒤 "begin"이 클래스 멤버로
+              // 잘못 해석되어 파싱 전체가 어긋났다). 세미콜론을 먼저 소비한 "다음"에 검사하도록 고쳤다.
+              // 여기서는 시그니처를 평소대로 cd.Methods에 등록해 CodeGen의 시그니처 정의
+              // 단계를 그대로 재사용하고, 본문은 ParseMethodImpl과 같은 방식으로 바로 파싱해
+              // fProg.MethodImpls에 (마치 별도 구현부에 있던 것처럼) 담아둔다.
               Expect(tkSemicolon);
+              if Cur.Kind=tkBegin then
+              begin
+                cd.Methods.Add(sig);
+                fClassMethods[cn][mname]:=isFunc;
+                if sig.IsGeneric then
+                begin
+                  if not fGenericMethodNames.Contains(mname) then fGenericMethodNames.Add(mname);
+                  fMethodGenericParam[mname]:=sig.GenericParamNames;
+                  fMethodGenericConstraint[mname]:=sig.GenericParamConstraints;
+                end;
+
+                var inlImpl:=new TMethodImplNode(cn, mname, isFunc, sig.ReturnType);
+                inlImpl.ReturnGenericName:=sig.ReturnGenericName;
+                inlImpl.ParamNames.AddRange(sig.ParamNames);
+                inlImpl.ParamTypes.AddRange(sig.ParamTypes);
+                for var pgi88c:=0 to sig.ParamTypes.Count-1 do
+                begin
+                  if (sig.ParamTypes[pgi88c]=vtGeneric) or (sig.ParamTypes[pgi88c]=vtGenericArray) then
+                    inlImpl.ParamGenericNames.Add(sig.ParamClassNames[pgi88c])
+                  else
+                    inlImpl.ParamGenericNames.Add('');
+                  if (sig.ParamTypes[pgi88c]=vtIntArray) or (sig.ParamTypes[pgi88c]=vtStrArray) or (sig.ParamTypes[pgi88c]=vtGenericArray) then
+                    if not fArrayNames.Contains(sig.ParamNames[pgi88c]) then fArrayNames.Add(sig.ParamNames[pgi88c]);
+                end;
+
+                var savedClass88c:=fCurClass; var savedFunc88c:=fCurFunc;
+                var savedParams88c:=fCurParams; var savedMethodParamNames88c:=fCurMethodParamNames;
+                fCurClass:=cn; fCurFunc:=mname;
+                fCurParams:=new List<string>;
+                foreach var pnCp88c in inlImpl.ParamNames do fCurParams.Add(pnCp88c);
+                fCurMethodParamNames:=new List<string>;
+                foreach var pnCp88c2 in inlImpl.ParamNames do fCurMethodParamNames.Add(pnCp88c2);
+
+                if (Cur.Kind=tkVar) or (Cur.Kind=tkConst) then
+                begin
+                  ParseLocalDeclSections(inlImpl.LocalVars, inlImpl.ConstDecls);
+                  foreach var lvcp88c in inlImpl.LocalVars do fCurParams.Add(lvcp88c.Name);
+                  foreach var lccp88c in inlImpl.ConstDecls do fCurParams.Add(lccp88c.Name);
+                end;
+
+                Expect(tkBegin);
+                var inlComp:=new TCompoundStmtNode;
+                ParseStatementsUntilEnd(inlComp.Statements); // [Stage 58] panic-mode 오류 복구
+                Expect(tkEnd); Expect(tkSemicolon);
+                inlImpl.Body:=inlComp;
+                fProg.MethodImpls.Add(inlImpl);
+
+                fCurClass:=savedClass88c; fCurFunc:=savedFunc88c;
+                fCurParams:=savedParams88c; fCurMethodParamNames:=savedMethodParamNames88c;
+              end
+              else
+              begin
               // [Stage 53] 메서드 지시자: virtual;/override;/abstract; — 순서·조합 무관하게 여러 개 허용
               // (예: "procedure Foo; virtual; abstract;"). 지시자마다 세미콜론이 따라온다.
               while (Cur.Kind=tkVirtual) or (Cur.Kind=tkOverride) or (Cur.Kind=tkAbstract) do
@@ -2421,6 +2485,7 @@ type
                 if not fGenericMethodNames.Contains(mname) then fGenericMethodNames.Add(mname);
                 fMethodGenericParam[mname]:=sig.GenericParamNames;
                 fMethodGenericConstraint[mname]:=sig.GenericParamConstraints;
+              end;
               end;
             end
 
