@@ -4081,12 +4081,73 @@ type
     // 목록에 없으면 원래 이름 그대로 돌려주고(변화 없음), 이후 단계에서 필요해지면 추가한다.
     function ResolveWellKnownShortName(name: string): string;
     begin
+      // [Stage 86] 기존 인터페이스 단축 이름
       if name='IDisposable' then Result:='System.IDisposable'
       else if name='IComparable' then Result:='System.IComparable'
       else if name='ICloneable' then Result:='System.ICloneable'
       else if name='IFormattable' then Result:='System.IFormattable'
       else if name='IEnumerable' then Result:='System.Collections.IEnumerable'
       else if name='IEnumerator' then Result:='System.Collections.IEnumerator'
+      // [Stage 87] System.Windows.Forms 단축 이름
+      else if name='Form'                then Result:='System.Windows.Forms.Form'
+      else if name='Label'               then Result:='System.Windows.Forms.Label'
+      else if name='Button'              then Result:='System.Windows.Forms.Button'
+      else if name='TextBox'             then Result:='System.Windows.Forms.TextBox'
+      else if name='Panel'               then Result:='System.Windows.Forms.Panel'
+      else if name='GroupBox'            then Result:='System.Windows.Forms.GroupBox'
+      else if name='ComboBox'            then Result:='System.Windows.Forms.ComboBox'
+      else if name='ListBox'             then Result:='System.Windows.Forms.ListBox'
+      else if name='CheckBox'            then Result:='System.Windows.Forms.CheckBox'
+      else if name='RadioButton'         then Result:='System.Windows.Forms.RadioButton'
+      else if name='PictureBox'          then Result:='System.Windows.Forms.PictureBox'
+      else if name='TabControl'          then Result:='System.Windows.Forms.TabControl'
+      else if name='TabPage'             then Result:='System.Windows.Forms.TabPage'
+      else if name='TreeView'            then Result:='System.Windows.Forms.TreeView'
+      else if name='ListView'            then Result:='System.Windows.Forms.ListView'
+      else if name='MenuStrip'           then Result:='System.Windows.Forms.MenuStrip'
+      else if name='ToolStrip'           then Result:='System.Windows.Forms.ToolStrip'
+      else if name='StatusStrip'         then Result:='System.Windows.Forms.StatusStrip'
+      else if name='ToolStripMenuItem'   then Result:='System.Windows.Forms.ToolStripMenuItem'
+      else if name='ContextMenuStrip'    then Result:='System.Windows.Forms.ContextMenuStrip'
+      else if name='TableLayoutPanel'    then Result:='System.Windows.Forms.TableLayoutPanel'
+      else if name='FlowLayoutPanel'     then Result:='System.Windows.Forms.FlowLayoutPanel'
+      else if name='SplitContainer'      then Result:='System.Windows.Forms.SplitContainer'
+      else if name='SplitterPanel'       then Result:='System.Windows.Forms.SplitterPanel'
+      else if name='DataGridView'        then Result:='System.Windows.Forms.DataGridView'
+      else if name='RichTextBox'         then Result:='System.Windows.Forms.RichTextBox'
+      else if name='NumericUpDown'       then Result:='System.Windows.Forms.NumericUpDown'
+      else if name='TrackBar'            then Result:='System.Windows.Forms.TrackBar'
+      else if name='ProgressBar'         then Result:='System.Windows.Forms.ProgressBar'
+      else if name='Timer'               then Result:='System.Windows.Forms.Timer'
+      else if name='OpenFileDialog'      then Result:='System.Windows.Forms.OpenFileDialog'
+      else if name='SaveFileDialog'      then Result:='System.Windows.Forms.SaveFileDialog'
+      else if name='FolderBrowserDialog' then Result:='System.Windows.Forms.FolderBrowserDialog'
+      else if name='ColorDialog'         then Result:='System.Windows.Forms.ColorDialog'
+      else if name='FontDialog'          then Result:='System.Windows.Forms.FontDialog'
+      else if name='MessageBox'          then Result:='System.Windows.Forms.MessageBox'
+      else if name='Application'         then Result:='System.Windows.Forms.Application'
+      else if name='Control'             then Result:='System.Windows.Forms.Control'
+      else if name='UserControl'         then Result:='System.Windows.Forms.UserControl'
+      else if name='ContainerControl'    then Result:='System.Windows.Forms.ContainerControl'
+      else if name='ScrollableControl'   then Result:='System.Windows.Forms.ScrollableControl'
+      else if name='ToolStripPanel'      then Result:='System.Windows.Forms.ToolStripPanel'
+      // [Stage 87] System.Drawing 단축 이름
+      else if name='Font'                then Result:='System.Drawing.Font'
+      else if name='FontFamily'          then Result:='System.Drawing.FontFamily'
+      else if name='Color'               then Result:='System.Drawing.Color'
+      else if name='Bitmap'              then Result:='System.Drawing.Bitmap'
+      else if name='Image'               then Result:='System.Drawing.Image'
+      else if name='Pen'                 then Result:='System.Drawing.Pen'
+      else if name='Brush'               then Result:='System.Drawing.Brush'
+      else if name='SolidBrush'          then Result:='System.Drawing.SolidBrush'
+      else if name='Graphics'            then Result:='System.Drawing.Graphics'
+      else if name='Icon'                then Result:='System.Drawing.Icon'
+      // [Stage 87] System 단축 이름
+      else if name='EventArgs'           then Result:='System.EventArgs'
+      else if name='EventHandler'        then Result:='System.EventHandler'
+      else if name='Exception'           then Result:='System.Exception'
+      else if name='Object'              then Result:='System.Object'
+      else if name='String'              then Result:='System.String'
       else Result:=name;
     end;
 
@@ -4134,6 +4195,22 @@ type
           except
             on E: Exception do fFailedAutoLoads.Add(candidate); // 이 어셈블리는 GAC에 없음 — 다음부터 재시도 안 함
           end;
+        end;
+      end;
+
+      // [Stage 87] 화이트리스트와 fAutoAssemblyMap 모두에서 못 찾은 경우 —
+      // 현재 AppDomain에 로드된 모든 어셈블리를 뒤져 단순 이름(점 없음) 또는 전체 경로로 탐색.
+      // uses 절의 네임스페이스 탐색을 CodeGen 레벨에서 보완한다.
+      foreach var _asm87cg in System.AppDomain.CurrentDomain.GetAssemblies() do
+      begin
+        try
+          t:=_asm87cg.GetType(dottedName);
+          if t<>nil then begin Result:=t; exit; end;
+          // 단순 이름인 경우 어셈블리의 타입 목록에서 이름 끝 부분 일치로 탐색
+          if not dottedName.Contains('.') then
+            foreach var _tp87cg in _asm87cg.GetExportedTypes() do
+              if _tp87cg.Name=dottedName then begin Result:=_tp87cg; exit; end;
+        except
         end;
       end;
 

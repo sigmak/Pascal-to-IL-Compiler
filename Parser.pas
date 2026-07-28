@@ -74,6 +74,9 @@ type
     // 들어갈 때 새로 만들고 나올 때 이전 값(보통 nil)으로 복원한다 — 한 겹만 지원하므로
     // 지역 서브프로그램 자신의 본문 파싱 중에는 새로 만들지 않고 그대로 이어서 쓴다.
     fCurNestedAlias: Dictionary<string, string>;
+    // [Stage 87] uses 절에 나온 네임스페이스 목록 — System, System.Drawing, System.Windows.Forms 등.
+    // ParseParamTypeExt/ParseVarType에서 단순 이름(EventArgs, Label 등)을 완전 경로로 해석할 때 사용.
+    fImportedNamespaces: List<string>;
     fClassNames: List<string>; // 선언된 클래스 이름 목록 (제네릭 템플릿 이름 + 단형화된 구체 이름 포함)
     fInterfaceNames: List<string>; // 선언된 인터페이스 이름 목록
     fEnumNames: List<string>; // [Phase 1] 선언된 열거형 이름 목록 (타입 파싱 시 vtEnum 분류용)
@@ -323,6 +326,30 @@ type
       begin
         fPos:=fPos+1; Result:=vtObject;
       end
+      else if Cur.Kind=tkIdent then
+      begin
+        // [Stage 87] 로컬 클래스도 아닌 단순 이름 — uses 절 네임스페이스에서 탐색
+        var _qn87v:=Cur.Text;
+        var _resolved87v:='';
+        foreach var _ns87v in fImportedNamespaces do
+        begin
+          var _full87v:=_ns87v+'.'+_qn87v;
+          try
+            var _t87v:=System.Type.GetType(_full87v);
+            if _t87v=nil then
+              foreach var _asm87v in System.AppDomain.CurrentDomain.GetAssemblies() do
+              begin _t87v:=_asm87v.GetType(_full87v); if _t87v<>nil then break; end;
+            if _t87v<>nil then begin _resolved87v:=_full87v; break; end;
+          except
+          end;
+        end;
+        if _resolved87v<>'' then
+        begin
+          fPos:=fPos+1; fLastGenericName:=_resolved87v; Result:=vtObject;
+        end
+        else
+          raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': 타입이 와야 합니다 ("'+Cur.Text+'")');
+      end
       else raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': 타입이 와야 합니다 ("'+Cur.Text+'")');
     end;
 
@@ -352,8 +379,6 @@ type
         cn:=Cur.Text; fLastGenericName:=cn; fPos:=fPos+1; Result:=vtSet; exit;
       end;
       // [Stage 87] object — .NET System.Object 매개변수/필드 타입
-      // (WinForms 이벤트 핸들러의 "sender: object" 관용구 — uFileMonitoring.pas의
-      // OnFileChangedEvent(sender: object; e: ...)에서 처음 필요해짐)
       if (Cur.Kind=tkIdent) and (Cur.Text.ToLower='object') and (not fClassNames.Contains(Cur.Text)) then
       begin
         fPos:=fPos+1; cn:='System.Object'; isExt:=true; Result:=vtObject; exit;
@@ -376,8 +401,37 @@ type
         end
         else
         begin
-          fPos:=savedPos4;
-          Result:=ParseVarType; // 기본 타입도 지역클래스도 아니면 여기서 명확한 에러
+          // [Stage 87] 점 없는 단순 이름 — uses 절 네임스페이스에서 탐색.
+          // 예: EventArgs → System.EventArgs / System.Windows.Forms.EventArgs
+          // CLR에 실제로 있는 첫 번째 완전 경로를 사용한다.
+          var _resolved87:='';
+          foreach var _ns87 in fImportedNamespaces do
+          begin
+            var _full87:=_ns87+'.'+qn4;
+            try
+              var _t87:=System.Type.GetType(_full87);
+              if _t87=nil then
+              begin
+                // GetType이 nil 반환 시 — 로드된 어셈블리 전체에서 재탐색
+                foreach var _asm87 in System.AppDomain.CurrentDomain.GetAssemblies() do
+                begin
+                  _t87:=_asm87.GetType(_full87);
+                  if _t87<>nil then break;
+                end;
+              end;
+              if _t87<>nil then begin _resolved87:=_full87; break; end;
+            except
+            end;
+          end;
+          if _resolved87<>'' then
+          begin
+            cn:=_resolved87; isExt:=true; Result:=vtObject;
+          end
+          else
+          begin
+            fPos:=savedPos4;
+            Result:=ParseVarType; // 기본 타입도 지역클래스도 아니면 여기서 명확한 에러
+          end;
         end;
       end
       else
@@ -1658,7 +1712,62 @@ type
       begin
         fPos:=fPos+1; Expect(tkDot);
         var selfMname2:=Expect(tkIdent).Text;
-        if Cur.Kind=tkAssign then
+        // [Stage 87] self.필드.프로퍼티... 3단 이상 체인: self.label1.Location := ...
+        // 점이 또 오면 체인을 계속 읽어 Qualifier로 쌓는다.
+        if Cur.Kind=tkDot then
+        begin
+          var selfChain87:=selfMname2;
+          while Cur.Kind=tkDot do
+          begin
+            fPos:=fPos+1;
+            var selfNext87:=Expect(tkIdent).Text;
+            if Cur.Kind=tkDot then
+              selfChain87:=selfChain87+'.'+selfNext87
+            else if Cur.Kind=tkAssign then
+            begin
+              // selfChain87.selfNext87 := rhs
+              fPos:=fPos+1; rhs:=ParseExpr;
+              var fas87:=new TFieldAssignStmtNode(selfNext87, rhs);
+              fas87.Qualifier:=selfChain87;
+              Result:=fas87;
+              break;
+            end
+            else if Cur.Kind=tkPlusAssign then
+            begin
+              fPos:=fPos+1;
+              if Cur.Kind=tkLParen then
+              begin
+                var evs87:=new TEventSubscribeStmtNode(selfChain87, selfNext87, '');
+                evs87.Lambda:=ParseLambdaExpr;
+                Result:=evs87;
+              end
+              else
+              begin
+                var handlerName87:=Expect(tkIdent).Text;
+                Result:=new TEventSubscribeStmtNode(selfChain87, selfNext87, handlerName87);
+              end;
+              break;
+            end
+            else
+            begin
+              // selfChain87.selfNext87(args) — 메서드 호출
+              mcs:=new TMethodCallStmtNode(selfChain87, selfNext87);
+              if Cur.Kind=tkLParen then
+              begin
+                fPos:=fPos+1;
+                if Cur.Kind<>tkRParen then
+                begin
+                  mcs.Args.Add(ParseExpr);
+                  while Cur.Kind=tkComma do begin fPos:=fPos+1; mcs.Args.Add(ParseExpr); end;
+                end;
+                Expect(tkRParen);
+              end;
+              Result:=mcs;
+              break;
+            end;
+          end;
+        end
+        else if Cur.Kind=tkAssign then
         begin
           fPos:=fPos+1; rhs:=ParseExpr;
           Result:=new TFieldAssignStmtNode(selfMname2, rhs); // Qualifier='' → self 필드/속성 대입
@@ -2583,9 +2692,34 @@ type
                 end
                 else
                 begin
-                  fPos:=savedPos2;
-                  fldType:=ParseVarType;
-                  if fldType=vtGenericArray then fldCn:=fLastGenericName;
+                  // [Stage 87] 점 없는 단순 이름 — uses 네임스페이스에서 탐색
+                  var _resolved87f:='';
+                  foreach var _ns87f in fImportedNamespaces do
+                  begin
+                    var _full87f:=_ns87f+'.'+qn;
+                    try
+                      var _t87f:=System.Type.GetType(_full87f);
+                      if _t87f=nil then
+                        foreach var _asm87f in System.AppDomain.CurrentDomain.GetAssemblies() do
+                        begin _t87f:=_asm87f.GetType(_full87f); if _t87f<>nil then break; end;
+                      if _t87f<>nil then begin _resolved87f:=_full87f; break; end;
+                    except
+                    end;
+                  end;
+                  if _resolved87f<>'' then
+                  begin
+                    fldType:=vtObject; fldCn:=_resolved87f; fldIsExt:=true;
+                  end
+                  else
+                  begin
+                    fPos:=savedPos2;
+                    fldType:=ParseVarType;
+                    if (fldType=vtGenericArray) or (fldType=vtObject) then
+                    begin
+                      if fldType=vtObject then begin fldCn:=fLastGenericName; fldIsExt:=(fldCn<>'') and not fClassNames.Contains(fldCn); end
+                      else fldCn:=fLastGenericName;
+                    end;
+                  end;
                 end;
               end
               else
@@ -3391,6 +3525,7 @@ type
       fClassNames:=new List<string>;
       fInterfaceNames:=new List<string>;
       fEnumNames:=new List<string>; // [Phase 1]
+      fImportedNamespaces:=new List<string>; // [Stage 87]
       fRecordNames:=new List<string>; // [Stage 62]
       fEnumMemberEnumName:=new Dictionary<string, string>; // [Stage 51]
       fEnumMemberOrdinal:=new Dictionary<string, integer>; // [Stage 51]
@@ -3485,14 +3620,19 @@ type
     // (실제 다른 유닛과의 링크는 Stage 82에서 다룬다 — 지금은 여전히 이름만 버린다).
     procedure ParseAndDiscardUsesClause;
     begin
+      // [Stage 87] uses 절 이름을 fImportedNamespaces에 저장한다.
+      // 단순 이름(EventArgs, Label 등)을 ParseParamTypeExt/ParseVarType에서
+      // 완전 경로로 해석하는 데 사용한다.
       fPos:=fPos+1; // 'uses' 소비
-      Expect(tkIdent);
-      while Cur.Kind=tkDot do begin fPos:=fPos+1; Expect(tkIdent); end;
+      var _nsName87:=Expect(tkIdent).Text;
+      while Cur.Kind=tkDot do begin fPos:=fPos+1; _nsName87:=_nsName87+'.'+Expect(tkIdent).Text; end;
+      if not fImportedNamespaces.Contains(_nsName87) then fImportedNamespaces.Add(_nsName87);
       while Cur.Kind=tkComma do
       begin
         fPos:=fPos+1;
-        Expect(tkIdent);
-        while Cur.Kind=tkDot do begin fPos:=fPos+1; Expect(tkIdent); end;
+        _nsName87:=Expect(tkIdent).Text;
+        while Cur.Kind=tkDot do begin fPos:=fPos+1; _nsName87:=_nsName87+'.'+Expect(tkIdent).Text; end;
+        if not fImportedNamespaces.Contains(_nsName87) then fImportedNamespaces.Add(_nsName87);
       end;
       Expect(tkSemicolon);
     end;
