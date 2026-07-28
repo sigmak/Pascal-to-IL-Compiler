@@ -473,6 +473,17 @@ type
           aIL.Emit(OpCodes.Callvirt, localGetM85);
           curType:=localGetM85.ReturnType;
         end
+        // [Stage 89] 괄호 없이 부른 인자 없는 메서드 — 예: w.GetValue.ToString처럼 Pascal
+        // 관례상 인자 없는 함수는 괄호를 생략할 수 있다. 프로퍼티(get_ 접두)도 필드도 아니고
+        // 실제 메서드 이름과 일치하면 그냥 호출한다(인자 개수 불일치는 원래 소스가 괄호 없이
+        // 쓸 수 있는 진짜 무인자 메서드라는 전제하에 검사하지 않는다).
+        else if (localClsName78<>'') and fInstanceMethods.ContainsKey(localClsName78)
+           and fInstanceMethods[localClsName78].ContainsKey(segs[i]) then
+        begin
+          var localM89: MethodBuilder := fInstanceMethods[localClsName78][segs[i]];
+          aIL.Emit(OpCodes.Callvirt, localM89);
+          curType:=localM89.ReturnType;
+        end
         else if (localClsName78<>'') and fFieldBuilders.ContainsKey(localClsName78)
            and fFieldBuilders[localClsName78].ContainsKey(segs[i]) then
         begin
@@ -546,6 +557,10 @@ type
            and fInstanceMethods[localClsName78].ContainsKey('get_'+segs[i]) then
           // [Stage 85] 로컬 클래스의 프로퍼티 getter
           curType:=fInstanceMethods[localClsName78]['get_'+segs[i]].ReturnType
+        // [Stage 89] 괄호 없이 부른 인자 없는 메서드 — EmitQualifierChainLoad와 동일한 사유
+        else if (localClsName78<>'') and fInstanceMethods.ContainsKey(localClsName78)
+           and fInstanceMethods[localClsName78].ContainsKey(segs[i]) then
+          curType:=fInstanceMethods[localClsName78][segs[i]].ReturnType
         else if (localClsName78<>'') and fFieldBuilders.ContainsKey(localClsName78)
            and fFieldBuilders[localClsName78].ContainsKey(segs[i]) then
           curType:=fFieldBuilders[localClsName78][segs[i]].FieldType

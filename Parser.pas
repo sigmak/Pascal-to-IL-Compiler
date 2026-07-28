@@ -2277,13 +2277,20 @@ type
 
             // [Stage 42] 생성자 시그니처: constructor Create;
             // [Stage 47] 매개변수 있는 생성자도 지원 (procedure/function 시그니처 파싱과 동일한 패턴)
+            // [Stage 89] 실제 레포(uTest.pas)는 이름 없이 그냥 "constructor;"라고만 쓰고 바로
+            // "begin...end;"로 본문을 붙인다 — 이름 생략은 "Create"의 축약형(디자이너가 뽑는
+            // 흔한 표기), 본문은 procedure/function과 마찬가지로 클래스 선언 "안"에 인라인으로 온다.
             else if Cur.Kind=tkConstructor then
             begin
               fPos:=fPos+1;
-              var ctorName:=Expect(tkIdent).Text;
-              if ctorName<>'Create' then
-                raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString
-                  +': 생성자 이름은 "Create"만 지원합니다 (Stage 42)');
+              var ctorName:='Create';
+              if Cur.Kind=tkIdent then
+              begin
+                ctorName:=Cur.Text; fPos:=fPos+1;
+                if ctorName<>'Create' then
+                  raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString
+                    +': 생성자 이름은 "Create"만 지원합니다 (Stage 42)');
+              end;
               if Cur.Kind=tkLParen then
               begin
                 fPos:=fPos+1;
@@ -2307,6 +2314,39 @@ type
               end;
               Expect(tkSemicolon);
               cd.HasUserConstructor:=true;
+
+              // [Stage 89] "constructor; begin ... end;" — {$include}로 끌려온 procedure와
+              // 완전히 같은 이유(시그니처를 끝맺는 ';'을 소비한 "다음"에 tkBegin을 검사)로 처리한다.
+              if Cur.Kind=tkBegin then
+              begin
+                var cimpl89:=new TConstructorImplNode(cn);
+                foreach var cp89 in cd.ConstructorParams do cimpl89.Parameters.Add(cp89);
+
+                var savedClass89:=fCurClass; var savedFunc89:=fCurFunc;
+                var savedParams89:=fCurParams; var savedMethodParamNames89:=fCurMethodParamNames;
+                fCurClass:=cn; fCurFunc:='Create';
+                fCurParams:=new List<string>;
+                foreach var cpn89 in cimpl89.Parameters do fCurParams.Add(cpn89.Name);
+                fCurMethodParamNames:=new List<string>;
+                foreach var cpn89b in cimpl89.Parameters do fCurMethodParamNames.Add(cpn89b.Name);
+
+                if (Cur.Kind=tkVar) or (Cur.Kind=tkConst) then
+                begin
+                  ParseLocalDeclSections(cimpl89.LocalVars, cimpl89.ConstDecls);
+                  foreach var lvcp89 in cimpl89.LocalVars do fCurParams.Add(lvcp89.Name);
+                  foreach var lccp89 in cimpl89.ConstDecls do fCurParams.Add(lccp89.Name);
+                end;
+
+                Expect(tkBegin);
+                var cimplComp89:=new TCompoundStmtNode;
+                ParseStatementsUntilEnd(cimplComp89.Statements); // [Stage 58] panic-mode 오류 복구
+                Expect(tkEnd); Expect(tkSemicolon);
+                cimpl89.Body:=cimplComp89;
+                fProg.ConstructorImpls.Add(cimpl89);
+
+                fCurClass:=savedClass89; fCurFunc:=savedFunc89;
+                fCurParams:=savedParams89; fCurMethodParamNames:=savedMethodParamNames89;
+              end;
             end
 
             // [Phase 1] 프로퍼티 시그니처: property Name: Type read FX write FX;
