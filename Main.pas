@@ -21,7 +21,9 @@ uses
 
 const
   DefaultExampleDir = 'Examples';
-  DefaultExampleFile = 'uFSWatcherService.pas'; // [Stage 88]
+  
+  DefaultExampleFile = 'uVisualStates.pas'; // [Stage 88b]
+  //DefaultExampleFile = 'uFSWatcherService.pas'; // [Stage 88]
   //DefaultExampleFile = 'uFileMonitoring.pas'; // [Stage 87]
   //DefaultExampleFile = 'Test_stage87.pas'; // [Stage 86]
   //DefaultExampleFile = 'Test_stage86.pas'; // [Stage 86]
