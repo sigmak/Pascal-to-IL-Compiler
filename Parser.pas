@@ -3838,7 +3838,14 @@ type
       fProg:=prog; // 깊이 상관없이(식/타입 파싱 도중) GenericInstantiations에 접근하기 위함
 
       // [Stage 81] unit이면 type 섹션 앞에 'interface' 키워드가 와야 한다.
-      if prog.IsUnit then Expect(tkInterface);
+      // [Stage 92] 단, fChild.pas처럼 interface/implementation 없이 바로
+      // uses + type + begin end. 로 가는 단순 유닛도 허용한다.
+      var _hasInterface92 := false;
+      if prog.IsUnit then
+      begin
+        if Cur.Kind=tkInterface then begin fPos:=fPos+1; _hasInterface92:=true; end;
+        // interface 없으면 그냥 계속 (단순 유닛)
+      end;
 
       if Cur.Kind=tkUses then ParseAndDiscardUsesClause;
 
@@ -3855,10 +3862,19 @@ type
       // [Stage 81] unit이면 여기서 'implementation' 키워드, 그리고 그 섹션 전용 uses도
       // 올 수 있다. 이후의 메서드 구현부/var/const 파싱은 program/library와 완전히 동일한
       // 문법이라 아래 기존 코드를 그대로 재사용한다.
+      // [Stage 92] interface가 없는 단순 유닛은 implementation도 없을 수 있다.
       if prog.IsUnit then
       begin
-        Expect(tkImplementation);
-        if Cur.Kind=tkUses then ParseAndDiscardUsesClause;
+        if _hasInterface92 then
+        begin
+          Expect(tkImplementation);
+          if Cur.Kind=tkUses then ParseAndDiscardUsesClause;
+        end
+        else if Cur.Kind=tkImplementation then
+        begin
+          fPos:=fPos+1; // 'implementation' 소비
+          if Cur.Kind=tkUses then ParseAndDiscardUsesClause;
+        end;
       end;
 
       // 클래스 메서드 구현 또는 일반 함수/프로시저

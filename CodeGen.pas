@@ -1319,7 +1319,26 @@ type
         // TCounter.Create / new TCounter / new System.IO.FileStream(a,b,c) → Newobj
         // (지역 클래스 또는 외부 타입 모두 지원. [Stage 40] 인자 있는 외부 생성자 추가)
         neo:=TNewObjectExprNode(e);
-        if neo.IsExternalType then
+        // [Stage 92] new Type[n](e1, e2, ...) — 배열 리터럴
+        if neo.ArraySizeExpr <> nil then
+        begin
+          var _arrElemType92 := ResolveExternalType(neo.ClassName);
+          EmitExpr(aIL, neo.ArraySizeExpr); // 배열 크기를 스택에 push
+          aIL.Emit(OpCodes.Newarr, _arrElemType92);
+          // 요소 초기화: 각 인덱스에 Stelem
+          for var _ai92 := 0 to neo.Args.Count-1 do
+          begin
+            aIL.Emit(OpCodes.Dup);                          // 배열 참조 복제
+            aIL.Emit(OpCodes.Ldc_I4, _ai92);               // 인덱스
+            EmitExpr(aIL, neo.Args[_ai92]);                 // 요소 값
+            // 요소 타입에 따라 Stelem 변형 선택
+            if _arrElemType92.IsValueType then
+              aIL.Emit(OpCodes.Stelem, _arrElemType92)
+            else
+              aIL.Emit(OpCodes.Stelem_Ref);
+          end;
+        end
+        else if neo.IsExternalType then
         begin
           var _extCtorType:=ResolveExternalType(neo.ClassName);
           if neo.Args.Count=0 then
@@ -1344,12 +1363,8 @@ type
         begin
           if not fCtorBuilders.ContainsKey(neo.ClassName) then
             raise new Exception('알 수 없는 클래스 "'+neo.ClassName+'"');
-          // [Stage 53] abstract 메서드가 있는 클래스는 인스턴스화할 수 없다. CLR도 런타임에
-          // MemberAccessException으로 막긴 하지만, 실행 시점이 아니라 지금(컴파일 시점)
-          // 알려주는 게 훨씬 낫다.
           if fAbstractMethods.ContainsKey(neo.ClassName) and (fAbstractMethods[neo.ClassName].Count>0) then
             raise new Exception('"'+neo.ClassName+'"은(는) abstract 메서드를 갖고 있어 인스턴스를 생성할 수 없습니다 (abstract 클래스).');
-          // [Stage 47] 로컬(우리 컴파일러가 만든) 클래스도 매개변수 있는 생성자를 지원한다.
           ctor:=fCtorBuilders[neo.ClassName];
           var _ctorParamsLocal: array of System.Type;
           if fCtorParamClrTypes.ContainsKey(neo.ClassName) then _ctorParamsLocal:=fCtorParamClrTypes[neo.ClassName]
@@ -4480,6 +4495,21 @@ type
       else if name='char'                then Result:='System.Char'
       else if (name='bool') or (name='boolean') then Result:='System.Boolean'
       else if name='object'              then Result:='System.Object'
+      // [Stage 92] System.Reflection
+      else if name='Assembly'                  then Result:='System.Reflection.Assembly'
+      // [Stage 92] WeifenLuo.WinFormsUI.Docking 단축 이름
+      else if name='DockContent'               then Result:='WeifenLuo.WinFormsUI.Docking.DockContent'
+      else if name='DockPanel'                 then Result:='WeifenLuo.WinFormsUI.Docking.DockPanel'
+      else if name='DockState'                 then Result:='WeifenLuo.WinFormsUI.Docking.DockState'
+      else if name='DockAreas'                 then Result:='WeifenLuo.WinFormsUI.Docking.DockAreas'
+      else if name='DockAlignment'             then Result:='WeifenLuo.WinFormsUI.Docking.DockAlignment'
+      else if name='VS2005Theme'               then Result:='WeifenLuo.WinFormsUI.Docking.VS2005Theme'
+      else if name='VS2003Theme'               then Result:='WeifenLuo.WinFormsUI.Docking.VS2003Theme'
+      else if name='VS2012LightTheme'          then Result:='WeifenLuo.WinFormsUI.Docking.VS2012LightTheme'
+      else if name='VS2013LightTheme'          then Result:='WeifenLuo.WinFormsUI.Docking.VS2013LightTheme'
+      else if name='VS2015DarkTheme'           then Result:='WeifenLuo.WinFormsUI.Docking.VS2015DarkTheme'
+      else if name='VS2015LightTheme'          then Result:='WeifenLuo.WinFormsUI.Docking.VS2015LightTheme'
+      else if name='VS2015BlueTheme'           then Result:='WeifenLuo.WinFormsUI.Docking.VS2015BlueTheme'
       else Result:=name;
     end;
 
@@ -6516,6 +6546,19 @@ type
          'WindowsBase','WindowsBase, Version=4.0.0.0, Culture=neutral, PublicKeyToken=31bf3856ad364e35',
          'System.Xaml','System.Xaml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'];
       fFailedAutoLoads:=new HashSet<string>;
+      // [Stage 92] WeifenLuo.WinFormsUI.Docking — 로컬 DLL을 실행 경로에서 로드.
+      // GAC에 없으므로 Assembly.LoadFile로 직접 경로 지정.
+      // fAutoAssemblyMap은 GAC 전용이라 여기서 직접 로드한다.
+      try
+        var _weiDir92:=System.IO.Path.GetDirectoryName(System.Reflection.Assembly.GetEntryAssembly().Location);
+        var _weiPath92:=System.IO.Path.Combine(_weiDir92, 'WeifenLuo.WinFormsUI.Docking.dll');
+        if System.IO.File.Exists(_weiPath92) then
+        begin
+          var _weiAsm92:=System.Reflection.Assembly.LoadFile(_weiPath92);
+          fLoadedAssemblies.Add(_weiAsm92);
+        end;
+      except
+      end;
     end;
 
     // WPF는 'PresentationFramework','PresentationCore','WindowsBase' (GAC),

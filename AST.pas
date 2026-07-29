@@ -150,7 +150,8 @@ type
   TNewObjectExprNode = class(TExprNode)
   public ClassName: string; IsExternalType: boolean;
     Args: List<TExprNode>; // [Stage 40] new TypeName(args) — 생성자 인자 (없으면 빈 목록)
-    constructor Create(cn: string); begin ClassName:=cn; IsExternalType:=false; Args:=new List<TExprNode>; end;
+    ArraySizeExpr: TExprNode; // [Stage 92] new Type[n](e1,...) — nil이면 일반 생성자
+    constructor Create(cn: string); begin ClassName:=cn; IsExternalType:=false; Args:=new List<TExprNode>; ArraySizeExpr:=nil; end;
   end;
 
   // c.GetValue, c.Init(10) → 인스턴스 메서드 호출 (반환값 있음 → 식)

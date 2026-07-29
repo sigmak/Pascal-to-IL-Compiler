@@ -22,7 +22,8 @@ uses
 const
   DefaultExampleDir = 'Examples';
   
-  DefaultExampleFile = 'uAboutBox.pas'; // [Stage 91]
+  DefaultExampleFile = 'fChild.pas'; // [Stage 92]
+  //DefaultExampleFile = 'uAboutBox.pas'; // [Stage 91]
   //DefaultExampleFile = 'uTest.pas'; // [Stage 90]
   //DefaultExampleFile = 'Test_stage89.pas'; // [Stage 89]
   //DefaultExampleFile = 'Test_stage88c.pas'; // [Stage 88c]
@@ -701,6 +702,15 @@ begin
         totalTokenCount := totalTokenCount + fileTokens.Count;
         foreach var rd in fileLexer.ReferenceDirectives do
           if not allReferenceDirectives.Contains(rd) then allReferenceDirectives.Add(rd);
+        // [Stage 92] uses 절에 WeifenLuo.WinFormsUI.Docking이 있으면
+        // 입력 파일과 같은 디렉토리에서 DLL을 찾아 자동으로 참조 추가한다.
+        if fileSrc.Contains('WeifenLuo.WinFormsUI.Docking') then
+        begin
+          var _srcDir92 := System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(filePath));
+          var _dllPath92 := System.IO.Path.Combine(_srcDir92, 'WeifenLuo.WinFormsUI.Docking.dll');
+          if System.IO.File.Exists(_dllPath92) and not allReferenceDirectives.Contains(_dllPath92) then
+            allReferenceDirectives.Add(_dllPath92);
+        end;
         // [Stage 69] apptype은 파일마다 다를 수 있으니 나중 파일(=entry, 목록의 마지막) 값이 우선하도록 덮어쓴다.
         if fileLexer.AppTypeDirective<>'' then entryAppType := fileLexer.AppTypeDirective;
 
