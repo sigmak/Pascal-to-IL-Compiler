@@ -22,7 +22,8 @@ uses
 const
   DefaultExampleDir = 'Examples';
   
-  DefaultExampleFile = 'fChild.pas'; // [Stage 92]
+  DefaultExampleFile = 'uMain.pas'; // [Stage 93]
+  //DefaultExampleFile = 'fChild.pas'; // [Stage 92]
   //DefaultExampleFile = 'uAboutBox.pas'; // [Stage 91]
   //DefaultExampleFile = 'uTest.pas'; // [Stage 90]
   //DefaultExampleFile = 'Test_stage89.pas'; // [Stage 89]
@@ -352,6 +353,37 @@ begin
   Result := sb.ToString;
 end;
 
+// [Stage 94] {$reference X.dll} 지시문(및 WeifenLuo.WinFormsUI.Docking 자동 감지)로 모은
+// 어셈블리를, CodeGen이 실제로 등록하기(전체 파일 파싱이 다 끝난 뒤, GenerateExe 직전)보다
+// 먼저 이 프로세스의 AppDomain에 미리 로드해 둔다. 이게 없으면 Parser의 Stage 87
+// 필드/변수 타입 해석(uses 절 네임스페이스 + AppDomain.CurrentDomain.GetAssemblies() 탐색)이
+// 파싱 도중에는 그 어셈블리가 아직 로드되지 않은 상태라 "DockPanel" 같은 타입을 "타입이
+// 와야 합니다" 에러로 못 찾는다 — 실제 파일에 도달해서 codegen.AddReferenceAssembly가
+// 불릴 때는 이미 너무 늦다(파싱은 그 전에 다 끝나 있으므로). 여기서는 실패해도 조용히
+// 넘어간다 — 정식 등록과 강명(Version/Culture/PublicKeyToken) 재시도는 CodeGen의
+// AddReferenceAssembly가 나중에 그대로 담당한다.
+procedure TryEarlyLoadAssembly(nameOrPath: string);
+var shortName: string;
+begin
+  try
+    if nameOrPath.ToLower.EndsWith('.dll') then
+    begin
+      shortName := nameOrPath.Substring(0, nameOrPath.Length - 4);
+      try
+        System.Reflection.Assembly.Load(shortName);
+      except
+        try
+          System.Reflection.Assembly.LoadFrom(nameOrPath);
+        except
+        end;
+      end;
+    end
+    else
+      System.Reflection.Assembly.LoadFrom(nameOrPath);
+  except
+  end;
+end;
+
 function StripCommentsForUsesScan(sourceCode: string): string;
 var
   sb: System.Text.StringBuilder;
@@ -392,9 +424,19 @@ begin
   // 경우 = 진짜 다중 파일 링크의 기본 시나리오). unit은 "unit Name; interface uses ...;"
   // 형태라 program/library와 달리 ';' 대신 'interface' 키워드가 uses 앞에 낀다 — 있어도
   // 없어도 매치되도록 선택적으로 허용한다.
+  // [Stage 94 버그 수정] 이 프로젝트의 실제 소스는 관례상 "Unit uMain;"처럼 키워드를
+  // 대문자로 시작한다(Program/Unit/Uses 전부 마찬가지). 그런데 이 정규식은 IgnoreCase
+  // 없이 소문자 'program|library|unit'/'uses'만 매치했다 — 그래서 uMain.pas처럼
+  // "Unit uMain; interface uses fChild, uAboutBox, ...;"인 파일은 정규식 자체가
+  // 매치 실패(m.Success=false)해서 uses 이름을 단 하나도 못 뽑고 그냥 조용히 exit해
+  // 버렸다. 그 결과 fChild/uAboutBox/uVisualStates/... 전부 "로컬 유닛 아님"으로
+  // 처리되어 파서가 이 타입들을 하나도 몰라 "타입이 와야 합니다" 에러가 난 것이다.
+  // (uAboutBox.pas 등 이전 파일들은 uses에 로컬 유닛이 없어서 이 버그가 우연히
+  //  드러나지 않았을 뿐이다.)
   m := System.Text.RegularExpressions.Regex.Match(scanSrc,
     '\b(program|library|unit)\s+\w+\s*;\s*(?:interface\s+)?uses\s+(.*?);',
-    System.Text.RegularExpressions.RegexOptions.Singleline);
+    System.Text.RegularExpressions.RegexOptions.Singleline or
+    System.Text.RegularExpressions.RegexOptions.IgnoreCase);
   if not m.Success then exit;
   raw := m.Groups[2].Value;
   parts := raw.Split(',');
@@ -662,7 +704,27 @@ begin
           Writeln('    ' + (oi + 1).ToString + '. ' + System.IO.Path.GetFileName(compileOrder[oi]));
       end
       else
+      begin
         Writeln('[유닛탐색] 로컬 유닛 의존성 없음 — 단일 파일 컴파일');
+        // [Stage 94] 진단: 왜 하나도 못 찾았는지 바로 보이도록, uses 절에서 뽑아낸 이름과
+        // 그 이름을 실제로 어느 폴더에서 찾아봤는지/찾았는지를 그대로 출력한다. 이게 있으면
+        // "파일을 넣었는데도 안 잡힌다"는 상황에서 원인(폴더 위치, 파일명 오타/불일치 등)이
+        // 바로 로그에 드러난다.
+        var _diagSrc94 := System.IO.File.ReadAllText(inputPath, Encoding.UTF8);
+        var _diagNames94 := ExtractUsesNames(_diagSrc94);
+        if _diagNames94.Count>0 then
+        begin
+          Writeln('  (진단) uses 절에서 뽑은 이름별 파일 탐색 결과:');
+          foreach var _dn94 in _diagNames94 do
+          begin
+            var _dp94 := ResolveUnitFile(_dn94, unitSearchDirs);
+            if _dp94<>'' then
+              Writeln('    - ' + _dn94 + ' → 찾음: ' + _dp94)
+            else
+              Writeln('    - ' + _dn94 + ' → 못 찾음 (검색 폴더: ' + string.Join(' | ', unitSearchDirs) + ')');
+          end;
+        end;
+      end;
       Writeln;
     except
       on E: Exception do
@@ -701,15 +763,31 @@ begin
         var fileTokens := fileLexer.Tokenize;
         totalTokenCount := totalTokenCount + fileTokens.Count;
         foreach var rd in fileLexer.ReferenceDirectives do
-          if not allReferenceDirectives.Contains(rd) then allReferenceDirectives.Add(rd);
+          if not allReferenceDirectives.Contains(rd) then
+          begin
+            allReferenceDirectives.Add(rd);
+            TryEarlyLoadAssembly(rd); // [Stage 94] Parser가 이 파일을 파싱하기 전에 미리 로드
+          end;
         // [Stage 92] uses 절에 WeifenLuo.WinFormsUI.Docking이 있으면
         // 입력 파일과 같은 디렉토리에서 DLL을 찾아 자동으로 참조 추가한다.
+        // [Stage 97 버그 수정] 이전에는 정확히 "WeifenLuo.WinFormsUI.Docking.dll" 파일 하나만
+        // 찾았다. 그런데 이 라이브러리는 VS2005Theme/VS2015DarkTheme 같은 테마 클래스를
+        // 메인 dll이 아니라 "WeifenLuo.WinFormsUI.Docking.ThemeVS2005.dll",
+        // "WeifenLuo.WinFormsUI.Docking.ThemeVS2005Multithreading.dll" 같은 별도 dll에
+        // 나눠 담아 배포한다 — 그래서 "new VS2005Theme" 같은 코드는 메인 dll만 등록해서는
+        // "외부 타입 VS2005Theme을(를) 찾을 수 없습니다"로 계속 실패한다. 같은 폴더에서
+        // "WeifenLuo.WinFormsUI.Docking*.dll" 패턴에 맞는 파일을 전부(메인+테마들) 찾아
+        // 등록하도록 넓혔다.
         if fileSrc.Contains('WeifenLuo.WinFormsUI.Docking') then
         begin
           var _srcDir92 := System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(filePath));
-          var _dllPath92 := System.IO.Path.Combine(_srcDir92, 'WeifenLuo.WinFormsUI.Docking.dll');
-          if System.IO.File.Exists(_dllPath92) and not allReferenceDirectives.Contains(_dllPath92) then
-            allReferenceDirectives.Add(_dllPath92);
+          if System.IO.Directory.Exists(_srcDir92) then
+            foreach var _dllPath92 in System.IO.Directory.GetFiles(_srcDir92, 'WeifenLuo.WinFormsUI.Docking*.dll') do
+              if not allReferenceDirectives.Contains(_dllPath92) then
+              begin
+                allReferenceDirectives.Add(_dllPath92);
+                TryEarlyLoadAssembly(_dllPath92); // [Stage 94] 위와 동일한 이유로 미리 로드
+              end;
         end;
         // [Stage 69] apptype은 파일마다 다를 수 있으니 나중 파일(=entry, 목록의 마지막) 값이 우선하도록 덮어쓴다.
         if fileLexer.AppTypeDirective<>'' then entryAppType := fileLexer.AppTypeDirective;

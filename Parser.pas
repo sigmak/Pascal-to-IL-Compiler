@@ -185,6 +185,30 @@ type
 
     function Cur: TToken; begin Result:=fTokens[fPos]; end;
 
+    // [Stage 94] ParseTypeName(필드/변수 선언 타입, Stage 87)이 쓰는 것과 같은 방식으로 —
+    // uses 절에 나열된 네임스페이스들 + 이미 로드된 어셈블리 목록에서 name이 실제로 어떤
+    // 타입으로 존재하는지 찾는다. 식(expression) 위치에서 "TabControl(sender)"처럼 우리가
+    // 미리 알 수 없는(사용자 함수도 로컬 클래스도 아닌) 외부 타입 이름으로의 캐스트를
+    // 인식하는 데 재사용한다. 찾으면 fullName에 "네임스페이스.타입이름"을 채우고 true.
+    function TryResolveExternalTypeByUses(name: string; var fullName: string): boolean;
+    var _ns93: string; _full93: string; _t93: System.Type; _asm93: System.Reflection.Assembly;
+    begin
+      fullName:='';
+      foreach _ns93 in fImportedNamespaces do
+      begin
+        _full93:=_ns93+'.'+name;
+        try
+          _t93:=System.Type.GetType(_full93);
+          if _t93=nil then
+            foreach _asm93 in System.AppDomain.CurrentDomain.GetAssemblies() do
+            begin _t93:=_asm93.GetType(_full93); if _t93<>nil then break; end;
+          if _t93<>nil then begin fullName:=_full93; break; end;
+        except
+        end;
+      end;
+      Result:=fullName<>'';
+    end;
+
     // [Stage 70] LINQ 스타일 확장 메서드 체이닝(Source.Where(...).Select(...) 등) 인식을 위해
     // 현재 위치에서 offset만큼 앞선 토큰을 소비 없이 미리 본다. 범위를 벗어나면 마지막 토큰
     // (항상 tkEOF여야 함 — Lexer가 토큰 스트림 끝에 EOF를 붙여 둔다는 기존 전제를 그대로 따름)을 돌려준다.
@@ -757,6 +781,7 @@ type
     function ParsePrimary: TExprNode;
     var t: TToken; inner, argE, idxE: TExprNode;
         cn: TFuncCallExprNode; mc: TMethodCallExprNode;
+        extCastFull93: string;
     begin
       t:=Cur;
 
@@ -911,7 +936,29 @@ type
             +'"는 new로 생성할 수 없습니다 — 변수 선언만으로 이미 필드가 기본값(0/빈 문자열 등)으로 초기화됩니다');
         var neoN:=new TNewObjectExprNode(newTn);
         neoN.IsExternalType:=not fClassNames.Contains(newTn);
-        if Cur.Kind=tkLParen then
+        if Cur.Kind=tkLBracket then
+        begin
+          // [Stage 92] new Type[SizeExpr](item1, item2, ...) — 배열 생성(+ 선택적 초기화 목록).
+          // WinForms 디자이너가 흔히 내보내는
+          // "new System.Windows.Forms.ToolStripItem[9](a, b, ..., i)" 패턴. CodeGen(EmitExpr의
+          // TNewObjectExprNode 처리)은 이미 ArraySizeExpr/Args를 보고 Newarr+Stelem을 내는
+          // 지원이 있었지만, Parser가 이 문법 자체를 인식 못 해 '['를 만나면 곧장
+          // "예상 tkRParen 실제 tkLBracket"으로 실패하고 있었다.
+          fPos:=fPos+1; // '[' 소비
+          neoN.ArraySizeExpr:=ParseExpr;
+          Expect(tkRBracket);
+          if Cur.Kind=tkLParen then
+          begin
+            fPos:=fPos+1;
+            if Cur.Kind<>tkRParen then
+            begin
+              neoN.Args.Add(ParseExpr);
+              while Cur.Kind=tkComma do begin fPos:=fPos+1; neoN.Args.Add(ParseExpr); end;
+            end;
+            Expect(tkRParen);
+          end;
+        end
+        else if Cur.Kind=tkLParen then
         begin
           fPos:=fPos+1;
           if Cur.Kind<>tkRParen then
@@ -1231,6 +1278,20 @@ type
           var castArgDirect92:=ParseExpr;
           Expect(tkRParen);
           Result:=new TExternalCastExprNode(t.Text, castArgDirect92);
+        end
+
+        // [Stage 94] TabControl(sender) 같은, 원시 타입이 아닌 임의의 외부(.NET) 타입으로의
+        // 캐스트. byte(204)와 같은 문제이지만 대상이 프로젝트가 미리 알 수 없는(화이트리스트로
+        // 못 채우는) 외부 클래스 이름이라, uses 절 네임스페이스 + 이미 로드된 어셈블리에서
+        // 실제로 그 이름의 타입이 존재하는지 찾아본다(ParseTypeName의 Stage 87과 동일한 방식).
+        // 사용자 함수/로컬 클래스 이름과 겹치면 그쪽을 우선한다.
+        else if (Cur.Kind=tkLParen) and (not fFuncNames.Contains(t.Text)) and (not fClassNames.Contains(t.Text))
+                and TryResolveExternalTypeByUses(t.Text, extCastFull93) then
+        begin
+          fPos:=fPos+1; // '(' 소비
+          var castArgExt94:=ParseExpr;
+          Expect(tkRParen);
+          Result:=new TExternalCastExprNode(extCastFull93, castArgExt94);
         end
 
         // [Stage 93] 괄호 없이 부른 인자 0개 표준 라이브러리 함수 — 예: GetCurrentDir;
@@ -3586,10 +3647,15 @@ type
           end;
         end
         else begin vt:=ParseVarType; if (vt=vtEnum) or (vt=vtSet) or (vt=vtMatrix) then cn:=fLastGenericName; end; // [Stage 67]
+        // [Stage 93] "Name: Type := expr;" — 전역 var 초기화식 (예: visualStates: VisualStates := new VisualStates();)
+        var giveInit93: TExprNode := nil;
+        if Cur.Kind=tkAssign then begin fPos:=fPos+1; giveInit93:=ParseExpr; end;
         Expect(tkSemicolon);
         foreach var nm in ns do
         begin
-          aProg.VarDecls.Add(new TVarDecl(nm, vt, cn, isExt));
+          var vd93:=new TVarDecl(nm, vt, cn, isExt);
+          vd93.InitExpr:=giveInit93; // 이름이 여러 개(a, b: T := expr;)면 각자 같은 초기화식을 공유
+          aProg.VarDecls.Add(vd93);
           if (vt=vtIntArray) or (vt=vtStrArray) then fArrayNames.Add(nm);
           if vt=vtMatrix then begin if not fArrayNames.Contains(nm) then fArrayNames.Add(nm); end; // [Stage 67]
         end;
@@ -3877,9 +3943,20 @@ type
         end;
       end;
 
-      // 클래스 메서드 구현 또는 일반 함수/프로시저
-      while (Cur.Kind=tkFunction) or (Cur.Kind=tkProcedure) or (Cur.Kind=tkConstructor) or (Cur.Kind=tkOperator) do
+      // [Stage 92 버그 수정] 클래스 메서드 구현/일반 함수·프로시저/생성자/연산자와 var/const 섹션은
+      // 순서 상관없이 얼마든지 번갈아 나올 수 있다(예: var 섹션이 맨 앞에 한 번 나오고 그 뒤에
+      // 여러 procedure 구현부가 이어지는 경우). 예전에는 이 둘이 별도의 while 루프였는데, 첫 번째
+      // 루프(함수/프로시저)가 "한 번 끝나면 다신 안 돌아오는" 구조라 var 섹션이 함수/프로시저보다
+      // 먼저 나오면 그 뒤에 남은 함수/프로시저 구현부들을 통째로 못 읽고 곧장 "end."을 기대하다
+      // "예상 tkEnd 실제 tkProcedure" 에러로 이어졌다. 하나의 루프로 합쳐서 매 반복마다 어느 쪽이든
+      // 올 수 있게 한다.
+      while (Cur.Kind=tkFunction) or (Cur.Kind=tkProcedure) or (Cur.Kind=tkConstructor) or (Cur.Kind=tkOperator)
+            or (Cur.Kind=tkVar) or (Cur.Kind=tkConst) do
       begin
+        if Cur.Kind=tkVar then ParseVarSection(prog)
+        else if Cur.Kind=tkConst then ParseConstSection(prog)
+        else
+        begin
         // [Phase 2] 함수/프로시저/메서드/생성자 구현 하나가 깨져도 전체를 멈추지 않고
         // 오류를 모은 뒤 다음 구현부(또는 var/begin) 자리로 건너뛰어 계속한다.
         var implStartPos:=fPos;
@@ -3949,12 +4026,7 @@ type
             end;
           end;
         end;
-      end;
-
-      // [Stage 61] var/const 섹션은 순서 상관없이 번갈아 나올 수 있다.
-      while (Cur.Kind=tkVar) or (Cur.Kind=tkConst) do
-      begin
-        if Cur.Kind=tkVar then ParseVarSection(prog) else ParseConstSection(prog);
+        end;
       end;
 
       // [Stage 44] library는 begin...end 초기화 블록이 없을 수 있다 — 디자이너가 생성하는

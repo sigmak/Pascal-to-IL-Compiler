@@ -739,10 +739,12 @@ type
     // [Stage 41] VarType=vtObject일 때만 의미 있음. true면 ClassName이 점(.)으로 연결된
     // 외부 .NET 타입 이름(예: System.Text.StringBuilder) — TParamDef.IsExternal과 동일한 역할.
     IsExternal: boolean;
+    // [Stage 93] "Name: Type := expr;" 형태의 전역 var 초기화식. nil이면 초기화 없음(기존과 동일).
+    InitExpr: TExprNode;
     constructor Create(n: string; t: TVarType; cn: string); overload;
-    begin Name:=n; VarType:=t; ClassName:=cn; IsExternal:=false; end;
+    begin Name:=n; VarType:=t; ClassName:=cn; IsExternal:=false; InitExpr:=nil; end;
     constructor Create(n: string; t: TVarType; cn: string; isExt: boolean); overload;
-    begin Name:=n; VarType:=t; ClassName:=cn; IsExternal:=isExt; end;
+    begin Name:=n; VarType:=t; ClassName:=cn; IsExternal:=isExt; InitExpr:=nil; end;
   end;
 
   // [Stage 61] const 선언 (전역/지역). "const Name = 식;" 형태는 식으로부터 타입을 추론하고

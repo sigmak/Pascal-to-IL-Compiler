@@ -1319,23 +1319,28 @@ type
         // TCounter.Create / new TCounter / new System.IO.FileStream(a,b,c) → Newobj
         // (지역 클래스 또는 외부 타입 모두 지원. [Stage 40] 인자 있는 외부 생성자 추가)
         neo:=TNewObjectExprNode(e);
-        // [Stage 92] new Type[n](e1, e2, ...) — 배열 리터럴
-        if neo.ArraySizeExpr <> nil then
+        if neo.ArraySizeExpr<>nil then
         begin
-          var _arrElemType92 := ResolveExternalType(neo.ClassName);
-          EmitExpr(aIL, neo.ArraySizeExpr); // 배열 크기를 스택에 push
-          aIL.Emit(OpCodes.Newarr, _arrElemType92);
-          // 요소 초기화: 각 인덱스에 Stelem
-          for var _ai92 := 0 to neo.Args.Count-1 do
+          // [Stage 96 버그 수정] new Type[N](e1,...,eN) — 배열 생성 리터럴. Stage 92에서
+          // Parser는 이 문법(ArraySizeExpr)을 인식하도록 고쳐졌지만 CodeGen 쪽은
+          // ArraySizeExpr를 아예 확인하지 않고 그냥 "생성자 인자 N개"로 오인해서
+          // N-인자 생성자를 찾다가 실패했다 — WinForms 디자이너가 흔히 내보내는
+          // "new System.Windows.Forms.ToolStripItem[9](a, b, ..., i)"(요소 9개를 그대로
+          // 채운 ToolStripItem[] 배열)에서 실제로 터졌다. Newarr로 배열을 만들고
+          // 인자들을 Stelem으로 채워 넣는다.
+          var _arrElemT96: System.Type;
+          if neo.IsExternalType then _arrElemT96:=ResolveExternalType(neo.ClassName)
+          else if fBuiltTypes.ContainsKey(neo.ClassName) then _arrElemT96:=fBuiltTypes[neo.ClassName]
+          else raise new Exception('배열 원소 타입 "'+neo.ClassName+'"을(를) 찾을 수 없습니다 (new '+neo.ClassName+'[...] 배열 생성).');
+          EmitExpr(aIL, neo.ArraySizeExpr);
+          aIL.Emit(OpCodes.Newarr, _arrElemT96);
+          for var _arrI96:=0 to neo.Args.Count-1 do
           begin
-            aIL.Emit(OpCodes.Dup);                          // 배열 참조 복제
-            aIL.Emit(OpCodes.Ldc_I4, _ai92);               // 인덱스
-            EmitExpr(aIL, neo.Args[_ai92]);                 // 요소 값
-            // 요소 타입에 따라 Stelem 변형 선택
-            if _arrElemType92.IsValueType then
-              aIL.Emit(OpCodes.Stelem, _arrElemType92)
-            else
-              aIL.Emit(OpCodes.Stelem_Ref);
+            aIL.Emit(OpCodes.Dup);
+            aIL.Emit(OpCodes.Ldc_I4, _arrI96);
+            EmitArgForParamType(aIL, neo.Args[_arrI96], _arrElemT96);
+            if _arrElemT96.IsValueType then aIL.Emit(OpCodes.Stelem, _arrElemT96)
+            else aIL.Emit(OpCodes.Stelem_Ref);
           end;
         end
         else if neo.IsExternalType then
@@ -1363,8 +1368,12 @@ type
         begin
           if not fCtorBuilders.ContainsKey(neo.ClassName) then
             raise new Exception('알 수 없는 클래스 "'+neo.ClassName+'"');
+          // [Stage 53] abstract 메서드가 있는 클래스는 인스턴스화할 수 없다. CLR도 런타임에
+          // MemberAccessException으로 막긴 하지만, 실행 시점이 아니라 지금(컴파일 시점)
+          // 알려주는 게 훨씬 낫다.
           if fAbstractMethods.ContainsKey(neo.ClassName) and (fAbstractMethods[neo.ClassName].Count>0) then
             raise new Exception('"'+neo.ClassName+'"은(는) abstract 메서드를 갖고 있어 인스턴스를 생성할 수 없습니다 (abstract 클래스).');
+          // [Stage 47] 로컬(우리 컴파일러가 만든) 클래스도 매개변수 있는 생성자를 지원한다.
           ctor:=fCtorBuilders[neo.ClassName];
           var _ctorParamsLocal: array of System.Type;
           if fCtorParamClrTypes.ContainsKey(neo.ClassName) then _ctorParamsLocal:=fCtorParamClrTypes[neo.ClassName]
@@ -4495,21 +4504,6 @@ type
       else if name='char'                then Result:='System.Char'
       else if (name='bool') or (name='boolean') then Result:='System.Boolean'
       else if name='object'              then Result:='System.Object'
-      // [Stage 92] System.Reflection
-      else if name='Assembly'                  then Result:='System.Reflection.Assembly'
-      // [Stage 92] WeifenLuo.WinFormsUI.Docking 단축 이름
-      else if name='DockContent'               then Result:='WeifenLuo.WinFormsUI.Docking.DockContent'
-      else if name='DockPanel'                 then Result:='WeifenLuo.WinFormsUI.Docking.DockPanel'
-      else if name='DockState'                 then Result:='WeifenLuo.WinFormsUI.Docking.DockState'
-      else if name='DockAreas'                 then Result:='WeifenLuo.WinFormsUI.Docking.DockAreas'
-      else if name='DockAlignment'             then Result:='WeifenLuo.WinFormsUI.Docking.DockAlignment'
-      else if name='VS2005Theme'               then Result:='WeifenLuo.WinFormsUI.Docking.VS2005Theme'
-      else if name='VS2003Theme'               then Result:='WeifenLuo.WinFormsUI.Docking.VS2003Theme'
-      else if name='VS2012LightTheme'          then Result:='WeifenLuo.WinFormsUI.Docking.VS2012LightTheme'
-      else if name='VS2013LightTheme'          then Result:='WeifenLuo.WinFormsUI.Docking.VS2013LightTheme'
-      else if name='VS2015DarkTheme'           then Result:='WeifenLuo.WinFormsUI.Docking.VS2015DarkTheme'
-      else if name='VS2015LightTheme'          then Result:='WeifenLuo.WinFormsUI.Docking.VS2015LightTheme'
-      else if name='VS2015BlueTheme'           then Result:='WeifenLuo.WinFormsUI.Docking.VS2015BlueTheme'
       else Result:=name;
     end;
 
@@ -5113,13 +5107,44 @@ type
         else if e is TFieldReadExprNode then
         begin
           var _fnm90:=TFieldReadExprNode(e).FieldName;
-          if TryFindFieldBuilder(fCurClassName, _fnm90, _fb90) then Result:=_fb90.FieldType;
+          if TryFindFieldBuilder(fCurClassName, _fnm90, _fb90) then Result:=_fb90.FieldType
+          else
+          begin
+            // [Stage 95 버그 수정] ClientSize처럼 자기 클래스가 직접 선언한 필드가 아니라
+            // 외부 상속 타입(Form → ScrollableControl → Control 등)의 프로퍼티/필드일 때
+            // 폴백이 없어서 함수 맨 위의 기본값 System.Object로 그냥 떨어졌다. 그 결과
+            // "self.ClientSize.Height"처럼 체인으로 이어지는 바깥쪽 .Height가 System.Object
+            // 위에서 Height를 찾다가 "타입 System.Object에 멤버 Height가 없습니다"로 터졌다.
+            // IsChainStartSegment/EmitQualifierChainLoad가 이미 쓰는 것과 같은
+            // FindExternalAncestorType 폴백을 여기도 추가한다.
+            var _extAnc90:=FindExternalAncestorType(fCurClassName);
+            if _extAnc90<>nil then
+            begin
+              var _extPi90:=SafeGetProperty(_extAnc90, _fnm90);
+              if _extPi90<>nil then Result:=_extPi90.PropertyType
+              else
+              begin
+                var _extFi90:=_extAnc90.GetField(_fnm90);
+                if _extFi90<>nil then Result:=_extFi90.FieldType;
+              end;
+            end;
+          end;
         end
         else if e is TNewObjectExprNode then
         begin
           var _no90:=TNewObjectExprNode(e);
-          if _no90.IsExternalType then Result:=ResolveExternalType(_no90.ClassName)
-          else if fBuiltTypes.ContainsKey(_no90.ClassName) then Result:=fBuiltTypes[_no90.ClassName];
+          var _no90ElemT: System.Type;
+          if _no90.IsExternalType then _no90ElemT:=ResolveExternalType(_no90.ClassName)
+          else if fBuiltTypes.ContainsKey(_no90.ClassName) then _no90ElemT:=fBuiltTypes[_no90.ClassName]
+          else _no90ElemT:=nil;
+          if _no90ElemT<>nil then
+          begin
+            // [Stage 96] new Type[N](...)는 원소 타입이 아니라 배열 타입(Type[])을 낳는다 —
+            // TChainedMemberExprNode 등이 이 노드를 Inner로 삼아 체인을 이어갈 때
+            // (예: new T[N](...).Length) 잘못된 타입으로 멤버를 찾지 않도록 한다.
+            if _no90.ArraySizeExpr<>nil then Result:=_no90ElemT.MakeArrayType()
+            else Result:=_no90ElemT;
+          end;
         end
         else if e is TStrLiteralNode then Result:=typeof(string)
         else if e is TIntLiteralNode then Result:=typeof(integer)
@@ -5260,6 +5285,32 @@ type
         var localFb85: FieldBuilder := fFieldBuilders[localClsName85][memberName];
         EmitArgForParamType(aIL, valueExpr, localFb85.FieldType);
         aIL.Emit(OpCodes.Stfld, localFb85);
+      end
+      else if (localClsName85<>'') and (FindExternalAncestorType(localClsName85)<>nil) then
+      begin
+        // [Stage 98 버그 수정] targetType이 아직 CreateType되지 않은 로컬 TypeBuilder인데
+        // memberName이 그 클래스가 직접 선언한 setter/필드가 아니라 외부 상속 타입(예:
+        // FormChild : Form → Control의 Text)에서 물려받은 프로퍼티/필드인 경우 —
+        // 위의 두 분기 모두 못 찾고 예전에는 곧장 targetType(TypeBuilder) 위에서
+        // GetProperty를 불렀는데, TypeBuilder는 CreateType 전까지 리플렉션 조회 자체를
+        // 지원하지 않아 "The invoked member is not supported in a dynamic module"으로
+        // 터졌다. 외부 조상 타입 쪽에서 프로퍼티/필드를 찾고, 그 setter를 (가상 디스패치라
+        // 인스턴스의 실제 런타임 타입과 무관하게 동작하는) Callvirt로 호출하면 된다.
+        var _ancT98:=FindExternalAncestorType(localClsName85);
+        var _ancPi98:=SafeGetProperty(_ancT98, memberName);
+        if (_ancPi98<>nil) and (_ancPi98.GetSetMethod<>nil) then
+        begin
+          EmitArgForParamType(aIL, valueExpr, _ancPi98.PropertyType);
+          aIL.Emit(OpCodes.Callvirt, _ancPi98.GetSetMethod);
+        end
+        else
+        begin
+          var _ancFi98:=_ancT98.GetField(memberName);
+          if _ancFi98=nil then
+            raise new Exception('타입 "'+localClsName85+'"(및 조상 "'+_ancT98.FullName+'")에 필드/속성 "'+memberName+'"가 없습니다.');
+          EmitArgForParamType(aIL, valueExpr, _ancFi98.FieldType);
+          aIL.Emit(OpCodes.Stfld, _ancFi98);
+        end;
       end
       else
       begin
@@ -6546,19 +6597,6 @@ type
          'WindowsBase','WindowsBase, Version=4.0.0.0, Culture=neutral, PublicKeyToken=31bf3856ad364e35',
          'System.Xaml','System.Xaml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'];
       fFailedAutoLoads:=new HashSet<string>;
-      // [Stage 92] WeifenLuo.WinFormsUI.Docking — 로컬 DLL을 실행 경로에서 로드.
-      // GAC에 없으므로 Assembly.LoadFile로 직접 경로 지정.
-      // fAutoAssemblyMap은 GAC 전용이라 여기서 직접 로드한다.
-      try
-        var _weiDir92:=System.IO.Path.GetDirectoryName(System.Reflection.Assembly.GetEntryAssembly().Location);
-        var _weiPath92:=System.IO.Path.Combine(_weiDir92, 'WeifenLuo.WinFormsUI.Docking.dll');
-        if System.IO.File.Exists(_weiPath92) then
-        begin
-          var _weiAsm92:=System.Reflection.Assembly.LoadFile(_weiPath92);
-          fLoadedAssemblies.Add(_weiAsm92);
-        end;
-      except
-      end;
     end;
 
     // WPF는 'PresentationFramework','PresentationCore','WindowsBase' (GAC),

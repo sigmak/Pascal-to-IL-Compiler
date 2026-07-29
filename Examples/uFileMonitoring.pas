@@ -1,9 +1,7 @@
-unit uFileMonitoring;
+﻿unit uFileMonitoring;
 
 interface
-
 uses System;
-
 type
   FileChangeWatcher = class(IDisposable)
   private
@@ -12,22 +10,26 @@ type
     activeWatchers: Dictionary<FileChangeWatcher, FileChangeWatcher>;
     wasChangedExternally: boolean;
     FEnabled: boolean;
+    
     procedure SetEnabled(Value: boolean); // SetEnabled 메서드 선언
+    
     procedure SetWatcher;
     procedure OnFileChangedEvent(sender: object; e: System.IO.FileSystemEventArgs);
     //procedure showChangedFileMessage; //2024.10.06 일단주석 나중에 수정예정
     //procedure MainForm_Activated(sender: object; e: EventArgs); //2024.10.06 일단주석 나중에 수정예정
+    
   public
     constructor Create(path: string);
     procedure Dispose;
     property Enabled: boolean read FEnabled write SetEnabled;
+    
   end;
 
 implementation
 
 constructor FileChangeWatcher.Create(path: string);
 begin
-  //VisualPABCSingleton.MainForm.Activated += MainForm_Activated; // 2024.10.06 주석 처리 나중에 수정예정
+  //VisualPABCSingleton.MainForm.Activated += MainForm_Activated;  // 2024.10.06 주석 처리 나중에 수정예정
   fileName := path;
   activeWatchers := new Dictionary<FileChangeWatcher, FileChangeWatcher>;
   activeWatchers.Add(self, self);
@@ -59,7 +61,7 @@ begin
 
   if not FEnabled then
     exit;
-
+    
   try
     if watcher = nil then
     begin
@@ -93,19 +95,21 @@ procedure FileChangeWatcher.showChangedFileMessage;
 var
   mes: string;
 begin
+  
   if not System.IO.File.Exists(fileName) then
   begin
     mes := Form1StringResources.Get('FILE_NOT_EXIST_MESSAGE');
-    if MessageBox.Show(fileName + #10#10 + mes, Form1StringResources.Get('CHANGED_FILE'),
-      MessageBoxButtons.YesNo, MessageBoxIcon.Question) = DialogResult.Yes then
+    if MessageBox.Show(fileName + #10#10 + mes, Form1StringResources.Get('CHANGED_FILE'), 
+                       MessageBoxButtons.YesNo, MessageBoxIcon.Question) = DialogResult.Yes then
       WorkbenchServiceFactory.FileService.SetFileAsChanged(fileName)
     else
       WorkbenchServiceFactory.FileService.CloseFile(fileName);
     exit;
   end;
+
   mes := Form1StringResources.Get('FILE_CHANGED_MESSAGE');
-  if MessageBox.Show(fileName + #10#10 + mes, Form1StringResources.Get('CHANGED_FILE'),
-    MessageBoxButtons.YesNo, MessageBoxIcon.Question) = DialogResult.Yes then
+  if MessageBox.Show(fileName + #10#10 + mes, Form1StringResources.Get('CHANGED_FILE'), 
+                     MessageBoxButtons.YesNo, MessageBoxIcon.Question) = DialogResult.Yes then
     WorkbenchServiceFactory.FileService.ReloadFile(fileName)
   else
     WorkbenchServiceFactory.FileService.SetFileAsChanged(fileName);
@@ -124,5 +128,4 @@ begin
   end;
 end;
 }
-
 end.

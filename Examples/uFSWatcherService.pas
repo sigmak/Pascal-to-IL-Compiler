@@ -1,8 +1,8 @@
-unit uFSWatcherService;
+﻿unit uFSWatcherService;
 
 interface
 
-uses uFileMonitoring;
+uses uFileMonitoring; 
 
 {
 type
@@ -14,13 +14,13 @@ type
     procedure Dispose;
     property Enabled: boolean read FEnabled write FEnabled;
   end;
-//---------------------------------------
+//---------------------------------------  
 }
-
 type
   FSWatcherService = class
   private
     watchers: Dictionary<string, FileChangeWatcher>;
+  
   public
     constructor Create;
     procedure AddWatcher(FileName: string);
@@ -30,20 +30,17 @@ type
   end;
 
 implementation
-
 {
 constructor FileChangeWatcher.Create(FileName: string);
 begin
   // 컴파일 에러 때문에 일단 작성, 차후 수정예정
 end;
-
 procedure FileChangeWatcher.Dispose;
 begin
   // 컴파일 에러 때문에 일단 작성, 차후 수정예정
 end;
 }
 //---------------------------------------
-
 constructor FSWatcherService.Create;
 begin
   watchers := new Dictionary<string, FileChangeWatcher>;
@@ -98,5 +95,4 @@ begin
     // 예외 처리
   end;
 end;
-
 end.
