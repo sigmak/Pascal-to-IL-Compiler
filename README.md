@@ -33,3 +33,11 @@ Main.pas     진입점. TestSource 문자열 + 실행 로직만 남김.
 
 Stage 완료 시점마다 커밋 + 태그.
 
+-------------------------------------------------------------------------
+활용하거나 활용될 pascal wpf xaml Designer 사용된 개발툴 및 컨트롤 들
+
+1) PascalABC.net : https://pascalabc.net/en/
+2) WpfDesigner : https://www.nuget.org/api/v2/package/ICSharpCode.WpfDesigner/8.1.56
+3) AvalonEdit : https://www.nuget.org/packages/AvalonEdit/6.3.1.120
+4) DockPanelSuite : https://www.nuget.org/api/v2/package/DockPanelSuite/3.1.0
+5) DockPanelSuite.ThemeVS2015 : https://www.nuget.org/packages/DockPanelSuite.ThemeVS2015/
