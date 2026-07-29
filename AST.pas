@@ -11,7 +11,11 @@ type
   // 변수/식 타입
   // ----------------------------------------------------------
   TVarType = (vtInteger, vtString, vtIntArray, vtStrArray, vtObject, vtInterface, vtBoolean, vtGeneric, vtGenericArray,
-              vtReal, vtChar, vtInt64, vtEnum, vtSet, vtMatrix, vtInferred);
+              vtReal, vtChar, vtInt64, vtEnum, vtSet, vtMatrix, vtInferred, vtObjArray);
+  // [Stage 90] vtObjArray: "array of object" — 요소가 System.Object인 1차원 CLR 배열(object[]).
+  //   .NET 리플렉션 API(예: Assembly.GetCustomAttributes)가 흔히 object[]를 반환/요구하므로,
+  //   vtIntArray/vtStrArray와 동급의 독립 타입으로 둔다(제네릭 단형화용 vtGenericArray와는 무관 —
+  //   저 타입은 "array of T" 템플릿 자리이고, vtObjArray는 처음부터 구체 타입이다).
   // [Stage 68] vtInferred: 람다 매개변수에 타입 명시가 없을 때(예: (sender, e) -> ...)의 임시
   //   placeholder. 실제 CLR 타입은 CodeGen이 델리게이트의 Invoke 시그니처에서 위치별로 가져와
   //   확정한다 — 파서 단계에서는 "타입 미정"이라는 사실만 기록해 둔다.
@@ -240,6 +244,35 @@ type
     constructor Create(p: string; b: TExprNode); begin ParamName:=p; Body:=b; end;
   end;
 
+  // [Stage 91] typeof(TypeName) — .NET typeof 연산자. TypeName은 점(.)으로 연결된 외부 타입
+  // 전체 이름(예: "System.Reflection.AssemblyCopyrightAttribute"). CodeGen은 Ldtoken+
+  // Type.GetTypeFromHandle로 System.Type 값을 만든다.
+  TTypeOfExprNode = class(TExprNode)
+  public TypeName: string;
+    constructor Create(tn: string); begin TypeName:=tn; end;
+  end;
+
+  // [Stage 90] TargetType(InnerExpr) — 외부(.NET) 타입으로의 캐스트. 기존 "TypeName(expr).member"
+  // 패턴은 expr 자리에 단순 변수/필드 이름만 허용했는데(캐스트 대상을 문자열 ObjName으로만
+  // 기억했으므로), attributes[0]처럼 배열 인덱스 등 임의의 식이 캐스트 대상으로 오는 경우를
+  // 지원하지 못했다. 이 노드는 InnerExpr을 그대로 들고 있다가 CodeGen이 Emit 후 Castclass한다 —
+  // TChainedMemberExprNode의 Inner 자리에 넣으면 ".member"로 자연스럽게 이어진다.
+  TExternalCastExprNode = class(TExprNode)
+  public TargetType: string; InnerExpr: TExprNode;
+    constructor Create(tt: string; ie: TExprNode); begin TargetType:=tt; InnerExpr:=ie; end;
+  end;
+
+  // [Stage 90] Inner.MemberName 또는 Inner.MemberName(Args) — 메서드 호출 결과(또는 임의의 식)
+  // 뒤에 계속 이어지는 일반 멤버 접근/메서드 호출. 기존에는 obj.Method(...) 같은 "단순 이름.멤버"
+  // 체인만 파서가 처리할 수 있었고, a.GetName().Version.ToString()처럼 호출 결과 위에 또
+  // 점(.)이 이어지는 패턴은 지원하지 않았다(파서가 다음 토큰으로 tkRParen을 기대하다가 tkDot을
+  // 만나 에러). Inner의 실제 CLR 타입은 CodeGen이 InferExprClrType으로 리플렉션 추론해 멤버를 찾는다.
+  TChainedMemberExprNode = class(TExprNode)
+  public Inner: TExprNode; MemberName: string; IsCall: boolean; Args: List<TExprNode>;
+    constructor Create(inn: TExprNode; m: string; isC: boolean);
+    begin Inner:=inn; MemberName:=m; IsCall:=isC; Args:=new List<TExprNode>; end;
+  end;
+
   // [Stage 70] Source.MethodName(...)  형태의 LINQ 스타일 확장 메서드 호출.
   // MethodName은 'Where'/'Select'/'Sum'/'Count'/'ToArray' 중 하나로 제한한다(1차 제약).
   // Where/Select는 Lambda가 필수(각각 predicate/selector), Sum/Count/ToArray는 Lambda=nil(인자 없음).
@@ -264,6 +297,14 @@ type
   TWritelnStringStmtNode = class(TStmtNode)
   public Text: string;
     constructor Create(t: string); begin Text:=t; end;
+  end;
+
+  // [Stage 90] writeln(a, b, c, ...) — 표준 Pascal처럼 여러 인자를 콤마로 받아 순서대로 이어붙여
+  // 출력하고 마지막에 줄바꿈한다. 기존 TWritelnExprStmtNode(인자 1개)는 그대로 남겨 단일 인자
+  // 경로를 건드리지 않고, 인자가 2개 이상일 때만 이 노드를 쓴다.
+  TWritelnArgsStmtNode = class(TStmtNode)
+  public Args: List<TExprNode>;
+    constructor Create; begin Args:=new List<TExprNode>; end;
   end;
 
   // [Stage 75] Readln; 또는 Readln(변수); — 콘솔에서 한 줄 입력을 기다린다.

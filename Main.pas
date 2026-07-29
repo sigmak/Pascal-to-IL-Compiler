@@ -22,7 +22,8 @@ uses
 const
   DefaultExampleDir = 'Examples';
   
-  DefaultExampleFile = 'uTest.pas'; // [Stage 90]
+  DefaultExampleFile = 'uAboutBox.pas'; // [Stage 91]
+  //DefaultExampleFile = 'uTest.pas'; // [Stage 90]
   //DefaultExampleFile = 'Test_stage89.pas'; // [Stage 89]
   //DefaultExampleFile = 'Test_stage88c.pas'; // [Stage 88c]
   //DefaultExampleFile = 'uVisualStates.pas'; // [Stage 88b]

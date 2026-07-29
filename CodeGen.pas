@@ -183,6 +183,8 @@ type
       else if t=vtSet then Result:=typeof(integer)
       else if t=vtIntArray then Result:=typeof(integer).MakeArrayType()
       else if t=vtStrArray then Result:=typeof(string).MakeArrayType()
+      // [Stage 90] array of object → object[] (예: Assembly.GetCustomAttributes 반환값을 담는 지역변수)
+      else if t=vtObjArray then Result:=typeof(System.Object).MakeArrayType()
       // [Stage 67] vtMatrix: array of array of <elemtype> → CLR jagged array (elemtype)[][]
       else if t=vtMatrix then
       begin
@@ -376,7 +378,7 @@ type
       if (fLocalScope.Has(first) or fGlobalScope.Has(first)) and (GetVarClassName(first)<>'') then
       begin Result:=true; exit; end;
       if (FindExternalAncestorType(fCurClassName)<>nil)
-         and (FindExternalAncestorType(fCurClassName).GetProperty(first)<>nil) then
+         and (SafeGetProperty(FindExternalAncestorType(fCurClassName), first)<>nil) then
       begin Result:=true; exit; end;
       Result:=false;
     end;
@@ -442,10 +444,10 @@ type
       else
       begin
         extSelf:=FindExternalAncestorType(fCurClassName);
-        if (extSelf<>nil) and (extSelf.GetProperty(first)<>nil) then
+        if (extSelf<>nil) and (SafeGetProperty(extSelf, first)<>nil) then
         begin
           aIL.Emit(OpCodes.Ldarg_0);
-          pi:=extSelf.GetProperty(first);
+          pi:=SafeGetProperty(extSelf, first);
           aIL.Emit(OpCodes.Callvirt, pi.GetGetMethod);
           curType:=pi.PropertyType;
         end
@@ -495,7 +497,11 @@ type
         else
         begin
           // 외부 CLR 타입(TreeView 등) — 기존 GetProperty/GetField 경로
-          pi:=curType.GetProperty(segs[i]);
+          // [버그 수정 - Stage 93] TableLayoutPanel.Controls처럼 파생 타입이 'new'로 같은
+          // 이름의 프로퍼티를 다른 반환 타입으로 가리는 경우 curType.GetProperty(name)이
+          // AmbiguousMatchException을 던진다 — SafeGetProperty가 가장 파생된 선언으로
+          // 소거해서 찾아준다.
+          pi:=SafeGetProperty(curType, segs[i]);
           if pi<>nil then
           begin
             aIL.Emit(OpCodes.Callvirt, pi.GetGetMethod);
@@ -538,7 +544,7 @@ type
       else
       begin
         extSelf:=FindExternalAncestorType(fCurClassName);
-        if (extSelf<>nil) and (extSelf.GetProperty(first)<>nil) then curType:=extSelf.GetProperty(first).PropertyType
+        if (extSelf<>nil) and (SafeGetProperty(extSelf, first)<>nil) then curType:=SafeGetProperty(extSelf, first).PropertyType
         else raise new Exception('알 수 없는 한정자 "'+first+'" (연쇄 속성 접근의 시작점을 찾을 수 없습니다)');
       end;
 
@@ -566,8 +572,9 @@ type
           curType:=fFieldBuilders[localClsName78][segs[i]].FieldType
         else
         begin
-          // 외부 CLR 타입 — 기존 GetProperty/GetField 경로
-          pi:=curType.GetProperty(segs[i]);
+          // 외부 CLR 타입 — 기존 GetProperty/GetField 경로 (Stage 93: SafeGetProperty로
+          // AmbiguousMatchException 방지, EmitQualifierChainLoad와 동일한 이유)
+          pi:=SafeGetProperty(curType, segs[i]);
           if pi<>nil then curType:=pi.PropertyType
           else
           begin
@@ -707,7 +714,7 @@ type
           var _extType:=FindExternalAncestorType(fCurClassName);
           if _extType<>nil then
           begin
-            var _pi:=_extType.GetProperty(_fr.FieldName);
+            var _pi:=SafeGetProperty(_extType, _fr.FieldName);
             if (_pi<>nil) and (_pi.PropertyType=typeof(string)) then Result:=vtString
             else if (_pi<>nil) and (_pi.PropertyType=typeof(boolean)) then Result:=vtBoolean
             else
@@ -751,7 +758,7 @@ type
             // 첫 세그먼트가 진짜 외부 네임스페이스/타입 경로 — 기존 TStaticMemberExprNode와
             // 동일한 방식으로 정적 필드/프로퍼티를 조회한다 (예: System.EventArgs.Empty).
             var _staticT4:=ResolveExternalType(_mc4.ObjName);
-            var _spi4:=_staticT4.GetProperty(_mc4.MethodName);
+            var _spi4:=SafeGetProperty(_staticT4, _mc4.MethodName);
             if (_spi4<>nil) and (_spi4.PropertyType=typeof(string)) then Result:=vtString
             else
             begin
@@ -835,7 +842,7 @@ type
             var _extAnc4c:=FindExternalAncestorType(_cn4c);
             if _extAnc4c<>nil then
             begin
-              var _extPi4c:=_extAnc4c.GetProperty(_mc4.MethodName);
+              var _extPi4c:=SafeGetProperty(_extAnc4c, _mc4.MethodName);
               if (_extPi4c<>nil) and (_extPi4c.PropertyType=typeof(string)) then Result:=vtString
               else if (_extPi4c<>nil) and (_extPi4c.PropertyType=typeof(boolean)) then Result:=vtBoolean
               else
@@ -885,6 +892,8 @@ type
       else if e is TArrayIndexExprNode then
       begin
         if GetVarType(TArrayIndexExprNode(e).ArrName)=vtStrArray then Result:=vtString
+        // [Stage 90] array of object 원소 읽기는 vtObject로 추론
+        else if GetVarType(TArrayIndexExprNode(e).ArrName)=vtObjArray then Result:=vtObject
         else Result:=vtInteger;
       end
       // [Stage 67] 2차원 배열 원소 읽기 타입 추론
@@ -918,7 +927,7 @@ type
       begin
         var _sm4:=TStaticMemberExprNode(e);
         var _smType4:=ResolveExternalType(_sm4.TypeName);
-        var _smPi4:=_smType4.GetProperty(_sm4.MemberName);
+        var _smPi4:=SafeGetProperty(_smType4, _sm4.MemberName);
         if (_smPi4<>nil) and (_smPi4.PropertyType=typeof(string)) then Result:=vtString
         else
         begin
@@ -997,11 +1006,31 @@ type
           if _bc72.Args.Count=0 then Result:=vtReal else Result:=vtInteger;
         end
         else if (_bc72.Name='UpperCase') or (_bc72.Name='LowerCase') or (_bc72.Name='Trim')
-                or (_bc72.Name='Copy') or (_bc72.Name='FloatToStr') or (_bc72.Name='ReadLn') then
+                or (_bc72.Name='Copy') or (_bc72.Name='FloatToStr') or (_bc72.Name='ReadLn')
+                or (_bc72.Name='Format') or (_bc72.Name='GetCurrentDir') then // [Stage 90/93]
           Result:=vtString
         else if _bc72.Name='Pos' then Result:=vtInteger
         else if _bc72.Name='Chr' then Result:=vtChar
         else Result:=vtInteger; // 방어적 폴백(정상 경로면 도달하지 않음)
+      end
+      // [Stage 91] typeof(...)의 결과(System.Type)는 별도 vtType이 없으므로 vtObject로 취급.
+      else if e is TTypeOfExprNode then Result:=vtObject
+      // [Stage 90] TargetType(expr) 캐스트 결과 — 캐스트 대상 타입 자체가 곧 결과 타입.
+      // vtObject로 취급하고 클래스 이름은 GetExprClrType/ObjCastType 경로에서 다시 조회되므로
+      // 여기서는 "객체"라는 사실만 전달하면 충분하다.
+      else if e is TExternalCastExprNode then Result:=vtObject
+      // [Stage 90] a.GetName().Version.ToString() 같은 체인의 결과 타입 — 실제 CLR 반환
+      // 타입을 리플렉션으로 추론해 가장 가까운 Pascal 타입으로 매핑한다(예: string→vtString).
+      else if e is TChainedMemberExprNode then
+      begin
+        var _chT90:=GetExprClrType(e);
+        if _chT90=typeof(string) then Result:=vtString
+        else if _chT90=typeof(integer) then Result:=vtInteger
+        else if _chT90=typeof(int64) then Result:=vtInt64
+        else if _chT90=typeof(double) then Result:=vtReal
+        else if _chT90=typeof(boolean) then Result:=vtBoolean
+        else if _chT90=typeof(char) then Result:=vtChar
+        else Result:=vtObject;
       end
       else Result:=vtInteger;
     end;
@@ -1265,7 +1294,7 @@ type
           var _extType:=FindExternalAncestorType(fCurClassName);
           if _extType=nil then
             raise new Exception('필드/속성을 찾을 수 없음: '+fCurClassName+'.'+fr.FieldName);
-          var _pi:=_extType.GetProperty(fr.FieldName);
+          var _pi:=SafeGetProperty(_extType, fr.FieldName);
           if _pi<>nil then
           begin
             var _getter:=_pi.GetGetMethod;
@@ -1387,8 +1416,48 @@ type
           else
           begin
             // 첫 세그먼트가 진짜 외부 정적 타입 경로 — 기존 TStaticMemberExprNode와 동일한 동작.
-            var _staticTE:=ResolveExternalType(mc.ObjName);
-            var _spiE:=_staticTE.GetProperty(mc.MethodName);
+            // [Stage 92] Parser는 "TypeName(expr).member"가 바로 뒤에 '.'로 이어질 때만 캐스트로
+            // 인식한다. "(TypeName(expr)).member"처럼 캐스트가 추가 괄호에 한 번 더 싸여 있으면
+            // 괄호가 먼저 닫혀버려 캐스트인지 정적 호출인지 파싱 시점엔 구분이 안 되고, 일단
+            // 정적 호출(ObjName=한정자, MethodName=마지막 세그먼트)로 넘어온다. 이때 ObjName이
+            // 실제 타입이 아니라 네임스페이스뿐이면(예: "System.Reflection") 아래
+            // ResolveExternalType(mc.ObjName)이 실패한다 — 그 경우 ObjName+'.'+MethodName
+            // 전체를 하나의 타입 이름으로 재시도해서 캐스트로 처리한다.
+            var _staticTE: System.Type := nil;
+            try _staticTE:=ResolveExternalType(mc.ObjName); except end;
+
+            if (_staticTE=nil) and (mc.Args.Count=1) then
+            begin
+              var _castTE92: System.Type := nil;
+              try _castTE92:=ResolveExternalType(mc.ObjName+'.'+mc.MethodName); except end;
+              if _castTE92<>nil then
+              begin
+                EmitExpr(aIL, mc.Args[0]);
+                if _castTE92.IsValueType then
+                begin
+                  var _cnFN92:=_castTE92.FullName;
+                  if _cnFN92='System.Byte' then aIL.Emit(OpCodes.Conv_U1)
+                  else if _cnFN92='System.SByte' then aIL.Emit(OpCodes.Conv_I1)
+                  else if _cnFN92='System.Int16' then aIL.Emit(OpCodes.Conv_I2)
+                  else if _cnFN92='System.UInt16' then aIL.Emit(OpCodes.Conv_U2)
+                  else if _cnFN92='System.Int32' then aIL.Emit(OpCodes.Conv_I4)
+                  else if _cnFN92='System.UInt32' then aIL.Emit(OpCodes.Conv_U4)
+                  else if _cnFN92='System.Int64' then aIL.Emit(OpCodes.Conv_I8)
+                  else if _cnFN92='System.UInt64' then aIL.Emit(OpCodes.Conv_U8)
+                  else if _cnFN92='System.Single' then aIL.Emit(OpCodes.Conv_R4)
+                  else if _cnFN92='System.Double' then aIL.Emit(OpCodes.Conv_R8)
+                  else if _cnFN92='System.Char' then aIL.Emit(OpCodes.Conv_U2);
+                end
+                else
+                  aIL.Emit(OpCodes.Castclass, _castTE92);
+                exit;
+              end;
+            end;
+
+            if _staticTE=nil then
+              raise new Exception('외부 타입 "'+mc.ObjName+'"을(를) 찾을 수 없습니다. 기본 프레임워크(WinForms/WPF/System.*)가 아니라면 {$reference 어셈블리명.dll} 지시문으로 해당 타입이 들어있는 어셈블리를 먼저 등록했는지 확인하세요.');
+
+            var _spiE:=SafeGetProperty(_staticTE, mc.MethodName);
             if (mc.Args.Count=0) and (_spiE<>nil) and (_spiE.GetGetMethod<>nil) then
               aIL.Emit(OpCodes.Call, _spiE.GetGetMethod)
             else
@@ -1551,7 +1620,7 @@ type
               var _extAnc:=FindExternalAncestorType(cn);
               if _extAnc=nil then
                 raise new Exception('알 수 없는 메서드 "'+cn+'.'+mc.MethodName+'"');
-              var _extPi:=_extAnc.GetProperty(mc.MethodName);
+              var _extPi:=SafeGetProperty(_extAnc, mc.MethodName);
               if _extPi<>nil then
               begin
                 var _extGetter:=_extPi.GetGetMethod;
@@ -1637,14 +1706,14 @@ type
           end;
         end
         else if (FindExternalAncestorType(fCurClassName)<>nil)
-                and (FindExternalAncestorType(fCurClassName).GetProperty(mc.ObjName)<>nil) then
+                and (SafeGetProperty(FindExternalAncestorType(fCurClassName), mc.ObjName)<>nil) then
         begin
           // [버그 수정] Controls.Count 처럼, 한정자(qualifier) 자체가 로컬변수/필드가 아니라
           // self가 상속받은 외부 타입(Form 등)의 프로퍼티이고, 그 결과를 값으로 쓰는 경우
           // (statement 위치의 Controls.Add(...)는 이미 별도 분기에서 처리되고 있었으나,
           // 식 위치에서 값을 리턴받는 이 경로가 빠져 있었다).
           var _extAnc7:=FindExternalAncestorType(fCurClassName);
-          var _extPi7:=_extAnc7.GetProperty(mc.ObjName);
+          var _extPi7:=SafeGetProperty(_extAnc7, mc.ObjName);
           aIL.Emit(OpCodes.Ldarg_0);
           aIL.Emit(OpCodes.Callvirt, _extPi7.GetGetMethod);
           var _qType7:=_extPi7.PropertyType;
@@ -1691,7 +1760,48 @@ type
             end;
           end;
         end
-        else raise new Exception('알 수 없는 변수 "'+mc.ObjName+'"');
+        else
+        begin
+          // [버그 수정] ObjName이 필드/지역변수/외부 조상 프로퍼티 어디에도 없으면,
+          // 마지막으로 점 없는 단일 이름의 외부 정적 타입(주로 enum, 예: ColumnHeaderStyle)일
+          // 가능성을 시도한다. 기존에는 이 케이스를 아예 시도하지 않고 곧장
+          // "알 수 없는 변수"로 던졌다 (ObjName 자체에 '.'이 있는 체인 케이스만
+          // 위쪽 1364번째 줄 분기에서 static 타입 경로를 탔었음).
+          var _bareStaticT: System.Type := nil;
+          try _bareStaticT := ResolveExternalType(mc.ObjName); except end;
+          if _bareStaticT <> nil then
+          begin
+            var _bareSpi := SafeGetProperty(_bareStaticT, mc.MethodName);
+            if (mc.Args.Count=0) and (_bareSpi<>nil) and (_bareSpi.GetGetMethod<>nil) then
+              aIL.Emit(OpCodes.Call, _bareSpi.GetGetMethod)
+            else
+            begin
+              var _bareSfi := _bareStaticT.GetField(mc.MethodName);
+              if (mc.Args.Count=0) and (_bareSfi<>nil) then
+              begin
+                // enum 멤버는 리터럴(상수) 필드라 런타임 저장 공간이 없다 — Ldsfld를 쓰면
+                // MissingFieldException. GetRawConstantValue로 실제 정수값을 꺼내
+                // Ldc_I4로 직접 올려야 한다 (Stage 76에서 체인 경로에 적용했던 것과 동일).
+                if _bareSfi.IsLiteral then
+                  aIL.Emit(OpCodes.Ldc_I4, System.Convert.ToInt32(_bareSfi.GetRawConstantValue))
+                else
+                  aIL.Emit(OpCodes.Ldsfld, _bareSfi);
+              end
+              else
+              begin
+                var _bareSmi := ResolveMethodByArity(_bareStaticT, mc.MethodName, mc.Args, true);
+                if _bareSmi=nil then
+                  raise new Exception('외부 타입 "'+_bareStaticT.FullName+'"에 정적 멤버 "'+mc.MethodName+'"가 없습니다.');
+                var _bareSmiParams:=_bareSmi.GetParameters;
+                for var _bareSmiAi:=0 to mc.Args.Count-1 do
+                  EmitArgForParamType(aIL, mc.Args[_bareSmiAi], _bareSmiParams[_bareSmiAi].ParameterType);
+                aIL.Emit(OpCodes.Call, _bareSmi);
+              end;
+            end;
+          end
+          else
+            raise new Exception('알 수 없는 변수 "'+mc.ObjName+'"');
+        end;
       end
 
       else if e is TExternalIndexExprNode then
@@ -1729,6 +1839,89 @@ type
         aIL.Emit(OpCodes.Callvirt, eiItemProp.GetGetMethod);
       end
 
+      // [Stage 91] typeof(TypeName) — IL로는 Ldtoken(타입) 다음 Type.GetTypeFromHandle 호출.
+      else if e is TTypeOfExprNode then
+      begin
+        var to91:=TTypeOfExprNode(e);
+        aIL.Emit(OpCodes.Ldtoken, ResolveExternalType(to91.TypeName));
+        aIL.Emit(OpCodes.Call, typeof(System.Type).GetMethod('GetTypeFromHandle',[typeof(System.RuntimeTypeHandle)]));
+      end
+
+      // [Stage 90] TargetType(InnerExpr) — 임의의 식을 외부 타입으로 캐스트. Inner를 평가해 스택에
+      // 올린다. 참조 타입이면 Castclass, [Stage 92] byte(x)/(byte)(x)처럼 대상이 원시 값 타입이면
+      // Castclass는 값 타입에 쓸 수 없으므로(검증 오류) 대신 알맞은 숫자 변환 명령을 낸다.
+      else if e is TExternalCastExprNode then
+      begin
+        var ec90:=TExternalCastExprNode(e);
+        EmitExpr(aIL, ec90.InnerExpr);
+        var ec90Type:=ResolveExternalType(ec90.TargetType);
+        if ec90Type.IsValueType then
+        begin
+          var ec90FN:=ec90Type.FullName;
+          if ec90FN='System.Byte' then aIL.Emit(OpCodes.Conv_U1)
+          else if ec90FN='System.SByte' then aIL.Emit(OpCodes.Conv_I1)
+          else if ec90FN='System.Int16' then aIL.Emit(OpCodes.Conv_I2)
+          else if ec90FN='System.UInt16' then aIL.Emit(OpCodes.Conv_U2)
+          else if ec90FN='System.Int32' then aIL.Emit(OpCodes.Conv_I4)
+          else if ec90FN='System.UInt32' then aIL.Emit(OpCodes.Conv_U4)
+          else if ec90FN='System.Int64' then aIL.Emit(OpCodes.Conv_I8)
+          else if ec90FN='System.UInt64' then aIL.Emit(OpCodes.Conv_U8)
+          else if ec90FN='System.Single' then aIL.Emit(OpCodes.Conv_R4)
+          else if ec90FN='System.Double' then aIL.Emit(OpCodes.Conv_R8)
+          else if ec90FN='System.Char' then aIL.Emit(OpCodes.Conv_U2);
+          // 그 외(사용자 struct/enum 등) 값 타입은 변환 없이 그대로 둔다 — 소스 값이 이미
+          // 호환 가능한 표현이라고 가정한다.
+        end
+        else
+          aIL.Emit(OpCodes.Castclass, ec90Type);
+      end
+
+      // [Stage 90] Inner.MemberName / Inner.MemberName(args) — 메서드 호출 결과 위에 이어지는
+      // 일반 멤버 접근/메서드 호출 체인 (예: a.GetName().Version.ToString()).
+      // Inner를 먼저 평가해 스택에 올리고, Inner의 실제 CLR 타입을 GetExprClrType으로 추론해
+      // 그 타입 위에서 리플렉션으로 멤버(속성/필드/메서드)를 찾는다. Inner가 값 타입(struct/enum)이면
+      // Callvirt가 요구하는 "주소"가 없으므로 임시 지역변수에 저장한 뒤 Ldloca+Call로 처리한다.
+      else if e is TChainedMemberExprNode then
+      begin
+        var ch90:=TChainedMemberExprNode(e);
+        EmitExpr(aIL, ch90.Inner);
+        var chType90:=GetExprClrType(ch90.Inner);
+        var chIsVal90:=chType90.IsValueType;
+        if chIsVal90 then
+        begin
+          var chTmp90:=aIL.DeclareLocal(chType90);
+          aIL.Emit(OpCodes.Stloc, chTmp90);
+          aIL.Emit(OpCodes.Ldloca, chTmp90);
+        end;
+        if not ch90.IsCall then
+        begin
+          var chPi90:=SafeGetProperty(chType90, ch90.MemberName);
+          if (chPi90<>nil) and (chPi90.GetGetMethod<>nil) then
+          begin
+            if chIsVal90 then aIL.Emit(OpCodes.Call, chPi90.GetGetMethod)
+            else aIL.Emit(OpCodes.Callvirt, chPi90.GetGetMethod);
+          end
+          else
+          begin
+            var chFi90:=chType90.GetField(ch90.MemberName);
+            if chFi90=nil then
+              raise new Exception('타입 "'+chType90.FullName+'"에 멤버 "'+ch90.MemberName+'"가 없습니다.');
+            aIL.Emit(OpCodes.Ldfld, chFi90);
+          end;
+        end
+        else
+        begin
+          var chMi90:=ResolveMethodByArity(chType90, ch90.MemberName, ch90.Args, false);
+          if chMi90=nil then
+            raise new Exception('타입 "'+chType90.FullName+'"에 메서드 "'+ch90.MemberName+'"가 없습니다 (인자 '+ch90.Args.Count.ToString+'개).');
+          var chMiParams90:=chMi90.GetParameters;
+          for var chAi90:=0 to ch90.Args.Count-1 do
+            EmitArgForParamType(aIL, ch90.Args[chAi90], chMiParams90[chAi90].ParameterType);
+          if chIsVal90 then aIL.Emit(OpCodes.Call, chMi90)
+          else aIL.Emit(OpCodes.Callvirt, chMi90);
+        end;
+      end
+
       else if e is TArrayIndexExprNode then
       begin
         ai:=TArrayIndexExprNode(e);
@@ -1739,7 +1932,8 @@ type
         // array of integer는 우연히 맞았지만 array of string은 참조(포인터)를 4바이트
         // 정수로 잘못 읽어 쓰레기 값이 나왔다. 원소를 쓰는 쪽(Stelem, 아래 TArrayAssignStmtNode)은
         // 이미 배열 타입을 보고 Stelem_Ref/Stelem_I4를 갈라 쓰고 있었으므로 읽는 쪽도 맞춘다.
-        if GetVarType(ai.ArrName)=vtStrArray then aIL.Emit(OpCodes.Ldelem_Ref)
+        // [Stage 90] array of object도 문자열 배열과 마찬가지로 참조 타입 원소이므로 Ldelem_Ref.
+        if (GetVarType(ai.ArrName)=vtStrArray) or (GetVarType(ai.ArrName)=vtObjArray) then aIL.Emit(OpCodes.Ldelem_Ref)
         else aIL.Emit(OpCodes.Ldelem_I4);
       end
 
@@ -1948,7 +2142,7 @@ type
         // TypeName.MemberName — 정적 필드/속성 읽기 (예: System.EventArgs.Empty)
         var sm:=TStaticMemberExprNode(e);
         var smType:=ResolveExternalType(sm.TypeName);
-        var smPi:=smType.GetProperty(sm.MemberName);
+        var smPi:=SafeGetProperty(smType, sm.MemberName);
         if (smPi<>nil) and (smPi.GetGetMethod<>nil) then
           aIL.Emit(OpCodes.Call, smPi.GetGetMethod) // 정적 프로퍼티 getter는 Call(비가상)
         else
@@ -2348,6 +2542,46 @@ type
         aIL.Emit(OpCodes.Call, typeof(System.Console).GetMethod('ReadLine', System.Type.EmptyTypes));
       end
 
+      else if node.Name='Format' then
+      begin
+        // [Stage 93] Format('{0}, {1}', a, b, ...) → System.String.Format(fmt, object[]).
+        // 파서(NormalizeBuiltinFuncName, Stage 90)는 이미 이 이름을 인식해 TBuiltinCallExprNode로
+        // 넘겨주고 있었지만 여기 EmitBuiltinCall에는 실제 구현이 빠져 있었다.
+        // .NET string.Format은 {0},{1}.. 자리표시자를 그대로 쓰므로 형식 문자열은 변환 없이
+        // 그대로 넘긴다. 나머지 인자는 object[]에 담아 전달하는데, 값 타입 인자
+        // (integer/int64/real/boolean/char)는 Box하지 않으면 원시값이 그대로 object 참조
+        // 슬롯에 들어가 실행 시 손상된다 — string 등 참조 타입은 Box 불필요.
+        if node.Args.Count<1 then
+          raise new Exception('Format()는 인자가 최소 1개(형식 문자열) 필요합니다 (Stage 93)');
+        EmitExpr(aIL, node.Args[0]); // 형식 문자열
+        var _fmtArgCount:=node.Args.Count-1;
+        aIL.Emit(OpCodes.Ldc_I4, _fmtArgCount);
+        aIL.Emit(OpCodes.Newarr, typeof(System.Object));
+        for var _fmtI:=0 to _fmtArgCount-1 do
+        begin
+          aIL.Emit(OpCodes.Dup);
+          aIL.Emit(OpCodes.Ldc_I4, _fmtI);
+          var _fmtArgT:=InferType(node.Args[_fmtI+1]);
+          EmitExpr(aIL, node.Args[_fmtI+1]);
+          if _fmtArgT=vtInteger then aIL.Emit(OpCodes.Box, typeof(integer))
+          else if _fmtArgT=vtInt64 then aIL.Emit(OpCodes.Box, typeof(int64))
+          else if _fmtArgT=vtReal then aIL.Emit(OpCodes.Box, typeof(double))
+          else if _fmtArgT=vtBoolean then aIL.Emit(OpCodes.Box, typeof(boolean))
+          else if _fmtArgT=vtChar then aIL.Emit(OpCodes.Box, typeof(char));
+          aIL.Emit(OpCodes.Stelem_Ref);
+        end;
+        aIL.Emit(OpCodes.Call, typeof(System.String).GetMethod('Format',
+          [typeof(string), typeof(System.Object).MakeArrayType()]));
+      end
+
+      else if node.Name='GetCurrentDir' then
+      begin
+        // [Stage 93] appPath := GetCurrentDir; — 괄호 없이 쓰는 무인자 표준 함수.
+        // .NET에는 System.IO.Directory.GetCurrentDirectory()가 동일한 역할을 한다.
+        if node.Args.Count<>0 then raise new Exception('GetCurrentDir()는 인자가 없어야 합니다 (Stage 93)');
+        aIL.Emit(OpCodes.Call, typeof(System.IO.Directory).GetMethod('GetCurrentDirectory', System.Type.EmptyTypes));
+      end
+
       else
         raise new Exception('알 수 없는 표준 라이브러리 함수 "'+node.Name+'" (Stage 72)');
     end;
@@ -2378,6 +2612,60 @@ type
     begin
       if fCurExceptDepth>0 then aIL.Emit(OpCodes.Leave, fMethodExitLabel)
       else aIL.Emit(OpCodes.Br, fMethodExitLabel);
+    end;
+
+    // [Stage 90] writeln(a, b, c, ...)의 인자 하나를 출력한다. useNewLine=false면 Console.Write
+    // (줄바꿈 없이 이어붙임), true면 Console.WriteLine(마지막 인자에서 줄바꿈까지 포함).
+    // 기존 TWritelnExprStmtNode(인자 1개, 항상 WriteLine)와 동일한 타입별 오버로드 선택 로직을
+    // Write/WriteLine 양쪽에 공통으로 쓸 수 있게 메서드 이름만 매개변수로 뺐다.
+    procedure EmitWriteArg(aIL: ILGenerator; argExpr: TExprNode; useNewLine: boolean);
+    var wMethodName: string; wet: TVarType;
+    begin
+      if useNewLine then wMethodName:='WriteLine' else wMethodName:='Write';
+      wet:=InferType(argExpr);
+      if wet=vtString then
+      begin
+        EmitExpr(aIL, argExpr);
+        aIL.Emit(OpCodes.Call, typeof(Console).GetMethod(wMethodName,[typeof(string)]));
+      end
+      else if wet=vtBoolean then
+      begin
+        EmitExpr(aIL, argExpr);
+        aIL.Emit(OpCodes.Call, typeof(Console).GetMethod(wMethodName,[typeof(boolean)]));
+      end
+      else if wet=vtReal then
+      begin
+        EmitExpr(aIL, argExpr);
+        aIL.Emit(OpCodes.Call, typeof(Console).GetMethod(wMethodName,[typeof(double)]));
+      end
+      else if wet=vtChar then
+      begin
+        EmitExpr(aIL, argExpr);
+        aIL.Emit(OpCodes.Call, typeof(Console).GetMethod(wMethodName,[typeof(char)]));
+      end
+      else if wet=vtInt64 then
+      begin
+        EmitExpr(aIL, argExpr);
+        aIL.Emit(OpCodes.Call, typeof(Console).GetMethod(wMethodName,[typeof(int64)]));
+      end
+      else if wet=vtGeneric then
+      begin
+        EmitExpr(aIL, argExpr);
+        aIL.Emit(OpCodes.Box, GetGenericExprClrType(argExpr));
+        aIL.Emit(OpCodes.Call, typeof(Console).GetMethod(wMethodName,[typeof(System.Object)]));
+      end
+      // [Stage 90] vtObject(예: assembly.FullName처럼 정확한 타입을 못 잡는 외부 멤버, 또는
+      // 실제로 object인 값) — object 오버로드로 내보내면 CLR이 알아서 ToString()을 호출해준다.
+      else if wet=vtObject then
+      begin
+        EmitExpr(aIL, argExpr);
+        aIL.Emit(OpCodes.Call, typeof(Console).GetMethod(wMethodName,[typeof(System.Object)]));
+      end
+      else
+      begin
+        EmitExpr(aIL, argExpr);
+        aIL.Emit(OpCodes.Call, typeof(Console).GetMethod(wMethodName,[typeof(integer)]));
+      end;
     end;
 
     procedure EmitStatement(aIL: ILGenerator; s: TStmtNode);
@@ -2472,6 +2760,16 @@ type
         end;
       end
 
+      // [Stage 90] writeln(a, b, c, ...) — 마지막 인자 전까지는 Console.Write(줄바꿈 없음)로
+      // 이어붙이고, 마지막 인자만 Console.WriteLine으로 내보내 표준 Pascal writeln과 같은
+      // "다 이어붙인 뒤 한 번 줄바꿈" 동작을 만든다.
+      else if s is TWritelnArgsStmtNode then
+      begin
+        var wa90:=TWritelnArgsStmtNode(s);
+        for var wi90:=0 to wa90.Args.Count-1 do
+          EmitWriteArg(aIL, wa90.Args[wi90], wi90=wa90.Args.Count-1);
+      end
+
       else if s is TResultAssignStmtNode then
       begin
         // [Stage 57] Result := 'a'; 에서 함수 반환형이 string이면 char 리터럴을
@@ -2559,7 +2857,7 @@ type
           extType:=FindExternalAncestorType(fCurClassName);
           if extType=nil then
             raise new Exception('필드/속성을 찾을 수 없음: '+fCurClassName+'.'+fas.FieldName);
-          propInfo:=extType.GetProperty(fas.FieldName);
+          propInfo:=SafeGetProperty(extType, fas.FieldName);
           if propInfo<>nil then
           begin
             setter:=propInfo.GetSetMethod;
@@ -2896,14 +3194,14 @@ type
           end;
         end
         else if (FindExternalAncestorType(fCurClassName)<>nil)
-                and (FindExternalAncestorType(fCurClassName).GetProperty(mcs.ObjName)<>nil) then
+                and (SafeGetProperty(FindExternalAncestorType(fCurClassName), mcs.ObjName)<>nil) then
         begin
           // [Stage 68 재확인] Controls.Add(Button1); 처럼, 한정자(qualifier) 자체가
           // 로컬변수/필드가 아니라 self가 상속받은 외부 타입(Form 등)의 프로퍼티인 경우.
           // self를 로드하고 그 프로퍼티의 게터를 호출해 얻은 값(예: Form.Controls의
           // ControlCollection 인스턴스)에 대고 실제 메서드(Add 등)를 호출한다.
           extType:=FindExternalAncestorType(fCurClassName);
-          propInfo:=extType.GetProperty(mcs.ObjName);
+          propInfo:=SafeGetProperty(extType, mcs.ObjName);
           aIL.Emit(OpCodes.Ldarg_0);
           aIL.Emit(OpCodes.Callvirt, propInfo.GetGetMethod);
           qTargetType:=propInfo.PropertyType;
@@ -3057,6 +3355,9 @@ type
         EmitExpr(aIL, sl.NewSize);
         if at2=vtStrArray then
           rm:=typeof(System.Array).GetMethod('Resize').MakeGenericMethod([typeof(string)])
+        // [Stage 90] array of object
+        else if at2=vtObjArray then
+          rm:=typeof(System.Array).GetMethod('Resize').MakeGenericMethod([typeof(System.Object)])
         else
           rm:=typeof(System.Array).GetMethod('Resize').MakeGenericMethod([typeof(integer)]);
         aIL.Emit(OpCodes.Call, rm);
@@ -3075,7 +3376,8 @@ type
         EmitExpr(aIL, aa.Index);
         if at2=vtStrArray then EmitValueForVType(aIL, aa.ValueExpr, vtString)
         else EmitExpr(aIL, aa.ValueExpr);
-        if at2=vtStrArray then aIL.Emit(OpCodes.Stelem_Ref)
+        // [Stage 90] array of object 원소 쓰기도 문자열과 마찬가지로 참조 타입이라 Stelem_Ref.
+        if (at2=vtStrArray) or (at2=vtObjArray) then aIL.Emit(OpCodes.Stelem_Ref)
         else aIL.Emit(OpCodes.Stelem_I4);
       end
 
@@ -3600,6 +3902,16 @@ type
         for i:=0 to TMethodCallExprNode(e).Args.Count-1 do
           CollectVarNamesInExpr(TMethodCallExprNode(e).Args[i], names);
       end
+      // [Stage 90] TargetType(expr) 캐스트 대상 안의 변수도 클로저 캡처 대상에 포함
+      else if e is TExternalCastExprNode then
+        CollectVarNamesInExpr(TExternalCastExprNode(e).InnerExpr, names)
+      // [Stage 90] a.GetName().Version.ToString() 같은 체인 안의 변수도 클로저 캡처 대상에 포함
+      else if e is TChainedMemberExprNode then
+      begin
+        CollectVarNamesInExpr(TChainedMemberExprNode(e).Inner, names);
+        for i:=0 to TChainedMemberExprNode(e).Args.Count-1 do
+          CollectVarNamesInExpr(TChainedMemberExprNode(e).Args[i], names);
+      end
       else if e is TBinOpNode then
       begin
         CollectVarNamesInExpr(TBinOpNode(e).Left, names);
@@ -3639,6 +3951,10 @@ type
     begin
       if s=nil then exit;
       if s is TWritelnExprStmtNode then CollectVarNamesInExpr(TWritelnExprStmtNode(s).Arg, names)
+      // [Stage 90] writeln(a, b, c, ...)의 각 인자 안의 변수도 클로저 캡처 대상에 포함
+      else if s is TWritelnArgsStmtNode then
+        for i:=0 to TWritelnArgsStmtNode(s).Args.Count-1 do
+          CollectVarNamesInExpr(TWritelnArgsStmtNode(s).Args[i], names)
       else if s is TAssignStmtNode then
       begin
         names.Add(TAssignStmtNode(s).VarName);
@@ -4148,6 +4464,22 @@ type
       else if name='Exception'           then Result:='System.Exception'
       else if name='Object'              then Result:='System.Object'
       else if name='String'              then Result:='System.String'
+      // [Stage 92] byte(x)/(byte)(x) 같은 .NET 원시 값 타입 캐스트가 쓸 소문자 별칭들.
+      // Parser의 IsPrimitiveCastTypeName 화이트리스트와 짝을 이룬다.
+      else if name='byte'                then Result:='System.Byte'
+      else if name='sbyte'               then Result:='System.SByte'
+      else if name='short'               then Result:='System.Int16'
+      else if name='ushort'              then Result:='System.UInt16'
+      else if name='int'                 then Result:='System.Int32'
+      else if name='uint'                then Result:='System.UInt32'
+      else if name='long'                then Result:='System.Int64'
+      else if name='ulong'               then Result:='System.UInt64'
+      else if name='single'              then Result:='System.Single'
+      else if name='double'              then Result:='System.Double'
+      else if name='decimal'             then Result:='System.Decimal'
+      else if name='char'                then Result:='System.Char'
+      else if (name='bool') or (name='boolean') then Result:='System.Boolean'
+      else if name='object'              then Result:='System.Object'
       else Result:=name;
     end;
 
@@ -4380,8 +4712,8 @@ type
         begin
           // Self 필드가 아니면(예: 외부 상속 타입의 프로퍼티) 그 프로퍼티 타입도 확인해본다.
           var extSelf52:=FindExternalAncestorType(fCurClassName);
-          if (extSelf52<>nil) and (extSelf52.GetProperty(fn52)<>nil) then
-            Result:=extSelf52.GetProperty(fn52).PropertyType
+          if (extSelf52<>nil) and (SafeGetProperty(extSelf52, fn52)<>nil) then
+            Result:=SafeGetProperty(extSelf52, fn52).PropertyType
           else
           begin
             vt:=InferType(e);
@@ -4408,6 +4740,30 @@ type
           Result:=ResolveExternalType(TNewObjectExprNode(e).ClassName);
         except
           Result:=nil; // 타입을 못 찾아도 기존과 동일하게 중립 폴백
+        end;
+      end
+      // [Stage 91] typeof(...)가 다른 호출의 인자로 쓰이는 경우(예: GetCustomAttributes(typeof(X), false))
+      // — 정확히 System.Type을 돌려줘야 그 타입을 받는 오버로드가 올바르게 선택된다.
+      else if e is TTypeOfExprNode then Result:=typeof(System.Type)
+      // [Stage 90] TargetType(expr) 캐스트 결과가 다른 호출의 인자로 쓰이는 경우 — 캐스트 대상
+      // 타입 자체가 정확한 CLR 타입이므로 오버로드 점수 계산에 그대로 쓸 수 있다.
+      else if e is TExternalCastExprNode then
+      begin
+        try
+          Result:=ResolveExternalType(TExternalCastExprNode(e).TargetType);
+        except
+          Result:=nil;
+        end;
+      end
+      // [Stage 90] a.GetName().Version.ToString() 같은 체인이 다른 호출의 인자로 쓰이는 경우 —
+      // GetExprClrType으로 실제 CLR 반환 타입을 정확히 돌려줘서 오버로드 점수 계산이 중립으로
+      // 처리되지 않게 한다.
+      else if e is TChainedMemberExprNode then
+      begin
+        try
+          Result:=GetExprClrType(e);
+        except
+          Result:=nil;
         end;
       end
       else
@@ -4461,11 +4817,38 @@ type
     //   Object 등 상위 클래스에서 상속된 멤버는 DeclaringType이 다르므로 건너뜀.
     // ---------------------------------------------------------------
     function SafeGetProperty(t: System.Type; name: string): PropertyInfo;
+    var curT91: System.Type; props91: array of PropertyInfo; p91: PropertyInfo;
     begin
       if t.GetType().Name = 'TypeBuilderInstantiation' then
-        Result := nil
-      else
+      begin
+        Result := nil;
+        exit;
+      end;
+      try
         Result := t.GetProperty(name);
+      except
+        on E: System.Reflection.AmbiguousMatchException do
+        begin
+          // [버그 수정 - Stage 93] 파생 타입이 'new'(Shadows)로 부모의 동일 이름 프로퍼티를
+          // 다른 반환 타입으로 가리는 경우(예: TableLayoutPanel.Controls가
+          // Control.Controls를 TableLayoutControlCollection으로 가림), 인자 없는
+          // GetProperty(name)은 두 선언을 동시에 찾아내 모호하다며 예외를 던진다.
+          // DeclaredOnly로 가장 파생된 타입부터 위로 올라가며 처음 찾은(=가장 파생된)
+          // 선언을 사용해 사람이 기대하는 동작(파생 클래스 쪽 선언 우선)과 맞춘다.
+          Result := nil;
+          curT91 := t;
+          while curT91 <> nil do
+          begin
+            props91 := curT91.GetProperties(BindingFlags.Public or BindingFlags.NonPublic or
+                                              BindingFlags.Instance or BindingFlags.Static or
+                                              BindingFlags.DeclaredOnly);
+            foreach p91 in props91 do
+              if p91.Name = name then begin Result := p91; break; end;
+            if Result <> nil then break;
+            curT91 := curT91.BaseType;
+          end;
+        end;
+      end;
     end;
 
     function SafeGetMethods(t: System.Type; flags: BindingFlags): array of MethodInfo;
@@ -4600,7 +4983,22 @@ type
             exit // 체인(예: MainMenu.Items.xxx)은 미리 계산하려면 IL을 실제로 방출해야
                  // 하므로(EmitQualifierChainLoad) 여기서는 다루지 않고 기존 폴백에 맡긴다.
           else
-            qType:=ResolveExternalType(mc.ObjName); // 외부 정적 타입 경로 (예: System.Drawing.Image)
+          begin
+            qType:=nil;
+            try qType:=ResolveExternalType(mc.ObjName); except end; // 외부 정적 타입 경로 (예: System.Drawing.Image)
+            // [Stage 92] "(TypeName(expr)).member"가 괄호로 한 번 더 싸여 있으면 Parser가
+            // 캐스트를 정적 호출(ObjName=한정자, MethodName=마지막 세그먼트)로 잘못 넘긴다
+            // (EmitExpr의 TMethodCallExprNode 처리에 있는 것과 짝을 이루는 보정). ObjName이
+            // 실제 타입이 아니라 네임스페이스뿐이면 위에서 qType이 nil이 되는데, 이때
+            // ObjName+MethodName 전체가 진짜 타입이면 이 식 자체가 "그 타입으로의 캐스트"이므로
+            // CLR 타입은 qType 위의 멤버가 아니라 캐스트 대상 타입 그 자체다.
+            if (qType=nil) and (mc.Args.Count=1) then
+            begin
+              var _castT92: System.Type := nil;
+              try _castT92:=ResolveExternalType(mc.ObjName+'.'+mc.MethodName); except end;
+              if _castT92<>nil then begin Result:=_castT92; exit; end;
+            end;
+          end;
         end
         else if fLocalScope.Has(mc.ObjName) and fLocalScope.HasClrType(mc.ObjName) then
           qType:=fLocalScope.GetClrType(mc.ObjName)
@@ -4623,7 +5021,7 @@ type
           exit;
 
         if qType=nil then exit;
-        pi:=qType.GetProperty(mc.MethodName);
+        pi:=SafeGetProperty(qType, mc.MethodName);
         if (mc.Args.Count=0) and (pi<>nil) and (pi.GetGetMethod<>nil) then
         begin Result:=pi.PropertyType; exit; end;
         mi:=ResolveMethodByArity(qType, mc.MethodName, mc.Args, mc.ObjName.IndexOf('.')>=0);
@@ -4631,6 +5029,78 @@ type
       except
         Result:=nil; // 무엇이든 실패하면 조용히 중립 폴백(기존 동작 유지)
       end;
+    end;
+
+    // [Stage 90] 임의의 식 e를 평가했을 때 스택에 올라오는 값의 실제 CLR Type을(가능한 한도까지)
+    // 정적으로 추론한다 — TChainedMemberExprNode(예: a.GetName().Version)가 이어지는 멤버를
+    // 리플렉션으로 찾으려면 그 왼쪽(Inner) 식의 CLR 타입을 먼저 알아야 하기 때문에 필요하다.
+    // 판별 불가능하면 typeof(System.Object)로 안전하게 폴백한다(호출부가 멤버를 못 찾으면
+    // 어차피 명확한 예외를 던지도록 되어 있으므로, 여기서 잘못 단정하는 것보다 안전하다).
+    function GetExprClrType(e: TExprNode): System.Type;
+    var _fb90: FieldBuilder;
+    begin
+      Result:=typeof(System.Object);
+      try
+        if e is TTypeOfExprNode then
+        begin
+          // [Stage 91] typeof(...)의 결과는 항상 System.Type.
+          Result:=typeof(System.Type);
+        end
+        else if e is TExternalCastExprNode then
+        begin
+          // [Stage 90] TargetType(inner) — 캐스트 결과의 CLR 타입은 항상 TargetType 자체.
+          Result:=ResolveExternalType(TExternalCastExprNode(e).TargetType);
+        end
+        else if e is TChainedMemberExprNode then
+        begin
+          var _ch90:=TChainedMemberExprNode(e);
+          var _innerT90:=GetExprClrType(_ch90.Inner);
+          if _innerT90=nil then exit;
+          var _pi90:=SafeGetProperty(_innerT90, _ch90.MemberName);
+          if (not _ch90.IsCall) and (_pi90<>nil) and (_pi90.GetGetMethod<>nil) then
+          begin Result:=_pi90.PropertyType; exit; end;
+          if not _ch90.IsCall then
+          begin
+            var _fi90:=_innerT90.GetField(_ch90.MemberName);
+            if _fi90<>nil then begin Result:=_fi90.FieldType; exit; end;
+          end;
+          var _mi90:=ResolveMethodByArity(_innerT90, _ch90.MemberName, _ch90.Args, false);
+          if _mi90<>nil then Result:=_mi90.ReturnType;
+        end
+        else if e is TMethodCallExprNode then
+        begin
+          var _rt90:=TryResolveMethodCallClrType(TMethodCallExprNode(e));
+          if _rt90<>nil then Result:=_rt90;
+        end
+        else if e is TVarRefNode then
+        begin
+          var _vn90:=TVarRefNode(e).VarName;
+          if fLocalScope.Has(_vn90) and fLocalScope.HasClrType(_vn90) then Result:=fLocalScope.GetClrType(_vn90)
+          else if fGlobalScope.Has(_vn90) and fGlobalScope.HasClrType(_vn90) then Result:=fGlobalScope.GetClrType(_vn90)
+          else if fLocalScope.Has(_vn90) and fLocalScope.HasClassName(_vn90) then Result:=FindExternalAncestorType(fLocalScope.GetClassName(_vn90))
+          else if fGlobalScope.Has(_vn90) and fGlobalScope.HasClassName(_vn90) then Result:=FindExternalAncestorType(fGlobalScope.GetClassName(_vn90));
+        end
+        else if e is TFieldReadExprNode then
+        begin
+          var _fnm90:=TFieldReadExprNode(e).FieldName;
+          if TryFindFieldBuilder(fCurClassName, _fnm90, _fb90) then Result:=_fb90.FieldType;
+        end
+        else if e is TNewObjectExprNode then
+        begin
+          var _no90:=TNewObjectExprNode(e);
+          if _no90.IsExternalType then Result:=ResolveExternalType(_no90.ClassName)
+          else if fBuiltTypes.ContainsKey(_no90.ClassName) then Result:=fBuiltTypes[_no90.ClassName];
+        end
+        else if e is TStrLiteralNode then Result:=typeof(string)
+        else if e is TIntLiteralNode then Result:=typeof(integer)
+        else if e is TRealLiteralNode then Result:=typeof(double)
+        else if e is TInt64LiteralNode then Result:=typeof(int64)
+        else if e is TBoolLiteralNode then Result:=typeof(boolean)
+        else if e is TCharLiteralNode then Result:=typeof(char);
+      except
+        Result:=typeof(System.Object); // 실패하면 안전한 폴백(멤버를 못 찾으면 호출부가 명확한 예외를 던짐)
+      end;
+      if Result=nil then Result:=typeof(System.Object);
     end;
 
     // [Stage 48] 외부 생성자/메서드에 인자를 하나씩 넣을 때, 기대하는 매개변수 타입이
@@ -4764,7 +5234,7 @@ type
       else
       begin
         // 기존 경로: 외부 CLR 타입, 또는 이미 CreateType된 타입
-        pi:=targetType.GetProperty(memberName);
+        pi:=SafeGetProperty(targetType, memberName);
         if pi<>nil then
         begin
           setr:=pi.GetSetMethod;
@@ -4790,7 +5260,7 @@ type
     var pi2: PropertyInfo; fi2: System.Reflection.FieldInfo; setr2: MethodInfo;
     begin
       // [Stage 57] System.Console.Title := 'a'; 같은 정적 속성/필드 대입 경로도 동일하게 처리.
-      pi2:=targetType.GetProperty(memberName);
+      pi2:=SafeGetProperty(targetType, memberName);
       if (pi2<>nil) and (pi2.GetSetMethod<>nil) then
       begin
         setr2:=pi2.GetSetMethod;

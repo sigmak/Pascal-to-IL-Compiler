@@ -151,7 +151,36 @@ type
       else if lw='ord' then Result:='Ord'
       else if lw='chr' then Result:='Chr'
       else if lw='readln' then Result:='ReadLn'
+      // [Stage 90] Format('{0}, {1}', a, b) — .NET string.Format 스타일 문자열 서식.
+      // 인자 개수는 여기서 검증하지 않고(가변 인자) CodeGen의 EmitBuiltinCall에서 처리한다.
+      else if lw='format' then Result:='Format'
+      // [Stage 93] GetCurrentDir — 인자 없이 괄호 없이도 쓰는 표준 함수(파스칼 관례).
+      // IsNiladicBuiltinFuncName에 등록된 이름만 괄호 없는 호출도 허용한다.
+      else if lw='getcurrentdir' then Result:='GetCurrentDir'
       else Result:='';
+    end;
+
+    // [Stage 93] 괄호 없이도 호출 가능한(인자 0개) 표준 라이브러리 함수 이름 화이트리스트.
+    // Pascal 관례상 인자 없는 함수는 괄호를 생략할 수 있다(예: appPath := GetCurrentDir;).
+    // 여기 없는 이름은 기존처럼 '(' 뒤따를 때만 함수 호출로 인식된다.
+    function IsNiladicBuiltinFuncName(text: string): boolean;
+    var lw3: string;
+    begin
+      lw3:=text.ToLower;
+      Result:=(lw3='getcurrentdir');
+    end;
+
+    // [Stage 92] byte(204) 처럼 .NET 원시 값 타입 이름을 캐스트 대상으로 쓰는 표현을 인식하기
+    // 위한 화이트리스트. WinForms 디자이너가 생성하는 (byte)(204) 류 캐스트 지원의 기반이 된다.
+    // (여기 없는 이름은 기존 경로대로 일반 함수 호출/식별자로 계속 처리된다.)
+    function IsPrimitiveCastTypeName(text: string): boolean;
+    var lw2: string;
+    begin
+      lw2:=text.ToLower;
+      Result:=(lw2='byte') or (lw2='sbyte') or (lw2='short') or (lw2='ushort') or
+              (lw2='int') or (lw2='uint') or (lw2='long') or (lw2='ulong') or
+              (lw2='single') or (lw2='double') or (lw2='decimal') or
+              (lw2='char') or (lw2='bool') or (lw2='boolean') or (lw2='object');
     end;
 
     function Cur: TToken; begin Result:=fTokens[fPos]; end;
@@ -300,6 +329,10 @@ type
           begin fPos:=fPos+1; fLastGenericName:='char'; Result:=vtGenericArray; end
         else if Cur.Kind=tkInt64 then
           begin fPos:=fPos+1; fLastGenericName:='int64'; Result:=vtGenericArray; end
+        // [Stage 90] array of object — .NET object[] (예: Assembly.GetCustomAttributes의 반환 타입).
+        // fClassNames에 없는 'object'라는 단순 식별자일 때만 반응(사용자 클래스 이름 'object'와 충돌 방지).
+        else if (Cur.Kind=tkIdent) and (Cur.Text.ToLower='object') and (not fClassNames.Contains(Cur.Text)) then
+          begin fPos:=fPos+1; Result:=vtObjArray; end
         // [Stage 37] array of T — 제네릭 템플릿 본문에서만 등장. 실제 타입은 Monomorphize가 채운다.
         else if (Cur.Kind=tkIdent) and fCurGenericParams.Contains(Cur.Text) then
           begin fLastGenericName:=Cur.Text; fPos:=fPos+1; Result:=vtGenericArray; end
@@ -739,6 +772,20 @@ type
         Result:=new TBinOpNode(boSub, new TIntLiteralNode(0), ParsePrimary);
       end
 
+      // [Stage 91] typeof(TypeName) — .NET typeof 연산자. System.Type 값을 만든다(주로
+      // GetCustomAttributes(Type, bool) 같은 리플렉션 API 인자로 쓰인다). 괄호 안이 "값 식"이
+      // 아니라 "타입 이름"이라 일반 ParseExpr로는 못 다룬다(변수/필드가 아니므로) — 그래서
+      // 등록 안 된 평범한 식별자로 오인되어 typeof만 홀로 소비되고 뒤의 "(...)"가 그대로
+      // 남아 "예상 tkRParen 실제 tkLParen" 에러로 이어졌다. 일반 tkIdent 분기보다 먼저 검사.
+      else if (t.Kind=tkIdent) and (t.Text.ToLower='typeof') and (PeekAt(1).Kind=tkLParen) then
+      begin
+        fPos:=fPos+2; // 'typeof' '(' 소비
+        var toName:=Expect(tkIdent).Text;
+        while Cur.Kind=tkDot do begin fPos:=fPos+1; toName:=toName+'.'+Expect(tkIdent).Text; end;
+        Expect(tkRParen);
+        Result:=new TTypeOfExprNode(toName);
+      end
+
       else if t.Kind=tkIntLiteral then
       begin
         fPos:=fPos+1;
@@ -989,24 +1036,36 @@ type
             begin
               var castType2:=string.Join('.', segs2);
               var innerName2:='';
+              var isSimpleCastTarget90:=true;
               if castArgs2[0] is TVarRefNode then innerName2:=TVarRefNode(castArgs2[0]).VarName
               else if castArgs2[0] is TFieldReadExprNode then innerName2:=TFieldReadExprNode(castArgs2[0]).FieldName
-              else raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': 캐스트 대상은 단순 변수/필드 이름이어야 합니다');
-              fPos:=fPos+1; // '.' 소비
-              var member3:=ExpectMemberName; // [Stage 41] 키워드 속성명(Length 등) 허용
-              var mc3:=new TMethodCallExprNode(innerName2, member3);
-              mc3.ObjCastType:=castType2;
-              if Cur.Kind=tkLParen then
+              else isSimpleCastTarget90:=false;
+
+              if not isSimpleCastTarget90 then
               begin
-                fPos:=fPos+1;
-                if Cur.Kind<>tkRParen then
+                // [Stage 90] 단순 변수/필드가 아닌 임의의 식(예: attributes[0]) — 캐스트 노드로 감싸고
+                // 뒤의 ".member"/".method(...)"는 ParsePrimary 끝의 범용 체이닝 루프에 맡긴다
+                // (거기서 TChainedMemberExprNode로 감싸며, 여러 단계 체이닝도 자동으로 처리됨).
+                Result:=new TExternalCastExprNode(castType2, castArgs2[0]);
+              end
+              else
+              begin
+                fPos:=fPos+1; // '.' 소비
+                var member3:=ExpectMemberName; // [Stage 41] 키워드 속성명(Length 등) 허용
+                var mc3:=new TMethodCallExprNode(innerName2, member3);
+                mc3.ObjCastType:=castType2;
+                if Cur.Kind=tkLParen then
                 begin
-                  mc3.Args.Add(ParseAddSub);
-                  while Cur.Kind=tkComma do begin fPos:=fPos+1; mc3.Args.Add(ParseAddSub); end;
+                  fPos:=fPos+1;
+                  if Cur.Kind<>tkRParen then
+                  begin
+                    mc3.Args.Add(ParseAddSub);
+                    while Cur.Kind=tkComma do begin fPos:=fPos+1; mc3.Args.Add(ParseAddSub); end;
+                  end;
+                  Expect(tkRParen);
                 end;
-                Expect(tkRParen);
+                Result:=mc3;
               end;
-              Result:=mc3;
             end
             else
             begin
@@ -1163,6 +1222,26 @@ type
           Result:=bcn;
         end
 
+        // [Stage 92] byte(204) 같은 .NET 원시 값 타입 캐스트. 사용자 함수/클래스 이름과
+        // 겹치면 그쪽을 우선하도록 fFuncNames/fClassNames에 없을 때만 반응한다.
+        else if (Cur.Kind=tkLParen) and IsPrimitiveCastTypeName(t.Text) and
+                (not fFuncNames.Contains(t.Text)) and (not fClassNames.Contains(t.Text)) then
+        begin
+          fPos:=fPos+1; // '(' 소비
+          var castArgDirect92:=ParseExpr;
+          Expect(tkRParen);
+          Result:=new TExternalCastExprNode(t.Text, castArgDirect92);
+        end
+
+        // [Stage 93] 괄호 없이 부른 인자 0개 표준 라이브러리 함수 — 예: GetCurrentDir;
+        // (Pascal 관례상 무인자 함수는 괄호 생략 가능). IsNiladicBuiltinFuncName 화이트리스트에
+        // 있고 사용자가 같은 이름의 함수/필드를 직접 정의하지 않았을 때만 반응한다.
+        else if (NormalizeBuiltinFuncName(t.Text)<>'') and IsNiladicBuiltinFuncName(t.Text)
+                and (Cur.Kind<>tkLParen) and (not fFuncNames.Contains(t.Text)) then
+        begin
+          Result:=new TBuiltinCallExprNode(NormalizeBuiltinFuncName(t.Text));
+        end
+
         else
         begin
           // 메서드 본문 안에서의 식별자 읽기: 매개변수 이름이면 지역 변수 참조,
@@ -1185,7 +1264,28 @@ type
         // 비교식이 "예상 tkRParen 실제 tkGe" 에러가 났다(비교 연산자는 ParseExpr에만 있고
         // ParseAddSub까지는 안 내려옴). ParseExpr는 ParseAddSub의 상위 호환(비교 연산자가
         // 없으면 결과가 완전히 같음)이라 안전하게 바꿀 수 있다.
-        fPos:=fPos+1; inner:=ParseExpr; Expect(tkRParen); Result:=inner;
+        fPos:=fPos+1; inner:=ParseExpr; Expect(tkRParen);
+
+        // [Stage 92] C 스타일 캐스트 (TypeName)(Expr) 인식 — WinForms 디자이너가 생성하는
+        // ((byte)(204)) 같은 표현이 여기 해당한다. 괄호로 묶인 식이 단순 식별자(타입 이름)
+        // 하나뿐이고 바로 뒤에 또 '('가 이어지는 경우인데, 이 조합은 캐스트가 아니고서는
+        // 문법적으로 나올 수 없다(괄호식 뒤에 괄호식이 연산자 없이 바로 이어붙는 경우가
+        // 없으므로) — 그래서 화이트리스트 없이 항상 캐스트로 해석해도 안전하다.
+        if Cur.Kind=tkLParen then
+        begin
+          var castTypeName92:='';
+          if inner is TVarRefNode then castTypeName92:=TVarRefNode(inner).VarName
+          else if inner is TFieldReadExprNode then castTypeName92:=TFieldReadExprNode(inner).FieldName;
+          if castTypeName92<>'' then
+          begin
+            fPos:=fPos+1; // '(' 소비
+            var castArgParen92:=ParseExpr;
+            Expect(tkRParen);
+            inner:=new TExternalCastExprNode(castTypeName92, castArgParen92);
+          end;
+        end;
+
+        Result:=inner;
       end
 
       else
@@ -1195,27 +1295,52 @@ type
       // 화이트리스트 이름(IsSeqExtMethodName) + 바로 뒤 '(' 조합일 때만 반응하므로, 위에서 이미
       // 처리된 일반 obj.Method(...) 호출 파싱(TMethodCallExprNode)과는 겹치지 않는다. 여러 번
       // 체이닝 가능(Where(...).Select(...).Sum() 등) — while로 반복.
-      while (Cur.Kind=tkDot) and IsSeqExtMethodName(PeekAt(1)) and (PeekAt(2).Kind=tkLParen) do
+      // [Stage 90] 위 LINQ 체이닝과, 그 외 일반 멤버 접근/메서드 호출 체인을 하나의 루프로
+      // 합쳐서(둘이 섞여도, 예: X.Foo().Where(...).Bar 처럼) 계속 이어질 수 있게 한다.
+      while Cur.Kind=tkDot do
       begin
-        fPos:=fPos+1; // '.' 소비
-        var extName:=Cur.Text; fPos:=fPos+1; // 메서드 이름 소비
-        Expect(tkLParen);
-        var extLam: TExprLambdaNode := nil;
-        if (extName='Where') or (extName='Select') then
+        if IsSeqExtMethodName(PeekAt(1)) and (PeekAt(2).Kind=tkLParen) then
         begin
-          // 매개변수 하나 -> 식  (괄호 있는 (x) -> ...  / 없는 x -> ... 둘 다 허용)
-          var extParamName: string;
+          fPos:=fPos+1; // '.' 소비
+          var extName:=Cur.Text; fPos:=fPos+1; // 메서드 이름 소비
+          Expect(tkLParen);
+          var extLam: TExprLambdaNode := nil;
+          if (extName='Where') or (extName='Select') then
+          begin
+            // 매개변수 하나 -> 식  (괄호 있는 (x) -> ...  / 없는 x -> ... 둘 다 허용)
+            var extParamName: string;
+            if Cur.Kind=tkLParen then
+            begin
+              fPos:=fPos+1; extParamName:=Expect(tkIdent).Text; Expect(tkRParen);
+            end
+            else
+              extParamName:=Expect(tkIdent).Text;
+            Expect(tkArrow);
+            extLam:=new TExprLambdaNode(extParamName, ParseExpr);
+          end;
+          Expect(tkRParen);
+          Result:=new TSeqExtCallExprNode(Result, extName, extLam);
+        end
+        else
+        begin
+          // [Stage 90] 일반 체인: expr.Member 또는 expr.Member(args). 예: a.GetName().Version.ToString().
+          fPos:=fPos+1; // '.' 소비
+          var chMember:=ExpectMemberName;
           if Cur.Kind=tkLParen then
           begin
-            fPos:=fPos+1; extParamName:=Expect(tkIdent).Text; Expect(tkRParen);
+            var chNode:=new TChainedMemberExprNode(Result, chMember, true);
+            fPos:=fPos+1;
+            if Cur.Kind<>tkRParen then
+            begin
+              chNode.Args.Add(ParseAddSub);
+              while Cur.Kind=tkComma do begin fPos:=fPos+1; chNode.Args.Add(ParseAddSub); end;
+            end;
+            Expect(tkRParen);
+            Result:=chNode;
           end
           else
-            extParamName:=Expect(tkIdent).Text;
-          Expect(tkArrow);
-          extLam:=new TExprLambdaNode(extParamName, ParseExpr);
+            Result:=new TChainedMemberExprNode(Result, chMember, false);
         end;
-        Expect(tkRParen);
-        Result:=new TSeqExtCallExprNode(Result, extName, extLam);
       end;
     end;
 
@@ -1404,10 +1529,25 @@ type
     begin
       if Cur.Kind=tkWriteln then
       begin
-        fPos:=fPos+1; Expect(tkLParen); rhs:=ParseExpr; Expect(tkRParen);
-        if rhs is TStrLiteralNode then
-          Result:=new TWritelnStringStmtNode(TStrLiteralNode(rhs).Value)
-        else Result:=new TWritelnExprStmtNode(rhs);
+        fPos:=fPos+1; Expect(tkLParen); rhs:=ParseExpr;
+        // [Stage 90] writeln(a, b, c, ...) — 콤마로 이어지는 추가 인자 지원.
+        // (기존에는 인자를 정확히 1개만 받았고, 콤마가 나오면 "예상 tkRParen 실제 tkComma" 에러.)
+        if Cur.Kind=tkComma then
+        begin
+          var wArgs:=new List<TExprNode>; wArgs.Add(rhs);
+          while Cur.Kind=tkComma do begin fPos:=fPos+1; wArgs.Add(ParseExpr); end;
+          Expect(tkRParen);
+          var wNode90:=new TWritelnArgsStmtNode;
+          wNode90.Args:=wArgs;
+          Result:=wNode90;
+        end
+        else
+        begin
+          Expect(tkRParen);
+          if rhs is TStrLiteralNode then
+            Result:=new TWritelnStringStmtNode(TStrLiteralNode(rhs).Value)
+          else Result:=new TWritelnExprStmtNode(rhs);
+        end;
       end
 
       // [Stage 75] Readln; 또는 Readln(변수);
@@ -2581,7 +2721,7 @@ type
                     inlImpl.ParamGenericNames.Add(sig.ParamClassNames[pgi88c])
                   else
                     inlImpl.ParamGenericNames.Add('');
-                  if (sig.ParamTypes[pgi88c]=vtIntArray) or (sig.ParamTypes[pgi88c]=vtStrArray) or (sig.ParamTypes[pgi88c]=vtGenericArray) then
+                  if (sig.ParamTypes[pgi88c]=vtIntArray) or (sig.ParamTypes[pgi88c]=vtStrArray) or (sig.ParamTypes[pgi88c]=vtGenericArray) or (sig.ParamTypes[pgi88c]=vtObjArray) then
                     if not fArrayNames.Contains(sig.ParamNames[pgi88c]) then fArrayNames.Add(sig.ParamNames[pgi88c]);
                 end;
 
@@ -2812,7 +2952,7 @@ type
         foreach var nm in ns do
         begin
           aList.Add(new TVarDecl(nm, vt, cn, isExt));
-          if (vt=vtIntArray) or (vt=vtStrArray) or (vt=vtGenericArray) then fArrayNames.Add(nm); // [Stage 37]
+          if (vt=vtIntArray) or (vt=vtStrArray) or (vt=vtGenericArray) or (vt=vtObjArray) then fArrayNames.Add(nm); // [Stage 37/90]
           if vt=vtMatrix then begin if not fArrayNames.Contains(nm) then fArrayNames.Add(nm); end; // [Stage 67]
         end;
       end;
@@ -2915,7 +3055,7 @@ type
             end;
             // [Stage 28] array of integer/string 매개변수를 본문에서 a[i]로 인덱싱할 수
             // 있으려면 fArrayNames에 등록되어야 한다(별개 버그, 함께 수정).
-            if (pt=vtIntArray) or (pt=vtStrArray) or (pt=vtGenericArray) then // [Stage 37]
+            if (pt=vtIntArray) or (pt=vtStrArray) or (pt=vtGenericArray) or (pt=vtObjArray) then // [Stage 37/90]
               foreach var pbn in pBatch do
                 if not fArrayNames.Contains(pbn) then fArrayNames.Add(pbn);
             if Cur.Kind=tkSemicolon then fPos:=fPos+1 else break;
@@ -3144,7 +3284,7 @@ type
             // [Stage 28] array of integer/string 매개변수도 본문에서 a[i]로 인덱싱할 수
             // 있어야 하는데, 이전에는 매개변수 이름이 fArrayNames에 등록되지 않아
             // 배열 인덱스 식으로 인식되지 않았다(별개 버그, 이번에 함께 수정).
-            if (pt=vtIntArray) or (pt=vtStrArray) or (pt=vtGenericArray) then fArrayNames.Add(nm); // [Stage 37]
+            if (pt=vtIntArray) or (pt=vtStrArray) or (pt=vtGenericArray) or (pt=vtObjArray) then fArrayNames.Add(nm); // [Stage 37/90]
             if pt=vtMatrix then begin if not fArrayNames.Contains(nm) then fArrayNames.Add(nm); end; // [Stage 67]
           end;
           if Cur.Kind=tkSemicolon then fPos:=fPos+1 else break;
