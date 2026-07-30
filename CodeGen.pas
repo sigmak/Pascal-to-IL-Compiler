@@ -200,6 +200,23 @@ type
       begin
         if fBuiltTypes.ContainsKey(cn) then Result:=fBuiltTypes[cn]
         else if fTypeBuilders.ContainsKey(cn) then Result:=fTypeBuilders[cn]
+        // [버그 수정] cn이 사용자 정의 Pascal 클래스가 아니라 'ListViewItem'처럼
+        // 외부 CLR 타입 이름일 수 있다. 이 경우를 처리하지 않고 바로 System.Object로
+        // 폴백해 버리면, 예를 들어 "function MakeItem(...): ListViewItem;" 같은
+        // 최상위 함수의 MethodBuilder.ReturnType이 System.Object로 등록된다.
+        // 그러면 InferArgClrType의 TFuncCallExprNode 분기가 MakeItem(...) 호출의
+        // 인자 타입을 System.Object로 돌려주고, ScoreParamMatch가
+        // Items.Add(string)/Items.Add(ListViewItem) 두 오버로드 모두를 매치 실패(-100)로
+        // 동점 처리해 GetMethods() 나열 순서상 우연히 앞선 Add(string)이 선택되었다.
+        // 그 결과 IL이 ListViewItem 인스턴스를 String으로 castclass하게 되어
+        // 런타임에 "'ListviewItem' 형식 개체를 'String' 형식으로 캐스팅할 수 없습니다"
+        // InvalidCastException이 발생했다. 여기서 ResolveExternalType으로 한 번 더
+        // 실제 CLR 타입을 찾아본다.
+        else if cn<>'' then
+        begin
+          try Result:=ResolveExternalType(cn);
+          except Result:=typeof(System.Object); end;
+        end
         else Result:=typeof(System.Object);
       end
       else if t=vtInterface then
@@ -4618,6 +4635,9 @@ type
       else if name='TabPage'             then Result:='System.Windows.Forms.TabPage'
       else if name='TreeView'            then Result:='System.Windows.Forms.TreeView'
       else if name='ListView'            then Result:='System.Windows.Forms.ListView'
+      else if name='ListViewItem'        then Result:='System.Windows.Forms.ListViewItem'
+      else if name='ColumnHeader'        then Result:='System.Windows.Forms.ColumnHeader'
+      else if name='ListViewGroup'       then Result:='System.Windows.Forms.ListViewGroup'
       else if name='MenuStrip'           then Result:='System.Windows.Forms.MenuStrip'
       else if name='ToolStrip'           then Result:='System.Windows.Forms.ToolStrip'
       else if name='StatusStrip'         then Result:='System.Windows.Forms.StatusStrip'

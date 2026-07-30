@@ -21,8 +21,8 @@ uses
 
 const
   DefaultExampleDir = 'Examples';
-  
-  DefaultExampleFile = 'PascalABC_IDE.pabcproj'; // [Stage 93b]
+  DefaultExampleFile = 'PascalABC_IDE.pabcproj'; // [Stage 93c] About 메뉴 클릭시 오류 해결 그리고 ICSharpCode.TextEditor.dll,  Debugger.Core.dll 이렇게 2개의 파일을 examples 폴더에 추가해줘야됨.
+  //DefaultExampleFile = 'PascalABC_IDE.pabcproj'; // [Stage 93b]
   //DefaultExampleFile = 'PascalABC_IDE.pas'; // [Stage 93b]
   //DefaultExampleFile = 'uMain.pas'; // [Stage 93]
   //DefaultExampleFile = 'fChild.pas'; // [Stage 92]
