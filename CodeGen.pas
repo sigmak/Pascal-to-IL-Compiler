@@ -497,11 +497,22 @@ type
         else
         begin
           // 외부 CLR 타입(TreeView 등) — 기존 GetProperty/GetField 경로
+          // [Stage 100] curType이 로컬 TypeBuilder인데(localClsName78<>'') 위 세 검사(로컬
+          // getter/무인자메서드/필드)에 다 안 걸렸다면, 이 멤버는 로컬 클래스가 상속만 받은
+          // 외부 조상 타입(예: FormChild : DockContent의 DockPanel 프로퍼티)의 것이다.
+          // curType(아직 CreateType 전인 TypeBuilder) 그대로 GetProperty/GetField를 부르면
+          // TypeBuilder는 리플렉션 조회 자체를 지원하지 않아 NotSupportedException
+          // ("The invoked member is not supported in a dynamic module.")이 난다 — 외부 조상
+          // 타입으로 바꿔서 조회한다.
           // [버그 수정 - Stage 93] TableLayoutPanel.Controls처럼 파생 타입이 'new'로 같은
           // 이름의 프로퍼티를 다른 반환 타입으로 가리는 경우 curType.GetProperty(name)이
           // AmbiguousMatchException을 던진다 — SafeGetProperty가 가장 파생된 선언으로
           // 소거해서 찾아준다.
-          pi:=SafeGetProperty(curType, segs[i]);
+          var _reflT100:=curType;
+          if (localClsName78<>'') and (FindExternalAncestorType(localClsName78)<>nil) then
+            _reflT100:=FindExternalAncestorType(localClsName78);
+
+          pi:=SafeGetProperty(_reflT100, segs[i]);
           if pi<>nil then
           begin
             aIL.Emit(OpCodes.Callvirt, pi.GetGetMethod);
@@ -509,9 +520,9 @@ type
           end
           else
           begin
-            fi:=curType.GetField(segs[i]);
+            fi:=_reflT100.GetField(segs[i]);
             if fi=nil then
-              raise new Exception('타입 "'+curType.FullName+'"에 속성/필드 "'+segs[i]+'"가 없습니다 (연쇄 접근 중 — 경로: '+string.Join('.', segs)+')');
+              raise new Exception('타입 "'+_reflT100.FullName+'"에 속성/필드 "'+segs[i]+'"가 없습니다 (연쇄 접근 중 — 경로: '+string.Join('.', segs)+')');
             aIL.Emit(OpCodes.Ldfld, fi);
             curType:=fi.FieldType;
           end;
@@ -865,6 +876,21 @@ type
         begin
           var _effType4b:=_qfb4.FieldType;
           if _mc4.ObjCastType<>'' then _effType4b:=ResolveExternalType(_mc4.ObjCastType);
+          // [Stage 101] _effType4b가 아직 CreateType 전인 로컬 TypeBuilder(예: DockContent를
+          // 상속하는 FormChild)면, 아래 SafeGetProperty/ResolveMethodByArity(순수 리플렉션)가
+          // TypeBuilder에 대해 NotSupportedException("The invoked member is not supported in
+          // a dynamic module.")을 던진다(예: formChild1.Pane의 타입을 추론하려는 경우). 이
+          // 함수는 타입 추론 전용이라 IL은 안 건드리니, 외부 조상 타입으로 바꿔서 조회한다
+          // (EmitQualifierChainLoad에 적용한 것과 같은 방식).
+          if _effType4b is TypeBuilder then
+          begin
+            var _localCls101:='';
+            foreach var _tbKvp101 in fTypeBuilders do
+              if _tbKvp101.Value = TypeBuilder(_effType4b) then
+              begin _localCls101:=_tbKvp101.Key; break; end;
+            if (_localCls101<>'') and (FindExternalAncestorType(_localCls101)<>nil) then
+              _effType4b:=FindExternalAncestorType(_localCls101);
+          end;
           var _pi4:=SafeGetProperty(_effType4b, _mc4.MethodName);
           if (_pi4<>nil) and (_pi4.PropertyType=typeof(string)) then Result:=vtString
           else
@@ -1715,18 +1741,65 @@ type
             _qType:=ResolveExternalType(mc.ObjCastType);
             aIL.Emit(OpCodes.Castclass, _qType);
           end;
-          var _pi5:=SafeGetProperty(_qType, mc.MethodName);
-          if (mc.Args.Count=0) and (_pi5<>nil) and (_pi5.GetGetMethod<>nil) then
-            aIL.Emit(OpCodes.Callvirt, _pi5.GetGetMethod)
+          // [Stage 98] _qType이 아직 CreateType되지 않은 로컬(사용자 정의) 클래스의
+          // TypeBuilder이면 아래 SafeGetProperty/ResolveMethodByArity(순수 리플렉션 경로)가
+          // TypeBuilder에 대해 NotSupportedException("Type has not been created.")을 던진다
+          // (예: 식 위치에서 값으로 쓰이는 formChild1.Pane — DockContent를 상속하는 FormChild
+          // 필드의 프로퍼티를 다른 호출의 인자로 넘기는 경우). 문장 위치의 동일한 문제(위쪽
+          // TryFindFieldBuilder(fCurClassName, mcs.ObjName, qfb) 분기)와 같은 방식으로, 로컬
+          // 클래스 이름을 fTypeBuilders에서 역조회해 메타데이터 기반 경로
+          // (FindInstanceMethod/FindExternalAncestorType)로 처리한다.
+          var _localClsExpr98:string:='';
+          if _qType is TypeBuilder then
+            foreach var _tbKvpExpr98 in fTypeBuilders do
+              if _tbKvpExpr98.Value = TypeBuilder(_qType) then
+              begin _localClsExpr98:=_tbKvpExpr98.Key; break; end;
+
+          if _localClsExpr98<>'' then
+          begin
+            var _imbExpr98: MethodBuilder;
+            if (mc.Args.Count=0) and fFieldBuilders.ContainsKey(_localClsExpr98) and fFieldBuilders[_localClsExpr98].ContainsKey(mc.MethodName) then
+              aIL.Emit(OpCodes.Ldfld, fFieldBuilders[_localClsExpr98][mc.MethodName])
+            else if TryFindInstanceMethod(_localClsExpr98, mc.MethodName, _imbExpr98) then
+            begin
+              EmitArgsCoerced(aIL, mc.Args, FindInstanceMethodParamTypes(_localClsExpr98, mc.MethodName));
+              aIL.Emit(OpCodes.Callvirt, _imbExpr98);
+            end
+            else if FindExternalAncestorType(_localClsExpr98)<>nil then
+            begin
+              var _extAncExpr98:=FindExternalAncestorType(_localClsExpr98);
+              var _getPExpr98:=SafeGetProperty(_extAncExpr98, mc.MethodName);
+              if (mc.Args.Count=0) and (_getPExpr98<>nil) and (_getPExpr98.GetGetMethod<>nil) then
+                aIL.Emit(OpCodes.Callvirt, _getPExpr98.GetGetMethod)
+              else
+              begin
+                var _emiExpr98:=ResolveMethodByArity(_extAncExpr98, mc.MethodName, mc.Args, false);
+                if _emiExpr98=nil then
+                  raise new Exception('로컬 클래스 "'+_localClsExpr98+'"(외부 조상 "'+_extAncExpr98.FullName+'")에 메서드/필드 "'+mc.MethodName+'"가 없습니다 (인자 '+mc.Args.Count.ToString+'개).');
+                var _emiParamsExpr98:=_emiExpr98.GetParameters;
+                for var _emiAiExpr98:=0 to mc.Args.Count-1 do
+                  EmitArgForParamType(aIL, mc.Args[_emiAiExpr98], _emiParamsExpr98[_emiAiExpr98].ParameterType);
+                aIL.Emit(OpCodes.Callvirt, _emiExpr98);
+              end;
+            end
+            else
+              raise new Exception('로컬 클래스 "'+_localClsExpr98+'"에 메서드/필드 "'+mc.MethodName+'"가 없습니다.');
+          end
           else
           begin
-            var _emi5:=ResolveMethodByArity(_qType, mc.MethodName, mc.Args, false);
-            if _emi5=nil then
-              raise new Exception('타입 "'+_qType.FullName+'"에 메서드 "'+mc.MethodName+'"가 없습니다 (인자 '+mc.Args.Count.ToString+'개).');
-            var _emi5Params:=_emi5.GetParameters;
-            for var _emi5Ai:=0 to mc.Args.Count-1 do
-              EmitArgForParamType(aIL, mc.Args[_emi5Ai], _emi5Params[_emi5Ai].ParameterType);
-            aIL.Emit(OpCodes.Callvirt, _emi5);
+            var _pi5:=SafeGetProperty(_qType, mc.MethodName);
+            if (mc.Args.Count=0) and (_pi5<>nil) and (_pi5.GetGetMethod<>nil) then
+              aIL.Emit(OpCodes.Callvirt, _pi5.GetGetMethod)
+            else
+            begin
+              var _emi5:=ResolveMethodByArity(_qType, mc.MethodName, mc.Args, false);
+              if _emi5=nil then
+                raise new Exception('타입 "'+_qType.FullName+'"에 메서드 "'+mc.MethodName+'"가 없습니다 (인자 '+mc.Args.Count.ToString+'개).');
+              var _emi5Params:=_emi5.GetParameters;
+              for var _emi5Ai:=0 to mc.Args.Count-1 do
+                EmitArgForParamType(aIL, mc.Args[_emi5Ai], _emi5Params[_emi5Ai].ParameterType);
+              aIL.Emit(OpCodes.Callvirt, _emi5);
+            end;
           end;
         end
         else if (FindExternalAncestorType(fCurClassName)<>nil)
@@ -2861,6 +2934,23 @@ type
             end;
             EmitPropertyOrFieldSet(aIL, qTargetType, fas.FieldName, fas.ValueExpr);
           end
+          else if fas.Qualifier.Contains('.') then
+          begin
+            // [Stage 99] fas.Qualifier가 "formChild2.DockPanel"처럼 점(.)을 포함한 실제 체인이면
+            // (필드/변수로 시작해서 프로퍼티를 타고 내려가는 경우), 통째로 외부 정적 타입 이름인 줄
+            // 알고 ResolveExternalType에 그대로 넘기면 안 된다(예: "외부 타입
+            // 'formChild2.DockPanel'을(를) 찾을 수 없습니다" 에러). EmitQualifierChainLoad로
+            // 체인을 한 세그먼트씩 제대로 따라가며 로드한 뒤, 그 결과 타입에 최종
+            // 필드/프로퍼티를 설정한다.
+            var _chainSegs99:=new List<string>(fas.Qualifier.Split('.'));
+            EmitQualifierChainLoad(aIL, _chainSegs99, qTargetType);
+            if fas.QualifierCastType<>'' then
+            begin
+              qTargetType:=ResolveExternalType(fas.QualifierCastType);
+              aIL.Emit(OpCodes.Castclass, qTargetType);
+            end;
+            EmitPropertyOrFieldSet(aIL, qTargetType, fas.FieldName, fas.ValueExpr);
+          end
           else
             EmitStaticPropertyOrFieldSet(aIL, ResolveExternalType(fas.Qualifier), fas.FieldName, fas.ValueExpr);
         end
@@ -2923,6 +3013,17 @@ type
           else if fBuiltTypes.ContainsKey(ivClassName) then ivClrType:=fBuiltTypes[ivClassName]
           else if fTypeBuilders.ContainsKey(ivClassName) then ivClrType:=fTypeBuilders[ivClassName]
           else ivClrType:=typeof(System.Object);
+        end
+        else if ivs.ValueExpr is TExternalCastExprNode then
+        begin
+          // [버그수정] TabControl(sender) 같은 외부타입 캐스트식은 InferType이
+          // vtObject라는 것만 알려줄 뿐 실제 캐스트 대상 타입(TargetType)은 모른다.
+          // 이 분기가 없으면 아래 else 폴백(VTC(ivVt,''))이 System.Object로
+          // DeclareLocal 해버려서, 이후 "tabControl.SelectedTab"처럼 캐스트 결과에
+          // 멤버 접근을 하면 System.Object에 그 멤버가 없다고 터진다.
+          var ivExtCast:=TExternalCastExprNode(ivs.ValueExpr);
+          ivClrType:=ResolveExternalType(ivExtCast.TargetType);
+          ivIsExternal:=true;
         end
         else if ivs.ValueExpr is TMethodCallExprNode then
         begin
@@ -3042,6 +3143,21 @@ type
         end
         else if mcs.ObjName='' then
         begin
+          // [버그수정] Halt / Halt(exitCode) — 파스칼 내장 프로시저. Writeln/Readln/Exit와
+          // 달리 전용 AST 노드가 없어서 지금까지는 일반 메서드 호출로 파싱되어 여기
+          // "암시적 self 호출" 분기로 흘러들었고, Form1(및 조상 타입 Form)에 "Halt"라는
+          // 메서드가 없어 "외부 타입 ... 에 메서드 Halt가 없습니다" 예외로 이어졌다.
+          // System.Environment.Exit(int32)로 매핑해 프로그램을 즉시 종료시킨다.
+          if mcs.MethodName.ToUpper()='HALT' then
+          begin
+            if mcs.Args.Count>0 then
+              EmitArgForParamType(aIL, mcs.Args[0], typeof(integer))
+            else
+              aIL.Emit(OpCodes.Ldc_I4_0);
+            aIL.Emit(OpCodes.Call, typeof(System.Environment).GetMethod('Exit', [typeof(integer)]));
+          end
+          else
+          begin
           // 암시적 self 호출: Show; Close(); 등 — 지역 메서드 우선, 없으면 외부 상속 타입에서 탐색
           aIL.Emit(OpCodes.Ldarg_0); // self
           if TryFindInstanceMethod(fCurClassName, mcs.MethodName, imb) then
@@ -3063,6 +3179,7 @@ type
               EmitArgForParamType(aIL, mcs.Args[_emiAi0], _emiParams0[_emiAi0].ParameterType);
             aIL.Emit(OpCodes.Callvirt, emi);
             if emi.ReturnType<>typeof(System.Void) then aIL.Emit(OpCodes.Pop);
+          end;
           end;
         end
         else if (fLocalScope.Has(mcs.ObjName) or fGlobalScope.Has(mcs.ObjName))
@@ -3132,7 +3249,13 @@ type
           end
           else
           begin
-            imb:=FindInstanceMethod(cn, mcs.MethodName);
+            // [버그수정] cn(예: TAboutBox)이 자체적으로 mcs.MethodName(예: ShowDialog)을
+            // 정의하지 않고 외부 조상 타입(Form 등)에서 상속받은 경우, FindInstanceMethod는
+            // 로컬(파스칼) 클래스 계층(fClassParents)만 훑고 예외를 던진다 — "암시적 self
+            // 호출" 분기(3144번째 줄 부근)에서 이미 쓰는 것과 동일한 외부 조상 타입 폴백을
+            // 여기(지역변수를 통한 호출)에도 추가한다.
+            if TryFindInstanceMethod(cn, mcs.MethodName, imb) then
+            begin
             if mcs.GenericArgTypes.Count>0 then
             begin
               // [Stage 74] obj.Method<T,U>(...) — 명시적 타입 인자로 닫은 뒤 그 닫힌 메서드를 호출한다.
@@ -3151,6 +3274,21 @@ type
               // void 메서드가 아닌 경우 반환값 버리기
               if imb.ReturnType<>typeof(System.Void) then
                 aIL.Emit(OpCodes.Pop);
+            end;
+            end
+            else
+            begin
+              var cnExtType:=FindExternalAncestorType(cn);
+              if cnExtType=nil then
+                raise new Exception('알 수 없는 메서드 "'+cn+'.'+mcs.MethodName+'"');
+              var cnEmi:=ResolveMethodByArity(cnExtType, mcs.MethodName, mcs.Args, false);
+              if cnEmi=nil then
+                raise new Exception('외부 타입 "'+cnExtType.FullName+'"에 메서드 "'+mcs.MethodName+'"가 없습니다 (인자 '+mcs.Args.Count.ToString+'개).');
+              var cnEmiParams:=cnEmi.GetParameters;
+              for var cnEmiAi:=0 to mcs.Args.Count-1 do
+                EmitArgForParamType(aIL, mcs.Args[cnEmiAi], cnEmiParams[cnEmiAi].ParameterType);
+              aIL.Emit(OpCodes.Callvirt, cnEmi);
+              if cnEmi.ReturnType<>typeof(System.Void) then aIL.Emit(OpCodes.Pop);
             end;
           end;
         end
@@ -3180,8 +3318,8 @@ type
 
           if localClsNameFB<>'' then
           begin
-            var imbFB:=FindInstanceMethod(localClsNameFB, mcs.MethodName);
-            if imbFB<>nil then
+            var imbFB: MethodBuilder;
+            if TryFindInstanceMethod(localClsNameFB, mcs.MethodName, imbFB) then
             begin
               EmitArgsCoerced(aIL, mcs.Args, FindInstanceMethodParamTypes(localClsNameFB, mcs.MethodName));
               aIL.Emit(OpCodes.Callvirt, imbFB);
@@ -3192,6 +3330,34 @@ type
               // 인자 없는 필드 읽기 (문장 위치이므로 결과값은 버림)
               aIL.Emit(OpCodes.Ldfld, fFieldBuilders[localClsNameFB][mcs.MethodName]);
               aIL.Emit(OpCodes.Pop);
+            end
+            else if FindExternalAncestorType(localClsNameFB)<>nil then
+            begin
+              // [Stage 98] FormChild(로컬 클래스) : DockContent(외부 조상, WeifenLuo)처럼, 로컬
+              // 클래스가 상속만 받고 오버라이드하지 않은 외부 조상 메서드(예:
+              // formChild1.Show(dockPanelMain, DockState.DockLeft))는 fInstanceMethods/
+              // fFieldBuilders 어디에도 없어서 위 두 분기가 다 실패해 "알 수 없는 메서드"로
+              // 잘못 죽는다. 객체 참조는 이미 스택에 로드돼 있으니(위의 Ldarg_0; Ldfld qfb 등),
+              // 외부 조상 타입에서 리플렉션으로 실제 메서드를 찾아 그대로 호출한다
+              // (아래쪽 "self가 상속한 외부 프로퍼티" 분기와 동일한 방식).
+              var _extAncFB94:=FindExternalAncestorType(localClsNameFB);
+              var _getPFB94:=SafeGetProperty(_extAncFB94, mcs.MethodName);
+              if (mcs.Args.Count=0) and (_getPFB94<>nil) and (_getPFB94.GetGetMethod<>nil) then
+              begin
+                aIL.Emit(OpCodes.Callvirt, _getPFB94.GetGetMethod);
+                aIL.Emit(OpCodes.Pop);
+              end
+              else
+              begin
+                var _emiFB94:=ResolveMethodByArity(_extAncFB94, mcs.MethodName, mcs.Args, false);
+                if _emiFB94=nil then
+                  raise new Exception('로컬 클래스 "'+localClsNameFB+'"(외부 조상 "'+_extAncFB94.FullName+'")에 메서드/필드 "'+mcs.MethodName+'"가 없습니다 (인자 '+mcs.Args.Count.ToString+'개).');
+                var _emiParamsFB94:=_emiFB94.GetParameters;
+                for var _emiAiFB94:=0 to mcs.Args.Count-1 do
+                  EmitArgForParamType(aIL, mcs.Args[_emiAiFB94], _emiParamsFB94[_emiAiFB94].ParameterType);
+                aIL.Emit(OpCodes.Callvirt, _emiFB94);
+                if _emiFB94.ReturnType<>typeof(System.Void) then aIL.Emit(OpCodes.Pop);
+              end;
             end
             else
               raise new Exception('로컬 클래스 "'+localClsNameFB+'"에 메서드/필드 "'+mcs.MethodName+'"가 없습니다.');
@@ -4307,6 +4473,14 @@ type
           else if fTypeBuilders.ContainsKey(clsName) then clrType:=fTypeBuilders[clsName]
           else clrType:=typeof(System.Object);
         end
+        else if cd.ValueExpr is TExternalCastExprNode then
+        begin
+          // TInlineVarStmtNode 쪽과 동일한 버그: SomeType(expr) 캐스트식의 실제
+          // 타입을 반영하지 않으면 System.Object로 선언되어 이후 멤버 접근이 깨진다.
+          var extCast:=TExternalCastExprNode(cd.ValueExpr);
+          clrType:=ResolveExternalType(extCast.TargetType);
+          isExtT:=true;
+        end
         else
           clrType:=VTC(vt, '');
       end;
@@ -4788,6 +4962,41 @@ type
           Result:=GetExprClrType(e);
         except
           Result:=nil;
+        end;
+      end
+      // [버그 수정] MakeItem(...) 처럼 최상위 함수 호출 결과를 직접 다른 메서드의 인자로
+      // 넘길 때(예: dgvModules.Items.Add(MakeItem(...))) InferArgClrType에 TFuncCallExprNode
+      // 분기가 없어 마지막 else 폴백으로 떨어졌다. InferType은 vtObject를 반환하지만
+      // case vt of 안에 vtObject 케이스가 없으므로 Result가 nil(중립)로 남았고,
+      // ScoreParamMatch가 Add(string)/Add(ListViewItem) 양쪽을 모두 0점 동점으로 처리해
+      // GetMethods() 나열 순서상 먼저 나온 Add(string)이 선택됐다. 그 결과 IL이
+      // ListViewItem을 String으로 castclass하는 코드를 방출해 런타임에
+      // InvalidCastException이 발생했다.
+      // fMethods에 등록된 MethodBuilder.ReturnType으로 정확한 CLR 반환 타입을 구해
+      // 오버로드 점수 계산이 올바른 후보를 선택하도록 한다.
+      else if e is TFuncCallExprNode then
+      begin
+        var _fc50:=TFuncCallExprNode(e);
+        try
+          if fMethods.ContainsKey(_fc50.FuncName) then
+          begin
+            var _mbRet50:=fMethods[_fc50.FuncName].ReturnType;
+            if (_mbRet50<>nil) and (_mbRet50<>typeof(System.Void)) then
+              Result:=_mbRet50;
+            // Result가 nil로 남으면 아래 공통 폴백(InferType)이 이어받는다
+          end;
+        except
+          Result:=nil;
+        end;
+        // MethodBuilder에서 반환 타입을 못 찾은 경우 기존 InferType 폴백
+        if Result=nil then
+        begin
+          vt:=InferType(e);
+          case vt of
+            vtString:  Result:=typeof(string);
+            vtBoolean: Result:=typeof(boolean);
+            vtInteger: Result:=typeof(integer);
+          end;
         end;
       end
       else
@@ -5741,6 +5950,42 @@ type
       // [Stage 61] 생성자 본문의 지역 const 선언 처리
       foreach var cd61 in impl.ConstDecls do EmitConstDecl(il, fLocalScope, cd61);
 
+      // [버그수정] 사용자가 "constructor Create; begin InitializeComponent; ... end;"처럼
+      // 생성자 본문에 "inherited Create(...)"를 직접 쓰지 않으면, 지금까지는 부모(예:
+      // System.Windows.Forms.Form) 생성자가 전혀 실행되지 않았다. Form/Control의 내부
+      // 상태(RightToLeft 등 CreateParams 계산에 쓰이는 필드들)가 초기화되지 않은 채로
+      // InitializeComponent가 self.ClientSize := ... 를 실행하면
+      // Control.get_RightToLeft() 안에서 NullReferenceException이 터진다 — C#에서
+      // 파생 클래스 생성자가 base(...)를 안 쓰면 컴파일러가 자동으로 부모의 매개변수
+      // 없는 생성자를 호출해주는 것과 동일한 처리를 여기서 해준다.
+      var hasExplicitInherited: boolean := false;
+      foreach st in impl.Body.Statements do
+        if st is TInheritedCallStmtNode then begin hasExplicitInherited:=true; break; end;
+      if not hasExplicitInherited then
+      begin
+        var autoParentCtor: ConstructorInfo;
+        var autoParentName: string:='';
+        if fClassParents.ContainsKey(impl.ClassName) then autoParentName:=fClassParents[impl.ClassName];
+        if (autoParentName<>'') and fCtorBuilders.ContainsKey(autoParentName) then
+          autoParentCtor:=fCtorBuilders[autoParentName]
+        else if fClassExternalParentType.ContainsKey(impl.ClassName) then
+          // 실제 외부 부모 클래스(예: class(TSomeExternalBase)) — BuildClassShell이
+          // 이미 리플렉션으로 확인해 둔 진짜 부모 타입을 그대로 쓴다.
+          autoParentCtor:=fClassExternalParentType[impl.ClassName].GetConstructor(System.Type.EmptyTypes)
+        else
+          // [버그수정] cd.ParentName이 실은 인터페이스였던 경우(예: class(IDisposable))
+          // BuildClassShell은 실제 CLR 부모를 System.Object로 두고 인터페이스는
+          // AddInterfaceImplementation으로 별도 등록한다 — fClassParents에는 여전히
+          // "IDisposable"이라는 원래 이름이 남아있어서, 그 이름으로 생성자를 찾으려 하면
+          // (인터페이스는 생성자가 없으므로) 항상 실패했다. ParentName이 없거나 인터페이스로
+          // 판명된 경우엔 진짜 부모인 System.Object의 기본 생성자를 쓴다.
+          autoParentCtor:=typeof(System.Object).GetConstructor(System.Type.EmptyTypes);
+        if autoParentCtor=nil then
+          raise new Exception('클래스 "'+impl.ClassName+'"의 부모 "'+autoParentName+'"에 매개변수 없는 public 생성자가 없어 자동으로 상속 생성자를 호출할 수 없습니다. 본문에 "inherited Create(...)"를 직접 써주세요.');
+        il.Emit(OpCodes.Ldarg_0);
+        il.Emit(OpCodes.Call, autoParentCtor);
+      end;
+
       // [Stage 83] 필드 인라인 기본값 초기화를 사용자 본문 실행 전에 대입한다.
       // (본문 안의 "inherited Create(...)"가 이보다 먼저 실행돼야 하는 드문 경우는
       // 위 EmitClassFieldDefaults 주석에 적어둔 1차 제약으로 남겨둔다.)
@@ -6246,6 +6491,13 @@ type
         // 필드 접근(Ldflda 등)이 깨진다.
         retCn66:='';
         if fOperatorFuncRetClass.ContainsKey(d.Name) then retCn66:=fOperatorFuncRetClass[d.Name];
+        // [버그 수정] 연산자 오버로딩이 아닌 일반 함수도 ReturnType=vtObject이면
+        // ReturnClassName(예: 'ListViewItem')을 VTC에 넘겨야 정확한 CLR 반환 타입을 얻는다.
+        // 그래야 fMethods[d.Name].ReturnType이 System.Object가 아니라 실제 타입이 되고,
+        // InferArgClrType의 TFuncCallExprNode 분기와 EmitArgForParamType 안전망이
+        // 올바른 오버로드를 선택하게 된다.
+        if (retCn66='') and (d.ReturnType=vtObject) and (d.ReturnClassName<>'') then
+          retCn66:=d.ReturnClassName;
         retClrType:=VTC(d.ReturnType, retCn66);
       end;
       mb:=tb.DefineMethod(d.Name, MethodAttributes.Public or MethodAttributes.Static,

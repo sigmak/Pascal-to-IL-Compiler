@@ -819,6 +819,10 @@ type
   TFuncDeclNode = class
   public Name: string; Parameters: List<TParamDef>;
     ReturnType: TVarType; Body: TCompoundStmtNode;
+    // [버그 수정] ReturnType=vtObject일 때 반환 클래스/외부 타입 이름.
+    // 예: "function MakeItem(...): ListViewItem;" → ReturnClassName='ListViewItem'
+    // DeclareStaticFunc가 VTC(vtObject, ReturnClassName)으로 정확한 CLR 반환 타입을 얻는다.
+    ReturnClassName: string;
     LocalVars: List<TVarDecl>; // [Stage 28] 함수 본문 안의 지역 변수 선언(var 섹션)
     ConstDecls: List<TConstDecl>; // [Stage 61] 함수 본문 안의 지역 const 선언
     // [Stage 36] 최상위 제네릭 함수: function Identity<T>(x: T): T;
@@ -841,7 +845,7 @@ type
       Name:=n; Parameters:=new List<TParamDef>; LocalVars:=new List<TVarDecl>;
       ConstDecls:=new List<TConstDecl>; // [Stage 61]
       IsGeneric:=false; GenericParamNames:=new List<string>; GenericParamConstraints:=new List<string>;
-      ReturnGenericName:='';
+      ReturnGenericName:=''; ReturnClassName:=''; // [버그 수정]
       NestedFuncs:=new List<TFuncDeclNode>; NestedProcs:=new List<TProcDeclNode>; // [Stage 65]
       IsIterator:=false; IterElemType:=vtInteger; // [Stage 69]
     end;

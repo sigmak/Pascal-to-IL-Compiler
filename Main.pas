@@ -22,7 +22,9 @@ uses
 const
   DefaultExampleDir = 'Examples';
   
-  DefaultExampleFile = 'uMain.pas'; // [Stage 93]
+  DefaultExampleFile = 'PascalABC_IDE.pabcproj'; // [Stage 93b]
+  //DefaultExampleFile = 'PascalABC_IDE.pas'; // [Stage 93b]
+  //DefaultExampleFile = 'uMain.pas'; // [Stage 93]
   //DefaultExampleFile = 'fChild.pas'; // [Stage 92]
   //DefaultExampleFile = 'uAboutBox.pas'; // [Stage 91]
   //DefaultExampleFile = 'uTest.pas'; // [Stage 90]
@@ -141,6 +143,34 @@ begin
       // 실행 파일 위치에 없으면 현재 작업 디렉터리 기준으로 한 번 더 시도
       Result := System.IO.Path.Combine(DefaultExampleDir, DefaultExampleFile);
   end;
+end;
+
+// [개선] .pabcproj 프로젝트 파일을 직접 넘겨도 자동으로 MainFile(실제 진입 소스)을
+// 찾아 컴파일하도록 한다 — 대부분의 상용 IDE가 소스 파일 하나가 아니라 프로젝트
+// 파일을 열면 알아서 진입점을 찾아 빌드하는 것과 동일한 사용성을 위함. 프로젝트
+// XML은 지금은 속성이 한 줄에 다 나열된 단순한 형태(PascalABC_IDE.pabcproj 참고)라
+// 별도 XML 파서 없이 정규식으로 MainFile / OutputFileName 속성만 뽑아낸다.
+// 못 찾으면 mainFile은 ''을 돌려주고, 호출부가 통상적인 "파일을 찾을 수 없음"
+// 오류로 처리한다.
+procedure ResolveProject(projPath: string; var mainFile: string; var outputFileName: string);
+var
+  projSrc: string; m: System.Text.RegularExpressions.Match; projDir: string;
+begin
+  mainFile := '';
+  outputFileName := '';
+  try
+    projSrc := System.IO.File.ReadAllText(projPath, Encoding.UTF8);
+  except
+    exit;
+  end;
+  projDir := System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(projPath));
+  m := System.Text.RegularExpressions.Regex.Match(projSrc, 'MainFile\s*=\s*"([^"]*)"',
+    System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+  if m.Success and (m.Groups[1].Value.Trim <> '') then
+    mainFile := System.IO.Path.Combine(projDir, m.Groups[1].Value.Trim);
+  m := System.Text.RegularExpressions.Regex.Match(projSrc, 'OutputFileName\s*=\s*"([^"]*)"',
+    System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+  if m.Success then outputFileName := m.Groups[1].Value.Trim;
 end;
 
 // [Stage 33] 진단 메시지 개선.
@@ -437,8 +467,24 @@ begin
     '\b(program|library|unit)\s+\w+\s*;\s*(?:interface\s+)?uses\s+(.*?);',
     System.Text.RegularExpressions.RegexOptions.Singleline or
     System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-  if not m.Success then exit;
-  raw := m.Groups[2].Value;
+  if not m.Success then
+  begin
+    // [버그수정] 'program Name;' 헤더 자체가 없는 진입점 파일(예: 'uses uMain; begin ...
+    // end.'로 바로 시작 — Parser.pas가 이제 이런 헤더 없는 program도 허용하도록 고쳐졌다)은
+    // 위 정규식이 애초에 요구하는 "program|library|unit 이름;" 접두부가 없어서 매치가
+    // 실패하고, 그러면 지금까지는 그냥 조용히 exit해 로컬 의존성을 0개로 취급했다.
+    // 그 결과 uMain의 Form1 같은 타입을 컴파일러가 전혀 몰라 "외부 타입을 찾을 수
+    // 없습니다" 오류로 이어졌다. 헤더가 없으면 파일 맨 앞(공백/스트립된 주석 제외)의
+    // 'uses ...;' 절을 대신 찾는다.
+    m := System.Text.RegularExpressions.Regex.Match(scanSrc,
+      '\buses\s+(.*?);',
+      System.Text.RegularExpressions.RegexOptions.Singleline or
+      System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+    if not m.Success then exit;
+    raw := m.Groups[1].Value;
+  end
+  else
+    raw := m.Groups[2].Value;
   parts := raw.Split(',');
   foreach p in parts do
   begin
@@ -649,7 +695,7 @@ begin
 end;
 
 var
-  inputPath, sourceCode, outputName: string;
+  inputPath, sourceCode, outputName, projOutputName: string;
   prog: TProgramNode;
   mono: TMonomorphizer;
   codegen: TCodeGenerator;
@@ -667,6 +713,29 @@ begin
   Writeln('=== Pascal-to-.NET 컴파일러 ===');
 
   inputPath := ResolveInputPath;
+  projOutputName := '';
+
+  // [개선] .pabcproj 확장자면 소스 파일이 아니라 프로젝트 파일이므로, Lexer에 넘기기 전에
+  // 먼저 ResolveProject로 XML을 읽어 실제 진입 소스(MainFile)를 찾아 inputPath를 그걸로
+  // 바꿔치기한다. 이렇게 해야 대부분의 상용 컴파일러처럼 소스 파일과 프로젝트 파일을
+  // 모두 그대로 넘겨도 알아서 컴파일할 수 있다.
+  if System.IO.Path.GetExtension(inputPath).ToLower = '.pabcproj' then
+  begin
+    var projMainFile, projOutName: string;
+    ResolveProject(inputPath, projMainFile, projOutName);
+    if (projMainFile <> '') and System.IO.File.Exists(projMainFile) then
+    begin
+      Writeln('[프로젝트] ' + inputPath);
+      Writeln('  → 진입 소스: ' + projMainFile);
+      inputPath := projMainFile;
+      projOutputName := projOutName;
+    end
+    else
+    begin
+      Writeln('실패: 프로젝트 파일에서 MainFile을 찾을 수 없거나 해당 파일이 존재하지 않습니다: ' + inputPath);
+      inputPath := ''; // 아래 File.Exists 체크에서 정상적으로 "찾을 수 없음" 처리되도록
+    end;
+  end;
 
   if not System.IO.File.Exists(inputPath) then
   begin
@@ -882,10 +951,19 @@ begin
     if ok then
     try
       // [Stage 44] library는 .dll로, program은 기존처럼 .exe로 저장한다.
-      if prog.IsLibrary then
-        outputName := System.IO.Path.GetFileNameWithoutExtension(inputPath) + '.dll'
+      // [개선] 프로젝트 파일(.pabcproj)의 OutputFileName이 있으면 그 이름(확장자 제외한 base name)을
+      // 우선 사용한다 — inputPath는 이미 MainFile(.pas)로 치환돼 있으므로 그대로 두면 프로젝트가
+      // 지정한 exe/dll 이름과 다른 결과물이 나온다.
+      var outputBaseName: string;
+      if projOutputName <> '' then
+        outputBaseName := System.IO.Path.GetFileNameWithoutExtension(projOutputName)
       else
-        outputName := System.IO.Path.GetFileNameWithoutExtension(inputPath) + '.exe';
+        outputBaseName := System.IO.Path.GetFileNameWithoutExtension(inputPath);
+
+      if prog.IsLibrary then
+        outputName := outputBaseName + '.dll'
+      else
+        outputName := outputBaseName + '.exe';
       codegen := new TCodeGenerator(prog);
 
       // [Stage 45] 소스 안의 {$reference X.dll} 지시문에서 뽑아둔 어셈블리를 codegen에 등록.

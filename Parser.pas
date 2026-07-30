@@ -381,7 +381,9 @@ type
       end
       else if (Cur.Kind=tkIdent) and fClassNames.Contains(Cur.Text) then
       begin
-        fPos:=fPos+1; Result:=vtObject;
+        // [버그 수정] 로컬 클래스 이름도 fLastGenericName에 저장 — 외부 타입(405번 줄)과
+        // 동일하게, 호출부(함수/메서드 반환 타입 파싱)가 ReturnClassName을 채울 수 있도록.
+        fLastGenericName:=Cur.Text; fPos:=fPos+1; Result:=vtObject;
       end
       else if Cur.Kind=tkIdent then
       begin
@@ -3403,6 +3405,10 @@ type
       begin
         d.ReturnType:=ParseVarType;
         if (d.ReturnType=vtGeneric) or (d.ReturnType=vtGenericArray) then d.ReturnGenericName:=fLastGenericName; // [Stage 36/37]
+        // [버그 수정] vtObject 반환 타입이면 fLastGenericName에 클래스/외부 타입 이름이 들어있다
+        // (ParseVarType의 로컬 클래스 분기와 외부 타입 분기 모두 fLastGenericName을 채운다).
+        // DeclareStaticFunc가 VTC(vtObject, ReturnClassName)으로 정확한 CLR 반환 타입을 얻는다.
+        if d.ReturnType=vtObject then d.ReturnClassName:=fLastGenericName;
       end;
       Expect(tkSemicolon);
       sv:=fCurFunc; fCurFunc:=d.Name;
@@ -3571,6 +3577,7 @@ type
       ParseParams(d.Parameters);
       Expect(tkColon); d.ReturnType:=ParseVarType;
       if (d.ReturnType=vtGeneric) or (d.ReturnType=vtGenericArray) then d.ReturnGenericName:=fLastGenericName;
+      if d.ReturnType=vtObject then d.ReturnClassName:=fLastGenericName; // [버그 수정]
       Expect(tkSemicolon);
       sv:=fCurFunc; fCurFunc:=mangled;
       if (Cur.Kind=tkVar) or (Cur.Kind=tkConst) then ParseLocalDeclSections(d.LocalVars, d.ConstDecls);
@@ -3899,7 +3906,18 @@ type
       end
       else
       begin
-        Expect(tkProgram); prog:=new TProgramNode(Expect(tkIdent).Text); Expect(tkSemicolon);
+        // [버그수정] 'program Name;' 헤더가 없는 파일(예: 'uses uMain; begin ... end.'로
+        // 바로 시작하는 진입점 파일 — 실제 PascalABC.NET/디자이너 산출물에서 흔한 형태)을
+        // 지금까지는 Expect(tkProgram)이 무조건 요구해서 "예상 tkProgram 실제 tkUses"
+        // 파싱 오류로 막혔다. tkProgram 토큰이 보이면 기존대로 소비하고, 없으면 그냥
+        // 이름 없는 프로그램으로 취급해 넘어간다(실행에 이름 자체는 쓰이지 않는다 —
+        // 출력 파일명은 GenerateExe의 outName 매개변수로 별도로 정해진다).
+        if Cur.Kind=tkProgram then
+        begin
+          fPos:=fPos+1; prog:=new TProgramNode(Expect(tkIdent).Text); Expect(tkSemicolon);
+        end
+        else
+          prog:=new TProgramNode('Program');
       end;
       fProg:=prog; // 깊이 상관없이(식/타입 파싱 도중) GenericInstantiations에 접근하기 위함
 
