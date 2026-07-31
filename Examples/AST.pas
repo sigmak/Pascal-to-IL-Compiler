@@ -112,15 +112,6 @@ type
     begin Expr:=e; TargetType:=tt; IsExternalType:=false; end;
   end;
 
-  // [Stage 93c] <식> is <TypeName> — 런타임 타입 체크. TAsCastExprNode와 완전히 같은 모양
-  // (대상 식 + 목표 타입 이름 + 외부타입 여부)이지만, 캐스트에 실패하면 예외를 던지는 as와
-  // 달리 성공/실패를 bool로 돌려준다(CodeGen에서 isinst + null 비교로 구현).
-  TIsCheckExprNode = class(TExprNode)
-  public Expr: TExprNode; TargetType: string; IsExternalType: boolean;
-    constructor Create(e: TExprNode; tt: string);
-    begin Expr:=e; TargetType:=tt; IsExternalType:=false; end;
-  end;
-
   // [Stage 30] inherited MethodName(args...)  — 식으로 쓰이는 경우 (함수: 반환값 있음).
   // 예: Result := inherited GetValue();
   TInheritedCallExprNode = class(TExprNode)
@@ -145,16 +136,9 @@ type
 
   // [Stage 78] 외부 컬렉션 인덱서: obj[i]. Qualifier는 점(.)으로 연결된 한정자 체인
   // 문자열(예: "Tree.Nodes") — TMethodCallExprNode의 ObjName과 같은 관례를 따른다.
-  // [버그 수정] obj[i][j] 처럼 인덱서가 두 번 연달아 오는 경우(예: Dictionary<string,
-  // List<string>>인 필드를 fMap[key][idx]로 읽는 패턴) 지원을 위해 IndexExpr2(선택, nil이면
-  // 단일 인덱싱)를 추가했다 — 첫 인덱싱 결과 타입에 대해 다시 인덱서를 찾아 적용한다.
-  // 또한 obj[i].Field 처럼 인덱싱 결과의 필드/프로퍼티를 읽는 경우(예: Entries[vn].ClassName —
-  // Dictionary<string, TScopeEntry> 필드)를 위해 MemberName(선택, ''이면 없음)도 추가했다.
-  // IndexExpr2와 MemberName은 파서가 상호 배타적으로만 채운다(둘 다 채워지는 문법은 없음).
   TExternalIndexExprNode = class(TExprNode)
-  public Qualifier: string; IndexExpr: TExprNode; IndexExpr2: TExprNode; MemberName: string;
-    constructor Create(q: string; i: TExprNode);
-    begin Qualifier:=q; IndexExpr:=i; IndexExpr2:=nil; MemberName:=''; end;
+  public Qualifier: string; IndexExpr: TExprNode;
+    constructor Create(q: string; i: TExprNode); begin Qualifier:=q; IndexExpr:=i; end;
   end;
 
   TLengthExprNode = class(TExprNode)
@@ -191,7 +175,7 @@ type
     constructor Create(f: string); begin FieldName:=f; end;
   end;
 
-  TBinOpKind = (boAdd, boSub, boMul, boDiv, boMod, boAnd, boOr, boShl, boShr); // [버그 수정] shl/shr 파서는 있었는데 열거형에 멤버가 빠져 있었음
+  TBinOpKind = (boAdd, boSub, boMul, boDiv, boMod, boAnd, boOr);
   TBinOpNode = class(TExprNode)
   public Op: TBinOpKind; Left, Right: TExprNode;
     // 주의: 매개변수 이름을 필드명 Op와 대소문자만 다르게 두면 안 됨.
@@ -485,35 +469,6 @@ type
     end;
   end;
 
-  // [버그 수정] 외부 컬렉션 이중 인덱서 대입: Qualifier[Idx1][Idx2] := Value.
-  // (예: fClassMethods[cn][mname]:=isFunc — Dictionary<string, Dictionary<string,bool>> 필드)
-  // Stage 88의 단일 인덱서 대입(TMethodCallStmtNode('set_Item')로 위임)만으로는 두 단계를
-  // 표현할 수 없어서(첫 단계는 "읽어서 다음 컬렉션을 얻는" get이고, 마지막 단계만 set이다)
-  // 전용 노드를 둔다.
-  TExternalDoubleIndexAssignStmtNode = class(TStmtNode)
-  public Qualifier: string; Idx1, Idx2, ValueExpr: TExprNode;
-    constructor Create(q: string; i1, i2, v: TExprNode);
-    begin Qualifier:=q; Idx1:=i1; Idx2:=i2; ValueExpr:=v; end;
-  end;
-
-  // [버그 수정] 외부 컬렉션 인덱서 결과에 메서드 호출: Qualifier[IndexExpr].MethodName(Args);
-  // (예: fClassFields[cn].Add(propName) — Dictionary<string, List<string>> 필드)
-  TExternalIndexMethodCallStmtNode = class(TStmtNode)
-  public Qualifier: string; IndexExpr: TExprNode; MethodName: string; Args: List<TExprNode>;
-    constructor Create(q: string; idx: TExprNode; mth: string);
-    begin Qualifier:=q; IndexExpr:=idx; MethodName:=mth; Args:=new List<TExprNode>; end;
-  end;
-
-  // [버그 수정] 외부 컬렉션 인덱서 결과의 필드/프로퍼티 대입: Qualifier[IndexExpr].FieldName := Value;
-  // (예: Entries[vn].ClassName:=cn — Dictionary<string, TScopeEntry> 필드). 위
-  // TExternalIndexMethodCallStmtNode와 형제 노드 — '.' 뒤가 '('(메서드 호출)이 아니라
-  // ':='(필드 대입)인 경우.
-  TExternalIndexFieldAssignStmtNode = class(TStmtNode)
-  public Qualifier: string; IndexExpr: TExprNode; FieldName: string; ValueExpr: TExprNode;
-    constructor Create(q: string; idx: TExprNode; f: string; v: TExprNode);
-    begin Qualifier:=q; IndexExpr:=idx; FieldName:=f; ValueExpr:=v; end;
-  end;
-
   // self.fValue := 식  (메서드 본문 안에서 필드 쓰기)
   // Qualifier=''  이면 self의 필드/속성. Qualifier<>'' 이면 그 이름의 필드를 통해
   // 접근하는 대상의 속성/필드 (예: Button1.Text := '...' → Qualifier='Button1', FieldName='Text')
@@ -601,11 +556,10 @@ type
     // [Stage 36] ParamType=vtGeneric일 때는 이 매개변수가 참조하는 타입 매개변수 이름(예: 'T')을 담는다.
     ClassName: string;
     IsExternal: boolean; // [Stage 31] true면 ClassName이 외부 .NET 타입 이름
-    IsByRef: boolean;    // [Stage 100] var/const 참조 매개변수이면 true — CLR ByRef 타입으로 내보낸다.
     constructor Create(n: string; t: TVarType); overload;
-    begin Name:=n; ParamType:=t; ClassName:=''; IsExternal:=false; IsByRef:=false; end;
+    begin Name:=n; ParamType:=t; ClassName:=''; IsExternal:=false; end;
     constructor Create(n: string; t: TVarType; cn: string; isExt: boolean); overload;
-    begin Name:=n; ParamType:=t; ClassName:=cn; IsExternal:=isExt; IsByRef:=false; end;
+    begin Name:=n; ParamType:=t; ClassName:=cn; IsExternal:=isExt; end;
   end;
 
   // [Stage 64] Button1.Click += (a: T1; b: T2) -> 문장;  형태의 인라인 람다.
@@ -671,7 +625,6 @@ type
     // ParamTypes[i]=vtObject일 때는 클래스/외부타입 이름, vtGeneric일 때는 [Stage 32] 타입 매개변수 이름(예: 'K')
     ParamClassNames: List<string>;
     ParamIsExternal: List<boolean>;  // true면 ParamClassNames[i]가 외부 .NET 타입
-    ParamIsByRef: List<boolean>;     // [Stage 100] true면 var/const 참조 매개변수 — CLR ByRef 타입으로 내보낸다.
     // [Stage 53] virtual/override/abstract 지시자.
     // 이 컴파일러는 모든 인스턴스 메서드를 이미 Virtual+HideBySig로 정의하고 이름/시그니처
     // 일치로 자동 override(슬롯 재사용)하므로, IsVirtual/IsOverride는 지금 당장 코드생성
@@ -691,7 +644,6 @@ type
       Name:=n; IsFunction:=isFunc; ReturnType:=ret; ReturnGenericName:='';
       ParamNames:=new List<string>; ParamTypes:=new List<TVarType>;
       ParamClassNames:=new List<string>; ParamIsExternal:=new List<boolean>;
-      ParamIsByRef:=new List<boolean>; // [Stage 100]
       IsVirtual:=false; IsOverride:=false; IsAbstract:=false;
       IsGeneric:=false; GenericParamNames:=new List<string>; GenericParamConstraints:=new List<string>;
     end;
@@ -826,7 +778,6 @@ type
     ReturnGenericName: string; // [Stage 32] ReturnType=vtGeneric일 때 어느 타입 매개변수인지 (예: 'T'/'K'/'V')
     ParamNames: List<string>; ParamTypes: List<TVarType>;
     ParamGenericNames: List<string>; // [Stage 32] ParamTypes[i]=vtGeneric일 때 그 타입 매개변수 이름, 아니면 ''
-    ParamIsByRef: List<boolean>;     // [Stage 100] var/const 참조 매개변수 여부 — TMethodSignature.ParamIsByRef와 대응
     LocalVars: List<TVarDecl>; // [Stage 28] 메서드 본문 안의 지역 변수 선언(var 섹션)
     ConstDecls: List<TConstDecl>; // [Stage 61] 메서드 본문 안의 지역 const 선언
     // [Stage 74] 메서드 자신의 제네릭 타입 매개변수(선언부 TMethodSignature.IsGeneric과 대응,
@@ -840,7 +791,6 @@ type
       ClassName:=cn; MethodName:=mn; IsFunction:=isFunc; ReturnType:=ret; ReturnGenericName:='';
       ParamNames:=new List<string>; ParamTypes:=new List<TVarType>;
       ParamGenericNames:=new List<string>;
-      ParamIsByRef:=new List<boolean>; // [Stage 100]
       LocalVars:=new List<TVarDecl>;
       ConstDecls:=new List<TConstDecl>; // [Stage 61]
       IsGeneric:=false; GenericParamNames:=new List<string>; GenericParamConstraints:=new List<string>;

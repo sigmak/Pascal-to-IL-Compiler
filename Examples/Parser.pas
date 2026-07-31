@@ -258,40 +258,10 @@ type
 
     // [Phase 1] ExpectMemberName처럼, read/write/property 같은 Phase 1 키워드도
     // 멤버 이름 위치에서는 식별자로 허용해야 한다.
-    // [버그 수정] Type/Class/Record/String/Array/Set/Integer/Boolean처럼 이 언어의 예약어와
-    // 이름이 겹치는 .NET 멤버(예: "System.Type.GetType(...)"의 "Type", "arr.ToArray()"의
-    // 반환 등)가 실제 소스에 흔한데, 이 목록에 빠져 있어서 ExpectMemberName을 쓰는 모든
-    // 자리(정적 멤버 호출 체인, 메서드 체이닝 등)에서 식 파싱 도중 실패했다. 이 실패는 문장
-    // 경계가 아니라 식 한가운데서 일어나기 때문에 오류복구가 크게 어긋나, 실제 원인과
-    // 전혀 무관해 보이는 오류가 파일 뒷부분 곳곳에서 눈사태처럼 쏟아지는 결과로 이어졌다 —
-    // ExpectDotSegment가 이미 개별적으로 허용하던 것과 동일한 키워드 집합을 여기 공용
-    // 헬퍼에 합쳐서, ExpectMemberName을 쓰는 모든 곳이 한 번에 혜택을 보도록 했다.
     function IsKeywordAllowedAsMemberName(k: TTokenKind): boolean;
     begin
       Result:=(k=tkLength) or (k=tkRead) or (k=tkWrite) or (k=tkReal)
-           or (k=tkDouble) or (k=tkChar) or (k=tkInt64)
-           or (k=tkType) or (k=tkClass) or (k=tkRecord) or (k=tkStringType)
-           or (k=tkArray) or (k=tkSet) or (k=tkInteger) or (k=tkBoolean);
-    end;
-
-    // [Stage 93c] 점(.)으로 연결된 외부 타입/네임스페이스 경로의 한 구간(segment)을 소비한다.
-    // "System.Type", "System.Array", "System.Text.StringBuilder"처럼 .NET 쪽 이름에는
-    // 이 언어의 예약어와 겹치는 이름(Type, Array, Class, Record, String, Set, Char, Integer,
-    // Double, Real, Int64, Boolean 등)이 흔히 등장하므로, ExpectMemberName과 마찬가지로
-    // tkIdent뿐 아니라 이런 키워드 토큰도 허용해 원래 철자(Text) 그대로 돌려준다.
-    function ExpectDotSegment: string;
-    var t: TToken;
-    begin
-      t:=Cur;
-      if (t.Kind=tkIdent) or IsKeywordAllowedAsMemberName(t.Kind)
-         or (t.Kind=tkType) or (t.Kind=tkClass) or (t.Kind=tkRecord) or (t.Kind=tkStringType)
-         or (t.Kind=tkArray) or (t.Kind=tkSet) or (t.Kind=tkInteger) or (t.Kind=tkBoolean) then
-      begin
-        fPos:=fPos+1; Result:=t.Text;
-      end
-      else
-        raise new Exception('줄 '+t.Line.ToString+', 열 '+t.Column.ToString
-          +': 점(.) 뒤에 이름이 와야 합니다 ("'+t.Text+'")');
+           or (k=tkDouble) or (k=tkChar) or (k=tkInt64);
     end;
 
     // [Stage 86] 외부(.NET) 제네릭 타입의 타입 인자 하나를 파싱한다.
@@ -317,7 +287,7 @@ type
           argName:=ResolveGenericInstantiation(argName);
           Result:=argName; exit;
         end;
-        while Cur.Kind=tkDot do begin fPos:=fPos+1; argName:=argName+'.'+ExpectDotSegment; end;
+        while Cur.Kind=tkDot do begin fPos:=fPos+1; argName:=argName+'.'+Expect(tkIdent).Text; end;
         if Cur.Kind=tkLt then // 중첩된 외부 제네릭 타입 인자 (예: Dictionary<string, List<string>>)
         begin
           fPos:=fPos+1;
@@ -415,31 +385,10 @@ type
         // 동일하게, 호출부(함수/메서드 반환 타입 파싱)가 ReturnClassName을 채울 수 있도록.
         fLastGenericName:=Cur.Text; fPos:=fPos+1; Result:=vtObject;
       end
-      // [버그 수정] List<TToken>, Dictionary<string,X> 같은 외부(.NET) 제네릭 컬렉션 타입을
-      // 함수/메서드 반환 타입(또는 var 선언)으로 쓴 경우. 예전에는 필드 선언(ParseTypeSection)
-      // 에서만 ParseExternalGenericType을 재사용했고, ParseVarType 자체는 단순 식별자 하나만
-      // 보는 아래 리플렉션 조회로 바로 빠져 "List" 뒤의 '<...>'를 이해하지 못한 채
-      // "타입이 와야 합니다" 오류로 실패했다. 사용자 정의 제네릭 클래스(TStack<T> 등) 이름과
-      // 겹치면 기존 단형화 경로를 우선하도록, fGenericClassNames에 없는 이름일 때만 반응한다.
-      else if (Cur.Kind=tkIdent) and (PeekAt(1).Kind=tkLt) and (not fGenericClassNames.Contains(Cur.Text)) then
-      begin
-        var _extGenBaseVT:=Cur.Text; fPos:=fPos+1;
-        fLastGenericName:=ParseExternalGenericType(_extGenBaseVT);
-        Result:=vtObject;
-      end
       else if Cur.Kind=tkIdent then
       begin
-        // [Stage 93c 버그수정] 점(.)으로 연결된 완전한 외부 타입 이름 직접 파싱.
-        // 예: System.Type, System.Reflection.Assembly, System.Text.StringBuilder
-        // 첫 세그먼트가 tkIdent이고 바로 뒤에 '.'이 이어지면 완전한 경로로 간주한다.
-        // '.' 뒤 세그먼트는 예약어(Type, Array, Object 등)도 허용하도록 ExpectDotSegment를 쓴다.
-        var _qn87v:=Cur.Text; fPos:=fPos+1;
-        if Cur.Kind=tkDot then
-        begin
-          while Cur.Kind=tkDot do begin fPos:=fPos+1; _qn87v:=_qn87v+'.'+ExpectDotSegment; end;
-          fLastGenericName:=_qn87v; Result:=vtObject; exit;
-        end;
-        // 점 없는 단순 이름 — uses 절 네임스페이스에서 탐색
+        // [Stage 87] 로컬 클래스도 아닌 단순 이름 — uses 절 네임스페이스에서 탐색
+        var _qn87v:=Cur.Text;
         var _resolved87v:='';
         foreach var _ns87v in fImportedNamespaces do
         begin
@@ -455,10 +404,10 @@ type
         end;
         if _resolved87v<>'' then
         begin
-          fLastGenericName:=_resolved87v; Result:=vtObject;
+          fPos:=fPos+1; fLastGenericName:=_resolved87v; Result:=vtObject;
         end
         else
-          raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': 타입이 와야 합니다 ("'+_qn87v+'")');
+          raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': 타입이 와야 합니다 ("'+Cur.Text+'")');
       end
       else raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': 타입이 와야 합니다 ("'+Cur.Text+'")');
     end;
@@ -493,21 +442,6 @@ type
       begin
         fPos:=fPos+1; cn:='System.Object'; isExt:=true; Result:=vtObject; exit;
       end;
-      // [Stage 93c 버그수정] List<TParamDef>, Dictionary<K,V> 같은 외부 제네릭 타입이
-      // constructor/메서드 매개변수 타입으로 올 때 파싱하지 못하는 문제 수정.
-      // 필드 선언(ParseTypeSection 안)에는 PeekAt(1).Kind=tkLt 분기가 있어 정상 처리되었지만
-      // ParseParamTypeExt 경로에는 동일한 분기가 빠져 있었다 — 동일한 로직을 여기도 추가한다.
-      // 단, fClassNames에 이미 등록된 로컬 제네릭 클래스(TStack<T> 등)보다 먼저 걸리면 안 되므로
-      // fClassNames 체크가 실패한 뒤(=로컬 제네릭이 아닌 경우)에만 이 분기로 온다.
-      if (Cur.Kind=tkIdent) and (not fClassNames.Contains(Cur.Text))
-         and (not fInterfaceNames.Contains(Cur.Text))
-         and (not fEnumNames.Contains(Cur.Text))
-         and (PeekAt(1).Kind=tkLt) then
-      begin
-        var _extGenBase93c:=Cur.Text; fPos:=fPos+1;
-        cn:=ParseExternalGenericType(_extGenBase93c);
-        isExt:=true; Result:=vtObject; exit;
-      end;
       if (Cur.Kind=tkIdent) and fClassNames.Contains(Cur.Text) then
       begin
         cn:=Cur.Text; fPos:=fPos+1; Result:=vtObject;
@@ -521,7 +455,7 @@ type
         var qn4:=Expect(tkIdent).Text;
         if Cur.Kind=tkDot then
         begin
-          while Cur.Kind=tkDot do begin fPos:=fPos+1; qn4:=qn4+'.'+ExpectDotSegment; end;
+          while Cur.Kind=tkDot do begin fPos:=fPos+1; qn4:=qn4+'.'+Expect(tkIdent).Text; end;
           cn:=qn4; isExt:=true; Result:=vtObject;
         end
         else
@@ -874,7 +808,7 @@ type
       begin
         fPos:=fPos+2; // 'typeof' '(' 소비
         var toName:=Expect(tkIdent).Text;
-        while Cur.Kind=tkDot do begin fPos:=fPos+1; toName:=toName+'.'+ExpectDotSegment; end;
+        while Cur.Kind=tkDot do begin fPos:=fPos+1; toName:=toName+'.'+Expect(tkIdent).Text; end;
         Expect(tkRParen);
         Result:=new TTypeOfExprNode(toName);
       end
@@ -894,41 +828,12 @@ type
       else if t.Kind=tkRealLiteral then
         begin fPos:=fPos+1; Result:=new TRealLiteralNode(t.RealValue); end
 
-      // [Phase 1] 문자 리터럴 (#65 또는 'A') / 문자열 리터럴.
-      // [버그 수정] 표준 Pascal 관용구인 "인접 리터럴 암시적 연결"을 지원한다: 'text'#10#13'text2'
-      // 처럼 문자열/문자 리터럴이 연산자('+') 없이 그냥 나란히 오면 하나로 이어붙인 것으로
-      // 취급한다(#10='줄바꿈 문자' 하나를 담은 리터럴이 바로 뒤 문자열과 자동 결합). Lexer가
-      // tkString과 tkCharLiteral을 별개 토큰으로 쪼개 놓기 때문에, 예전에는 이 둘이 연산자 없이
-      // 연달아 나오면 ParsePrimary가 첫 리터럴만 소비하고 반환해버려 그 다음 리터럴 토큰이
-      // "인자 목록이 끝나고 ), 가 와야 하는 자리"에서 튀어나온 것처럼 보여 "예상 tkRParen
-      // 실제 tkCharLiteral" 같은 오류로 이어졌다. 여기서는 tkCharLiteral/tkString이 연산자 없이
-      // 계속되는 동안 전부 이어붙여(fold) 하나의 상수로 접는다 — 리터럴이 char 하나뿐이면
-      // 기존과 동일하게 TCharLiteralNode(char 타입 유지)를, 그 외(문자열이 섞이거나 리터럴이
-      // 여러 개면)는 TStrLiteralNode(string)를 만든다.
-      else if (t.Kind=tkCharLiteral) or (t.Kind=tkString) then
-      begin
-        var litBuf:=new System.Text.StringBuilder;
-        var litCount:=0; var litAllChar:=true; var litSoleChar:=#0;
-        while (Cur.Kind=tkCharLiteral) or (Cur.Kind=tkString) do
-        begin
-          if Cur.Kind=tkCharLiteral then
-          begin
-            litBuf.Append(Cur.CharValue);
-            litSoleChar:=Cur.CharValue;
-          end
-          else
-          begin
-            litBuf.Append(Cur.Text);
-            litAllChar:=false;
-          end;
-          litCount:=litCount+1;
-          fPos:=fPos+1;
-        end;
-        if litAllChar and (litCount=1) then
-          Result:=new TCharLiteralNode(litSoleChar)
-        else
-          Result:=new TStrLiteralNode(litBuf.ToString);
-      end
+      // [Phase 1] 문자 리터럴 (#65 또는 'A')
+      else if t.Kind=tkCharLiteral then
+        begin fPos:=fPos+1; Result:=new TCharLiteralNode(t.CharValue); end
+
+      else if t.Kind=tkString then
+        begin fPos:=fPos+1; Result:=new TStrLiteralNode(t.Text); end
 
       else if t.Kind=tkResult then
         begin fPos:=fPos+1; Result:=new TResultRefNode; end
@@ -1027,7 +932,7 @@ type
           newTn:=ResolveGenericInstantiation(newTn)
         else if Cur.Kind=tkLt then // [Stage 86] new Dictionary<string, FileChangeWatcher> 같은 외부 제네릭 타입 생성
           newTn:=ParseExternalGenericType(newTn);
-        while Cur.Kind=tkDot do begin fPos:=fPos+1; newTn:=newTn+'.'+ExpectDotSegment; end;
+        while Cur.Kind=tkDot do begin fPos:=fPos+1; newTn:=newTn+'.'+Expect(tkIdent).Text; end;
         if fRecordNames.Contains(newTn) then // [Stage 62]
           raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': 레코드 "'+newTn
             +'"는 new로 생성할 수 없습니다 — 변수 선언만으로 이미 필드가 기본값(0/빈 문자열 등)으로 초기화됩니다');
@@ -1102,18 +1007,7 @@ type
       // [Stage 41] tkLength 단독 분기 제거 — 'length'는 이제 tkIdent로 내려오므로
       // tkIdent 분기 안에서 텍스트로 구분한다 (아래 참조).
 
-      // [버그 수정] Char/integer/double/real/int64/string/boolean 같은 기본 타입 이름은
-      // Lexer가 전용 키워드 토큰(tkChar/tkInteger/tkDouble/...)으로 내려주기 때문에, 실제
-      // 소스에서 이 이름들을 "Char.IsDigit(x)"나 "integer.Parse(s)"처럼 정적 멤버 호출의
-      // 한정자로 쓰거나 "char(code)"처럼 원시 타입 캐스트 대상으로 쓰면 이 분기(tkIdent만
-      // 인식)에 아예 도달하지 못해 "식이 와야 하는데 ..."로 실패했다. 바로 아래 tkIdent
-      // 분기의 로직(정적 메서드 호출/캐스트 판별 등)은 전부 t.Text(토큰의 원래 철자,
-      // Kind와 무관하게 항상 보존됨)로 동작하므로, 이 키워드 토큰들도 똑같이 여기로
-      // 흘려보내면 기존 로직을 그대로 재사용할 수 있다 — 식(expression) 파싱 위치에서는
-      // 이런 타입 키워드가 "타입 선언"으로 쓰일 일이 없으므로(타입 선언은 ParseVarType 등
-      // 별도 경로) 여기서 tkIdent와 동일하게 취급해도 안전하다.
-      else if (t.Kind=tkIdent) or (t.Kind=tkChar) or (t.Kind=tkInteger) or (t.Kind=tkDouble)
-              or (t.Kind=tkReal) or (t.Kind=tkInt64) or (t.Kind=tkStringType) or (t.Kind=tkBoolean) then
+      else if t.Kind=tkIdent then
       begin
         fPos:=fPos+1;
 
@@ -1324,34 +1218,6 @@ type
             Result:=new TArrayIndexExprNode(t.Text, idxE);
         end
 
-        // [Stage 100] 외부 컬렉션 인덱서 읽기: Pascal 배열이 아닌데 '['가 오면(예: fTokens[fPos])
-        // List<T>/Dictionary<K,V> 등 외부 제네릭 컬렉션의 인덱서 getter("get_Item")로 간주한다.
-        // Stage 88의 대입문 쪽 외부 인덱서 폴백(1930행 부근)과 대칭되는 식(expression) 위치 처리.
-        // [버그 수정] a[i][j]처럼 두 번째 '['가 바로 이어지는 경우(예: Dictionary<string,
-        // List<string>> 필드를 fMap[key][idx]로 읽는 패턴)도 지원한다 — CodeGen이 첫 인덱싱
-        // 결과 타입에 대해 다시 인덱서를 찾아 적용한다(TExternalIndexExprNode.IndexExpr2).
-        // [버그 수정] a[i].Field처럼 인덱싱 결과의 필드/프로퍼티를 읽는 경우(예:
-        // Entries[vn].ClassName — Dictionary<string, TScopeEntry> 필드)도 지원한다.
-        else if Cur.Kind=tkLBracket then
-        begin
-          fPos:=fPos+1;
-          var idxE100:=ParseAddSub;
-          Expect(tkRBracket);
-          var eiNode100:=new TExternalIndexExprNode(t.Text, idxE100);
-          if Cur.Kind=tkLBracket then
-          begin
-            fPos:=fPos+1;
-            eiNode100.IndexExpr2:=ParseAddSub;
-            Expect(tkRBracket);
-          end
-          else if Cur.Kind=tkDot then
-          begin
-            fPos:=fPos+1;
-            eiNode100.MemberName:=ExpectMemberName;
-          end;
-          Result:=eiNode100;
-        end
-
         // [Stage 36] 제네릭 함수 호출: Identity<integer>(5) — 명시적 타입 인자 필요
         else if (Cur.Kind=tkLt) and fGenericFuncNames.Contains(t.Text) then
         begin
@@ -1437,27 +1303,6 @@ type
                 and (Cur.Kind<>tkLParen) and (not fFuncNames.Contains(t.Text)) then
         begin
           Result:=new TBuiltinCallExprNode(NormalizeBuiltinFuncName(t.Text));
-        end
-
-        // [버그 수정] 위 어떤 분기에도 안 걸리고 클래스 메서드 본문 안(fCurClass<>'')에서
-        // '식별자(' 형태를 만나면, 인자 없는 암시적 self 호출(ParseStatement의 1985줄 근처와
-        // 동일한 패턴)의 '식(expression) 버전'으로 취급한다 — 예: "A or B or
-        // IsKeywordAllowedAsMemberName(t.Kind)"처럼 같은 클래스의 다른 메서드를 self. 없이
-        // 식 한가운데서 호출하는 경우. 예전에는 이 경우를 다루는 분기가 없어서 식별자만
-        // "변수 읽기"로 취급되고 뒤따르는 '('가 전혀 소비되지 않은 채 남아버렸다 — 그 결과
-        // 상위 호출부(예: if 조건문)가 'then'을 기대하는 자리에서 엉뚱하게 '('을 만나 실패하고,
-        // 그 위치 어긋남이 파일 뒷부분 전체로 눈사태처럼 번졌다.
-        else if (fCurClass<>'') and (Cur.Kind=tkLParen) then
-        begin
-          var selfCallExpr93:=new TMethodCallExprNode('', t.Text);
-          fPos:=fPos+1;
-          if Cur.Kind<>tkRParen then
-          begin
-            selfCallExpr93.Args.Add(ParseAddSub);
-            while Cur.Kind=tkComma do begin fPos:=fPos+1; selfCallExpr93.Args.Add(ParseAddSub); end;
-          end;
-          Expect(tkRParen);
-          Result:=selfCallExpr93;
         end
 
         else
@@ -1564,33 +1409,18 @@ type
 
     // [Stage 30] <식> as <TypeName> — Delphi에서 as는 *,/,mod와 같은 우선순위이므로
     // ParsePrimary 바로 위, ParseMulDivMod가 사용하는 자리에 끼워 넣는다.
-    // [Stage 93c] <식> is <TypeName> — 런타임 타입 체크도 같은 우선순위로 처리한다.
     function ParseAsCast: TExprNode;
     var e: TExprNode; tn: string; isExt: boolean; asN: TAsCastExprNode;
     begin
       e:=ParsePrimary;
-      while true do
+      while Cur.Kind=tkAs do
       begin
-        if Cur.Kind=tkAs then
-        begin
-          fPos:=fPos+1;
-          tn:=ExpectDotSegment; isExt:=false;
-          while Cur.Kind=tkDot do begin fPos:=fPos+1; tn:=tn+'.'+ExpectDotSegment; end;
-          if not (fClassNames.Contains(tn) or fInterfaceNames.Contains(tn)) then isExt:=true;
-          asN:=new TAsCastExprNode(e, tn); asN.IsExternalType:=isExt;
-          e:=asN;
-        end
-        // [Stage 93c] is 연산자: tkIdent("is") 텍스트로 식별
-        else if (Cur.Kind=tkIdent) and (Cur.Text.ToLower='is') then
-        begin
-          fPos:=fPos+1;
-          tn:=ExpectDotSegment; isExt:=false;
-          while Cur.Kind=tkDot do begin fPos:=fPos+1; tn:=tn+'.'+ExpectDotSegment; end;
-          if not (fClassNames.Contains(tn) or fInterfaceNames.Contains(tn)) then isExt:=true;
-          var isN:=new TIsCheckExprNode(e, tn); isN.IsExternalType:=isExt;
-          e:=isN;
-        end
-        else break;
+        fPos:=fPos+1;
+        tn:=Expect(tkIdent).Text; isExt:=false;
+        while Cur.Kind=tkDot do begin fPos:=fPos+1; tn:=tn+'.'+Expect(tkIdent).Text; end;
+        if not (fClassNames.Contains(tn) or fInterfaceNames.Contains(tn)) then isExt:=true;
+        asN:=new TAsCastExprNode(e, tn); asN.IsExternalType:=isExt;
+        e:=asN;
       end;
       Result:=e;
     end;
@@ -1599,17 +1429,11 @@ type
     var left: TExprNode; op: TBinOpKind;
     begin
       left:=ParseAsCast;
-      // [버그 수정] shl/shr는 Lexer에 전용 키워드 토큰이 없어 일반 tkIdent로 들어온다
-      // ('as'/'is'를 텍스트로 식별하는 ParseAsCast와 동일한 방식) — 표준 Pascal에서
-      // shl/shr는 *,/,div,mod,and와 같은 우선순위이므로 이 반복문에 함께 넣는다.
-      while (Cur.Kind=tkStar) or (Cur.Kind=tkSlash) or (Cur.Kind=tkMod) or (Cur.Kind=tkAnd)
-            or ((Cur.Kind=tkIdent) and ((Cur.Text.ToLower='shl') or (Cur.Text.ToLower='shr'))) do
+      while (Cur.Kind=tkStar) or (Cur.Kind=tkSlash) or (Cur.Kind=tkMod) or (Cur.Kind=tkAnd) do
       begin
         if Cur.Kind=tkStar then op:=boMul
         else if Cur.Kind=tkSlash then op:=boDiv
         else if Cur.Kind=tkMod then op:=boMod
-        else if (Cur.Kind=tkIdent) and (Cur.Text.ToLower='shl') then op:=boShl
-        else if (Cur.Kind=tkIdent) and (Cur.Text.ToLower='shr') then op:=boShr
         else op:=boAnd; // tkAnd — 표준 Pascal에서 and는 *,/,mod와 같은 우선순위
         fPos:=fPos+1; left:=new TBinOpNode(op, left, ParseAsCast);
       end;
@@ -1808,47 +1632,8 @@ type
 
       else if Cur.Kind=tkResult then
       begin
-        fPos:=fPos+1;
-        // [버그 수정] "Result.FuncNames.AddRange(fFuncNames);"처럼 Result의 멤버를 거쳐
-        // 메서드를 호출하는 문장 — 예전엔 'Result' 바로 뒤에 ':='만 허용해서, 이런 체인이
-        // 오면 곧장 Expect(tkAssign)이 실패했다. 일반 식별자의 점(.) 체인 문장 처리
-        // (위쪽 tkIdent 분기, qualifier/mname 구성)와 동일한 방식으로 처리하되, 시작
-        // 세그먼트가 'Result'라는 것만 다르다 — CodeGen 쪽 EmitQualifierChainLoad/
-        // IsChainStartSegment에 'Result'를 체인 시작점으로 인식하는 처리를 함께 추가했다.
-        if Cur.Kind=tkDot then
-        begin
-          var segsR93:=new List<string>; segsR93.Add('Result');
-          while Cur.Kind=tkDot do begin fPos:=fPos+1; segsR93.Add(ExpectMemberName); end;
-          var mnameR93:=segsR93[segsR93.Count-1];
-          var qualifierR93:=string.Join('.', segsR93.GetRange(0, segsR93.Count-1));
-          if Cur.Kind=tkAssign then
-          begin
-            fPos:=fPos+1; rhs:=ParseExpr;
-            var fasR93:=new TFieldAssignStmtNode(mnameR93, rhs);
-            fasR93.Qualifier:=qualifierR93;
-            Result:=fasR93;
-          end
-          else
-          begin
-            var mcsR93:=new TMethodCallStmtNode(qualifierR93, mnameR93);
-            if Cur.Kind=tkLParen then
-            begin
-              fPos:=fPos+1;
-              if Cur.Kind<>tkRParen then
-              begin
-                mcsR93.Args.Add(ParseExpr);
-                while Cur.Kind=tkComma do begin fPos:=fPos+1; mcsR93.Args.Add(ParseExpr); end;
-              end;
-              Expect(tkRParen);
-            end;
-            Result:=mcsR93;
-          end;
-        end
-        else
-        begin
-          Expect(tkAssign);
-          Result:=new TResultAssignStmtNode(ParseExpr);
-        end;
+        fPos:=fPos+1; Expect(tkAssign);
+        Result:=new TResultAssignStmtNode(ParseExpr);
       end
 
       else if Cur.Kind=tkSetLength then
@@ -1872,66 +1657,13 @@ type
 
       // [Stage 48] var x := 식; — begin...end 안에서 선언과 동시에 대입.
       // (WPF 진입점 템플릿의 "var t := new System.Threading.Thread(RunApp);" 패턴)
-      // [Stage 93c 버그수정] "var x: Type := 식" 형태(타입 명시 + 초기값)도 허용한다.
-      // 타입 정보는 파싱만 하고 버린다(CodeGen은 초기값 식의 타입에서 자동 추론).
-      // 또한 "var x: Type;" 형태(초기값 없음 — nil/0/'' 기본값)도 허용한다.
-      // [버그 수정] "var a, b: Type;"처럼 콤마로 여러 이름을 한 번에 선언하는 형태(초기값 없는
-      // 경우에만 의미가 있다 — 여러 이름이 값 하나를 공유해 대입받을 수는 없으므로)도 허용한다.
-      // 예전에는 첫 이름 뒤에 콤마가 오면 타입도 대입도 못 찾고 그냥 nil로 선언한 뒤 콤마를
-      // 그대로 남겨서, 다음 문장 구분자를 찾던 상위 루프가 "알 수 없는 문장 (\",\")"로 실패했다.
       else if Cur.Kind=tkVar then
       begin
         fPos:=fPos+1;
-        var ivNames:=new List<string>;
-        ivNames.Add(Expect(tkIdent).Text);
-        while Cur.Kind=tkComma do
-        begin
-          fPos:=fPos+1;
-          ivNames.Add(Expect(tkIdent).Text);
-        end;
-        if Cur.Kind=tkColon then
-        begin
-          // 타입 명시: 파싱만 하고 버린다
-          fPos:=fPos+1;
-          var _ivIsExt: boolean; var _ivCn: string;
-          ParseParamTypeExt(_ivIsExt, _ivCn);
-        end;
-        if (ivNames.Count=1) and (Cur.Kind=tkAssign) then
-        begin
-          fPos:=fPos+1;
-          Result:=new TInlineVarStmtNode(ivNames[0], ParseExpr);
-          fCurParams.Add(ivNames[0]); // 이후 문장에서 이 이름을 필드로 오인하지 않도록 지역변수로 등록
-        end
-        else
-        begin
-          // 초기값 없음(단일 이름 또는 콤마로 묶인 여러 이름) — 각각 nil 리터럴로 초기화하고
-          // (CodeGen이 기본값 처리) 여러 개면 TCompoundStmtNode 하나로 묶어 문장 하나처럼 취급한다.
-          var ivGroup:=new TCompoundStmtNode;
-          foreach var ivn2 in ivNames do
-          begin
-            ivGroup.Statements.Add(new TInlineVarStmtNode(ivn2, new TNilLiteralNode));
-            fCurParams.Add(ivn2);
-          end;
-          if ivGroup.Statements.Count=1 then Result:=ivGroup.Statements[0]
-          else Result:=ivGroup;
-        end;
-      end
-
-      // [Stage 93c 버그수정] foreach [var] VarName in CollExpr do Body
-      // PascalABC.NET의 foreach 구문 — for ... in과 동일하게 TForInStmtNode로 변환한다.
-      // "foreach var x in coll"(인라인 var 선언)와 "foreach x in coll"(기존 변수) 둘 다 허용.
-      // foreach는 Lexer에서 tkIdent("foreach")로 들어오므로 여기서 텍스트로 식별한다.
-      else if (Cur.Kind=tkIdent) and (Cur.Text.ToLower='foreach') then
-      begin
-        fPos:=fPos+1; // 'foreach' 소비
-        if Cur.Kind=tkVar then fPos:=fPos+1; // 선택적 'var' 소비
-        var feVarName:=Expect(tkIdent).Text;
-        Expect(tkIn);
-        var feCollExpr:=ParseExpr;
-        Expect(tkDo);
-        var feBody:=ParseStatement;
-        if not fCurParams.Contains(feVarName) then fCurParams.Add(feVarName);
-        Result:=new TForInStmtNode(feVarName, feCollExpr, feBody);
+        var ivn:=Expect(tkIdent).Text;
+        Expect(tkAssign);
+        Result:=new TInlineVarStmtNode(ivn, ParseExpr);
+        fCurParams.Add(ivn); // 이후 문장에서 이 이름을 필드로 오인하지 않도록 지역변수로 등록
       end
 
       else if Cur.Kind=tkIdent then
@@ -2098,14 +1830,7 @@ type
         end
 
         // 암시적 self 메서드 호출 (괄호 없음, 인자 없음): 예) Show; Close;
-        // [버그 수정] 예전엔 Cur.Kind=tkSemicolon만 허용해서, 이 호출이 어떤 블록의
-        // "마지막" 문장이거나 if-then/else의 단일 문장으로 쓰이면(뒤에 세미콜론이 아니라
-        // end/else/until/except/finally가 바로 오면) 이 분기를 타지 못하고 아래쪽 "대입문"
-        // 분기로 흘러가 "Adv := ..."로 오인해 Expect(tkAssign)이 엉뚱한 토큰(else 등)을
-        // 만나 실패했다. 문장이 합법적으로 끝날 수 있는 모든 위치를 인식하도록 넓혔다.
-        else if (fCurClass<>'') and
-                ((Cur.Kind=tkSemicolon) or (Cur.Kind=tkEnd) or (Cur.Kind=tkElse)
-                 or (Cur.Kind=tkUntil) or (Cur.Kind=tkExcept) or (Cur.Kind=tkFinally)) then
+        else if (fCurClass<>'') and (Cur.Kind=tkSemicolon) then
           Result:=new TMethodCallStmtNode('', nt.Text)
 
         // 배열 원소 대입 (1차원 또는 2차원)
@@ -2133,61 +1858,17 @@ type
         // 외부 제네릭 컬렉션의 인덱서 setter는 CLR에서 컴파일러가 자동 생성하는 "set_Item(key, value)"
         // 메서드라서, 이미 검증된 일반 외부 메서드 호출 경로(TMethodCallStmtNode)로 그대로 위임한다 —
         // CodeGen을 새로 손댈 필요 없이 리플렉션 기반 오버로드 해석을 재사용.
-        // [버그 수정] 첫 인덱싱 뒤에 오는 게 '('가 아니라 '['(두 번째 인덱서, 예:
-        // fClassMethods[cn][mname]:=isFunc — Dictionary<string,Dictionary<K,V>>)나 '.'(인덱서
-        // 결과에 메서드 호출, 예: fClassFields[cn].Add(propName) — Dictionary<string,List<T>>)인
-        // 경우도 있다. 이 두 형태는 기존 set_Item 위임 패턴으로는 표현이 안 돼(중간 단계가
-        // get이고 마지막 단계만 set/call이므로) 전용 AST 노드로 처리한다.
         else if Cur.Kind=tkLBracket then
         begin
           fPos:=fPos+1;
           var idxKey88:=ParseExpr;
           Expect(tkRBracket);
-          if Cur.Kind=tkLBracket then
-          begin
-            // a[i][j] := val — 이중 인덱서 대입
-            fPos:=fPos+1;
-            var idxKey88b:=ParseExpr;
-            Expect(tkRBracket);
-            Expect(tkAssign);
-            var valExpr88b:=ParseExpr;
-            Result:=new TExternalDoubleIndexAssignStmtNode(nt.Text, idxKey88, idxKey88b, valExpr88b);
-          end
-          else if Cur.Kind=tkDot then
-          begin
-            // a[i].Method(args) — 인덱서 결과에 메서드 호출(반환값 버림, 문장으로 사용)
-            // [버그 수정] a[i].Field := val — 인덱서 결과의 필드/프로퍼티 대입인 경우도 있다
-            // (예: Entries[vn].ClassName:=cn). 멤버 이름 다음에 오는 토큰으로 둘을 구분한다.
-            fPos:=fPos+1;
-            var idxMname88:=ExpectMemberName;
-            if Cur.Kind=tkAssign then
-            begin
-              fPos:=fPos+1;
-              var idxFieldVal88:=ParseExpr;
-              Result:=new TExternalIndexFieldAssignStmtNode(nt.Text, idxKey88, idxMname88, idxFieldVal88);
-            end
-            else
-            begin
-              var idxCall88:=new TExternalIndexMethodCallStmtNode(nt.Text, idxKey88, idxMname88);
-              Expect(tkLParen);
-              if Cur.Kind<>tkRParen then
-              begin
-                idxCall88.Args.Add(ParseExpr);
-                while Cur.Kind=tkComma do begin fPos:=fPos+1; idxCall88.Args.Add(ParseExpr); end;
-              end;
-              Expect(tkRParen);
-              Result:=idxCall88;
-            end;
-          end
-          else
-          begin
-            Expect(tkAssign);
-            var valExpr88:=ParseExpr;
-            var setItemCall88:=new TMethodCallStmtNode(nt.Text, 'set_Item');
-            setItemCall88.Args.Add(idxKey88);
-            setItemCall88.Args.Add(valExpr88);
-            Result:=setItemCall88;
-          end;
+          Expect(tkAssign);
+          var valExpr88:=ParseExpr;
+          var setItemCall88:=new TMethodCallStmtNode(nt.Text, 'set_Item');
+          setItemCall88.Args.Add(idxKey88);
+          setItemCall88.Args.Add(valExpr88);
+          Result:=setItemCall88;
         end
 
         // [버그 수정] 암시적 self 이벤트 구독 (self. 접두사 없음): 예) Shown += Form_Shown;
@@ -2453,9 +2134,6 @@ type
       else if Cur.Kind=tkFor then
       begin
         fPos:=fPos+1;
-        // [Stage 93c 버그수정] "for var i := 0 to N do" — PascalABC.NET의 인라인 var 선언 for 루프.
-        // 'var' 키워드가 오면 소비하고 이후는 기존 for 루프와 동일하게 처리한다.
-        if Cur.Kind=tkVar then fPos:=fPos+1;
         var vn:=Expect(tkIdent).Text;
         if Cur.Kind=tkIn then // [Stage 54] for VarName in CollExpr do Body
         begin
@@ -2518,7 +2196,7 @@ type
             // [Stage 43] on ex: System.Exception do — 점(.)으로 연결된 외부 예외 타입 이름도 허용.
             // (실제로는 ExTypeName을 CodeGen이 쓰지 않고 항상 typeof(System.Exception)으로 잡지만,
             // 파싱 자체가 dotted 이름에서 막히면 디자이너가 내는 코드를 아예 받을 수 없다.)
-            while Cur.Kind=tkDot do begin fPos:=fPos+1; tryNode.ExTypeName:=tryNode.ExTypeName+'.'+ExpectDotSegment; end;
+            while Cur.Kind=tkDot do begin fPos:=fPos+1; tryNode.ExTypeName:=tryNode.ExTypeName+'.'+Expect(tkIdent).Text; end;
             Expect(tkDo);
             tryNode.ExceptStmts.Add(ParseStatement);
             if Cur.Kind=tkSemicolon then fPos:=fPos+1;
@@ -2688,25 +2366,15 @@ type
     // 걸려 너무 일찍 멈추지 않도록 괄호 깊이를 추적한다.
     // [주의] 클래스 본문 자체에는 begin...end가 없으므로(멤버는 시그니처뿐, 본문은 별도
     // MethodImpl에서 파싱) ParseStatementsUntilEnd처럼 begin/end 깊이까지 추적할 필요는 없다.
-    // [버그 수정] 예전에는 괄호 깊이만 추적했다 — 클래스 멤버(인라인 메서드 본문 등) 안에
-    // 중첩된 begin...end가 있으면(예: "if X then begin A; B; end;"), 그 안쪽 end나
-    // 세미콜론에서 멈춰버려 아직 진짜 클래스 끝(end;)에 도달하지 않았는데도 조기 종료되는
-    // 문제가 있었다. 그 결과 뒤에 남은 진짜 소스 토큰들이 클래스 밖으로 새어나가 완전히
-    // 엉뚱한 위치(예: unit의 "implementation" 키워드를 기대하는 자리)에서 뜬금없는 오류가
-    // 발생했다. begin/end 중첩 깊이(beginDepth)를 함께 추적해, 중첩 블록 안의 end/세미콜론은
-    // 건너뛰고 실제로 이 멤버를 감싸는 클래스 레벨의 end만 경계로 인식하도록 고쳤다 —
-    // 최상위 복구 루프(ParseProgram의 syncDepth 처리)와 동일한 패턴이다.
     procedure SkipToMemberBoundary;
-    var parenDepth, beginDepth: integer;
+    var parenDepth: integer;
     begin
-      parenDepth:=0; beginDepth:=0;
-      while (Cur.Kind<>tkEOF) and not((Cur.Kind=tkEnd) and (beginDepth=0)) do
+      parenDepth:=0;
+      while (Cur.Kind<>tkEOF) and (Cur.Kind<>tkEnd) do
       begin
         if Cur.Kind=tkLParen then parenDepth:=parenDepth+1
         else if Cur.Kind=tkRParen then begin if parenDepth>0 then parenDepth:=parenDepth-1; end
-        else if Cur.Kind=tkBegin then beginDepth:=beginDepth+1
-        else if Cur.Kind=tkEnd then beginDepth:=beginDepth-1 // 여기 오는 경우는 beginDepth>0일 때뿐(위 while 조건)
-        else if (Cur.Kind=tkSemicolon) and (parenDepth=0) and (beginDepth=0) then begin fPos:=fPos+1; exit; end;
+        else if (Cur.Kind=tkSemicolon) and (parenDepth=0) then begin fPos:=fPos+1; exit; end;
         fPos:=fPos+1;
       end;
     end;
@@ -2848,27 +2516,6 @@ type
         else
         begin
           Expect(tkClass);
-
-          // [Stage 93c 버그수정] 전방 선언(forward declaration): "TFoo = class;" 형태.
-          // Pascal에서 두 클래스가 서로를 참조할 때(상호 참조) 한쪽을 먼저 이름만 선언해두고
-          // 실제 본문은 나중에 정의하는 관용구다(AST.pas의 TProcDeclNode = class; 가 예시).
-          // 파서는 이름을 fClassNames에 등록하고 ';'를 소비한 뒤 이 타입 선언을 마친다 —
-          // 실제 본문 선언이 나중에 같은 이름으로 다시 나오면 그때 정상 파싱된다.
-          // (중복 등록 방지: fClassNames.Contains 체크 후 추가)
-          if Cur.Kind=tkSemicolon then
-          begin
-            if not fClassNames.Contains(cn) then
-            begin
-              fClassNames.Add(cn);
-              fClassParent[cn]:='';
-              fClassInterface[cn]:='';
-              fClassFields[cn]:=new List<string>;
-              fClassMethods[cn]:=new Dictionary<string, boolean>;
-            end;
-            fPos:=fPos+1; // ';' 소비
-            continue; // 다음 타입 선언으로
-          end;
-
           cd:=new TClassDeclNode(cn);
           cd.IsGeneric:=(genParamNames.Count>0); cd.GenericParamNames:=genParamNames;
           cd.GenericParamConstraints:=genParamConstraints;
@@ -2888,7 +2535,7 @@ type
             while Cur.Kind=tkDot do
             begin
               fPos:=fPos+1;
-              pname:=pname+'.'+ExpectDotSegment;
+              pname:=pname+'.'+Expect(tkIdent).Text;
             end;
             if fRecordNames.Contains(pname) then // [Stage 62]
               raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': 레코드 "'+pname+'"는 상속할 수 없습니다 (값 타입)')
@@ -2906,7 +2553,7 @@ type
             Expect(tkRParen);
           end;
 
-          if not fClassNames.Contains(cn) then fClassNames.Add(cn); // 전방 선언 후 본문 재정의 시 중복 방지
+          fClassNames.Add(cn);
           fClassParent[cn]:=cd.ParentName;
           fClassInterface[cn]:=cd.InterfaceName; // [Stage 34] 제네릭 제약조건 검증용
 
@@ -2956,15 +2603,6 @@ type
                   raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString
                     +': 생성자 이름은 "Create"만 지원합니다 (Stage 42)');
               end;
-              // [Stage 99] 이 생성자 "하나만"의 매개변수 목록. 예전엔 이 자리에서 바로
-              // cd.ConstructorParams(클래스 전체 공용 리스트)에 밀어 넣었는데, 오버로드된
-              // 생성자가 여러 개면(예: constructor Create(a); overload; / constructor
-              // Create(a,b); overload;) 그 리스트 하나에 모든 생성자의 매개변수가 뒤섞여
-              // 버려서 각 생성자 구현부(TConstructorImplNode)가 자기 것만 정확히 알 수
-              // 없었다. curCtorParams에 이 생성자만의 매개변수를 따로 모아 뒀다가
-              // 아래에서 cimpl.Parameters로 그대로 넘긴다 — cd.ConstructorParams는
-              // 하위호환을 위해 계속 누적만 해 둔다(CodeGen은 이제 이걸 직접 쓰지 않는다).
-              var curCtorParams:=new List<TParamDef>;
               if Cur.Kind=tkLParen then
               begin
                 fPos:=fPos+1;
@@ -2979,11 +2617,7 @@ type
                     var ctorPIsExt:=false; var ctorPCn:='';
                     var ctorPt:=ParseParamTypeExt(ctorPIsExt, ctorPCn);
                     foreach var ctorPn in ctorPNames do
-                    begin
-                      var ctorPDef:=new TParamDef(ctorPn, ctorPt, ctorPCn, ctorPIsExt);
-                      curCtorParams.Add(ctorPDef);
-                      cd.ConstructorParams.Add(ctorPDef);
-                    end;
+                      cd.ConstructorParams.Add(new TParamDef(ctorPn, ctorPt, ctorPCn, ctorPIsExt));
                     ctorPNames.Clear;
                     if Cur.Kind=tkSemicolon then fPos:=fPos+1 else break;
                   end;
@@ -2993,23 +2627,12 @@ type
               Expect(tkSemicolon);
               cd.HasUserConstructor:=true;
 
-              // [Stage 99] 'overload' 지시어 허용. 예약어로 등록돼 있지 않아 그냥 tkIdent로
-              // 들어오므로 텍스트로 비교한다. 문법적으로 소비만 하고 실제 "어느 생성자를
-              // 호출할지" 판단(오버로드 해석)은 CodeGen이 new 시점의 인자 개수를 보고 정한다
-              // (기존에 외부 .NET 타입 생성자에 이미 쓰던 ResolveConstructorByArity와
-              // 같은 방식을 로컬 클래스 생성자에도 적용 — FindLocalCtorIndex 참고).
-              if (Cur.Kind=tkIdent) and (Cur.Text='overload') then
-              begin
-                fPos:=fPos+1;
-                Expect(tkSemicolon);
-              end;
-
               // [Stage 89] "constructor; begin ... end;" — {$include}로 끌려온 procedure와
               // 완전히 같은 이유(시그니처를 끝맺는 ';'을 소비한 "다음"에 tkBegin을 검사)로 처리한다.
               if Cur.Kind=tkBegin then
               begin
                 var cimpl89:=new TConstructorImplNode(cn);
-                foreach var cp89 in curCtorParams do cimpl89.Parameters.Add(cp89);
+                foreach var cp89 in cd.ConstructorParams do cimpl89.Parameters.Add(cp89);
 
                 var savedClass89:=fCurClass; var savedFunc89:=fCurFunc;
                 var savedParams89:=fCurParams; var savedMethodParamNames89:=fCurMethodParamNames;
@@ -3104,9 +2727,6 @@ type
                 begin
                   while true do
                   begin
-                    // [Stage 100] var/const 참조 매개변수 한정자
-                    var isByRef100b:=false;
-                    if (Cur.Kind=tkVar) or (Cur.Kind=tkConst) then begin isByRef100b:=true; fPos:=fPos+1; end;
                     var pn:=Expect(tkIdent).Text; pnames.Add(pn);
                     while Cur.Kind=tkComma do begin fPos:=fPos+1; pnames.Add(Expect(tkIdent).Text); end;
                     Expect(tkColon);
@@ -3117,7 +2737,6 @@ type
                     begin
                       sig.ParamNames.Add(pnm); sig.ParamTypes.Add(pt);
                       sig.ParamClassNames.Add(pCn2); sig.ParamIsExternal.Add(pIsExt2);
-                      sig.ParamIsByRef.Add(isByRef100b); // [Stage 100]
                     end;
                     pnames.Clear;
                     if Cur.Kind=tkSemicolon then fPos:=fPos+1 else break;
@@ -3144,15 +2763,7 @@ type
               // 단계를 그대로 재사용하고, 본문은 ParseMethodImpl과 같은 방식으로 바로 파싱해
               // fProg.MethodImpls에 (마치 별도 구현부에 있던 것처럼) 담아둔다.
               Expect(tkSemicolon);
-              // [버그 수정] 시그니처 뒤에 곧바로 본문(begin)이 아니라 지역 var/const 섹션이
-              // 먼저 오는 경우(예: "function ReadIdent: TToken; var sl, sc: integer; ...;
-              // begin ... end;")를 놓치고 있었다 — 이 조건이 Cur.Kind=tkBegin만 확인해서,
-              // var/const 섹션이 있으면 "본문 없음"(시그니처만)으로 오인해 아래 else 분기로
-              // 빠졌다. 그 결과 진짜 본문(var 섹션 + begin...end)이 클래스 멤버 목록에서
-              // 처리되지 못한 채 다음 반복으로 넘어가 "클래스 선언 안에서 알 수 없는 토큰
-              // var/begin/if/while..." 연쇄 오류로 이어졌다. var/const로 시작해도 본문이
-              //있는 것으로 인식하도록 조건을 넓혔다.
-              if (Cur.Kind=tkBegin) or (Cur.Kind=tkVar) or (Cur.Kind=tkConst) then
+              if Cur.Kind=tkBegin then
               begin
                 cd.Methods.Add(sig);
                 fClassMethods[cn][mname]:=isFunc;
@@ -3167,7 +2778,6 @@ type
                 inlImpl.ReturnGenericName:=sig.ReturnGenericName;
                 inlImpl.ParamNames.AddRange(sig.ParamNames);
                 inlImpl.ParamTypes.AddRange(sig.ParamTypes);
-                inlImpl.ParamIsByRef.AddRange(sig.ParamIsByRef); // [Stage 100]
                 for var pgi88c:=0 to sig.ParamTypes.Count-1 do
                 begin
                   if (sig.ParamTypes[pgi88c]=vtGeneric) or (sig.ParamTypes[pgi88c]=vtGenericArray) then
@@ -3280,7 +2890,7 @@ type
                 if Cur.Kind=tkDot then
                 begin
                   while Cur.Kind=tkDot do
-                  begin fPos:=fPos+1; qn:=qn+'.'+ExpectDotSegment; end;
+                  begin fPos:=fPos+1; qn:=qn+'.'+Expect(tkIdent).Text; end;
                   fldType:=vtObject; fldCn:=qn; fldIsExt:=true;
                 end
                 else
@@ -3343,15 +2953,6 @@ type
                 fld.DefaultValueExpr:=fldDefaultExpr; // [Stage 83]
                 cd.Fields.Add(fld);
                 fClassFields[cn].Add(fn);
-                // [버그 수정] 배열 타입 필드(예: "fChars: array of char;")는 지금까지
-                // fArrayNames에 등록되지 않아, 그 필드를 클래스 안에서(self. 없이) 직접
-                // "fChars[fPos]"처럼 인덱싱하면 식/문장 파서가 '['를 대괄호 인덱싱으로
-                // 인식하지 못하고 "알 수 없는 문장"으로 실패했다 — 지역변수/매개변수와
-                // 동일하게 등록해 인덱싱을 인식시킨다.
-                if (fldType=vtIntArray) or (fldType=vtStrArray) or (fldType=vtGenericArray) or (fldType=vtObjArray) then
-                  if not fArrayNames.Contains(fn) then fArrayNames.Add(fn);
-                if fldType=vtMatrix then
-                  if not fArrayNames.Contains(fn) then fArrayNames.Add(fn);
               end;
             end
 
@@ -3362,15 +2963,7 @@ type
               on ex: Exception do
               begin
                 ParseErrors.Add(ex.Message);
-                // [버그 수정] 오류가 난 시점의 토큰이 'begin' 자체인 경우(예: 함수 반환타입/지역
-                // var 섹션 파싱 실패로 위치가 어긋나 진짜 본문의 시작 'begin'을 "알 수 없는 토큰"
-                // 으로 오인한 경우), 예전에는 여기서 그 'begin'을 먼저 건너뛴 뒤 SkipToMemberBoundary
-                // 를 불러 begin/end 깊이를 0부터 세기 시작했다 — 그러면 이미 하나 소비된 'begin'을
-                // 셈에서 빼먹어, 실제로는 더 안쪽인 첫 번째 중첩 블록의 end에서 (한 단계 얕게)
-                // 잘못 멈춰버렸다. 'begin'일 때는 미리 건너뛰지 않고 그대로 SkipToMemberBoundary가
-                // 보게 해 깊이를 올바르게 1부터 세도록 한다 — 그 함수의 내부 while문 자체가 이미
-                // 최소 1회는 진행하므로(다른 토큰이면 그 토큰 자체를 소비) 무한루프 걱정도 없다.
-                if (fPos=memberStartPos) and (Cur.Kind<>tkBegin) then fPos:=fPos+1;
+                if fPos=memberStartPos then fPos:=fPos+1;
                 SkipToMemberBoundary;
               end;
             end;
@@ -3507,9 +3100,6 @@ type
         begin
           while true do
           begin
-            // [Stage 100] var/const 참조 매개변수 한정자
-            var isByRef100c:=false;
-            if (Cur.Kind=tkVar) or (Cur.Kind=tkConst) then begin isByRef100c:=true; fPos:=fPos+1; end;
             var pBatch:=new List<string>;
             var pn:=Expect(tkIdent).Text; impl.ParamNames.Add(pn); pBatch.Add(pn);
             while Cur.Kind=tkComma do
@@ -3525,7 +3115,6 @@ type
             begin
               impl.ParamTypes.Add(pt);
               impl.ParamGenericNames.Add(pGenName3);
-              impl.ParamIsByRef.Add(isByRef100c); // [Stage 100]
             end;
             // [Stage 28] array of integer/string 매개변수를 본문에서 a[i]로 인덱싱할 수
             // 있으려면 fArrayNames에 등록되어야 한다(별개 버그, 함께 수정).
@@ -3743,9 +3332,6 @@ type
       begin
         while true do
         begin
-          // [Stage 100] var/const 참조 매개변수 한정자(선택) — procedure Foo(var x: integer);
-          var isByRef100:=false;
-          if (Cur.Kind=tkVar) or (Cur.Kind=tkConst) then begin isByRef100:=true; fPos:=fPos+1; end;
           ns:=new List<string>; ns.Add(Expect(tkIdent).Text);
           while Cur.Kind=tkComma do begin fPos:=fPos+1; ns.Add(Expect(tkIdent).Text); end;
           Expect(tkColon);
@@ -3757,9 +3343,7 @@ type
           if (pt=vtGeneric) or (pt=vtGenericArray) then pCn5:=fLastGenericName; // [Stage 36/37] 제네릭 매개변수(예: x: T, a: array of T)의 타입 매개변수 이름 보존
           foreach var nm in ns do
           begin
-            var pd100:=new TParamDef(nm, pt, pCn5, pIsExt5);
-            pd100.IsByRef:=isByRef100; // [Stage 100]
-            aP.Add(pd100);
+            aP.Add(new TParamDef(nm, pt, pCn5, pIsExt5));
             // [Stage 28] array of integer/string 매개변수도 본문에서 a[i]로 인덱싱할 수
             // 있어야 하는데, 이전에는 매개변수 이름이 fArrayNames에 등록되지 않아
             // 배열 인덱스 식으로 인식되지 않았다(별개 버그, 이번에 함께 수정).
@@ -4059,7 +3643,7 @@ type
           var qnV:=Expect(tkIdent).Text;
           if Cur.Kind=tkDot then
           begin
-            while Cur.Kind=tkDot do begin fPos:=fPos+1; qnV:=qnV+'.'+ExpectDotSegment; end;
+            while Cur.Kind=tkDot do begin fPos:=fPos+1; qnV:=qnV+'.'+Expect(tkIdent).Text; end;
             cn:=qnV; isExt:=true; vt:=vtObject;
           end
           else
@@ -4254,13 +3838,13 @@ type
       // 완전 경로로 해석하는 데 사용한다.
       fPos:=fPos+1; // 'uses' 소비
       var _nsName87:=Expect(tkIdent).Text;
-      while Cur.Kind=tkDot do begin fPos:=fPos+1; _nsName87:=_nsName87+'.'+ExpectDotSegment; end;
+      while Cur.Kind=tkDot do begin fPos:=fPos+1; _nsName87:=_nsName87+'.'+Expect(tkIdent).Text; end;
       if not fImportedNamespaces.Contains(_nsName87) then fImportedNamespaces.Add(_nsName87);
       while Cur.Kind=tkComma do
       begin
         fPos:=fPos+1;
         _nsName87:=Expect(tkIdent).Text;
-        while Cur.Kind=tkDot do begin fPos:=fPos+1; _nsName87:=_nsName87+'.'+ExpectDotSegment; end;
+        while Cur.Kind=tkDot do begin fPos:=fPos+1; _nsName87:=_nsName87+'.'+Expect(tkIdent).Text; end;
         if not fImportedNamespaces.Contains(_nsName87) then fImportedNamespaces.Add(_nsName87);
       end;
       Expect(tkSemicolon);
@@ -4358,16 +3942,6 @@ type
       if prog.IsUnit then
         while (Cur.Kind=tkFunction) or (Cur.Kind=tkProcedure) do
           ParseInterfaceHeaderDecl(prog);
-
-      // [버그 수정] type 섹션(클래스 멤버) 파싱 중 오류복구(ParseErrors.Add + SkipToMemberBoundary/
-      // typeDeclStartPos 복구)가 일어났다면, 이 시점의 파서 위치가 이미 원래 문법과 어긋나 있을 수
-      // 있다 — 그 상태로 바로 Expect(tkImplementation) 등을 시도하면 진짜 원인과 전혀 무관한
-      // "예상 tkImplementation 실제 tkXxx" 같은 혼란스러운 오류만 보이고, 정작 ParseErrors에 쌓인
-      // 진짜 1차 오류(어느 클래스 멤버에서 무엇이 실패했는지)는 화면에 나오지 않은 채 묻혀버린다.
-      // 여기서 먼저 걸러 진짜 원인을 보여준다 — 아래쪽(4128번대 인근)의 최종 ParseErrors 체크와
-      // 동일한 형식이지만, 더 이해하기 힘든 후속 오류가 대신 튀어나오기 전에 선점해서 던진다.
-      if ParseErrors.Count>0 then
-        raise new Exception('구문 분석 오류 '+ParseErrors.Count.ToString+'건 발견:'#10+string.Join(#10, ParseErrors));
 
       // [Stage 81] unit이면 여기서 'implementation' 키워드, 그리고 그 섹션 전용 uses도
       // 올 수 있다. 이후의 메서드 구현부/var/const 파싱은 program/library와 완전히 동일한

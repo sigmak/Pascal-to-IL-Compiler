@@ -66,13 +66,8 @@ type
     fClassParents: Dictionary<string, string>; // 클래스명 → 부모 클래스명 ('' 이면 없음)
     fMethodReturnTypes: Dictionary<string, Dictionary<string, TVarType>>; // 클래스명/인터페이스명 → 메서드명 → 반환타입
     fMethodParamClrTypes: Dictionary<string, Dictionary<string, array of System.Type>>; // 클래스명 → 메서드명 → 매개변수 CLR 타입 배열
-    // [Stage 99] 클래스당 생성자가 1개뿐이라고 가정했던 예전 구조(값 하나)를, 오버로드된
-    // 생성자를 여러 개 담을 수 있도록 리스트로 바꿨다. 두 딕셔너리는 항상 같은 순서로
-    // 나란히 채워진다(i번째 ConstructorBuilder의 매개변수 타입이 fCtorParamClrTypes[cn][i]).
-    // 생성자가 1개뿐인(오버로드 없는) 기존 클래스들은 그냥 리스트에 원소가 1개 있는
-    // 것으로 취급되므로 동작이 그대로 유지된다.
-    fCtorBuilders: Dictionary<string, List<ConstructorBuilder>>; // 클래스명 → 생성자 목록 (CreateType 전에도 참조 가능하도록 보관)
-    fCtorParamClrTypes: Dictionary<string, List<array of System.Type>>; // [Stage 47/99] 클래스명 → 각 생성자의 매개변수 CLR 타입 배열
+    fCtorBuilders: Dictionary<string, ConstructorBuilder>; // 클래스명 → 기본 생성자 (CreateType 전에도 참조 가능하도록 보관)
+    fCtorParamClrTypes: Dictionary<string, array of System.Type>; // [Stage 47] 클래스명 → 생성자 매개변수 CLR 타입 배열
 
     // 외부 .NET 어셈블리 (WPF/WinForm/Avalonia 등) — GenerateExe 전에 AddReferenceAssembly로 채워짐
     fLoadedAssemblies: List<Assembly>;
@@ -1015,7 +1010,6 @@ type
         if fBuiltInterfaces.ContainsKey(_ac.TargetType) then Result:=vtInterface
         else Result:=vtObject;
       end
-      else if e is TIsCheckExprNode then Result:=vtBoolean // [Stage 93c] <식> is <TypeName> → 항상 bool
       else if e is TInheritedCallExprNode then // [Stage 30]
       begin
         var _ih:=TInheritedCallExprNode(e);
@@ -1140,14 +1134,11 @@ type
         // [Stage 47] 로컬 부모 클래스도 이제 매개변수 있는 생성자를 지원한다.
         // [버그 수정] ConstructorBuilder.GetParameters()는 CreateType 전에는 예외를 던지므로
         // 정의 시점에 미리 계산해 둔 fCtorParamClrTypes를 대신 사용한다.
-        // [Stage 99] 부모가 생성자를 여러 개(오버로드) 가질 수 있으므로, 이 호출의 인자
-        // 개수와 일치하는 것을 FindLocalCtorIndex로 골라 그 생성자를 호출한다.
-        var _parentCtorIdx3:=FindLocalCtorIndex(startCls3, args.Count);
-        if _parentCtorIdx3<0 then
-          raise new Exception('inherited Create: 부모 클래스 "'+startCls3+'"에 인자 '+args.Count.ToString+'개짜리 생성자가 없습니다.');
-        var _parentCtorParams3:=fCtorParamClrTypes[startCls3][_parentCtorIdx3];
+        var _parentCtorParams3: array of System.Type;
+        if fCtorParamClrTypes.ContainsKey(startCls3) then _parentCtorParams3:=fCtorParamClrTypes[startCls3]
+        else _parentCtorParams3:=nil;
         EmitArgsCoerced(aIL, args, _parentCtorParams3);
-        aIL.Emit(OpCodes.Call, fCtorBuilders[startCls3][_parentCtorIdx3]);
+        aIL.Emit(OpCodes.Call, fCtorBuilders[startCls3]);
       end
       else
       begin
@@ -1426,12 +1417,10 @@ type
           if fAbstractMethods.ContainsKey(neo.ClassName) and (fAbstractMethods[neo.ClassName].Count>0) then
             raise new Exception('"'+neo.ClassName+'"은(는) abstract 메서드를 갖고 있어 인스턴스를 생성할 수 없습니다 (abstract 클래스).');
           // [Stage 47] 로컬(우리 컴파일러가 만든) 클래스도 매개변수 있는 생성자를 지원한다.
-          // [Stage 99] 생성자가 여러 개(오버로드)일 수 있으므로 인자 개수로 맞는 것을 고른다.
-          var _localCtorIdx:=FindLocalCtorIndex(neo.ClassName, neo.Args.Count);
-          if _localCtorIdx<0 then
-            raise new Exception('"'+neo.ClassName+'"에 인자 '+neo.Args.Count.ToString+'개짜리 생성자가 없습니다.');
-          ctor:=fCtorBuilders[neo.ClassName][_localCtorIdx];
-          var _ctorParamsLocal:=fCtorParamClrTypes[neo.ClassName][_localCtorIdx];
+          ctor:=fCtorBuilders[neo.ClassName];
+          var _ctorParamsLocal: array of System.Type;
+          if fCtorParamClrTypes.ContainsKey(neo.ClassName) then _ctorParamsLocal:=fCtorParamClrTypes[neo.ClassName]
+          else _ctorParamsLocal:=nil;
           EmitArgsCoerced(aIL, neo.Args, _ctorParamsLocal);
           aIL.Emit(OpCodes.Newobj, ctor);
         end;
@@ -1564,36 +1553,6 @@ type
                 aIL.Emit(OpCodes.Call, _smiE);
               end;
             end;
-          end;
-        end
-        else if mc.ObjName='' then
-        begin
-          // [버그 수정] 식(expression) 위치에서 쓰이는 암시적 self 호출(예: "A or B or
-          // IsKeywordAllowedAsMemberName(t.Kind)")이 여태 처리되지 않았다 — 문장(statement)
-          // 위치의 동일 패턴(TMethodCallStmtNode, ObjName='' 분기)은 이미 있었지만 식 위치의
-          // TMethodCallExprNode 쪽엔 대응하는 분기가 아예 빠져 있어서, 지역변수/필드/외부
-          // 정적 타입 어디에도 안 걸리고 결국 "알 수 없는 변수 \"\""로 실패했다. 로직은
-          // 문장 버전과 동일(지역 메서드 우선, 없으면 외부 상속 타입에서 탐색)하되, 문장
-          // 버전과 달리 반환값을 Pop하지 않고 스택에 남겨 식의 값으로 쓴다.
-          aIL.Emit(OpCodes.Ldarg_0); // self
-          var _imbEC93: MethodBuilder;
-          if TryFindInstanceMethod(fCurClassName, mc.MethodName, _imbEC93) then
-          begin
-            EmitArgsCoerced(aIL, mc.Args, FindInstanceMethodParamTypes(fCurClassName, mc.MethodName));
-            aIL.Emit(OpCodes.Callvirt, _imbEC93);
-          end
-          else
-          begin
-            var _extTypeEC93:=FindExternalAncestorType(fCurClassName);
-            if _extTypeEC93=nil then
-              raise new Exception('알 수 없는 메서드 "'+fCurClassName+'.'+mc.MethodName+'"');
-            var _emiEC93:=ResolveMethodByArity(_extTypeEC93, mc.MethodName, mc.Args, false);
-            if _emiEC93=nil then
-              raise new Exception('외부 타입 "'+_extTypeEC93.FullName+'"에 메서드 "'+mc.MethodName+'"가 없습니다 (인자 '+mc.Args.Count.ToString+'개).');
-            var _emiEC93Params:=_emiEC93.GetParameters;
-            for var _emiEC93Ai:=0 to mc.Args.Count-1 do
-              EmitArgForParamType(aIL, mc.Args[_emiEC93Ai], _emiEC93Params[_emiEC93Ai].ParameterType);
-            aIL.Emit(OpCodes.Callvirt, _emiEC93);
           end;
         end
         else if (fLocalScope.Has(mc.ObjName) or fGlobalScope.Has(mc.ObjName))
@@ -1964,30 +1923,34 @@ type
         // [Stage 78] obj[i] — 대부분의 .NET 컬렉션이 따르는 관례(기본 인덱서 = "Item"
         // 프로퍼티, TreeNodeCollection 포함)를 리플렉션으로 찾아 get_Item(i)을 호출한다.
         // Qualifier(예: "Tree.Nodes")는 기존 체인 로딩 메커니즘을 그대로 재사용한다.
-        // [버그 수정] EmitIndexerGet으로 추출 + IndexExpr2가 있으면(obj[i][j]) 첫 인덱싱
-        // 결과 타입에 대해 다시 한 번 적용하고, MemberName이 있으면(obj[i].Field) 그
-        // 필드/프로퍼티를 읽는다(둘은 파서가 상호 배타적으로만 채운다).
         var eiN:=TExternalIndexExprNode(e);
         var eiSegs:=SplitByDot(eiN.Qualifier);
         var eiBaseType: System.Type;
         if not IsChainStartSegment(eiSegs[0]) then
           raise new Exception('알 수 없는 인덱서 대상 "'+eiN.Qualifier+'"');
         EmitQualifierChainLoad(aIL, eiSegs, eiBaseType);
-        var eiResultType:=EmitIndexerGet(aIL, eiBaseType, eiN.IndexExpr);
-        if eiN.IndexExpr2<>nil then
-          eiResultType:=EmitIndexerGet(aIL, eiResultType, eiN.IndexExpr2);
-        if eiN.MemberName<>'' then
+        // [버그 수정] TreeNodeCollection처럼 "Item" 인덱서가 여러 개 오버로드(Item[int],
+        // Item[string] 등)로 존재하는 타입은 GetProperty('Item')이 이름만으로 어느 것인지
+        // 정하지 못해 AmbiguousMatchException을 던진다. 실제 인덱스 식의 타입을 보고
+        // 파라미터가 가장 잘 맞는 오버로드를 직접 골라야 한다 (ResolveMethodByArity와
+        // 같은 원리, ScoreParamMatch/InferArgClrType 재사용).
+        var eiIdxArgType:=InferArgClrType(eiN.IndexExpr);
+        var eiItemProp: PropertyInfo := nil;
+        var eiBestScore:=System.Int32.MinValue;
+        foreach var eiCand in eiBaseType.GetProperties(BindingFlags.Public or BindingFlags.Instance) do
         begin
-          var eiFi:=eiResultType.GetField(eiN.MemberName, BindingFlags.Public or BindingFlags.Instance);
-          if eiFi<>nil then aIL.Emit(OpCodes.Ldfld, eiFi)
-          else
+          if (eiCand.Name='Item') and (eiCand.GetIndexParameters.Length=1) and (eiCand.GetGetMethod<>nil) then
           begin
-            var eiPi:=SafeGetProperty(eiResultType, eiN.MemberName);
-            if (eiPi=nil) or (eiPi.GetGetMethod=nil) then
-              raise new Exception('타입 "'+eiResultType.FullName+'"에 필드/프로퍼티 "'+eiN.MemberName+'"가 없습니다.');
-            aIL.Emit(OpCodes.Callvirt, eiPi.GetGetMethod);
+            var eiScore:=ScoreParamMatch(eiCand.GetIndexParameters()[0].ParameterType, eiIdxArgType);
+            if (eiItemProp=nil) or (eiScore>eiBestScore) then
+            begin eiBestScore:=eiScore; eiItemProp:=eiCand; end;
           end;
         end;
+        if eiItemProp=nil then
+          raise new Exception('타입 "'+eiBaseType.FullName+'"에는 인덱서(Item)가 없습니다.');
+        var eiIdxParams:=eiItemProp.GetIndexParameters();
+        EmitArgForParamType(aIL, eiN.IndexExpr, eiIdxParams[0].ParameterType);
+        aIL.Emit(OpCodes.Callvirt, eiItemProp.GetGetMethod);
       end
 
       // [Stage 91] typeof(TypeName) — IL로는 Ldtoken(타입) 다음 Type.GetTypeFromHandle 호출.
@@ -2203,14 +2166,7 @@ type
           // Left/Right를 스택에 push만 해두고 아무 명령도 방출하지 않던 버그.
           // Pascal boolean은 0/1(int32)로 표현되므로 비트 And/Or가 논리 And/Or와 동치이다.
           else if b.Op=boAnd then aIL.Emit(OpCodes.And)
-          else if b.Op=boOr then aIL.Emit(OpCodes.Or)
-          // [버그 수정] shl/shr는 파서(ParseMulDivMod)가 이미 인식하고 있었는데 여기 IL 방출
-          // 체인에 대응하는 분기가 없어서, boShl/boShr 값이 들어와도 그냥 Left/Right만 스택에
-          // push된 채 아무 명령도 안 나가고 있었다. shr는 표준 Pascal 관례대로 부호 없는(논리)
-          // 오른쪽 시프트로 방출한다(Delphi/FPC의 shr와 동일). 시프트 횟수는 IL 규약상 항상
-          // int32로 취급되므로 위쪽의 Conv_R8 보정과는 무관하다.
-          else if b.Op=boShl then aIL.Emit(OpCodes.Shl)
-          else if b.Op=boShr then aIL.Emit(OpCodes.Shr_Un);
+          else if b.Op=boOr then aIL.Emit(OpCodes.Or);
         end;
       end
 
@@ -2336,25 +2292,6 @@ type
         else if fTypeBuilders.ContainsKey(asc.TargetType) then targetT:=fTypeBuilders[asc.TargetType]
         else raise new Exception('as 캐스트 대상 타입을 찾을 수 없음: "'+asc.TargetType+'"');
         aIL.Emit(OpCodes.Castclass, targetT);
-      end
-
-      else if e is TIsCheckExprNode then
-      begin
-        // [Stage 93c] <식> is <TypeName> — Isinst는 캐스트 성공 시 그 참조를, 실패 시 null을
-        // 남긴다(Castclass와 달리 예외를 던지지 않음). null 여부만 bool로 뽑아내면 되므로
-        // Isinst → Ldnull → Cgt_Un(부호 없는 비교: null(0)보다 크면 true, 즉 null이 아니면 true)
-        // 순서로 구현한다. 대상 타입 조회 로직은 바로 위 TAsCastExprNode와 완전히 동일하다.
-        var isc:=TIsCheckExprNode(e);
-        EmitExpr(aIL, isc.Expr);
-        var isTargetT: System.Type;
-        if isc.IsExternalType then isTargetT:=ResolveExternalType(isc.TargetType)
-        else if fBuiltInterfaces.ContainsKey(isc.TargetType) then isTargetT:=fBuiltInterfaces[isc.TargetType]
-        else if fBuiltTypes.ContainsKey(isc.TargetType) then isTargetT:=fBuiltTypes[isc.TargetType]
-        else if fTypeBuilders.ContainsKey(isc.TargetType) then isTargetT:=fTypeBuilders[isc.TargetType]
-        else raise new Exception('is 타입 체크 대상 타입을 찾을 수 없음: "'+isc.TargetType+'"');
-        aIL.Emit(OpCodes.Isinst, isTargetT);
-        aIL.Emit(OpCodes.Ldnull);
-        aIL.Emit(OpCodes.Cgt_Un);
       end
 
       else if e is TInheritedCallExprNode then
@@ -3677,93 +3614,6 @@ type
         else aIL.Emit(OpCodes.Stelem_I4); // integer 기본
       end
 
-      // [버그 수정] 외부 컬렉션 이중 인덱서 대입: Qualifier[Idx1][Idx2] := Value
-      // (예: fClassMethods[cn][mname]:=isFunc). 첫 인덱싱은 get(내부 컬렉션을 얻음),
-      // 마지막 인덱싱만 set — EmitIndexerGet으로 얻은 중간 타입에 대해 다시 "Item" 세터를
-      // 리플렉션으로 찾아 적용한다(EmitIndexerGet과 대칭되는 set 버전을 여기서 인라인으로 짠다 —
-      // 재사용 지점이 한 곳뿐이라 별도 함수로 뽑지 않았다).
-      else if s is TExternalDoubleIndexAssignStmtNode then
-      begin
-        var edia:=TExternalDoubleIndexAssignStmtNode(s);
-        var ediaSegs:=SplitByDot(edia.Qualifier);
-        var ediaBaseType: System.Type;
-        if not IsChainStartSegment(ediaSegs[0]) then
-          raise new Exception('알 수 없는 인덱서 대상 "'+edia.Qualifier+'"');
-        EmitQualifierChainLoad(aIL, ediaSegs, ediaBaseType);
-        var ediaInnerType:=EmitIndexerGet(aIL, ediaBaseType, edia.Idx1); // 첫 단계: get → 내부 컬렉션
-        // 두 번째 단계: 내부 컬렉션의 "Item" 세터를 찾아 set_Item(Idx2, Value) 호출
-        var ediaIdxArgType:=InferArgClrType(edia.Idx2);
-        var ediaItemProp: PropertyInfo := nil;
-        var ediaBestScore:=System.Int32.MinValue;
-        foreach var ediaCand in ediaInnerType.GetProperties(BindingFlags.Public or BindingFlags.Instance) do
-        begin
-          if (ediaCand.Name='Item') and (ediaCand.GetIndexParameters.Length=1) and (ediaCand.GetSetMethod<>nil) then
-          begin
-            var ediaScore:=ScoreParamMatch(ediaCand.GetIndexParameters()[0].ParameterType, ediaIdxArgType);
-            if (ediaItemProp=nil) or (ediaScore>ediaBestScore) then
-            begin ediaBestScore:=ediaScore; ediaItemProp:=ediaCand; end;
-          end;
-        end;
-        if ediaItemProp=nil then
-          raise new Exception('타입 "'+ediaInnerType.FullName+'"에는 인덱서(Item) 세터가 없습니다.');
-        var ediaIdxParams:=ediaItemProp.GetIndexParameters();
-        EmitArgForParamType(aIL, edia.Idx2, ediaIdxParams[0].ParameterType);
-        EmitArgForParamType(aIL, edia.ValueExpr, ediaItemProp.PropertyType);
-        aIL.Emit(OpCodes.Callvirt, ediaItemProp.GetSetMethod);
-      end
-
-      // [버그 수정] 외부 컬렉션 인덱서 결과에 메서드 호출(문장): Qualifier[IndexExpr].MethodName(Args)
-      // (예: fClassFields[cn].Add(propName)). EmitIndexerGet으로 인덱싱 결과(내부 컬렉션)를
-      // 스택에 올린 뒤, 이미 검증된 ResolveMethodByArity/EmitArgForParamType 경로로 그대로
-      // 넘긴다 — 일반 외부 메서드 호출과 동일한 오버로드 해석을 재사용한다.
-      else if s is TExternalIndexMethodCallStmtNode then
-      begin
-        var eimc:=TExternalIndexMethodCallStmtNode(s);
-        var eimcSegs:=SplitByDot(eimc.Qualifier);
-        var eimcBaseType: System.Type;
-        if not IsChainStartSegment(eimcSegs[0]) then
-          raise new Exception('알 수 없는 인덱서 대상 "'+eimc.Qualifier+'"');
-        EmitQualifierChainLoad(aIL, eimcSegs, eimcBaseType);
-        var eimcInnerType:=EmitIndexerGet(aIL, eimcBaseType, eimc.IndexExpr);
-        var eimcMi:=ResolveMethodByArity(eimcInnerType, eimc.MethodName, eimc.Args, false);
-        if eimcMi=nil then
-          raise new Exception('타입 "'+eimcInnerType.FullName+'"에 메서드 "'+eimc.MethodName+'"가 없습니다 (인자 '+eimc.Args.Count.ToString+'개).');
-        var eimcParams:=eimcMi.GetParameters;
-        for var eimcAi:=0 to eimc.Args.Count-1 do
-          EmitArgForParamType(aIL, eimc.Args[eimcAi], eimcParams[eimcAi].ParameterType);
-        aIL.Emit(OpCodes.Callvirt, eimcMi);
-        if eimcMi.ReturnType<>typeof(System.Void) then aIL.Emit(OpCodes.Pop); // 문장이므로 반환값 버림
-      end
-
-      // [버그 수정] 외부 컬렉션 인덱서 결과의 필드/프로퍼티 대입: Qualifier[IndexExpr].FieldName := Value
-      // (예: Entries[vn].ClassName:=cn — TScopeEntry.ClassName은 진짜 필드, 프로퍼티가 아니다).
-      // EmitIndexerGet으로 인덱싱 결과(객체 참조)를 스택에 올린 뒤, 그 타입에서 이름으로
-      // 먼저 필드를 찾고(Stfld), 없으면 프로퍼티 세터로 폴백한다(Callvirt set_Xxx).
-      else if s is TExternalIndexFieldAssignStmtNode then
-      begin
-        var eifa:=TExternalIndexFieldAssignStmtNode(s);
-        var eifaSegs:=SplitByDot(eifa.Qualifier);
-        var eifaBaseType: System.Type;
-        if not IsChainStartSegment(eifaSegs[0]) then
-          raise new Exception('알 수 없는 인덱서 대상 "'+eifa.Qualifier+'"');
-        EmitQualifierChainLoad(aIL, eifaSegs, eifaBaseType);
-        var eifaInnerType:=EmitIndexerGet(aIL, eifaBaseType, eifa.IndexExpr);
-        var eifaFi:=eifaInnerType.GetField(eifa.FieldName, BindingFlags.Public or BindingFlags.Instance);
-        if eifaFi<>nil then
-        begin
-          EmitArgForParamType(aIL, eifa.ValueExpr, eifaFi.FieldType);
-          aIL.Emit(OpCodes.Stfld, eifaFi);
-        end
-        else
-        begin
-          var eifaPi:=SafeGetProperty(eifaInnerType, eifa.FieldName);
-          if (eifaPi=nil) or (eifaPi.GetSetMethod=nil) then
-            raise new Exception('타입 "'+eifaInnerType.FullName+'"에 필드/프로퍼티 "'+eifa.FieldName+'"가 없습니다.');
-          EmitArgForParamType(aIL, eifa.ValueExpr, eifaPi.PropertyType);
-          aIL.Emit(OpCodes.Callvirt, eifaPi.GetSetMethod);
-        end;
-      end
-
       // [Stage 67] 2차원 배열 초기화: SetLength(arr, rows, cols)
       // 전략:
       //   1) Newarr (행 배열) → arr에 저장
@@ -4182,14 +4032,6 @@ type
     end;
 
     // 메서드 시그니처의 i번째 매개변수의 실제 CLR 타입을 결정한다 (기본/지역클래스/외부타입 모두 포함)
-    // [Stage 100] var/const 참조 매개변수는 CLR ByRef 타입(예: string&)으로 내보낸다.
-    // ByRef 타입이면 원소(실제 값) 타입을, 아니면 그대로 돌려준다 — 로컬 슬롯 선언, 역참조
-    // 읽기(Ldobj)/역참조 쓰기(Stobj)에서 실제 값 타입이 필요할 때 이 함수를 거친다.
-    function ElemTypeIfByRef(t: System.Type): System.Type;
-    begin
-      if t.IsByRef then Result:=t.GetElementType else Result:=t;
-    end;
-
     function ResolveParamClrType(sig: TMethodSignature; i: integer): System.Type;
     begin
       if (sig.ParamTypes[i]=vtObject) and (i<sig.ParamIsExternal.Count) and sig.ParamIsExternal[i] then
@@ -4203,8 +4045,6 @@ type
         Result:=VTC(vtGeneric, sig.ParamClassNames[i])
       else
         Result:=VTC(sig.ParamTypes[i], '');
-      // [Stage 100] var/const 매개변수 — ByRef 타입으로 감싼다.
-      if (i<sig.ParamIsByRef.Count) and sig.ParamIsByRef[i] then Result:=Result.MakeByRefType;
     end;
 
     // [Stage 31] 최상위 함수/프로시저(TParamDef)의 매개변수 실제 CLR 타입을 결정한다.
@@ -4220,8 +4060,6 @@ type
       // 매개변수가 CodeGen까지 온 적이 없어 무해했다), true open generic 지원을 위해 명시한다.
       else if p.ParamType=vtGeneric then Result:=VTC(vtGeneric, p.ClassName)
       else Result:=VTC(p.ParamType, '');
-      // [Stage 100] var/const 매개변수 — ByRef 타입으로 감싼다.
-      if p.IsByRef then Result:=Result.MakeByRefType;
     end;
 
     // [Stage 68] 람다 매개변수에 타입 명시가 없을 때(vtInferred), 델리게이트 Invoke 시그니처에서
@@ -4257,7 +4095,6 @@ type
       end
       else if e is TLengthExprNode then names.Add(TLengthExprNode(e).ArrName)
       else if e is TAsCastExprNode then CollectVarNamesInExpr(TAsCastExprNode(e).Expr, names)
-      else if e is TIsCheckExprNode then CollectVarNamesInExpr(TIsCheckExprNode(e).Expr, names)
       else if e is TInheritedCallExprNode then
         for i:=0 to TInheritedCallExprNode(e).Args.Count-1 do
           CollectVarNamesInExpr(TInheritedCallExprNode(e).Args[i], names)
@@ -5319,32 +5156,6 @@ type
         Result := t.GetConstructors(BindingFlags.Public or BindingFlags.Instance);
     end;
 
-    // [버그 수정] obj[i] 형태의 외부 컬렉션 인덱서 getter 호출을 하나의 함수로 뽑아냈다 —
-    // 기존에는 TExternalIndexExprNode 처리부에 이 로직이 한 번만 인라인돼 있었는데, a[i][j]
-    // (이중 인덱싱) 지원을 위해 같은 로직을 두 번 적용해야 해서 재사용 가능하게 분리했다.
-    // 호출 전에 baseType 값의 인스턴스가 이미 스택에 올라가 있어야 하며, 호출 후에는
-    // get_Item 결과(다음 단계 인덱싱 또는 최종 값)가 스택에 남는다. Result는 그 결과의 CLR 타입.
-    function EmitIndexerGet(aIL: ILGenerator; baseType: System.Type; idxExpr: TExprNode): System.Type;
-    var idxArgType: System.Type; itemProp: PropertyInfo; bestScore: integer;
-    begin
-      idxArgType:=InferArgClrType(idxExpr);
-      itemProp:=nil; bestScore:=System.Int32.MinValue;
-      foreach var cand in baseType.GetProperties(BindingFlags.Public or BindingFlags.Instance) do
-      begin
-        if (cand.Name='Item') and (cand.GetIndexParameters.Length=1) and (cand.GetGetMethod<>nil) then
-        begin
-          var score:=ScoreParamMatch(cand.GetIndexParameters()[0].ParameterType, idxArgType);
-          if (itemProp=nil) or (score>bestScore) then begin bestScore:=score; itemProp:=cand; end;
-        end;
-      end;
-      if itemProp=nil then
-        raise new Exception('타입 "'+baseType.FullName+'"에는 인덱서(Item)가 없습니다.');
-      var idxParams:=itemProp.GetIndexParameters();
-      EmitArgForParamType(aIL, idxExpr, idxParams[0].ParameterType);
-      aIL.Emit(OpCodes.Callvirt, itemProp.GetGetMethod);
-      Result:=itemProp.PropertyType;
-    end;
-
     function ResolveMethodByArity(t: System.Type; mname: string; args: List<TExprNode>; isStatic: boolean): MethodInfo;
     var flags: BindingFlags; mi: MethodInfo; argCount: integer;
       bestScore: integer; bestMi: MethodInfo; found: boolean;
@@ -5395,24 +5206,6 @@ type
           begin bestScore:=score51; bestCi:=ci; found:=true; end;
         end;
       Result:=bestCi;
-    end;
-
-    // [Stage 99] 로컬(우리 컴파일러가 직접 정의한) 클래스의 생성자 오버로드 중에서
-    // 인자 개수가 일치하는 것의 인덱스를 fCtorBuilders[className]/fCtorParamClrTypes[className]
-    // 기준으로 찾는다. 같은 인자 개수의 오버로드가 여럿이면(타입만 다른 경우) 그중 첫
-    // 번째를 고른다 — ResolveConstructorByArity(외부 .NET 타입용)처럼 인자 타입까지
-    // 점수화하지는 않는다. 지금까지 실제로 나온 경우는 전부 인자 "개수"만으로 구분되므로
-    // (예: TRangeExprNode의 Create(lo) vs Create(lo,hi)) 우선은 이 정도로 충분하고,
-    // 같은 개수·다른 타입의 오버로드가 실제로 필요해지면 그때 타입 점수화를 추가한다.
-    // 못 찾으면 -1.
-    function FindLocalCtorIndex(className: string; argCount: integer): integer;
-    var lst: List<array of System.Type>; i: integer;
-    begin
-      Result:=-1;
-      if not fCtorParamClrTypes.ContainsKey(className) then exit;
-      lst:=fCtorParamClrTypes[className];
-      for i:=0 to lst.Count-1 do
-        if lst[i].Length=argCount then begin Result:=i; exit; end;
     end;
 
     // [Stage 76 버그수정 #3] "var img := System.Drawing.Image.FromFile(path);"처럼 외부
@@ -6063,68 +5856,29 @@ type
 
       // 기본 생성자 추가 (부모 생성자 호출로 체이닝)
       // [Stage 47] 클래스 선언부에 "constructor Create(...)"로 매개변수가 선언돼 있으면
-      // 그 시그니처 그대로 정의한다 (선언 없으면 빈 매개변수 목록 → 기존과 동일).
-      // [Stage 99] 오버로드된 생성자를 전부 지원하기 위해, "클래스 하나당 시그니처 하나"라고
-      // 가정했던 cd.ConstructorParams(모든 오버로드가 뒤섞인 리스트) 대신 fProg.ConstructorImpls
-      // 에서 이 클래스(cd.Name) 소유의 항목들을 그대로 가져와 "그 개수만큼" ConstructorBuilder를
-      // 만든다 — Parser.pas Stage 99 수정 이후 각 impl은 자기 자신의 Parameters만 정확히
-      // 갖고 있으므로 이게 곧 실제 오버로드 목록이다(순서=소스에 나온 순서).
-      var thisClassCtorImpls:=new List<TConstructorImplNode>;
-      if cd.HasUserConstructor then
-        foreach var _ci99 in fProg.ConstructorImpls do
-          if _ci99.ClassName=cd.Name then thisClassCtorImpls.Add(_ci99);
-
-      var ctorBuilderList:=new List<ConstructorBuilder>;
-      var ctorParamTypeList:=new List<array of System.Type>;
-
-      if thisClassCtorImpls.Count>0 then
-      begin
-        foreach var _ci99b in thisClassCtorImpls do
-        begin
-          var _ctorParamTypes99:=new System.Type[_ci99b.Parameters.Count];
-          for i:=0 to _ci99b.Parameters.Count-1 do
-            _ctorParamTypes99[i]:=ResolveTopParamClrType(_ci99b.Parameters[i]);
-          var _ctorBuilder99:=tb.DefineConstructor(
-            MethodAttributes.Public, CallingConventions.Standard, _ctorParamTypes99);
-          ctorBuilderList.Add(_ctorBuilder99);
-          ctorParamTypeList.Add(_ctorParamTypes99);
-        end;
-      end
-      else
-      begin
-        // 사용자 생성자 선언이 없는(HasUserConstructor=false) 경우: 예전과 동일하게
-        // 매개변수 없는 생성자 1개만 만든다.
-        var _ctorParamTypes99:=new System.Type[0];
-        var _ctorBuilder99:=tb.DefineConstructor(
-          MethodAttributes.Public, CallingConventions.Standard, _ctorParamTypes99);
-        ctorBuilderList.Add(_ctorBuilder99);
-        ctorParamTypeList.Add(_ctorParamTypes99);
-      end;
-
-      fCtorBuilders[cd.Name]:=ctorBuilderList;
-      fCtorParamClrTypes[cd.Name]:=ctorParamTypeList;
-
+      // 그 시그니처 그대로 정의한다 (선언 없으면 cd.ConstructorParams는 빈 목록 → 기존과 동일).
+      var ctorParamTypes:=new System.Type[cd.ConstructorParams.Count];
+      for i:=0 to cd.ConstructorParams.Count-1 do
+        ctorParamTypes[i]:=ResolveTopParamClrType(cd.ConstructorParams[i]);
+      fCtorParamClrTypes[cd.Name]:=ctorParamTypes;
+      var ctorBuilder:=tb.DefineConstructor(
+        MethodAttributes.Public,
+        CallingConventions.Standard,
+        ctorParamTypes);
+      fCtorBuilders[cd.Name]:=ctorBuilder;
       // [Stage 42] 사용자가 "constructor Create;"를 직접 선언한 클래스는 본문을 여기서 채우지
       // 않는다 — 이후 BuildConstructorBody가 ConstructorImpls에서 실제로 작성된 본문을
       // 컴파일해 넣는다 (inherited Create(...) 호출을 그 본문 안에서 원하는 위치에 직접
       // 쓸 수 있어야 하므로, 여기서 미리 "부모 호출 + Ret"를 넣어버리면 안 된다).
       if not cd.HasUserConstructor then
       begin
-        var ctorIL:=ctorBuilderList[0].GetILGenerator;
+        var ctorIL:=ctorBuilder.GetILGenerator;
         ctorIL.Emit(OpCodes.Ldarg_0);
         if (cd.ParentName<>'') and fCtorBuilders.ContainsKey(cd.ParentName) then
-        begin
           // 부모가 아직 CreateType되지 않았으므로 GetConstructor 대신
           // 만들어둔 ConstructorBuilder를 그대로 재사용 (.NET Core는 미완성
           // TypeBuilder에 대한 GetConstructor 호출을 지원하지 않음)
-          // [Stage 99] 부모도 생성자를 여러 개(오버로드) 가질 수 있으므로, 자동 체이닝은
-          // 항상 매개변수 없는(0개) 오버로드를 찾아 호출한다.
-          var _parentIdx99:=FindLocalCtorIndex(cd.ParentName, 0);
-          if _parentIdx99<0 then
-            raise new Exception('부모 클래스 "'+cd.ParentName+'"에 매개변수 없는 생성자가 없어 자식 클래스 "'+cd.Name
-              +'"의 기본 생성자를 자동 생성할 수 없습니다. 자식 클래스에 생성자를 직접 선언하고 inherited Create(...)를 명시해주세요.');
-          parentCtor:=fCtorBuilders[cd.ParentName][_parentIdx99];
-        end
+          parentCtor:=fCtorBuilders[cd.ParentName]
         else
         begin
           // 로컬에서 만든 클래스가 아니면(System.Object 또는 외부 어셈블리 타입)
@@ -6161,15 +5915,7 @@ type
       if not fCtorBuilders.ContainsKey(impl.ClassName) then
         raise new Exception('생성자를 찾을 수 없음: '+impl.ClassName+'.Create');
 
-      // [Stage 99] 이 클래스에 오버로드된 생성자가 여러 개 있을 수 있으므로, 지금 채워
-      // 넣으려는 이 구현부(impl)의 매개변수 개수와 일치하는 ConstructorBuilder를 골라야
-      // 한다 — BuildClassShell이 fProg.ConstructorImpls와 "같은 순서"로 만들어 뒀으므로
-      // FindLocalCtorIndex(개수 매칭)로 정확히 대응되는 하나를 찾는다.
-      var _implCtorIdx99:=FindLocalCtorIndex(impl.ClassName, impl.Parameters.Count);
-      if _implCtorIdx99<0 then
-        raise new Exception('생성자를 찾을 수 없음: '+impl.ClassName+'.Create('+impl.Parameters.Count.ToString+'개 인자)');
-
-      il:=fCtorBuilders[impl.ClassName][_implCtorIdx99].GetILGenerator;
+      il:=fCtorBuilders[impl.ClassName].GetILGenerator;
 
       savedLocalScope:=fLocalScope;
       svResult:=fResultLocal; svResultType:=fResultType;
@@ -6183,15 +5929,13 @@ type
 
       // [Stage 47] 생성자 매개변수를 로컬 슬롯에 복사 (Ldarg_1, Ldarg_2, ... — Ldarg_0은 self).
       // BuildMethodBody의 매개변수 바인딩과 동일한 패턴. CLR 타입은 BuildClassShell이
-      // 이 오버로드(impl)에 대해 미리 계산해 둔 fCtorParamClrTypes[..][_implCtorIdx99]를 사용한다
-      // (시그니처 일관성 유지) — [Stage 99] 오버로드가 여러 개면 반드시 같은 인덱스여야 한다.
-      var _implCtorParamTypes99:=fCtorParamClrTypes[impl.ClassName][_implCtorIdx99];
+      // cd.ConstructorParams로부터 미리 계산해 둔 fCtorParamClrTypes를 사용한다(시그니처 일관성 유지).
       for i:=0 to impl.Parameters.Count-1 do
       begin
         p:=impl.Parameters[i].Name;
         var pClrType:=typeof(integer);
-        if i<_implCtorParamTypes99.Length then
-          pClrType:=_implCtorParamTypes99[i];
+        if fCtorParamClrTypes.ContainsKey(impl.ClassName) and (i<fCtorParamClrTypes[impl.ClassName].Length) then
+          pClrType:=fCtorParamClrTypes[impl.ClassName][i];
         var loc:=il.DeclareLocal(pClrType);
         fLocalScope.Declare(p, loc, impl.Parameters[i].ParamType);
         if pClrType<>typeof(integer) then fLocalScope.SetClrType(p, pClrType);
@@ -6243,16 +5987,7 @@ type
         var autoParentName: string:='';
         if fClassParents.ContainsKey(impl.ClassName) then autoParentName:=fClassParents[impl.ClassName];
         if (autoParentName<>'') and fCtorBuilders.ContainsKey(autoParentName) then
-        begin
-          // [Stage 99] 부모도 생성자가 여러 개(오버로드)일 수 있으므로, 암묵적 자동
-          // 체이닝은 항상 매개변수 없는(0개) 오버로드를 고른다 — 부모가 무인자 생성자를
-          // 안 두고 있으면 아래에서 nil로 남아 기존과 동일하게 에러 메시지로 안내한다.
-          var _autoParentIdx99:=FindLocalCtorIndex(autoParentName, 0);
-          if _autoParentIdx99>=0 then
-            autoParentCtor:=fCtorBuilders[autoParentName][_autoParentIdx99]
-          else
-            autoParentCtor:=nil;
-        end
+          autoParentCtor:=fCtorBuilders[autoParentName]
         else if fClassExternalParentType.ContainsKey(impl.ClassName) then
           // 실제 외부 부모 클래스(예: class(TSomeExternalBase)) — BuildClassShell이
           // 이미 리플렉션으로 확인해 둔 진짜 부모 타입을 그대로 쓴다.
@@ -6295,7 +6030,6 @@ type
       svResult: LocalBuilder; svResultType: TVarType;
       svCurClass: string; st: TStmtNode;
       svExitLabel78: &Label; // [Stage 78]
-      mParamIsByRef100: List<boolean>; mParamElemType100: List<System.Type>; // [Stage 100]
     begin
       if not (fInstanceMethods.ContainsKey(impl.ClassName)
         and fInstanceMethods[impl.ClassName].ContainsKey(impl.MethodName)) then
@@ -6346,7 +6080,6 @@ type
       end;
 
       // 매개변수를 로컬 슬롯에 복사 (Ldarg_1, Ldarg_2, ... — Ldarg_0은 self)
-      mParamIsByRef100:=new List<boolean>; mParamElemType100:=new List<System.Type>; // [Stage 100]
       for i:=0 to impl.ParamNames.Count-1 do
       begin
         p:=impl.ParamNames[i];
@@ -6355,13 +6088,7 @@ type
            and fMethodParamClrTypes[impl.ClassName].ContainsKey(impl.MethodName)
            and (i<fMethodParamClrTypes[impl.ClassName][impl.MethodName].Length) then
           pClrType:=fMethodParamClrTypes[impl.ClassName][impl.MethodName][i];
-        // [Stage 100] var/const 매개변수는 pClrType이 ByRef 타입 — 로컬 슬롯 자체는 원소(값) 타입으로
-        // 만들고("복사 진입/복사 반환" 전략, 기존 코드 전체가 Ldloc/Stloc으로 값 슬롯을 다루는
-        // 전제를 그대로 재사용하기 위함), 진입 시 주소를 역참조(Ldobj)해서 그 값을 로컬에 복사해 넣는다.
-        var pIsByRef100:=pClrType.IsByRef;
-        var pElemType100:=ElemTypeIfByRef(pClrType);
-        mParamIsByRef100.Add(pIsByRef100); mParamElemType100.Add(pElemType100);
-        var loc:=il.DeclareLocal(pElemType100);
+        var loc:=il.DeclareLocal(pClrType);
         // [버그 수정] 예전에는 인스턴스 메서드의 매개변수 타입을 무조건 vtInteger로 기록해서,
         // GetVarType()에 의존하는 배열 원소 접근(Ldelem_I4 vs Ldelem_Ref 선택, Writeln 오버로드
         // 선택 등)이 array of string 매개변수에서도 항상 정수로 취급됐다 — 문자열 배열 원소를
@@ -6369,7 +6096,7 @@ type
         // 이미 채워 둔 impl.ParamTypes[i](구체 타입)를 그대로 사용한다.
         if i<impl.ParamTypes.Count then fLocalScope.Declare(p, loc, impl.ParamTypes[i])
         else fLocalScope.Declare(p, loc, vtInteger);
-        if pElemType100<>typeof(integer) then fLocalScope.SetClrType(p, pElemType100); // [Stage 100] pClrType→pElemType100
+        if pClrType<>typeof(integer) then fLocalScope.SetClrType(p, pClrType);
         // [Stage 74] vtGeneric 매개변수(x: T)도 ClassName에 타입 매개변수 이름을 기록해 둔다 —
         // GetVarClassName으로 되찾아 fCurGenericSubst[genName]을 다시 조회할 수 있어야
         // (예: Writeln(x)가 실제 T의 CLR 타입을 알아내 box하는 데) 쓸모가 있다.
@@ -6381,7 +6108,6 @@ type
         else if i=1 then il.Emit(OpCodes.Ldarg_2)
         else if i=2 then il.Emit(OpCodes.Ldarg_3)
         else il.Emit(OpCodes.Ldarg_S, byte(i+1));
-        if pIsByRef100 then il.Emit(OpCodes.Ldobj, pElemType100); // [Stage 100] 주소 역참조 → 값
         il.Emit(OpCodes.Stloc, loc);
       end;
 
@@ -6415,17 +6141,6 @@ type
       foreach st in impl.Body.Statements do EmitStatement(il, st);
 
       il.MarkLabel(fMethodExitLabel); // [Stage 78] exit 문의 착지점 — 정상 종료와 동일하게 처리
-      // [Stage 100] var/const 매개변수 복사-반환: 로컬 슬롯의 최종 값을 원래 주소에 다시 써준다.
-      for i:=0 to impl.ParamNames.Count-1 do
-        if (i<mParamIsByRef100.Count) and mParamIsByRef100[i] then
-        begin
-          if i=0 then il.Emit(OpCodes.Ldarg_1)
-          else if i=1 then il.Emit(OpCodes.Ldarg_2)
-          else if i=2 then il.Emit(OpCodes.Ldarg_3)
-          else il.Emit(OpCodes.Ldarg_S, byte(i+1));
-          il.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(impl.ParamNames[i]));
-          il.Emit(OpCodes.Stobj, mParamElemType100[i]);
-        end;
       if impl.IsFunction then
       begin
         il.Emit(OpCodes.Ldloc, fResultLocal);
@@ -6852,7 +6567,6 @@ type
       svR: LocalBuilder; svRT: TVarType; st: TStmtNode; retClrType: System.Type; i: integer;
       savedGenSubst71: Dictionary<string, System.Type>; // [Stage 71]
       svExitLabel78: &Label; // [Stage 78]
-      bParamIsByRef100: List<boolean>; // [Stage 100]
     begin
       // [Stage 71] 이 함수가 true open generic이면(DeclareStaticFunc가 fOpenGenericSubstOf에
       // 저장해 둔 치환표가 있으면) 본문을 컴파일하는 동안 fCurGenericSubst를 그 표로 맞춰
@@ -7068,8 +6782,8 @@ type
       fClassParents:=new Dictionary<string, string>;
       fMethodReturnTypes:=new Dictionary<string, Dictionary<string, TVarType>>;
       fMethodParamClrTypes:=new Dictionary<string, Dictionary<string, array of System.Type>>;
-      fCtorBuilders:=new Dictionary<string, List<ConstructorBuilder>>;
-      fCtorParamClrTypes:=new Dictionary<string, List<array of System.Type>>; // [Stage 47/99]
+      fCtorBuilders:=new Dictionary<string, ConstructorBuilder>;
+      fCtorParamClrTypes:=new Dictionary<string, array of System.Type>; // [Stage 47]
       fInterfaceBuilders:=new Dictionary<string, TypeBuilder>;
       fBuiltInterfaces:=new Dictionary<string, System.Type>;
       fBuiltEnums:=new Dictionary<string, System.Type>; // [Phase 1]
