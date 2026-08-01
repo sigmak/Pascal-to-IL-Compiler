@@ -183,6 +183,10 @@ var
   m: System.Text.RegularExpressions.Match;
   lineNo, colNo, i, startLn, endLn: integer;
   srcLines: array of string; marker, caretLine: string;
+  subLines: array of string;                        // [Stage 95 수정] 인라인 var → 선언부로
+  anyMatched: boolean;                              // [Stage 95 수정]
+  subLine: string;                                  // [Stage 95 수정]
+  sm: System.Text.RegularExpressions.Match;         // [Stage 95 수정]
 begin
   Writeln;
   Writeln('=====================================================');
@@ -209,7 +213,7 @@ begin
       Writeln(marker + i.ToString.PadLeft(4) + ' | ' + srcLines[i - 1]);
       if i = lineNo then
       begin
-        caretLine := ''.PadLeft(colNo - 1, ' ');
+        caretLine := new string(' ', colNo - 1);
         Writeln('            ' + caretLine + '^');
       end;
     end;
@@ -237,11 +241,11 @@ begin
     begin
       // [Stage 35] Lexer가 여러 개의 '알 수 없는 문자' 오류를 한 번에 모아 던진 경우:
       // 각 줄이 '줄 N, 열 C: ...' 형식이므로, 하나씩 나눠 각자의 소스 컨텍스트를 보여준다.
-      var subLines := ex.Message.Split(#10);
-      var anyMatched := false;
-      foreach var subLine in subLines do
+      subLines := ex.Message.Split(#10);
+      anyMatched := false;
+      foreach subLine in subLines do
       begin
-        var sm := System.Text.RegularExpressions.Regex.Match(subLine, '^줄 (\d+), 열 (\d+):\s*(.*)$');
+        sm := System.Text.RegularExpressions.Regex.Match(subLine, '^줄 (\d+), 열 (\d+):\s*(.*)$');
         if sm.Success then
         begin
           anyMatched := true;
@@ -252,7 +256,7 @@ begin
           if (lineNo >= 1) and (lineNo <= srcLines.Length) then
           begin
             Writeln('  >> ' + lineNo.ToString.PadLeft(4) + ' | ' + srcLines[lineNo - 1]);
-            caretLine := ''.PadLeft(colNo - 1, ' ');
+            caretLine := new string(' ', colNo - 1);
             Writeln('            ' + caretLine + '^');
           end;
           Writeln;
@@ -299,8 +303,8 @@ end;
 // {$reference}/{$apptype} 말고는 전부 "그냥 주석"으로 무시했기 때문에 {$include}의 내용이
 // 통째로 사라졌었다.
 //
-// StripCommentsForUsesScan과 마찬가지로 문자열 리터럴 안의 '{'는 별도로 가려내지 않는다
-// (이 프로젝트의 실제 소스에는 등장하지 않는 패턴이라 지금은 범위 밖으로 둔다).
+// [Stage 95] 문자열 리터럴 '...' 안의 '{$...'를 지시문으로 오인하던 버그 수정:
+// 이제 작은따옴표로 시작하는 리터럴은 닫는 따옴표까지 통째로 통과시킨다('' 이스케이프 포함).
 // 재귀적으로 중첩 include도 처리하며, 순환 include는 depth 제한으로 막는다.
 function ExpandIncludes(sourceCode: string; baseDir: string; depth: integer): string;
 var
@@ -309,6 +313,7 @@ var
   i, j, startI: integer;
   dirSb: System.Text.StringBuilder;
   dirText, dirBody, incName, incPath, incSrc: string;
+  inclMatch: System.Text.RegularExpressions.Match;
 begin
   if depth > 20 then
     raise new Exception('{$include} 중첩이 너무 깊습니다 (순환 참조가 있는지 확인하세요)');
@@ -317,9 +322,7 @@ begin
   i := 0;
   while i < chars.Length do
   begin
-    // [Stage 88c 수정] // 줄 주석 안에 등장하는 "{$include ...}" 같은 텍스트(예: 이 프로젝트
-    // 소스 자체의 설명용 주석)를 진짜 지시문으로 오인해 전개해버리는 버그가 있었다 —
-    // 줄 끝까지는 그대로 통과시키고 '{' 스캔을 하지 않는다.
+    // // 줄 주석 — 줄 끝까지 그대로 통과
     if (chars[i] = '/') and (i + 1 < chars.Length) and (chars[i + 1] = '/') then
     begin
       while (i < chars.Length) and (chars[i] <> #10) do
@@ -329,6 +332,36 @@ begin
       end;
       continue;
     end;
+
+    // [Stage 95] 문자열 리터럴 '...' — 안의 { 는 지시문이 아니므로 통째로 통과
+    if chars[i] = #39 then
+    begin
+      sb.Append(chars[i]);
+      i := i + 1;
+      while i < chars.Length do
+      begin
+        sb.Append(chars[i]);
+        if chars[i] = #39 then
+        begin
+          if (i + 1 < chars.Length) and (chars[i + 1] = #39) then
+          begin
+            // '' 이스케이프: 두 번째 따옴표도 소비
+            i := i + 1;
+            sb.Append(chars[i]);
+            i := i + 1;
+          end
+          else
+          begin
+            i := i + 1;
+            break; // 닫는 따옴표 — 문자열 끝
+          end;
+        end
+        else
+          i := i + 1;
+      end;
+      continue;
+    end;
+
     if chars[i] = '{' then
     begin
       startI := i;
@@ -343,29 +376,22 @@ begin
       if dirText.StartsWith('$') then
       begin
         dirBody := dirText.Substring(1).Trim;
-        // [Stage 88c 수정] 예전엔 dirBody.Substring('include'.Length)로 "include" 접두어를
-        // 잘라냈는데, 실제 실행에서 incName이 빈 문자열로 나오는 문제가 있었다(원인 불명 —
-        // Substring 인자 처리 쪽 문제로 추정). 인덱스 계산에 의존하지 않도록 정규식으로
-        // 다시 짰다: "include" 다음에 공백 하나 이상, 그 뒤 나머지 전부를 파일명으로 캡처.
-        var inclMatch := System.Text.RegularExpressions.Regex.Match(
+        inclMatch := System.Text.RegularExpressions.Regex.Match(
           dirBody, '(?i)^include\s+(.+)$');
         if inclMatch.Success then
         begin
           incName := inclMatch.Groups[1].Value.Trim;
-          // 따옴표로 감싸져 있으면($include 'x.inc') 벗겨낸다 — 안 감싸도(그냥 파일명만) 허용.
-          if (incName.Length >= 2) and incName.StartsWith('''') and incName.EndsWith('''') then
+          if (incName.Length >= 2) and (incName[1] = #39) and (incName[incName.Length] = #39) then
             incName := incName.Substring(1, incName.Length - 2);
           incPath := System.IO.Path.Combine(baseDir, incName);
           if not System.IO.File.Exists(incPath) then
             raise new Exception('{$include ' + incName + '} — 파일을 찾을 수 없습니다: ' + incPath);
           incSrc := System.IO.File.ReadAllText(incPath, Encoding.UTF8);
           sb.Append(ExpandIncludes(incSrc, baseDir, depth + 1));
-          if j < chars.Length then i := j + 1 else i := j; // '}' 다음으로 이동
+          if j < chars.Length then i := j + 1 else i := j;
           continue;
         end;
       end;
-      // include가 아닌 다른 {...}(주석, {$reference}, {$apptype} 등)는 원문 그대로 통과시켜
-      // Lexer.SkipWS가 예전처럼 처리하게 둔다.
       if j < chars.Length then
       begin
         sb.Append(sourceCode.Substring(startI, j - startI + 1));
@@ -373,7 +399,7 @@ begin
       end
       else
       begin
-        sb.Append(sourceCode.Substring(startI)); // 닫는 '}' 없이 EOF — Lexer가 알아서 처리
+        sb.Append(sourceCode.Substring(startI));
         i := j;
       end;
       continue;
@@ -517,6 +543,8 @@ procedure VisitUnitForOrder(filePath: string; searchDirs: List<string>;
 var
   key, src, depName, depPath: string;
   deps: List<string>;
+  cycleNames: List<string>;
+  ci: integer;
 begin
   key := System.IO.Path.GetFullPath(filePath);
   if visited.Contains(key) then exit;
@@ -524,8 +552,7 @@ begin
   if visiting.Contains(key) then
   begin
     pathStack.Add(filePath);
-    var cycleNames := new List<string>;
-    var ci: integer;
+    cycleNames := new List<string>;
     for ci := 0 to pathStack.Count - 1 do
       cycleNames.Add(System.IO.Path.GetFileName(pathStack[ci]));
     raise new Exception('유닛 순환 참조 발견: ' + string.Join(' -> ', cycleNames));
@@ -600,6 +627,7 @@ end;
 procedure RegisterProgramNames(prog: TProgramNode; fileLabel: string;
   seenClasses, seenFuncs, seenProcs, seenIfaces, seenEnums: Dictionary<string,string>);
 var c: TClassDeclNode; f: TFuncDeclNode; p: TProcDeclNode; i: TInterfaceDeclNode; e: TEnumDeclNode;
+    r62: TRecordDeclNode;
 begin
   foreach c in prog.ClassDecls do RegisterDeclName(seenClasses, c.Name, '클래스', fileLabel);
   foreach f in prog.FuncDecls do RegisterDeclName(seenFuncs, f.Name, '함수', fileLabel);
@@ -608,7 +636,7 @@ begin
   foreach e in prog.EnumDecls do RegisterDeclName(seenEnums, e.Name, '열거형', fileLabel);
   // [Stage 62] 레코드는 클래스와 이름공간을 공유하므로(같은 곳에서 "타입 이름"으로 참조됨)
   // seenClasses에 함께 등록한다 — 다른 파일의 클래스와 이름이 겹쳐도 여기서 잡힌다.
-  foreach var r62 in prog.RecordDecls do RegisterDeclName(seenClasses, r62.Name, '레코드', fileLabel);
+  foreach r62 in prog.RecordDecls do RegisterDeclName(seenClasses, r62.Name, '레코드', fileLabel);
 end;
 
 // src(다른 파일에서 파싱된 TProgramNode)의 선언들을 target으로 옮겨 붙인다.
@@ -616,13 +644,14 @@ end;
 procedure MergeProgramInto(target, src: TProgramNode; fileLabel: string;
   seenClasses, seenFuncs, seenProcs, seenIfaces, seenEnums: Dictionary<string,string>);
 var c: TClassDeclNode; f: TFuncDeclNode; p: TProcDeclNode; i: TInterfaceDeclNode; e: TEnumDeclNode;
+    r62: TRecordDeclNode;
 begin
   foreach c in src.ClassDecls do RegisterDeclName(seenClasses, c.Name, '클래스', fileLabel);
   foreach f in src.FuncDecls do RegisterDeclName(seenFuncs, f.Name, '함수', fileLabel);
   foreach p in src.ProcDecls do RegisterDeclName(seenProcs, p.Name, '프로시저', fileLabel);
   foreach i in src.InterfaceDecls do RegisterDeclName(seenIfaces, i.Name, '인터페이스', fileLabel);
   foreach e in src.EnumDecls do RegisterDeclName(seenEnums, e.Name, '열거형', fileLabel);
-  foreach var r62 in src.RecordDecls do RegisterDeclName(seenClasses, r62.Name, '레코드', fileLabel); // [Stage 62]
+  foreach r62 in src.RecordDecls do RegisterDeclName(seenClasses, r62.Name, '레코드', fileLabel); // [Stage 62]
 
   target.ClassDecls.AddRange(src.ClassDecls);
   target.FuncDecls.AddRange(src.FuncDecls);
@@ -659,6 +688,7 @@ end;
 // 섹션이 없다), 유닛이 아는 타입 이름은 애초에 전부 공개 API다.
 function FilterPublicSymbols(exported: TParserExternalSymbols; fileProg: TProgramNode;
   priorFuncNames, priorProcNames: HashSet<string>): TParserExternalSymbols;
+var k, fn, pn: string;
 begin
   Result := new TParserExternalSymbols;
   Result.ClassNames.AddRange(exported.ClassNames);
@@ -668,18 +698,18 @@ begin
   Result.GenericClassNames.AddRange(exported.GenericClassNames);
   Result.GenericFuncNames.AddRange(exported.GenericFuncNames);
   Result.GenericProcNames.AddRange(exported.GenericProcNames);
-  foreach var k in exported.ClassFields.Keys do Result.ClassFields.Add(k, exported.ClassFields[k]);
-  foreach var k in exported.ClassMethods.Keys do Result.ClassMethods.Add(k, exported.ClassMethods[k]);
-  foreach var k in exported.ClassParent.Keys do Result.ClassParent.Add(k, exported.ClassParent[k]);
-  foreach var k in exported.ClassInterface.Keys do Result.ClassInterface.Add(k, exported.ClassInterface[k]);
-  foreach var k in exported.ClassGenericParam.Keys do Result.ClassGenericParam.Add(k, exported.ClassGenericParam[k]);
-  foreach var k in exported.ClassGenericConstraint.Keys do Result.ClassGenericConstraint.Add(k, exported.ClassGenericConstraint[k]);
-  foreach var k in exported.FuncGenericParam.Keys do Result.FuncGenericParam.Add(k, exported.FuncGenericParam[k]);
-  foreach var k in exported.ProcGenericParam.Keys do Result.ProcGenericParam.Add(k, exported.ProcGenericParam[k]);
-  foreach var k in exported.FuncGenericConstraint.Keys do Result.FuncGenericConstraint.Add(k, exported.FuncGenericConstraint[k]);
-  foreach var k in exported.ProcGenericConstraint.Keys do Result.ProcGenericConstraint.Add(k, exported.ProcGenericConstraint[k]);
-  foreach var k in exported.EnumMemberEnumName.Keys do Result.EnumMemberEnumName.Add(k, exported.EnumMemberEnumName[k]);
-  foreach var k in exported.EnumMemberOrdinal.Keys do Result.EnumMemberOrdinal.Add(k, exported.EnumMemberOrdinal[k]);
+  foreach k in exported.ClassFields.Keys do Result.ClassFields.Add(k, exported.ClassFields[k]);
+  foreach k in exported.ClassMethods.Keys do Result.ClassMethods.Add(k, exported.ClassMethods[k]);
+  foreach k in exported.ClassParent.Keys do Result.ClassParent.Add(k, exported.ClassParent[k]);
+  foreach k in exported.ClassInterface.Keys do Result.ClassInterface.Add(k, exported.ClassInterface[k]);
+  foreach k in exported.ClassGenericParam.Keys do Result.ClassGenericParam.Add(k, exported.ClassGenericParam[k]);
+  foreach k in exported.ClassGenericConstraint.Keys do Result.ClassGenericConstraint.Add(k, exported.ClassGenericConstraint[k]);
+  foreach k in exported.FuncGenericParam.Keys do Result.FuncGenericParam.Add(k, exported.FuncGenericParam[k]);
+  foreach k in exported.ProcGenericParam.Keys do Result.ProcGenericParam.Add(k, exported.ProcGenericParam[k]);
+  foreach k in exported.FuncGenericConstraint.Keys do Result.FuncGenericConstraint.Add(k, exported.FuncGenericConstraint[k]);
+  foreach k in exported.ProcGenericConstraint.Keys do Result.ProcGenericConstraint.Add(k, exported.ProcGenericConstraint[k]);
+  foreach k in exported.EnumMemberEnumName.Keys do Result.EnumMemberEnumName.Add(k, exported.EnumMemberEnumName[k]);
+  foreach k in exported.EnumMemberOrdinal.Keys do Result.EnumMemberOrdinal.Add(k, exported.EnumMemberOrdinal[k]);
 
   if not fileProg.IsUnit then
   begin
@@ -689,9 +719,9 @@ begin
     exit;
   end;
 
-  foreach var fn in exported.FuncNames do
+  foreach fn in exported.FuncNames do
     if priorFuncNames.Contains(fn) or fileProg.PublicFuncNames.Contains(fn) then Result.FuncNames.Add(fn);
-  foreach var pn in exported.ProcNames do
+  foreach pn in exported.ProcNames do
     if priorProcNames.Contains(pn) or fileProg.PublicProcNames.Contains(pn) then Result.ProcNames.Add(pn);
 end;
 
@@ -703,12 +733,32 @@ var
   ok: boolean;
   mergedProg: TProgramNode;
   allReferenceDirectives: List<string>;
-  entryAppType: string; // [Stage 69] {$apptype windows|console}
+  entryAppType: string;
   seenClassNames, seenFuncNames, seenProcNames, seenIfaceNames, seenEnumNames: Dictionary<string,string>;
   totalTokenCount: integer;
   compileOrder: List<string>;
   fileProg: TProgramNode;
   symbolAccumulator: TParserExternalSymbols;
+  mergeLabel: string;
+  // [Stage 95 수정] 메인 블록 인라인 var → 선언부로
+  projMainFile, projOutName: string;
+  unitSearchDirs: List<string>;
+  inputDir, examplesDir, unitsDir: string;
+  _diagSrc94: string;
+  _diagNames94: List<string>;
+  _dn94, _dp94: string;
+  fi: integer;
+  filePath, fileLabel, fileSrc: string;
+  fileLexer: TLexer;
+  fileTokens: List<TToken>;
+  _srcDir92, _dllPath92: string;
+  fileParser: TParser;
+  priorFuncNames, priorProcNames: HashSet<string>;
+  exportedNow: TParserExternalSymbols;
+  hiddenFuncs, hiddenProcs: integer;
+  outputBaseName: string;
+  rd, s, refName: string; // foreach 루프 변수
+  oi: integer;
 
 begin
   Writeln('=== Pascal-to-.NET 컴파일러 ===');
@@ -722,7 +772,6 @@ begin
   // 모두 그대로 넘겨도 알아서 컴파일할 수 있다.
   if System.IO.Path.GetExtension(inputPath).ToLower = '.pabcproj' then
   begin
-    var projMainFile, projOutName: string;
     ResolveProject(inputPath, projMainFile, projOutName);
     if (projMainFile <> '') and System.IO.File.Exists(projMainFile) then
     begin
@@ -757,12 +806,12 @@ begin
     // 그 아래 Units\ 를 검색 경로로 쓴다. 탐색 자체가 실패하면(순환 참조 등) entry
     // 파일 하나만으로 컴파일을 계속한다 — 로컬 유닛을 안 쓰는 기존 단일 파일 테스트들이
     // 계속 그대로 동작해야 하기 때문.
-    var unitSearchDirs := new List<string>;
-    var inputDir := System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(inputPath));
+    unitSearchDirs := new List<string>;
+    inputDir := System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(inputPath));
     unitSearchDirs.Add(inputDir);
-    var examplesDir := System.IO.Path.Combine(inputDir, DefaultExampleDir);
+    examplesDir := System.IO.Path.Combine(inputDir, DefaultExampleDir);
     if System.IO.Directory.Exists(examplesDir) then unitSearchDirs.Add(examplesDir);
-    var unitsDir := System.IO.Path.Combine(inputDir, 'Units');
+    unitsDir := System.IO.Path.Combine(inputDir, 'Units');
     if System.IO.Directory.Exists(unitsDir) then unitSearchDirs.Add(unitsDir);
 
     try
@@ -770,7 +819,7 @@ begin
       if compileOrder.Count > 1 then
       begin
         Writeln('[유닛탐색] 의존성 ' + (compileOrder.Count - 1).ToString + '개 파일 발견 — 컴파일 순서(의존성 먼저):');
-        for var oi := 0 to compileOrder.Count - 1 do
+        for oi := 0 to compileOrder.Count - 1 do
           Writeln('    ' + (oi + 1).ToString + '. ' + System.IO.Path.GetFileName(compileOrder[oi]));
       end
       else
@@ -780,14 +829,14 @@ begin
         // 그 이름을 실제로 어느 폴더에서 찾아봤는지/찾았는지를 그대로 출력한다. 이게 있으면
         // "파일을 넣었는데도 안 잡힌다"는 상황에서 원인(폴더 위치, 파일명 오타/불일치 등)이
         // 바로 로그에 드러난다.
-        var _diagSrc94 := System.IO.File.ReadAllText(inputPath, Encoding.UTF8);
-        var _diagNames94 := ExtractUsesNames(_diagSrc94);
+        _diagSrc94 := System.IO.File.ReadAllText(inputPath, Encoding.UTF8);
+        _diagNames94 := ExtractUsesNames(_diagSrc94);
         if _diagNames94.Count>0 then
         begin
           Writeln('  (진단) uses 절에서 뽑은 이름별 파일 탐색 결과:');
-          foreach var _dn94 in _diagNames94 do
+          foreach _dn94 in _diagNames94 do
           begin
-            var _dp94 := ResolveUnitFile(_dn94, unitSearchDirs);
+            _dp94 := ResolveUnitFile(_dn94, unitSearchDirs);
             if _dp94<>'' then
               Writeln('    - ' + _dn94 + ' → 찾음: ' + _dp94)
             else
@@ -820,19 +869,35 @@ begin
     totalTokenCount := 0;
     symbolAccumulator := nil; // [Stage 56] 파일이 하나씩 파싱될 때마다 뒤로 누적됨
 
-    var fi := 0;
+    fi := 0;
     while ok and (fi < compileOrder.Count) do
     begin
-      var filePath := compileOrder[fi];
-      var fileLabel := System.IO.Path.GetFileName(filePath);
-      var fileSrc := System.IO.File.ReadAllText(filePath, Encoding.UTF8);
+      filePath := compileOrder[fi];
+      fileLabel := System.IO.Path.GetFileName(filePath);
+      fileSrc := System.IO.File.ReadAllText(filePath, Encoding.UTF8);
       // [Stage 88c] {$include x.inc} 전개 — 그 파일과 같은 디렉터리에서 찾는다.
-      fileSrc := ExpandIncludes(fileSrc, System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(filePath)), 0);
+      // [버그 수정] 이 호출이 바로 아래 try 블록 밖에 있어서, {$include}가 가리키는 파일이
+      // 없으면 ExpandIncludes가 던진 예외가 어디서도 잡히지 않고 프로그램 전체가 그대로
+      // 죽어버렸다("Main.pas(361) : Runtime exception: ..." — PrintCompileError를 거치지
+      // 않은 처리되지 않은 최상위 예외라 어느 파일 때문인지도 알기 어려웠다). 이제 이 호출도
+      // try/except로 감싸 다른 단계들과 똑같이 PrintCompileError로 "어느 파일(fileLabel)"에서
+      // 무엇을 찾지 못했는지 명확히 보여주고, 프로그램이 죽지 않고 ok:=false로 정상 종료되게 한다.
       try
-        var fileLexer := new TLexer(fileSrc);
-        var fileTokens := fileLexer.Tokenize;
+        fileSrc := ExpandIncludes(fileSrc, System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(filePath)), 0);
+      except
+        on E: Exception do
+        begin
+          PrintCompileError('include 전개(' + fileLabel + ')', fileSrc, E);
+          ok := false;
+        end;
+      end;
+
+      if ok then
+      try
+        fileLexer := new TLexer(fileSrc);
+        fileTokens := fileLexer.Tokenize;
         totalTokenCount := totalTokenCount + fileTokens.Count;
-        foreach var rd in fileLexer.ReferenceDirectives do
+        foreach rd in fileLexer.ReferenceDirectives do
           if not allReferenceDirectives.Contains(rd) then
           begin
             allReferenceDirectives.Add(rd);
@@ -850,9 +915,9 @@ begin
         // 등록하도록 넓혔다.
         if fileSrc.Contains('WeifenLuo.WinFormsUI.Docking') then
         begin
-          var _srcDir92 := System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(filePath));
+          _srcDir92 := System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(filePath));
           if System.IO.Directory.Exists(_srcDir92) then
-            foreach var _dllPath92 in System.IO.Directory.GetFiles(_srcDir92, 'WeifenLuo.WinFormsUI.Docking*.dll') do
+            foreach _dllPath92 in System.IO.Directory.GetFiles(_srcDir92, 'WeifenLuo.WinFormsUI.Docking*.dll') do
               if not allReferenceDirectives.Contains(_dllPath92) then
               begin
                 allReferenceDirectives.Add(_dllPath92);
@@ -862,16 +927,16 @@ begin
         // [Stage 69] apptype은 파일마다 다를 수 있으니 나중 파일(=entry, 목록의 마지막) 값이 우선하도록 덮어쓴다.
         if fileLexer.AppTypeDirective<>'' then entryAppType := fileLexer.AppTypeDirective;
 
-        var fileParser := new TParser(fileTokens);
+        fileParser := new TParser(fileTokens);
         // [Stage 82] 필터링 전/후를 비교하려면 "이 파일 파싱 전에 이미 알고 있던 이름"이
         // 필요하다 — ImportExternalSymbols가 fFuncNames/fProcNames를 건드리기 전에 미리
         // 스냅샷을 떠 둔다(symbolAccumulator 자체는 여기서 바뀌지 않으니 순서 문제 없음).
-        var priorFuncNames := new HashSet<string>;
-        var priorProcNames := new HashSet<string>;
+        priorFuncNames := new HashSet<string>;
+        priorProcNames := new HashSet<string>;
         if symbolAccumulator<>nil then
         begin
-          foreach var s in symbolAccumulator.FuncNames do priorFuncNames.Add(s);
-          foreach var s in symbolAccumulator.ProcNames do priorProcNames.Add(s);
+          foreach s in symbolAccumulator.FuncNames do priorFuncNames.Add(s);
+          foreach s in symbolAccumulator.ProcNames do priorProcNames.Add(s);
         end;
         // [Stage 56] 이전 파일들(의존성 먼저 순서)이 선언한 함수/클래스/... 이름을
         // 이 파서에 미리 알려준다 — 안 그러면 다른 파일에서 선언된 함수를 호출하는
@@ -880,12 +945,12 @@ begin
         fileProg := fileParser.ParseProgram;
         // [Stage 82] 다음 파일에 넘길 이름 테이블은 "전체"가 아니라 "공개된 것만" —
         // FilterPublicSymbols 참고. unit이 아닌 파일은 기존 동작(전체 공개) 그대로다.
-        var exportedNow := fileParser.ExportSymbols;
+        exportedNow := fileParser.ExportSymbols;
         symbolAccumulator := FilterPublicSymbols(exportedNow, fileProg, priorFuncNames, priorProcNames);
         if fileProg.IsUnit and (compileOrder.Count>1) then
         begin
-          var hiddenFuncs := exportedNow.FuncNames.Count - symbolAccumulator.FuncNames.Count;
-          var hiddenProcs := exportedNow.ProcNames.Count - symbolAccumulator.ProcNames.Count;
+          hiddenFuncs := exportedNow.FuncNames.Count - symbolAccumulator.FuncNames.Count;
+          hiddenProcs := exportedNow.ProcNames.Count - symbolAccumulator.ProcNames.Count;
           if (hiddenFuncs>0) or (hiddenProcs>0) then
             Writeln('  [유닛링크] "' + fileLabel + '": 공개 함수 ' + fileProg.PublicFuncNames.Count.ToString
               + '개/공개 프로시저 ' + fileProg.PublicProcNames.Count.ToString
@@ -932,7 +997,7 @@ begin
     begin
       prog := mergedProg;
       if entryAppType<>'' then prog.AppType := entryAppType; // [Stage 69]
-      var mergeLabel := '';
+      mergeLabel := '';
       if compileOrder.Count > 1 then mergeLabel := '(병합)';
       Writeln('[1/4] 토큰화 완료: ' + totalTokenCount.ToString + '개 토큰 (파일 ' + compileOrder.Count.ToString + '개 합계)');
       Writeln('[2/4] 구문분석 완료' + mergeLabel + ': 클래스 ' + prog.ClassDecls.Count.ToString
@@ -955,7 +1020,6 @@ begin
       // [개선] 프로젝트 파일(.pabcproj)의 OutputFileName이 있으면 그 이름(확장자 제외한 base name)을
       // 우선 사용한다 — inputPath는 이미 MainFile(.pas)로 치환돼 있으므로 그대로 두면 프로젝트가
       // 지정한 exe/dll 이름과 다른 결과물이 나온다.
-      var outputBaseName: string;
       if projOutputName <> '' then
         outputBaseName := System.IO.Path.GetFileNameWithoutExtension(projOutputName)
       else
@@ -974,7 +1038,7 @@ begin
       if allReferenceDirectives.Count>0 then
       begin
         Writeln('  참조 어셈블리 등록 중: ' + string.Join(', ', allReferenceDirectives));
-        foreach var refName in allReferenceDirectives do
+        foreach refName in allReferenceDirectives do
           codegen.AddReferenceAssembly(refName);
       end;
 

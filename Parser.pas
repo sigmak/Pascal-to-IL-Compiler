@@ -271,7 +271,19 @@ type
       Result:=(k=tkLength) or (k=tkRead) or (k=tkWrite) or (k=tkReal)
            or (k=tkDouble) or (k=tkChar) or (k=tkInt64)
            or (k=tkType) or (k=tkClass) or (k=tkRecord) or (k=tkStringType)
-           or (k=tkArray) or (k=tkSet) or (k=tkInteger) or (k=tkBoolean);
+           or (k=tkArray) or (k=tkSet) or (k=tkInteger) or (k=tkBoolean)
+           // [버그 수정] TypeAttributes.Public, BindingFlags.Public/Instance,
+           // OpCodes.And/Or 처럼 .NET 쪽 멤버 이름이 이 언어의 예약어(public/private/
+           // internal/and/or)와 철자가 겹치는 경우도 멤버 이름 자리에서는 허용한다.
+           or (k=tkPublic) or (k=tkPrivate) or (k=tkInternal)
+           or (k=tkAnd) or (k=tkOr)
+           // [Stage 95 버그 수정] MethodAttributes.Virtual, OpCodes.Not 처럼 이 언어의
+           // 예약어(virtual/override/abstract/not)와 철자가 겹치는 .NET 멤버/열거형
+           // 값도 멤버 이름 자리에서는 허용해야 한다. 이게 빠져 있어서 CodeGen.pas의
+           // MethodAttributes.Virtual, OpCodes.Not 같은 아주 흔한 표현식 전부가
+           // "멤버 이름이 와야 합니다"로 실패하고 있었다.
+           or (k=tkVirtual) or (k=tkOverride) or (k=tkAbstract) or (k=tkNot)
+           or (k=tkInterface);
     end;
 
     // [Stage 93c] 점(.)으로 연결된 외부 타입/네임스페이스 경로의 한 구간(segment)을 소비한다.
@@ -308,6 +320,17 @@ type
       if (Cur.Kind=tkReal) or (Cur.Kind=tkDouble) then begin fPos:=fPos+1; Result:='real'; exit; end;
       if Cur.Kind=tkChar then begin fPos:=fPos+1; Result:='char'; exit; end;
       if Cur.Kind=tkInt64 then begin fPos:=fPos+1; Result:='int64'; exit; end;
+      // [Stage 95 버그 수정] Dictionary<string, array of System.Type> 처럼 제네릭 타입
+      // 인자 자리에 "array of <T>"가 오는 경우를 예전엔 전혀 인식하지 못해 곧바로
+      // "제네릭 타입 인자로 지원되지 않는 타입 (array)" 오류로 실패했다. 재귀적으로
+      // 원소 타입을 파싱해 "array of <원소>" 문자열로 돌려준다 — CodeGen 쪽 CLR 타입
+      // 조립(ResolveExternalType 계열)이 이 표기를 이어서 처리한다.
+      if Cur.Kind=tkArray then
+      begin
+        fPos:=fPos+1; Expect(tkOf);
+        Result:='array of '+ParseExternalGenericTypeArg;
+        exit;
+      end;
       if Cur.Kind=tkIdent then
       begin
         argName:=Cur.Text; fPos:=fPos+1;
@@ -390,6 +413,30 @@ type
         // [Stage 37] array of T — 제네릭 템플릿 본문에서만 등장. 실제 타입은 Monomorphize가 채운다.
         else if (Cur.Kind=tkIdent) and fCurGenericParams.Contains(Cur.Text) then
           begin fLastGenericName:=Cur.Text; fPos:=fPos+1; Result:=vtGenericArray; end
+        // [Stage 90 확장] array of <로컬클래스> — 예: array of TMyRecord, array of TMyClass.
+        // fClassNames에 있는 이름이면 vtObjArray로 처리한다(object[] emit).
+        else if (Cur.Kind=tkIdent) and fClassNames.Contains(Cur.Text) then
+          begin fLastGenericName:=Cur.Text; fPos:=fPos+1; Result:=vtObjArray; end
+        // [Stage 90 확장] array of <외부 .NET 타입> — 예: array of MethodInfo, array of Type, array of Assembly.
+        // fClassNames에 없는 단순 식별자(점 없는 이름)도 vtObjArray로 받아서 CodeGen이
+        // object[]로 emit하도록 한다. fLastGenericName에 이름을 담아 두어 나중에 CodeGen이
+        // 더 정확한 CLR 타입을 쓰도록 확장할 때도 이 필드를 그대로 재활용할 수 있다.
+        else if Cur.Kind=tkIdent then
+        begin
+          // [Stage 95 버그 수정] "array of System.Type"처럼 외부 타입 이름이 점(.)으로
+          // 이어진 전체 경로일 수 있는데, 예전엔 첫 세그먼트("System")만 소비하고 멈춰서
+          // 뒤에 남은 ".Type"을 var/필드 선언 파서가 "예상 tkSemicolon 실제 tkDot"으로
+          // 오인해 실패했다. 이제 점으로 이어진 전체 경로를 다 소비해 fLastGenericName에 담는다.
+          var arrTypeName95:=Cur.Text;
+          fPos:=fPos+1;
+          while (Cur.Kind=tkDot) do
+          begin
+            fPos:=fPos+1; // '.' 소비
+            arrTypeName95:=arrTypeName95+'.'+ExpectDotSegment;
+          end;
+          fLastGenericName:=arrTypeName95;
+          Result:=vtObjArray;
+        end
         else raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': array of integer/string/real/char/int64'
           +'(또는 제네릭 문맥에서는 array of T)만 지원');
       end
@@ -437,6 +484,19 @@ type
         if Cur.Kind=tkDot then
         begin
           while Cur.Kind=tkDot do begin fPos:=fPos+1; _qn87v:=_qn87v+'.'+ExpectDotSegment; end;
+          // [Stage 95 버그 수정] "System.Collections.Generic.KeyValuePair<string, TypeBuilder>"처럼
+          // 점(.)으로 연결된 전체 경로 뒤에 제네릭 타입 인자 '<...>'가 바로 이어지는 경우를
+          // 예전엔 검사하지 않고 그대로 종료해버려서, 뒤에 남은 '<'를 호출부(변수/필드 선언)가
+          // "예상 tkSemicolon 실제 tkLt"로 오인해 실패했다. 여기서 이어서 소비한다.
+          if Cur.Kind=tkLt then
+          begin
+            fPos:=fPos+1;
+            var _dotGenArgs95:=new List<string>;
+            _dotGenArgs95.Add(ParseExternalGenericTypeArg);
+            while Cur.Kind=tkComma do begin fPos:=fPos+1; _dotGenArgs95.Add(ParseExternalGenericTypeArg); end;
+            Expect(tkGt);
+            _qn87v:=_qn87v+'<'+string.Join(',', _dotGenArgs95.ToArray)+'>';
+          end;
           fLastGenericName:=_qn87v; Result:=vtObject; exit;
         end;
         // 점 없는 단순 이름 — uses 절 네임스페이스에서 탐색
@@ -522,6 +582,17 @@ type
         if Cur.Kind=tkDot then
         begin
           while Cur.Kind=tkDot do begin fPos:=fPos+1; qn4:=qn4+'.'+ExpectDotSegment; end;
+          // [Stage 95 버그 수정] ParseVarType 쪽과 동일한 이유로, 점(.)으로 연결된
+          // 외부 타입 경로 뒤에 제네릭 타입 인자가 이어질 수 있다(매개변수/필드 타입 자리).
+          if Cur.Kind=tkLt then
+          begin
+            fPos:=fPos+1;
+            var _dotGenArgs95p:=new List<string>;
+            _dotGenArgs95p.Add(ParseExternalGenericTypeArg);
+            while Cur.Kind=tkComma do begin fPos:=fPos+1; _dotGenArgs95p.Add(ParseExternalGenericTypeArg); end;
+            Expect(tkGt);
+            qn4:=qn4+'<'+string.Join(',', _dotGenArgs95p.ToArray)+'>';
+          end;
           cn:=qn4; isExt:=true; Result:=vtObject;
         end
         else
@@ -873,7 +944,24 @@ type
       else if (t.Kind=tkIdent) and (t.Text.ToLower='typeof') and (PeekAt(1).Kind=tkLParen) then
       begin
         fPos:=fPos+2; // 'typeof' '(' 소비
-        var toName:=Expect(tkIdent).Text;
+        // [버그 수정] typeof(string), typeof(integer), typeof(boolean), typeof(char),
+        // typeof(real/double), typeof(int64)처럼 괄호 안 첫 세그먼트가 예약 타입 키워드인
+        // 경우 Lexer가 이를 tkIdent가 아니라 전용 토큰(tkStringType/tkInteger/...)으로 내보내서
+        // Expect(tkIdent)가 실패했다 — typeof(System.Xxx)처럼 진짜 식별자인 경우와 예약 타입
+        // 키워드인 경우를 둘 다 받아들이도록 첫 세그먼트만 분기 처리한다. 이후 '.'로 이어지는
+        // 세그먼트(예: typeof(System.Object) 등)는 기존처럼 ExpectDotSegment로 처리한다.
+        var toName: string;
+        case Cur.Kind of
+          tkStringType: begin toName:=Cur.Text; fPos:=fPos+1; end;
+          tkInteger:    begin toName:=Cur.Text; fPos:=fPos+1; end;
+          tkBoolean:    begin toName:=Cur.Text; fPos:=fPos+1; end;
+          tkChar:       begin toName:=Cur.Text; fPos:=fPos+1; end;
+          tkReal:       begin toName:=Cur.Text; fPos:=fPos+1; end;
+          tkDouble:     begin toName:=Cur.Text; fPos:=fPos+1; end;
+          tkInt64:      begin toName:=Cur.Text; fPos:=fPos+1; end;
+        else
+          toName:=Expect(tkIdent).Text;
+        end;
         while Cur.Kind=tkDot do begin fPos:=fPos+1; toName:=toName+'.'+ExpectDotSegment; end;
         Expect(tkRParen);
         Result:=new TTypeOfExprNode(toName);
@@ -946,12 +1034,16 @@ type
       // 지원한다(정수 범위 집합 등은 아직 지원하지 않음). 모든 원소가 같은 열거형에
       // 속해야 하며, 여기서 곧바로 32비트 비트마스크 상수로 접어(fold) 둔다 — 런타임에는
       // 그냥 정수 하나일 뿐이라 CodeGen은 Ldc_I4 한 번이면 된다.
+      // [Stage 95] 다만 [typeof(A), typeof(B)], ['x','y'], [propClrType]처럼 원소가
+      // 열거형 멤버가 아닌 임의의 식인 경우도 흔하다(리플렉션 API 인자, array of X 대입
+      // 우변 등) — 첫 원소가 "알려진 열거형 멤버 이름"일 때만 기존 집합 리터럴 경로를
+      // 타고, 그 외에는 일반 배열 리터럴(TArrayLiteralExprNode)로 폴백한다.
       else if t.Kind=tkLBracket then
       begin
         fPos:=fPos+1; // '[' 소비
-        var setEnumName:=''; var setMask:=0;
-        if Cur.Kind<>tkRBracket then
+        if (Cur.Kind=tkIdent) and fEnumMemberEnumName.ContainsKey(Cur.Text) then
         begin
+          var setEnumName:=''; var setMask:=0;
           while true do
           begin
             var memName:=Expect(tkIdent).Text;
@@ -966,9 +1058,23 @@ type
             setMask:=setMask or (1 shl fEnumMemberOrdinal[memName]);
             if Cur.Kind=tkComma then fPos:=fPos+1 else break;
           end;
+          Expect(tkRBracket);
+          Result:=new TSetLiteralExprNode(setEnumName, setMask);
+        end
+        else
+        begin
+          // [Stage 95] 일반 배열 리터럴 — 원소는 임의의 식(ParseAddSub, 다른 인자 목록
+          // 파싱과 동일한 우선순위)이며, 실제 CLR 배열 원소 타입은 CodeGen이 사용처
+          // (기대 매개변수 타입/대입 대상 타입)를 보고 정한다.
+          var arrLit95:=new TArrayLiteralExprNode;
+          if Cur.Kind<>tkRBracket then
+          begin
+            arrLit95.Elements.Add(ParseAddSub);
+            while Cur.Kind=tkComma do begin fPos:=fPos+1; arrLit95.Elements.Add(ParseAddSub); end;
+          end;
+          Expect(tkRBracket);
+          Result:=arrLit95;
         end;
-        Expect(tkRBracket);
-        Result:=new TSetLiteralExprNode(setEnumName, setMask);
       end
 
       else if t.Kind=tkSelf then // [Stage 30]
@@ -985,8 +1091,8 @@ type
             mc:=new TMethodCallExprNode('', selfMname); fPos:=fPos+1;
             if Cur.Kind<>tkRParen then
             begin
-              mc.Args.Add(ParseAddSub);
-              while Cur.Kind=tkComma do begin fPos:=fPos+1; mc.Args.Add(ParseAddSub); end;
+              mc.Args.Add(ParseExpr);
+              while Cur.Kind=tkComma do begin fPos:=fPos+1; mc.Args.Add(ParseExpr); end;
             end;
             Expect(tkRParen);
             Result:=mc;
@@ -1008,8 +1114,8 @@ type
           fPos:=fPos+1;
           if Cur.Kind<>tkRParen then
           begin
-            iceN.Args.Add(ParseAddSub);
-            while Cur.Kind=tkComma do begin fPos:=fPos+1; iceN.Args.Add(ParseAddSub); end;
+            iceN.Args.Add(ParseExpr);
+            while Cur.Kind=tkComma do begin fPos:=fPos+1; iceN.Args.Add(ParseExpr); end;
           end;
           Expect(tkRParen);
         end;
@@ -1028,6 +1134,20 @@ type
         else if Cur.Kind=tkLt then // [Stage 86] new Dictionary<string, FileChangeWatcher> 같은 외부 제네릭 타입 생성
           newTn:=ParseExternalGenericType(newTn);
         while Cur.Kind=tkDot do begin fPos:=fPos+1; newTn:=newTn+'.'+ExpectDotSegment; end;
+        // [Stage 95 버그 수정] "new System.Collections.Generic.List<MethodInfo>()"처럼 점(.)으로
+        // 이어진 외부 타입 경로 뒤에 제네릭 타입 인자가 오는 경우, 위의 두 tkLt 분기(line
+        // 1131/1133)는 첫 세그먼트("System") 바로 뒤에 '<'가 오는 경우만 봐서 놓쳤다 —
+        // dot 체인을 다 소비한 뒤에도 다시 한번 '<'를 확인해야 한다. 이게 없으면 뒤에 남은
+        // '<MethodInfo>'를 상위 식 파서가 "미만" 비교 연산자로 오인해 엉뚱한 곳에서 실패했다.
+        if Cur.Kind=tkLt then
+        begin
+          fPos:=fPos+1;
+          var _newGenArgs95:=new List<string>;
+          _newGenArgs95.Add(ParseExternalGenericTypeArg);
+          while Cur.Kind=tkComma do begin fPos:=fPos+1; _newGenArgs95.Add(ParseExternalGenericTypeArg); end;
+          Expect(tkGt);
+          newTn:=newTn+'<'+string.Join(',', _newGenArgs95.ToArray)+'>';
+        end;
         if fRecordNames.Contains(newTn) then // [Stage 62]
           raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': 레코드 "'+newTn
             +'"는 new로 생성할 수 없습니다 — 변수 선언만으로 이미 필드가 기본값(0/빈 문자열 등)으로 초기화됩니다');
@@ -1151,8 +1271,8 @@ type
               fPos:=fPos+1;
               if Cur.Kind<>tkRParen then
               begin
-                mc.Args.Add(ParseAddSub);
-                while Cur.Kind=tkComma do begin fPos:=fPos+1; mc.Args.Add(ParseAddSub); end;
+                mc.Args.Add(ParseExpr);
+                while Cur.Kind=tkComma do begin fPos:=fPos+1; mc.Args.Add(ParseExpr); end;
               end;
               Expect(tkRParen);
             end;
@@ -1214,8 +1334,8 @@ type
                   fPos:=fPos+1;
                   if Cur.Kind<>tkRParen then
                   begin
-                    mc3.Args.Add(ParseAddSub);
-                    while Cur.Kind=tkComma do begin fPos:=fPos+1; mc3.Args.Add(ParseAddSub); end;
+                    mc3.Args.Add(ParseExpr);
+                    while Cur.Kind=tkComma do begin fPos:=fPos+1; mc3.Args.Add(ParseExpr); end;
                   end;
                   Expect(tkRParen);
                 end;
@@ -1290,8 +1410,8 @@ type
                 fPos:=fPos+1;
                 if Cur.Kind<>tkRParen then
                 begin
-                  mc.Args.Add(ParseAddSub);
-                  while Cur.Kind=tkComma do begin fPos:=fPos+1; mc.Args.Add(ParseAddSub); end;
+                  mc.Args.Add(ParseExpr);
+                  while Cur.Kind=tkComma do begin fPos:=fPos+1; mc.Args.Add(ParseExpr); end;
                 end;
                 Expect(tkRParen);
               end;
@@ -1348,6 +1468,21 @@ type
           begin
             fPos:=fPos+1;
             eiNode100.MemberName:=ExpectMemberName;
+            // [Stage 95 버그 수정] obj[i].Method(args)처럼 인덱싱 결과에 메서드를 호출하는
+            // 경우(예: fFieldObjClassName[cn].ContainsKey(x), fBuiltInterfaces[n].GetMethod(m))도
+            // 식(값을 쓰는) 위치에서 흔하다. 예전엔 멤버 이름만 소비하고 바로 뒤에 남은 '('를
+            // 처리 못 해 상위 파서가 "예상 tkThen/tkRParen 실제 tkLParen" 등으로 실패했다.
+            if Cur.Kind=tkLParen then
+            begin
+              fPos:=fPos+1;
+              eiNode100.MethodArgs:=new List<TExprNode>;
+              if Cur.Kind<>tkRParen then
+              begin
+                eiNode100.MethodArgs.Add(ParseExpr);
+                while Cur.Kind=tkComma do begin fPos:=fPos+1; eiNode100.MethodArgs.Add(ParseExpr); end;
+              end;
+              Expect(tkRParen);
+            end;
           end;
           Result:=eiNode100;
         end
@@ -1360,8 +1495,8 @@ type
           Expect(tkLParen);
           if Cur.Kind<>tkRParen then
           begin
-            cn.Args.Add(ParseAddSub);
-            while Cur.Kind=tkComma do begin fPos:=fPos+1; cn.Args.Add(ParseAddSub); end;
+            cn.Args.Add(ParseExpr);
+            while Cur.Kind=tkComma do begin fPos:=fPos+1; cn.Args.Add(ParseExpr); end;
           end;
           Expect(tkRParen); Result:=cn;
         end
@@ -1372,8 +1507,8 @@ type
           cn:=new TFuncCallExprNode(ResolveCallName(t.Text)); fPos:=fPos+1; // [Stage 65] 지역 함수면 맹글링된 이름으로
           if Cur.Kind<>tkRParen then
           begin
-            cn.Args.Add(ParseAddSub);
-            while Cur.Kind=tkComma do begin fPos:=fPos+1; cn.Args.Add(ParseAddSub); end;
+            cn.Args.Add(ParseExpr);
+            while Cur.Kind=tkComma do begin fPos:=fPos+1; cn.Args.Add(ParseExpr); end;
           end;
           Expect(tkRParen); Result:=cn;
         end
@@ -1398,8 +1533,8 @@ type
           fPos:=fPos+1; // '(' 소비
           if Cur.Kind<>tkRParen then
           begin
-            bcn.Args.Add(ParseAddSub);
-            while Cur.Kind=tkComma do begin fPos:=fPos+1; bcn.Args.Add(ParseAddSub); end;
+            bcn.Args.Add(ParseExpr);
+            while Cur.Kind=tkComma do begin fPos:=fPos+1; bcn.Args.Add(ParseExpr); end;
           end;
           Expect(tkRParen);
           Result:=bcn;
@@ -1453,8 +1588,8 @@ type
           fPos:=fPos+1;
           if Cur.Kind<>tkRParen then
           begin
-            selfCallExpr93.Args.Add(ParseAddSub);
-            while Cur.Kind=tkComma do begin fPos:=fPos+1; selfCallExpr93.Args.Add(ParseAddSub); end;
+            selfCallExpr93.Args.Add(ParseExpr);
+            while Cur.Kind=tkComma do begin fPos:=fPos+1; selfCallExpr93.Args.Add(ParseExpr); end;
           end;
           Expect(tkRParen);
           Result:=selfCallExpr93;
@@ -1515,9 +1650,21 @@ type
       // 체이닝 가능(Where(...).Select(...).Sum() 등) — while로 반복.
       // [Stage 90] 위 LINQ 체이닝과, 그 외 일반 멤버 접근/메서드 호출 체인을 하나의 루프로
       // 합쳐서(둘이 섞여도, 예: X.Foo().Where(...).Bar 처럼) 계속 이어질 수 있게 한다.
-      while Cur.Kind=tkDot do
+      // [버그 수정] '.' 체이닝만 반복하고 그 뒤에 바로 오는 '[' 후위 인덱싱(예:
+      // GetIndexParameters()[0], SplitByDot(x)[0], TCast(e).Args[i])은 다루지 않아서,
+      // '['를 만나는 순간 루프가 조용히 끝나버리고 상위 호출부(대개 인자 목록)가 ')'를
+      // 기대하다 '['를 만나 "예상 tkRParen 실제 tkLBracket"으로 실패했다. tkLBracket도
+      // 함께 반복 조건에 넣어 TChainedIndexExprNode로 감싸고 계속 체이닝을 이어간다.
+      while (Cur.Kind=tkDot) or (Cur.Kind=tkLBracket) do
       begin
-        if IsSeqExtMethodName(PeekAt(1)) and (PeekAt(2).Kind=tkLParen) then
+        if Cur.Kind=tkLBracket then
+        begin
+          fPos:=fPos+1; // '[' 소비
+          var chIdx90:=ParseExpr;
+          Expect(tkRBracket);
+          Result:=new TChainedIndexExprNode(Result, chIdx90);
+        end
+        else if IsSeqExtMethodName(PeekAt(1)) and (PeekAt(2).Kind=tkLParen) then
         begin
           fPos:=fPos+1; // '.' 소비
           var extName:=Cur.Text; fPos:=fPos+1; // 메서드 이름 소비
@@ -1550,8 +1697,8 @@ type
             fPos:=fPos+1;
             if Cur.Kind<>tkRParen then
             begin
-              chNode.Args.Add(ParseAddSub);
-              while Cur.Kind=tkComma do begin fPos:=fPos+1; chNode.Args.Add(ParseAddSub); end;
+              chNode.Args.Add(ParseExpr);
+              while Cur.Kind=tkComma do begin fPos:=fPos+1; chNode.Args.Add(ParseExpr); end;
             end;
             Expect(tkRParen);
             Result:=chNode;
@@ -2108,7 +2255,7 @@ type
                  or (Cur.Kind=tkUntil) or (Cur.Kind=tkExcept) or (Cur.Kind=tkFinally)) then
           Result:=new TMethodCallStmtNode('', nt.Text)
 
-        // 배열 원소 대입 (1차원 또는 2차원)
+        // 배열 원소 대입 (1차원 또는 2차원) / 원소에 대한 메서드 호출·필드 대입 체이닝
         else if (Cur.Kind=tkLBracket) and fArrayNames.Contains(nt.Text) then
         begin
           fPos:=fPos+1; idx:=ParseExpr; Expect(tkRBracket);
@@ -2120,6 +2267,34 @@ type
             Expect(tkAssign); rhs:=ParseExpr;
             // 원소 타입은 CodeGen에서 스코프로 조회하므로 여기선 '' 전달
             Result:=new TMatrix2DAssignStmtNode(nt.Text, idx, idx2, rhs, '');
+          end
+          // [버그 수정] gpBuilders[i].SetGenericParameterAttributes(...) 처럼 로컬 배열 원소에
+          // 메서드를 호출하거나(반환값 버림) 필드/프로퍼티를 대입하는 경우 — 아래 [Stage 88]
+          // 외부 컬렉션 인덱서 분기의 tkDot 처리와 동일한 패턴을 그대로 재사용한다. 이게
+          // 없으면 '[idx]' 뒤에 '.'가 오는 순간 무조건 대입(:=)만 기대해 "예상 tkAssign
+          // 실제 tkDot"으로 실패했다.
+          else if Cur.Kind=tkDot then
+          begin
+            fPos:=fPos+1;
+            var idxMnameArr:=ExpectMemberName;
+            if Cur.Kind=tkAssign then
+            begin
+              fPos:=fPos+1;
+              var idxFieldValArr:=ParseExpr;
+              Result:=new TExternalIndexFieldAssignStmtNode(nt.Text, idx, idxMnameArr, idxFieldValArr);
+            end
+            else
+            begin
+              var idxCallArr:=new TExternalIndexMethodCallStmtNode(nt.Text, idx, idxMnameArr);
+              Expect(tkLParen);
+              if Cur.Kind<>tkRParen then
+              begin
+                idxCallArr.Args.Add(ParseExpr);
+                while Cur.Kind=tkComma do begin fPos:=fPos+1; idxCallArr.Args.Add(ParseExpr); end;
+              end;
+              Expect(tkRParen);
+              Result:=idxCallArr;
+            end;
           end
           else
           begin

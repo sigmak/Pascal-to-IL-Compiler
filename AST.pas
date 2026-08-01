@@ -153,13 +153,30 @@ type
   // IndexExpr2와 MemberName은 파서가 상호 배타적으로만 채운다(둘 다 채워지는 문법은 없음).
   TExternalIndexExprNode = class(TExprNode)
   public Qualifier: string; IndexExpr: TExprNode; IndexExpr2: TExprNode; MemberName: string;
+    // [Stage 95] obj[i].Method(args)처럼 인덱싱 결과에 메서드를 호출하는 식(값을 쓰는 위치).
+    // nil이면 메서드 호출이 아니라 단순 필드/프로퍼티 읽기(MemberName만 쓰임, 기존 동작).
+    MethodArgs: List<TExprNode>;
+    // [Stage 96] obj[i][j][k]...처럼 세 번째 이상 인덱싱이 이어지는 경우, IndexExpr/IndexExpr2
+    // 이후의 나머지 인덱스를 순서대로 담는다(nil이면 인덱싱이 2단계 이하).
+    ExtraIndices: List<TExprNode>;
     constructor Create(q: string; i: TExprNode);
-    begin Qualifier:=q; IndexExpr:=i; IndexExpr2:=nil; MemberName:=''; end;
+    begin Qualifier:=q; IndexExpr:=i; IndexExpr2:=nil; MemberName:=''; MethodArgs:=nil; ExtraIndices:=nil; end;
   end;
 
   TLengthExprNode = class(TExprNode)
   public ArrName: string;
     constructor Create(n: string); begin ArrName:=n; end;
+  end;
+
+  // [Stage 95] 일반 배열 리터럴: [typeof(a), typeof(b)], ['x','y'], [propClrType] 등.
+  // Stage 63의 TSetLiteralExprNode(열거형 비트마스크 집합)와 달리, 원소가 임의의 식(타입,
+  // 문자열, 변수 등)일 수 있는 경우를 위한 것 — 주로 GetMethod/GetConstructor/
+  // MakeGenericMethod 같은 리플렉션 API 인자나, array of X 필드에 대한 대입 우변으로 쓰인다.
+  // CLR 상의 실제 배열 원소 타입은 파서가 아니라 CodeGen이(호출부의 기대 매개변수 타입/
+  // 대입 대상 타입을 보고) 정한다 — EmitArgForParamType 참고.
+  TArrayLiteralExprNode = class(TExprNode)
+  public Elements: List<TExprNode>;
+    constructor Create; begin Elements:=new List<TExprNode>; end;
   end;
 
   // TCounter.Create → Newobj
@@ -288,6 +305,18 @@ type
   public Inner: TExprNode; MemberName: string; IsCall: boolean; Args: List<TExprNode>;
     constructor Create(inn: TExprNode; m: string; isC: boolean);
     begin Inner:=inn; MemberName:=m; IsCall:=isC; Args:=new List<TExprNode>; end;
+  end;
+
+  // [버그 수정] 임의의 식(함수 호출 결과, 캐스트, 체이닝된 멤버 접근 등) 바로 뒤에 오는
+  // 후위 인덱싱: Target[Index]. TArrayIndexExprNode/TExternalIndexExprNode는 대상을
+  // 문자열 한정자(변수/필드 이름)로만 표현할 수 있어서, GetIndexParameters()[0]이나
+  // SplitByDot(x)[0], TCast(e).Args[i]처럼 대상이 "이미 파싱된 식"인 경우를 표현하지
+  // 못했다(파서가 ')' 또는 '.' 다음에 '['를 만나면 그대로 실패). 이 노드는 Target을
+  // TExprNode 그대로 들고 있다가 CodeGen이 Target을 먼저 Emit하고 그 CLR 타입(배열이면
+  // Ldelem, 컬렉션이면 Item 인덱서)에 맞춰 인덱싱한다 — EmitIndexerGet 재사용.
+  TChainedIndexExprNode = class(TExprNode)
+  public Target: TExprNode; IndexExpr: TExprNode;
+    constructor Create(t: TExprNode; i: TExprNode); begin Target:=t; IndexExpr:=i; end;
   end;
 
   // [Stage 70] Source.MethodName(...)  형태의 LINQ 스타일 확장 메서드 호출.

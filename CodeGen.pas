@@ -1976,7 +1976,22 @@ type
         var eiResultType:=EmitIndexerGet(aIL, eiBaseType, eiN.IndexExpr);
         if eiN.IndexExpr2<>nil then
           eiResultType:=EmitIndexerGet(aIL, eiResultType, eiN.IndexExpr2);
-        if eiN.MemberName<>'' then
+        if eiN.ExtraIndices<>nil then
+          foreach var eiExtra96 in eiN.ExtraIndices do
+            eiResultType:=EmitIndexerGet(aIL, eiResultType, eiExtra96);
+        if (eiN.MemberName<>'') and (eiN.MethodArgs<>nil) then
+        begin
+          // [Stage 95] obj[i].Method(args) — 인덱싱 결과(스택에 이미 올라와 있음)에 대해
+          // 일반 외부 메서드 호출과 동일한 리플렉션 기반 오버로드 해석/인자 강제변환을 적용한다.
+          var eiMi95:=ResolveMethodByArity(eiResultType, eiN.MemberName, eiN.MethodArgs, false);
+          if eiMi95=nil then
+            raise new Exception('타입 "'+eiResultType.FullName+'"에 메서드 "'+eiN.MemberName+'"가 없습니다 (인자 '+eiN.MethodArgs.Count.ToString+'개).');
+          var eiParams95:=eiMi95.GetParameters;
+          for var eiAi95:=0 to eiN.MethodArgs.Count-1 do
+            EmitArgForParamType(aIL, eiN.MethodArgs[eiAi95], eiParams95[eiAi95].ParameterType);
+          aIL.Emit(OpCodes.Callvirt, eiMi95);
+        end
+        else if eiN.MemberName<>'' then
         begin
           var eiFi:=eiResultType.GetField(eiN.MemberName, BindingFlags.Public or BindingFlags.Instance);
           if eiFi<>nil then aIL.Emit(OpCodes.Ldfld, eiFi)
@@ -2071,6 +2086,19 @@ type
           if chIsVal90 then aIL.Emit(OpCodes.Call, chMi90)
           else aIL.Emit(OpCodes.Callvirt, chMi90);
         end;
+      end
+
+      // [버그 수정] Target[Index] — Target이 함수 호출 결과, 캐스트, 체이닝된 멤버 접근 등
+      // "이미 파싱된 임의의 식"인 후위 인덱싱(예: GetIndexParameters()[0], SplitByDot(x)[0],
+      // TCast(e).Args[i]). Target을 먼저 Emit해 스택에 올린 뒤, GetExprClrType으로 추론한
+      // 실제 CLR 타입을 EmitIndexerGet에 넘긴다 — 그 함수가 배열(Ldelem)/컬렉션(get_Item)
+      // 여부를 이미 판별해주므로 여기서는 재구현하지 않는다.
+      else if e is TChainedIndexExprNode then
+      begin
+        var cix90:=TChainedIndexExprNode(e);
+        EmitExpr(aIL, cix90.Target);
+        var cixType90:=GetExprClrType(cix90.Target);
+        EmitIndexerGet(aIL, cixType90, cix90.IndexExpr);
       end
 
       else if e is TArrayIndexExprNode then
@@ -4282,6 +4310,12 @@ type
         for i:=0 to TChainedMemberExprNode(e).Args.Count-1 do
           CollectVarNamesInExpr(TChainedMemberExprNode(e).Args[i], names);
       end
+      // [버그 수정] Target[Index] 후위 인덱싱(예: SplitByDot(x)[0]) 안의 변수도 클로저 캡처 대상에 포함
+      else if e is TChainedIndexExprNode then
+      begin
+        CollectVarNamesInExpr(TChainedIndexExprNode(e).Target, names);
+        CollectVarNamesInExpr(TChainedIndexExprNode(e).IndexExpr, names);
+      end
       else if e is TBinOpNode then
       begin
         CollectVarNamesInExpr(TBinOpNode(e).Left, names);
@@ -5147,6 +5181,16 @@ type
           Result:=nil;
         end;
       end
+      // [버그 수정] SplitByDot(x)[0]처럼 후위 인덱싱 결과가 다른 호출의 인자로 쓰이는 경우도
+      // TChainedMemberExprNode와 동일하게 GetExprClrType으로 정확한 타입을 구한다.
+      else if e is TChainedIndexExprNode then
+      begin
+        try
+          Result:=GetExprClrType(e);
+        except
+          Result:=nil;
+        end;
+      end
       // [버그 수정] MakeItem(...) 처럼 최상위 함수 호출 결과를 직접 다른 메서드의 인자로
       // 넘길 때(예: dgvModules.Items.Add(MakeItem(...))) InferArgClrType에 TFuncCallExprNode
       // 분기가 없어 마지막 else 폴백으로 떨어졌다. InferType은 vtObject를 반환하지만
@@ -5327,6 +5371,23 @@ type
     function EmitIndexerGet(aIL: ILGenerator; baseType: System.Type; idxExpr: TExprNode): System.Type;
     var idxArgType: System.Type; itemProp: PropertyInfo; bestScore: integer;
     begin
+      // [Stage 96 버그 수정] baseType이 진짜 CLR 배열(T[], 예: "array of System.Type" 필드가
+      // Dictionary 체인 인덱싱 뒤에 다시 인덱싱되는 경우, fMethodParamClrTypes[cn][mn][i])이면
+      // 배열은 리플렉션 "Item" 프로퍼티를 노출하지 않으므로(IL 수준에서 ldelem으로 직접 처리되는
+      // 컴파일러 내장 기능) 아래 프로퍼티 탐색은 항상 실패한다 — 여기서 먼저 배열이면 ldelem으로
+      // 처리하고 원소 타입을 돌려준다.
+      if baseType.IsArray then
+      begin
+        EmitArgForParamType(aIL, idxExpr, typeof(integer));
+        var elemT96:=baseType.GetElementType;
+        if not elemT96.IsValueType then aIL.Emit(OpCodes.Ldelem_Ref)
+        else if elemT96=typeof(char) then aIL.Emit(OpCodes.Ldelem_I2)
+        else if (elemT96=typeof(double)) then aIL.Emit(OpCodes.Ldelem_R8)
+        else if elemT96=typeof(int64) then aIL.Emit(OpCodes.Ldelem_I8)
+        else aIL.Emit(OpCodes.Ldelem_I4);
+        Result:=elemT96;
+        exit;
+      end;
       idxArgType:=InferArgClrType(idxExpr);
       itemProp:=nil; bestScore:=System.Int32.MinValue;
       foreach var cand in baseType.GetProperties(BindingFlags.Public or BindingFlags.Instance) do
@@ -5531,6 +5592,35 @@ type
         begin
           var _rt90:=TryResolveMethodCallClrType(TMethodCallExprNode(e));
           if _rt90<>nil then Result:=_rt90;
+        end
+        // [버그 수정] SplitByDot(x)[0]처럼 최상위 지역 함수 호출 결과에 이어서 인덱싱/체이닝하려면
+        // 먼저 그 함수의 실제 CLR 반환 타입을 알아야 한다 — InferArgClrType의 TFuncCallExprNode
+        // 분기와 동일하게 fMethods에 등록된 MethodBuilder.ReturnType을 그대로 재사용한다.
+        else if e is TFuncCallExprNode then
+        begin
+          var _fcn90:=TFuncCallExprNode(e);
+          if fMethods.ContainsKey(_fcn90.FuncName) then
+          begin
+            var _fcnRet90:=fMethods[_fcn90.FuncName].ReturnType;
+            if (_fcnRet90<>nil) and (_fcnRet90<>typeof(System.Void)) then Result:=_fcnRet90;
+          end;
+        end
+        // [버그 수정] Target[Index] 인덱싱 결과의 타입 — Target이 배열이면 원소 타입,
+        // 컬렉션(Item 인덱서)이면 그 프로퍼티 타입. 뒤에 또 '.Member'나 '[j]'가 이어지는
+        // 3단 이상 체이닝(예: GetIndexParameters()[0].ParameterType)에서 필요하다.
+        else if e is TChainedIndexExprNode then
+        begin
+          var _cix90:=TChainedIndexExprNode(e);
+          var _cixT90:=GetExprClrType(_cix90.Target);
+          if _cixT90<>nil then
+          begin
+            if _cixT90.IsArray then Result:=_cixT90.GetElementType
+            else
+            begin
+              var _cixPi90:=SafeGetProperty(_cixT90, 'Item');
+              if (_cixPi90<>nil) and (_cixPi90.GetGetMethod<>nil) then Result:=_cixPi90.PropertyType;
+            end;
+          end;
         end
         else if e is TVarRefNode then
         begin
