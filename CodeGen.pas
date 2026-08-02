@@ -189,7 +189,19 @@ type
       else if t=vtIntArray then Result:=typeof(integer).MakeArrayType()
       else if t=vtStrArray then Result:=typeof(string).MakeArrayType()
       // [Stage 90] array of object → object[] (예: Assembly.GetCustomAttributes 반환값을 담는 지역변수)
-      else if t=vtObjArray then Result:=typeof(System.Object).MakeArrayType()
+      // [자기컴파일] array of System.Type 처럼 cn이 "TypeName[]" 형태이면 그 외부 타입의 배열로 해석.
+      else if t=vtObjArray then
+      begin
+        // cn이 "SomeName[]" 형태이면 원소 타입을 찾아 배열 타입을 만든다
+        if (cn<>'') and cn.EndsWith('[]') then
+        begin
+          var _elemName:=cn.Substring(0, cn.Length-2);
+          var _elemType:=ResolveExternalType(_elemName);
+          if _elemType<>nil then Result:=_elemType.MakeArrayType()
+          else Result:=typeof(System.Object).MakeArrayType();
+        end
+        else Result:=typeof(System.Object).MakeArrayType();
+      end
       // [Stage 67] vtMatrix: array of array of <elemtype> → CLR jagged array (elemtype)[][]
       else if t=vtMatrix then
       begin
@@ -386,6 +398,10 @@ type
     function IsChainStartSegment(first: string): boolean;
     var dummyFb: FieldBuilder;
     begin
+      // [자기컴파일] Result.FuncNames.AddRange(...); 처럼 함수의 Result 값에서 시작하는
+      // 체인도 인식한다 — Result는 fResultLocal이라는 별도 CLR 로컬이라 필드/변수 조회로는
+      // 못 찾아서 그동안 "알 수 없는 한정자"로 빠졌었다.
+      if (first='Result') and (fResultLocal<>nil) then begin Result:=true; exit; end;
       if TryFindFieldBuilder(fCurClassName, first, dummyFb) then begin Result:=true; exit; end;
       if (fLocalScope.Has(first) or fGlobalScope.Has(first))
          and (fLocalScope.HasClrType(first) or fGlobalScope.HasClrType(first)) then
@@ -437,7 +453,12 @@ type
         localClsName78: string; tbKvp78: System.Collections.Generic.KeyValuePair<string, TypeBuilder>;
     begin
       first:=segs[0];
-      if TryFindFieldBuilder(fCurClassName, first, firstFb) then
+      if (first='Result') and (fResultLocal<>nil) then
+      begin
+        aIL.Emit(OpCodes.Ldloc, fResultLocal);
+        curType:=fResultLocal.LocalType;
+      end
+      else if TryFindFieldBuilder(fCurClassName, first, firstFb) then
       begin
         aIL.Emit(OpCodes.Ldarg_0);
         aIL.Emit(OpCodes.Ldfld, firstFb);
@@ -989,6 +1010,10 @@ type
       // [Stage 63] 집합 리터럴/멤버십 검사
       else if e is TSetLiteralExprNode then Result:=vtSet
       else if e is TInExprNode then Result:=vtBoolean
+      // [Stage 96] 일반 배열 리터럴 — 실제 CLR 배열 타입은 문맥(대입 대상/매개변수 타입)에 따라
+      // 달라지므로 여기서는 "참조 타입"이라는 것만 표시해둔다(EmitArgForParamType/EmitExpr이
+      // 실제 원소 타입까지 보고 Newarr/Stelem을 낸다).
+      else if e is TArrayLiteralExprNode then Result:=vtObject
       else if e is TBinOpNode then
       begin
         b:=TBinOpNode(e);
@@ -3107,10 +3132,22 @@ type
       else if s is TInlineVarStmtNode then
       begin
         var ivs:=TInlineVarStmtNode(s);
-        var ivVt:=InferType(ivs.ValueExpr);
+        var ivVt: TVarType;
         var ivClrType: System.Type;
         var ivClassName: string; var ivIsExternal: boolean;
         ivClassName:=''; ivIsExternal:=false;
+        if ivs.HasExplicitType then
+        begin
+          // [자기컴파일] "var x: Type;" / "var x: Type := 식;" — 타입이 명시돼 있으므로
+          // ValueExpr을 굳이 추론하지 않고, 지역변수 선언(TVarDecl) 경로가 이미 쓰던
+          // ResolveLocalVarClrType을 그대로 재사용해 정확한 CLR 타입을 얻는다.
+          ivVt:=ivs.ExplicitVarType; ivClassName:=ivs.ExplicitClassName; ivIsExternal:=ivs.ExplicitIsExternal;
+          var ivExplicitDecl:=new TVarDecl(ivs.VarName, ivVt, ivClassName, ivIsExternal);
+          ivClrType:=ResolveLocalVarClrType(ivExplicitDecl);
+        end
+        else
+        begin
+        ivVt:=InferType(ivs.ValueExpr);
         if ivs.ValueExpr is TNewObjectExprNode then
         begin
           // new Type(...) 표현식이면 그 노드가 이미 정확한 클래스명/외부 여부를 들고 있다 —
@@ -3154,6 +3191,7 @@ type
         end
         else
           ivClrType:=VTC(ivVt, '');
+        end; // [자기컴파일] HasExplicitType else 종료
         var ivLoc:=aIL.DeclareLocal(ivClrType);
         fLocalScope.Declare(ivs.VarName, ivLoc, ivVt);
         if (ivVt=vtObject) or (ivVt=vtInterface) then
@@ -3164,8 +3202,13 @@ type
           else
             fLocalScope.SetClrType(ivs.VarName, ivClrType);
         end;
-        EmitExpr(aIL, ivs.ValueExpr);
-        aIL.Emit(OpCodes.Stloc, ivLoc);
+        // [자기컴파일] "var x: Type;" (초기화식 없음)이면 대입을 생략한다 — CLR 로컬은
+        // 기본적으로 0/false/nil로 초기화되므로(.locals init) Pascal의 "선언만" 의미와 일치한다.
+        if ivs.ValueExpr<>nil then
+        begin
+          EmitExpr(aIL, ivs.ValueExpr);
+          aIL.Emit(OpCodes.Stloc, ivLoc);
+        end;
       end
 
       else if s is TAssignStmtNode then
@@ -5712,6 +5755,36 @@ type
     procedure EmitArgForParamType(aIL: ILGenerator; argExpr: TExprNode; paramType: System.Type);
     var _vr48: TVarRefNode; _delCtor48: ConstructorInfo;
     begin
+      // [Stage 96] 일반 배열 리터럴([typeof(x), ...] 등)이 배열 매개변수 자리에 오는 경우 —
+      // Newarr로 목표 매개변수의 실제 원소 타입(paramType.GetElementType)에 맞춰 배열을 만들고,
+      // 각 원소는 재귀적으로 EmitArgForParamType에 맡긴다(원소 자체가 typeof(...)/문자열/변수 등
+      // 임의의 식일 수 있으므로). Stage 92의 "new Type[n](e1,...)" 패턴과 동일한 Newarr/Stelem 관용구.
+      if (argExpr is TArrayLiteralExprNode) and paramType.IsArray then
+      begin
+        var _alElemT96:=paramType.GetElementType;
+        var _alElems96:=TArrayLiteralExprNode(argExpr).Elements;
+        aIL.Emit(OpCodes.Ldc_I4, _alElems96.Count);
+        aIL.Emit(OpCodes.Newarr, _alElemT96);
+        for var _alI96:=0 to _alElems96.Count-1 do
+        begin
+          aIL.Emit(OpCodes.Dup);
+          aIL.Emit(OpCodes.Ldc_I4, _alI96);
+          EmitArgForParamType(aIL, _alElems96[_alI96], _alElemT96);
+          if _alElemT96.IsValueType then aIL.Emit(OpCodes.Stelem, _alElemT96)
+          else aIL.Emit(OpCodes.Stelem_Ref);
+        end;
+        exit;
+      end;
+      // [Stage 96] 빈 집합 리터럴 []은(Mask=0, EnumName='') 파서가 구분할 수 없는 경우(예:
+      // GetMethod(name, [])처럼 "빈 배열"의 의미로 쓰였을 수도 있음) 배열 매개변수 자리에서는
+      // 그냥 길이 0 배열로 취급한다.
+      if (argExpr is TSetLiteralExprNode) and (TSetLiteralExprNode(argExpr).EnumName='')
+         and (TSetLiteralExprNode(argExpr).Mask=0) and paramType.IsArray then
+      begin
+        aIL.Emit(OpCodes.Ldc_I4, 0);
+        aIL.Emit(OpCodes.Newarr, paramType.GetElementType);
+        exit;
+      end;
       if (paramType=typeof(string)) and (argExpr is TCharLiteralNode) then
       begin
         aIL.Emit(OpCodes.Ldstr, TCharLiteralNode(argExpr).Value.ToString);

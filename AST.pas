@@ -563,8 +563,18 @@ type
   // 타입은 CodeGen이 ValueExpr을 통해 그때그때 추론한다.
   TInlineVarStmtNode = class(TStmtNode)
   public VarName: string; ValueExpr: TExprNode;
+    // [자기컴파일] "var x: Type;" / "var x: Type := 식;" 처럼 타입을 명시하는 형태 지원.
+    // HasExplicitType=false이면 기존과 동일하게 ValueExpr로부터 타입을 추론한다.
+    // ValueExpr=nil이면 초기화식 없이 선언만 한다(CLR 로컬의 기본 zero-init 값을 그대로 씀).
+    HasExplicitType: boolean;
+    ExplicitVarType: TVarType;
+    ExplicitClassName: string;
+    ExplicitIsExternal: boolean;
     constructor Create(n: string; v: TExprNode);
-    begin VarName:=n; ValueExpr:=v; end;
+    begin
+      VarName:=n; ValueExpr:=v;
+      HasExplicitType:=false; ExplicitVarType:=vtInteger; ExplicitClassName:=''; ExplicitIsExternal:=false;
+    end;
   end;
 
   // try ... except on E: ExType do <stmt> end

@@ -26,6 +26,10 @@ type
     tkIntToStr, tkBoolToStr, tkSetLength, tkLength,
     tkUses, tkNil, // [Stage 29] uses 절, nil 리터럴
     tkSelf, tkAs, tkInherited, // [Stage 30] self 키워드, as 캐스트, inherited 호출
+    tkIs, // [자기컴파일] <식> is <TypeName> 런타임 타입 체크 — AST(TIsCheckExprNode)/CodeGen은 이미
+          // Stage 93c에 준비돼 있었으나 Lexer/Parser에 'is' 키워드 인식이 빠져 있던 것을 보완.
+    tkShl, tkShr, // [자기컴파일] 비트 시프트 연산자. AST(TBinOpKind.boShl/boShr)/CodeGen(Shl/Shr_Un)은
+                  // 이미 준비돼 있었으나 Lexer/Parser에 실제 키워드 인식이 빠져 있던 것을 보완.
     tkNew, // [Stage 40] new TypeName(args) 객체 생성 구문
     tkConstructor, // [Stage 42] constructor Create; 선언/구현
     tkLibrary, // [Stage 44] library Name; 선언 (dll 산출물, begin...end 블록 생략 가능)
@@ -180,6 +184,12 @@ type
       else if lw='do'        then Result:=new TToken(tkDo,        w,sl,sc)
       else if lw='mod'       then Result:=new TToken(tkMod,       w,sl,sc)
       else if lw='for'       then Result:=new TToken(tkFor,       w,sl,sc)
+      // [Stage 101] foreach — 이 컴파일러 자신의 소스(Parser.pas 등 self-hosting 대상 7개 파일)가
+      // 전부 Pascal 고유의 "for x in y do" 대신 C# 스타일 "foreach x in y do"/"foreach var x in y do"를
+      // 쓰기 때문에, 셀프호스팅 컴파일 시 foreach가 그냥 tkIdent로 읽혀 "foreach"라는 이름의 변수에
+      // 대입하는 문장으로 오인되어 즉시 어긋났었다. foreach를 tkFor와 완전히 같은 토큰으로 취급해
+      // 기존 for-in 파싱 경로를 그대로 재사용한다.
+      else if lw='foreach'    then Result:=new TToken(tkFor,       w,sl,sc)
       else if lw='to'        then Result:=new TToken(tkTo,        w,sl,sc)
       else if lw='downto'    then Result:=new TToken(tkDownto,    w,sl,sc)
       else if lw='in'        then Result:=new TToken(tkIn,        w,sl,sc) // [Stage 54]
@@ -205,6 +215,9 @@ type
       else if lw='nil'       then Result:=new TToken(tkNil,       w,sl,sc)
       else if lw='self'      then Result:=new TToken(tkSelf,      w,sl,sc) // [Stage 30]
       else if lw='as'        then Result:=new TToken(tkAs,        w,sl,sc) // [Stage 30]
+      else if lw='is'        then Result:=new TToken(tkIs,        w,sl,sc) // [자기컴파일] is 타입체크
+      else if lw='shl'       then Result:=new TToken(tkShl,       w,sl,sc) // [자기컴파일] 왼쪽 시프트
+      else if lw='shr'       then Result:=new TToken(tkShr,       w,sl,sc) // [자기컴파일] 오른쪽 시프트
       else if lw='inherited' then Result:=new TToken(tkInherited, w,sl,sc) // [Stage 30]
       else if lw='new'       then Result:=new TToken(tkNew,       w,sl,sc) // [Stage 40]
       else if lw='constructor' then Result:=new TToken(tkConstructor, w,sl,sc) // [Stage 42]
