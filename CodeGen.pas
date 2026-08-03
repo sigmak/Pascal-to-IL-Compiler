@@ -64,6 +64,14 @@ type
     fInstanceMethods: Dictionary<string, Dictionary<string, MethodBuilder>>; // 클래스명 → 메서드명 → MB
     fAbstractMethods: Dictionary<string, List<string>>; // [Stage 53] 클래스명 → abstract로 선언된 메서드명 목록
     fClassParents: Dictionary<string, string>; // 클래스명 → 부모 클래스명 ('' 이면 없음)
+    // [진단] StackOverflowException은 .NET에서 절대 catch할 수 없고 어느 위치인지도 전혀
+    // 남기지 않는다(프로세스가 그냥 강제 종료됨). EmitExpr/EmitStatement가 예상 밖으로
+    // 깊게(또는 무한히) 재귀할 때, 실제 OS 스택이 터지기 훨씬 전인 안전한 문턱값에서 먼저
+    // "잡을 수 있는" 예외로 바꿔치기해 어떤 노드 타입에서 멈췄는지 드러내기 위한 카운터.
+    // 정상적인 코드는 이 함수들의 재귀 호출 체인이 수백 단계를 넘을 일이 거의 없으므로,
+    // 5000이라는 문턱값은 실제 정상 케이스를 오탐할 가능성은 낮으면서 진짜 폭주(무한재귀
+    // 또는 비정상적으로 깊은 재귀)는 훨씬 일찍 잡아낸다.
+    fEmitDepth: integer;
     fMethodReturnTypes: Dictionary<string, Dictionary<string, TVarType>>; // 클래스명/인터페이스명 → 메서드명 → 반환타입
     fMethodParamClrTypes: Dictionary<string, Dictionary<string, array of System.Type>>; // 클래스명 → 메서드명 → 매개변수 CLR 타입 배열
     // [Stage 99] 클래스당 생성자가 1개뿐이라고 가정했던 예전 구조(값 하나)를, 오버로드된
@@ -117,6 +125,11 @@ type
     // 만들기 위한 일련번호.
     fMainTB: TypeBuilder;
     fLambdaCounter: integer;
+    // [Stage 96] 전역 const를 Program 타입의 static readonly 필드로 올려 모든 함수에서
+    // Ldsfld로 접근 가능하게 한다. EmitConstDecl(Main 전용 로컬 슬롯)과 달리 어느
+    // 메서드 ILGenerator에서도 읽을 수 있다.
+    fGlobalConstFields: Dictionary<string, FieldBuilder>;
+    fGlobalConstVTypes: Dictionary<string, TVarType>;
     // [Stage 68] 클로저(변수 캡처) 있는 람다가 __ClosureN 클래스를 최상위 타입으로
     // 만들 때 필요 — fMainTB처럼 GenerateExe의 지역변수였던 modB를 인스턴스 필드로 승격.
     fModB: ModuleBuilder;
@@ -258,6 +271,8 @@ type
     begin
       if fLocalScope.Has(name) then Result:=fLocalScope.GetVType(name)
       else if fGlobalScope.Has(name) then Result:=fGlobalScope.GetVType(name)
+      // [Stage 96] 전역 const는 Scope 슬롯이 없고 fGlobalConstVTypes에 타입 정보가 있다.
+      else if fGlobalConstVTypes.ContainsKey(name) then Result:=fGlobalConstVTypes[name]
       else Result:=vtInteger;
     end;
 
@@ -415,6 +430,15 @@ type
       // 호출되고 "외부 타입 'c.Value'을(를) 찾을 수 없습니다" 예외가 난다.
       if (fLocalScope.Has(first) or fGlobalScope.Has(first)) and (GetVarClassName(first)<>'') then
       begin Result:=true; exit; end;
+      // [버그 수정] incName[1]처럼 원시 타입(vtString 등) 지역/전역 변수를 그대로 인덱싱/체이닝하는
+      // 경우 — 원시 타입 변수는 ClrType도 ClassName도 스코프에 기록되지 않아(주석 참고, GetExprClrType의
+      // 동일한 문제와 같은 사유) 지금까지는 체인 시작점으로 인식되지 못해 "알 수 없는 한정자/인덱서
+      // 대상"으로 실패했다. GetVarType으로 실제 원시 타입을 확인해 통과시킨다.
+      if (fLocalScope.Has(first) or fGlobalScope.Has(first))
+         and ((GetVarType(first)=vtString) or (GetVarType(first)=vtInteger)
+              or (GetVarType(first)=vtInt64) or (GetVarType(first)=vtReal)
+              or (GetVarType(first)=vtBoolean) or (GetVarType(first)=vtChar)) then
+      begin Result:=true; exit; end;
       if (FindExternalAncestorType(fCurClassName)<>nil)
          and (SafeGetProperty(FindExternalAncestorType(fCurClassName), first)<>nil) then
       begin Result:=true; exit; end;
@@ -451,6 +475,7 @@ type
     var i: integer; curType: System.Type; pi: PropertyInfo; fi: System.Reflection.FieldInfo;
         firstFb: FieldBuilder; first: string; extSelf: System.Type;
         localClsName78: string; tbKvp78: System.Collections.Generic.KeyValuePair<string, TypeBuilder>;
+        mi101: MethodInfo; // [버그 수정] 외부 CLR 타입의 괄호 없는 무인자 메서드(예: sb.ToString.Trim)용
     begin
       first:=segs[0];
       if (first='Result') and (fResultLocal<>nil) then
@@ -483,6 +508,18 @@ type
         if fLocalScope.Has(first) then aIL.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(first))
         else aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(first));
         curType:=fTypeBuilders[GetVarClassName(first)];
+      end
+      // [버그 수정] IsChainStartSegment와 동일 — incName[1]처럼 원시 타입 지역/전역 변수가
+      // 체인의 시작점인 경우, ClrType/ClassName 둘 다 스코프에 없으므로 실제 로드 코드도
+      // 여기서 새로 내야 한다(원시 타입 로컬은 Ldloc + VTC(GetVarType) 매핑으로 충분).
+      else if (fLocalScope.Has(first) or fGlobalScope.Has(first))
+              and ((GetVarType(first)=vtString) or (GetVarType(first)=vtInteger)
+                   or (GetVarType(first)=vtInt64) or (GetVarType(first)=vtReal)
+                   or (GetVarType(first)=vtBoolean) or (GetVarType(first)=vtChar)) then
+      begin
+        if fLocalScope.Has(first) then aIL.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(first))
+        else aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(first));
+        curType:=VTC(GetVarType(first), '');
       end
       else
       begin
@@ -564,10 +601,23 @@ type
           else
           begin
             fi:=_reflT100.GetField(segs[i]);
-            if fi=nil then
-              raise new Exception('타입 "'+_reflT100.FullName+'"에 속성/필드 "'+segs[i]+'"가 없습니다 (연쇄 접근 중 — 경로: '+string.Join('.', segs)+')');
-            aIL.Emit(OpCodes.Ldfld, fi);
-            curType:=fi.FieldType;
+            if fi<>nil then
+            begin
+              aIL.Emit(OpCodes.Ldfld, fi);
+              curType:=fi.FieldType;
+            end
+            else
+            begin
+              // [버그 수정] 프로퍼티도 필드도 아니면, Pascal 관례상 괄호를 생략한 인자 없는
+              // 메서드일 수 있다 (예: dirSb.ToString.Trim — StringBuilder.ToString()은 프로퍼티가
+              // 아니라 메서드다). 로컬 클래스에는 이미 이 처리(위 [Stage 89])가 있었지만 외부
+              // CLR 타입에는 빠져 있어서 곧장 "속성/필드가 없습니다"로 실패했다.
+              mi101:=_reflT100.GetMethod(segs[i], System.Type.EmptyTypes);
+              if mi101=nil then
+                raise new Exception('타입 "'+_reflT100.FullName+'"에 속성/필드/무인자 메서드 "'+segs[i]+'"가 없습니다 (연쇄 접근 중 — 경로: '+string.Join('.', segs)+')');
+              aIL.Emit(OpCodes.Callvirt, mi101);
+              curType:=mi101.ReturnType;
+            end;
           end;
         end;
       end;
@@ -581,6 +631,7 @@ type
     var i: integer; curType: System.Type; pi: PropertyInfo; fi: System.Reflection.FieldInfo;
         firstFb: FieldBuilder; first: string; extSelf: System.Type;
         localClsName78: string; tbKvp78: System.Collections.Generic.KeyValuePair<string, TypeBuilder>;
+        mi101: MethodInfo; // [버그 수정] EmitQualifierChainLoad와 동일 — 괄호 없는 무인자 메서드 지원
     begin
       first:=segs[0];
       if TryFindFieldBuilder(fCurClassName, first, firstFb) then curType:=firstFb.FieldType
@@ -595,6 +646,13 @@ type
       else if (fLocalScope.Has(first) or fGlobalScope.Has(first))
               and (GetVarClassName(first)<>'') and fTypeBuilders.ContainsKey(GetVarClassName(first)) then
         curType:=fTypeBuilders[GetVarClassName(first)]
+      // [버그 수정] EmitQualifierChainLoad/IsChainStartSegment와 동일 — incName[1]처럼
+      // 원시 타입 지역/전역 변수가 체인 시작점인 경우의 폴백.
+      else if (fLocalScope.Has(first) or fGlobalScope.Has(first))
+              and ((GetVarType(first)=vtString) or (GetVarType(first)=vtInteger)
+                   or (GetVarType(first)=vtInt64) or (GetVarType(first)=vtReal)
+                   or (GetVarType(first)=vtBoolean) or (GetVarType(first)=vtChar)) then
+        curType:=VTC(GetVarType(first), '')
       else
       begin
         extSelf:=FindExternalAncestorType(fCurClassName);
@@ -633,9 +691,16 @@ type
           else
           begin
             fi:=curType.GetField(segs[i]);
-            if fi=nil then
-              raise new Exception('타입 "'+curType.FullName+'"에 속성/필드 "'+segs[i]+'"가 없습니다 (연쇄 접근 중 — 경로: '+string.Join('.', segs)+')');
-            curType:=fi.FieldType;
+            if fi<>nil then curType:=fi.FieldType
+            else
+            begin
+              // [버그 수정] EmitQualifierChainLoad와 동일 — 프로퍼티/필드가 아니면 괄호 없는
+              // 무인자 메서드일 수 있다 (예: dirSb.ToString.Trim).
+              mi101:=curType.GetMethod(segs[i], System.Type.EmptyTypes);
+              if mi101=nil then
+                raise new Exception('타입 "'+curType.FullName+'"에 속성/필드/무인자 메서드 "'+segs[i]+'"가 없습니다 (연쇄 접근 중 — 경로: '+string.Join('.', segs)+')');
+              curType:=mi101.ReturnType;
+            end;
           end;
         end;
       end;
@@ -811,7 +876,18 @@ type
           begin
             // 첫 세그먼트가 진짜 외부 네임스페이스/타입 경로 — 기존 TStaticMemberExprNode와
             // 동일한 방식으로 정적 필드/프로퍼티를 조회한다 (예: System.EventArgs.Empty).
-            var _staticT4:=ResolveExternalType(_mc4.ObjName);
+            var _staticT4: System.Type;
+            try _staticT4:=ResolveExternalType(_mc4.ObjName); except _staticT4:=nil; end;
+            // [Stage 99 버그 수정] "System.Reflection.Assembly.GetExecutingAssembly"처럼
+            // ObjName 전체가 타입이 아니라 타입+무인자 정적 메서드 체인일 수 있다 — EmitExpr의
+            // 동일한 경로와 같은 방식으로 재시도한다(aIL=nil이므로 IL은 방출하지 않고 최종
+            // CLR 타입만 알아낸다).
+            if _staticT4=nil then
+            begin
+              var _isInst4: boolean;
+              try _staticT4:=ResolveOrEmitStaticChain(nil, _mc4.ObjName, _isInst4); except _staticT4:=nil; end;
+            end;
+            if _staticT4=nil then begin Result:=vtInteger; exit; end;
             var _spi4:=SafeGetProperty(_staticT4, _mc4.MethodName);
             if (_spi4<>nil) and (_spi4.PropertyType=typeof(string)) then Result:=vtString
             else
@@ -1081,10 +1157,11 @@ type
         end
         else if (_bc72.Name='UpperCase') or (_bc72.Name='LowerCase') or (_bc72.Name='Trim')
                 or (_bc72.Name='Copy') or (_bc72.Name='FloatToStr') or (_bc72.Name='ReadLn')
-                or (_bc72.Name='Format') or (_bc72.Name='GetCurrentDir') then // [Stage 90/93]
+                or (_bc72.Name='Format') or (_bc72.Name='GetCurrentDir') or (_bc72.Name='ParamStr') then // [Stage 90/93/96]
           Result:=vtString
         else if _bc72.Name='Pos' then Result:=vtInteger
         else if _bc72.Name='Chr' then Result:=vtChar
+        else if _bc72.Name='ParamCount' then Result:=vtInteger // [Stage 96]
         else Result:=vtInteger; // 방어적 폴백(정상 경로면 도달하지 않음)
       end
       // [Stage 91] typeof(...)의 결과(System.Type)는 별도 vtType이 없으므로 vtObject로 취급.
@@ -1299,6 +1376,10 @@ type
       ctor: ConstructorInfo; cn: string; vtVar: TVarType;
       _argIdx48: integer; // [Stage 48]
     begin
+      fEmitDepth:=fEmitDepth+1;
+      if fEmitDepth>5000 then
+        raise new Exception('[진단] EmitExpr 재귀 깊이 초과(5000) — 폭주 의심 노드: '+e.GetType.Name);
+      try
       if e is TIntLiteralNode then
       begin lit:=TIntLiteralNode(e); aIL.Emit(OpCodes.Ldc_I4, lit.Value); end
 
@@ -1352,8 +1433,26 @@ type
       else if e is TLengthExprNode then
       begin
         le:=TLengthExprNode(e);
+        // [버그 수정] Length(x)에서 x가 지역변수도 전역변수도 아니라 클래스 필드인 배열
+        // (예: 메서드 본문 안에서 자기 클래스의 배열 필드를 Length()로 재는 경우)이면,
+        // 예전에는 무조건 fGlobalScope.GetLoc(le.ArrName)를 호출해 존재하지 않는 키로
+        // KeyNotFoundException이 그대로 터졌다(호출부까지 예외 타입/메시지가 그대로
+        // 전파되어 "알 수 없는 변수" 같은 우리 쪽 진단 메시지도 못 남겼다). 다른 배열
+        // 접근부(TArrayIndexExprNode 등)와 마찬가지로 필드 폴백(Ldarg_0+Ldfld)을 추가한다.
         if fLocalScope.Has(le.ArrName) then aIL.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(le.ArrName))
-        else aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(le.ArrName));
+        else if fGlobalScope.Has(le.ArrName) then aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(le.ArrName))
+        else
+        begin
+          var leFb: FieldBuilder;
+          if TryFindFieldBuilder(fCurClassName, le.ArrName, leFb) then
+          begin
+            aIL.Emit(OpCodes.Ldarg_0);
+            aIL.Emit(OpCodes.Ldfld, leFb);
+          end
+          else
+            raise new Exception('알 수 없는 변수 "'+le.ArrName+'" (Length 인자로 쓰인 배열을 지역/전역 변수도, "'
+              +fCurClassName+'" 클래스의 필드도 아닌 곳에서 찾을 수 없습니다).');
+        end;
         aIL.Emit(OpCodes.Ldlen); aIL.Emit(OpCodes.Conv_I4);
       end
 
@@ -1557,12 +1656,33 @@ type
               end;
             end;
 
+            // [Stage 99 버그 수정] mc.ObjName 전체가 타입 이름으로 안 풀리면(예:
+            // "System.Reflection.Assembly.GetExecutingAssembly"), 마지막 세그먼트가
+            // 실제로는 타입의 무인자 정적 메서드/프로퍼티일 수 있다 — ResolveOrEmitStaticChain으로
+            // 재시도한다. 성공하면 이미 IL로 그 호출까지 방출되어 스택에 인스턴스가 로드된
+            // 상태이므로, 이후 mc.MethodName은 정적이 아니라 인스턴스 멤버로 조회해야 한다.
+            var _isInstTE: boolean := false;
+            if _staticTE=nil then
+              try _staticTE:=ResolveOrEmitStaticChain(aIL, mc.ObjName, _isInstTE); except _staticTE:=nil; end;
+
             if _staticTE=nil then
               raise new Exception('외부 타입 "'+mc.ObjName+'"을(를) 찾을 수 없습니다. 기본 프레임워크(WinForms/WPF/System.*)가 아니라면 {$reference 어셈블리명.dll} 지시문으로 해당 타입이 들어있는 어셈블리를 먼저 등록했는지 확인하세요.');
 
             var _spiE:=SafeGetProperty(_staticTE, mc.MethodName);
             if (mc.Args.Count=0) and (_spiE<>nil) and (_spiE.GetGetMethod<>nil) then
               aIL.Emit(OpCodes.Call, _spiE.GetGetMethod)
+            else if _isInstTE then
+            begin
+              // 체인이 이미 인스턴스를 스택에 올려둔 상태 — GetField/Ldsfld(순수 정적 필드
+              // 전용)는 의미가 없으므로 건너뛰고 바로 인스턴스 메서드로 조회한다.
+              var _smiEI:=ResolveMethodByArity(_staticTE, mc.MethodName, mc.Args, false);
+              if _smiEI=nil then
+                raise new Exception('타입 "'+_staticTE.FullName+'"에 인스턴스 멤버 "'+mc.MethodName+'"가 없습니다.');
+              var _smiEIParams:=_smiEI.GetParameters;
+              for var _smiEIAi:=0 to mc.Args.Count-1 do
+                EmitArgForParamType(aIL, mc.Args[_smiEIAi], _smiEIParams[_smiEIAi].ParameterType);
+              aIL.Emit(OpCodes.Callvirt, _smiEI);
+            end
             else
             begin
               var _sfiE:=_staticTE.GetField(mc.MethodName);
@@ -1672,7 +1792,8 @@ type
             else aIL.Emit(OpCodes.Callvirt, _emi6);
           end;
         end
-        else if fLocalScope.Has(mc.ObjName) or fGlobalScope.Has(mc.ObjName) then
+        else if fLocalScope.Has(mc.ObjName) or fGlobalScope.Has(mc.ObjName)
+                or fGlobalConstFields.ContainsKey(mc.ObjName) then  // [Stage 96] 전역 const도 허용
         begin
           cn:=GetVarClassName(mc.ObjName);
           vtVar:=GetVarType(mc.ObjName);
@@ -1683,10 +1804,16 @@ type
             if fRecordNames.Contains(cn) then aIL.Emit(OpCodes.Ldloca, fLocalScope.GetLoc(mc.ObjName))
             else aIL.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(mc.ObjName));
           end
-          else
+          else if fGlobalScope.Has(mc.ObjName) then
           begin
             if fRecordNames.Contains(cn) then aIL.Emit(OpCodes.Ldloca, fGlobalScope.GetLoc(mc.ObjName))
             else aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(mc.ObjName));
+          end
+          else
+          begin
+            // [Stage 96] 전역 const — static 필드에서 Ldsfld로 값을 로드한다.
+            // const는 항상 문자열/정수/실수 등 원시 타입이므로 레코드 분기 불필요.
+            aIL.Emit(OpCodes.Ldsfld, fGlobalConstFields[mc.ObjName]);
           end;
           if cn='' then
           begin
@@ -1711,6 +1838,19 @@ type
                   EmitArgForParamType(aIL, mc.Args[_strAi79], _strMiParams79[_strAi79].ParameterType);
                 aIL.Emit(OpCodes.Callvirt, _strMi79);
               end;
+            end
+            else if (mc.Args.Count=0) and (mc.MethodName='Length')
+                    and ((vtVar=vtIntArray) or (vtVar=vtStrArray) or (vtVar=vtObjArray)
+                         or (vtVar=vtGenericArray) or (vtVar=vtMatrix)) then
+            begin
+              // [버그 수정] 배열 지역/전역 변수(예: parts: array of string)에 .Length를
+              // 호출하는 경우를 이전에는 처리하지 않고 곧장 "알 수 없는 메서드"로 던졌다.
+              // 배열은 System.Array 파생 CLR 배열이라 Reflection으로 프로퍼티를 찾을 필요 없이
+              // Ldlen(스택 최상단 배열 참조 → 네이티브 uint 길이) + Conv_I4로 바로 계산할 수 있다
+              // (C#의 arr.Length가 컴파일되는 것과 동일한 IL 관용구). 위에서 이미 Ldloc/Ldsfld로
+              // 배열 참조가 스택에 올라가 있는 상태다.
+              aIL.Emit(OpCodes.Ldlen);
+              aIL.Emit(OpCodes.Conv_I4);
             end
             else if (mc.Args.Count=0) and (mc.MethodName='ToString')
                     and ((vtVar=vtInteger) or (vtVar=vtInt64) or (vtVar=vtReal) or (vtVar=vtBoolean) or (vtVar=vtChar)) then
@@ -2095,16 +2235,35 @@ type
           else
           begin
             var chFi90:=chType90.GetField(ch90.MemberName);
-            if chFi90=nil then
-              raise new Exception('타입 "'+chType90.FullName+'"에 멤버 "'+ch90.MemberName+'"가 없습니다.');
-            aIL.Emit(OpCodes.Ldfld, chFi90);
+            if chFi90<>nil then
+              aIL.Emit(OpCodes.Ldfld, chFi90)
+            else
+            begin
+              // [버그 수정] Object Pascal은 괄호 없는 무인자 메서드 호출을 허용한다
+              // (예: s.Trim, s.ToUpper — 파서는 '.' 뒤에 '('가 안 보이면 IsCall=false로
+              // TChainedMemberExprNode를 만든다. Parser.pas 1770행 부근 참고). 여태는 이
+              // 경우 프로퍼티/필드만 찾고 실패하면 바로 에러를 던져, string.Trim처럼 실제로는
+              // "인자 없는 메서드"인 멤버가 전부 "멤버가 없습니다" 오류로 막혔다. 프로퍼티/필드에서
+              // 못 찾으면 무인자 메서드로도 한 번 더 시도한다.
+              var chMi90Noargs:=ResolveMethodByArity(chType90, ch90.MemberName, new List<TExprNode>, false);
+              if chMi90Noargs=nil then
+                // [진단] chType90가 System.Object이면 십중팔구 GetExprClrType이 Inner의 실제
+                // 타입을 추론하지 못해 조용히 폴백한 것이다(진짜로 System.Object 타입인
+                // 식에 .Value 등을 쓴 경우는 드묾) — DescribeExprChain으로 어떤 식이었는지 밝힌다.
+                raise new Exception('타입 "'+chType90.FullName+'"에 멤버 "'+ch90.MemberName
+                  +'"가 없습니다. (식: '+DescribeExprChain(ch90.Inner)+'.'+ch90.MemberName
+                  +' — Inner 타입 추론 결과: '+chType90.FullName+')');
+              if chIsVal90 then aIL.Emit(OpCodes.Call, chMi90Noargs)
+              else aIL.Emit(OpCodes.Callvirt, chMi90Noargs);
+            end;
           end;
         end
         else
         begin
           var chMi90:=ResolveMethodByArity(chType90, ch90.MemberName, ch90.Args, false);
           if chMi90=nil then
-            raise new Exception('타입 "'+chType90.FullName+'"에 메서드 "'+ch90.MemberName+'"가 없습니다 (인자 '+ch90.Args.Count.ToString+'개).');
+            raise new Exception('타입 "'+chType90.FullName+'"에 메서드 "'+ch90.MemberName+'"가 없습니다 (인자 '+ch90.Args.Count.ToString
+              +'개). (식: '+DescribeExprChain(ch90.Inner)+'.'+ch90.MemberName+'(...))');
           var chMiParams90:=chMi90.GetParameters;
           for var chAi90:=0 to ch90.Args.Count-1 do
             EmitArgForParamType(aIL, ch90.Args[chAi90], chMiParams90[chAi90].ParameterType);
@@ -2129,15 +2288,43 @@ type
       else if e is TArrayIndexExprNode then
       begin
         ai:=TArrayIndexExprNode(e);
-        if fLocalScope.Has(ai.ArrName) then aIL.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(ai.ArrName))
-        else aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(ai.ArrName));
+        // [버그 수정] Length()에서 고쳤던 것과 동일한 패턴 — ai.ArrName이 지역변수도
+        // 전역변수도 아니라 클래스 필드인 배열(자기 클래스의 배열 필드를 인덱싱하는 경우)
+        // 이면, 예전에는 무조건 fGlobalScope.GetLoc을 호출해 KeyNotFoundException으로
+        // 죽었다. 필드 폴백(Ldarg_0+Ldfld)을 추가한다. 이 경로에서는 GetVarType(스코프
+        // 전용이라 필드 이름은 모두 기본값 vtInteger로 오판)을 쓸 수 없으므로, 원소가
+        // 참조 타입인지는 FieldBuilder의 실제 CLR 배열 원소 타입(IsValueType)으로 판단한다.
+        var aiIsRefElem: boolean;
+        if fLocalScope.Has(ai.ArrName) then
+        begin
+          aIL.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(ai.ArrName));
+          aiIsRefElem:=(GetVarType(ai.ArrName)=vtStrArray) or (GetVarType(ai.ArrName)=vtObjArray);
+        end
+        else if fGlobalScope.Has(ai.ArrName) then
+        begin
+          aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(ai.ArrName));
+          aiIsRefElem:=(GetVarType(ai.ArrName)=vtStrArray) or (GetVarType(ai.ArrName)=vtObjArray);
+        end
+        else
+        begin
+          var aiFb: FieldBuilder;
+          if TryFindFieldBuilder(fCurClassName, ai.ArrName, aiFb) then
+          begin
+            aIL.Emit(OpCodes.Ldarg_0);
+            aIL.Emit(OpCodes.Ldfld, aiFb);
+            aiIsRefElem:=(aiFb.FieldType.GetElementType<>nil) and (not aiFb.FieldType.GetElementType.IsValueType);
+          end
+          else
+            raise new Exception('알 수 없는 변수 "'+ai.ArrName+'" (배열 인덱싱 대상을 지역/전역 변수도, "'
+              +fCurClassName+'" 클래스의 필드도 아닌 곳에서 찾을 수 없습니다).');
+        end;
         EmitExpr(aIL, ai.Index);
         // [Stage 37 버그 수정] 이전에는 배열 종류와 무관하게 항상 Ldelem_I4를 썼다 —
         // array of integer는 우연히 맞았지만 array of string은 참조(포인터)를 4바이트
         // 정수로 잘못 읽어 쓰레기 값이 나왔다. 원소를 쓰는 쪽(Stelem, 아래 TArrayAssignStmtNode)은
         // 이미 배열 타입을 보고 Stelem_Ref/Stelem_I4를 갈라 쓰고 있었으므로 읽는 쪽도 맞춘다.
         // [Stage 90] array of object도 문자열 배열과 마찬가지로 참조 타입 원소이므로 Ldelem_Ref.
-        if (GetVarType(ai.ArrName)=vtStrArray) or (GetVarType(ai.ArrName)=vtObjArray) then aIL.Emit(OpCodes.Ldelem_Ref)
+        if aiIsRefElem then aIL.Emit(OpCodes.Ldelem_Ref)
         else aIL.Emit(OpCodes.Ldelem_I4);
       end
 
@@ -2162,7 +2349,11 @@ type
       else if e is TVarRefNode then
       begin
         vr:=TVarRefNode(e);
-        if fLocalScope.Has(vr.VarName) then aIL.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(vr.VarName))
+        // [Stage 96] 전역 const는 Program 타입의 static readonly 필드 — Ldsfld로 읽는다.
+        // fLocalScope/fGlobalScope(로컬 슬롯)보다 먼저 확인해야 한다.
+        if fGlobalConstFields.ContainsKey(vr.VarName) then
+          aIL.Emit(OpCodes.Ldsfld, fGlobalConstFields[vr.VarName])
+        else if fLocalScope.Has(vr.VarName) then aIL.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(vr.VarName))
         else if fGlobalScope.Has(vr.VarName) then aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(vr.VarName))
         else raise new Exception('선언되지 않은 변수 "'+vr.VarName+'"');
       end
@@ -2423,6 +2614,9 @@ type
         EmitBuiltinCall(aIL, TBuiltinCallExprNode(e))
 
       else raise new Exception('알 수 없는 식 노드: '+e.GetType.Name);
+      finally
+        fEmitDepth:=fEmitDepth-1;
+      end;
     end;
 
     // [Stage 70] LINQ 스타일 확장 메서드 하나(Where/Select/Sum/Count/ToArray)를 실제로 컴파일한다.
@@ -2812,6 +3006,31 @@ type
         aIL.Emit(OpCodes.Call, typeof(System.IO.Directory).GetMethod('GetCurrentDirectory', System.Type.EmptyTypes));
       end
 
+      // [Stage 96] ParamCount — 커맨드라인 인자 개수. Environment.GetCommandLineArgs()의
+      // 0번째는 실행 파일 경로 자신이므로, Pascal 관례(ParamStr(0)=실행파일, ParamStr(1..N)=인자)에
+      // 맞춰 배열 길이에서 1을 뺀 값을 돌려준다.
+      else if node.Name='ParamCount' then
+      begin
+        if node.Args.Count<>0 then raise new Exception('ParamCount는 인자가 없어야 합니다 (Stage 96)');
+        aIL.Emit(OpCodes.Call, typeof(System.Environment).GetMethod('GetCommandLineArgs', System.Type.EmptyTypes));
+        aIL.Emit(OpCodes.Ldlen);
+        aIL.Emit(OpCodes.Conv_I4);
+        aIL.Emit(OpCodes.Ldc_I4_1);
+        aIL.Emit(OpCodes.Sub);
+      end
+
+      // [Stage 96] ParamStr(n) — n번째 커맨드라인 인자. GetCommandLineArgs()[0]이 실행 파일
+      // 경로 자신이므로 ParamStr(1)은 그 배열의 인덱스 1과 정확히 일치해 별도 보정이 필요없다.
+      else if node.Name='ParamStr' then
+      begin
+        if node.Args.Count<>1 then raise new Exception('ParamStr()는 인자가 1개 필요합니다 (Stage 96)');
+        aIL.Emit(OpCodes.Call, typeof(System.Environment).GetMethod('GetCommandLineArgs', System.Type.EmptyTypes));
+        argT:=InferType(node.Args[0]);
+        EmitExpr(aIL, node.Args[0]);
+        if argT<>vtInteger then aIL.Emit(OpCodes.Call, typeof(System.Convert).GetMethod('ToInt32', [typeof(double)]));
+        aIL.Emit(OpCodes.Ldelem_Ref);
+      end
+
       else
         raise new Exception('알 수 없는 표준 라이브러리 함수 "'+node.Name+'" (Stage 72)');
     end;
@@ -2913,6 +3132,10 @@ type
       setter, emi: MethodInfo; qfb: FieldBuilder; qTargetType: System.Type;
       evs: TEventSubscribeStmtNode; evInfo: EventInfo; delCtor: ConstructorInfo;
     begin
+      fEmitDepth:=fEmitDepth+1;
+      if fEmitDepth>5000 then
+        raise new Exception('[진단] EmitStatement 재귀 깊이 초과(5000) — 폭주 의심 노드: '+s.GetType.Name);
+      try
       // [Stage 75] Readln; → Console.ReadLine() 호출 후 반환값 버림.
       // Readln(v) → Console.ReadLine() 결과를 문자열 변수 v에 대입.
       if s is TReadlnStmtNode then
@@ -3333,6 +3556,40 @@ type
           end;
           end;
         end
+        // [버그 수정] "Result.Add(x);"처럼 함수 자신의 반환값(Result) 위에서 메서드를 호출하는
+        // 문장(식이 아니라 문장 위치) — EmitExpr/EmitQualifierChainLoad 쪽은 'Result' 세그먼트를
+        // fResultLocal로 이미 특별 취급하지만, TMethodCallStmtNode 쪽엔 이 분기가 없었다. 그래서
+        // Result는 fLocalScope/fGlobalScope 어디에도 없으니 모든 분기를 다 지나쳐 맨 아래
+        // "외부 정적 타입" 폴백까지 흘러가 ResolveExternalType('Result')가 "외부 타입 Result를
+        // 찾을 수 없습니다"로 실패했다. fLocalScope/fGlobalScope 분기(바로 아래)와 동일한 패턴을
+        // fResultLocal에 대해 그대로 적용한다.
+        else if (mcs.ObjName='Result') and (fResultLocal<>nil) then
+        begin
+          qTargetType:=fResultLocal.LocalType;
+          aIL.Emit(OpCodes.Ldloc, fResultLocal);
+          if mcs.ObjCastType<>'' then
+          begin
+            qTargetType:=ResolveExternalType(mcs.ObjCastType);
+            aIL.Emit(OpCodes.Castclass, qTargetType);
+          end;
+          var _getPR:=SafeGetProperty(qTargetType, mcs.MethodName);
+          if (mcs.Args.Count=0) and (_getPR<>nil) and (_getPR.GetGetMethod<>nil) then
+          begin
+            aIL.Emit(OpCodes.Callvirt, _getPR.GetGetMethod);
+            aIL.Emit(OpCodes.Pop);
+          end
+          else
+          begin
+            var emiR:=ResolveMethodByArity(qTargetType, mcs.MethodName, mcs.Args, false);
+            if emiR=nil then
+              raise new Exception('타입 "'+qTargetType.FullName+'"에 메서드 "'+mcs.MethodName+'"가 없습니다 (인자 '+mcs.Args.Count.ToString+'개, 경로: Result.'+mcs.MethodName+')');
+            var _emiParamsR:=emiR.GetParameters;
+            for var _emiAiR:=0 to mcs.Args.Count-1 do
+              EmitArgForParamType(aIL, mcs.Args[_emiAiR], _emiParamsR[_emiAiR].ParameterType);
+            aIL.Emit(OpCodes.Callvirt, emiR);
+            if emiR.ReturnType<>typeof(System.Void) then aIL.Emit(OpCodes.Pop);
+          end;
+        end
         else if (fLocalScope.Has(mcs.ObjName) or fGlobalScope.Has(mcs.ObjName))
                 and (fLocalScope.HasClrType(mcs.ObjName) or fGlobalScope.HasClrType(mcs.ObjName)) then
         begin
@@ -3378,13 +3635,15 @@ type
             if emi.ReturnType<>typeof(System.Void) then aIL.Emit(OpCodes.Pop);
           end;
         end
-        else if fLocalScope.Has(mcs.ObjName) or fGlobalScope.Has(mcs.ObjName) then
+        else if fLocalScope.Has(mcs.ObjName) or fGlobalScope.Has(mcs.ObjName)
+                or fGlobalConstFields.ContainsKey(mcs.ObjName) then  // [Stage 96] 전역 const도 허용
         begin
           // c.Init(10) → Ldloc c + args + Call
           cn:=GetVarClassName(mcs.ObjName);
           vtVar:=GetVarType(mcs.ObjName);
           if fLocalScope.Has(mcs.ObjName) then aIL.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(mcs.ObjName))
-          else aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(mcs.ObjName));
+          else if fGlobalScope.Has(mcs.ObjName) then aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(mcs.ObjName))
+          else aIL.Emit(OpCodes.Ldsfld, fGlobalConstFields[mcs.ObjName]);  // [Stage 96] 전역 const
           if cn='' then raise new Exception('알 수 없는 메서드 "'+cn+'.'+mcs.MethodName+'"');
           // 인터페이스 타입 변수면 인터페이스 메서드로, 아니면 클래스 상속 체인에서 탐색
           // (Stage 10에서는 fInstanceMethods[cn] 직접 조회 + Call만 사용해 상속받은
@@ -3707,10 +3966,27 @@ type
       else if s is TArrayAssignStmtNode then
       begin
         aa:=TArrayAssignStmtNode(s); at2:=vtIntArray;
+        // [버그 수정] 읽기 쪽(TArrayIndexExprNode)과 동일한 패턴 — aa.ArrName이 지역/전역
+        // 변수가 아니라 클래스 필드인 배열이면 예전에는 fGlobalScope.GetLoc이 그대로
+        // KeyNotFoundException을 던졌다. 필드 폴백을 추가하고, 필드일 때는 GetVType(스코프
+        // 전용이라 필드는 조회 불가)이 아니라 FieldBuilder의 실제 CLR 원소 타입으로
+        // 참조/값 타입 여부(및 EmitValueForVType에 넘길 at2)를 판단한다.
+        var aaFb: FieldBuilder;
         if fGlobalScope.Has(aa.ArrName) then at2:=fGlobalScope.GetVType(aa.ArrName)
-        else if fLocalScope.Has(aa.ArrName) then at2:=fLocalScope.GetVType(aa.ArrName);
+        else if fLocalScope.Has(aa.ArrName) then at2:=fLocalScope.GetVType(aa.ArrName)
+        else if TryFindFieldBuilder(fCurClassName, aa.ArrName, aaFb) then
+        begin
+          if (aaFb.FieldType.GetElementType<>nil) and (not aaFb.FieldType.GetElementType.IsValueType) then
+            at2:=vtStrArray
+          else
+            at2:=vtIntArray;
+        end
+        else
+          raise new Exception('알 수 없는 변수 "'+aa.ArrName+'" (배열 대입 대상을 지역/전역 변수도, "'
+            +fCurClassName+'" 클래스의 필드도 아닌 곳에서 찾을 수 없습니다).');
         if fLocalScope.Has(aa.ArrName) then aIL.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(aa.ArrName))
-        else aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(aa.ArrName));
+        else if fGlobalScope.Has(aa.ArrName) then aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(aa.ArrName))
+        else begin aIL.Emit(OpCodes.Ldarg_0); aIL.Emit(OpCodes.Ldfld, aaFb); end;
         // [Stage 57] arr[i] := 'a'; 에서 arr가 문자열 배열이면 char 리터럴을 문자열로
         // 승격해야 한다 — 안 그러면 정수(문자코드)가 그대로 Stelem_Ref로 들어가
         // 힙 참조로 오인되어 GC/접근 시 크래시가 난다.
@@ -4250,6 +4526,9 @@ type
       end
 
       else raise new Exception('알 수 없는 문장 노드: '+s.GetType.Name);
+      finally
+        fEmitDepth:=fEmitDepth-1;
+      end;
     end;
 
     // 메서드 시그니처의 i번째 매개변수의 실제 CLR 타입을 결정한다 (기본/지역클래스/외부타입 모두 포함)
@@ -4922,6 +5201,7 @@ type
       else if name='Exception'           then Result:='System.Exception'
       else if name='Object'              then Result:='System.Object'
       else if name='String'              then Result:='System.String'
+      else if name='string'              then Result:='System.String' // [Stage 96] new string(ch, count) 등
       // [Stage 92] byte(x)/(byte)(x) 같은 .NET 원시 값 타입 캐스트가 쓸 소문자 별칭들.
       // Parser의 IsPrimitiveCastTypeName 화이트리스트와 짝을 이룬다.
       else if name='byte'                then Result:='System.Byte'
@@ -4929,6 +5209,15 @@ type
       else if name='short'               then Result:='System.Int16'
       else if name='ushort'              then Result:='System.UInt16'
       else if name='int'                 then Result:='System.Int32'
+      // [버그 수정] 이 컴파일러 자신의 소스(Lexer.pas/Parser.pas/Main.pas)는 .NET 별칭
+      // 'int'가 아니라 파스칼 고유 타입명 'integer'/'int64'를 그대로 "integer.Parse(...)",
+      // "int64.Parse(...)" 형태의 정적 호출 한정자로 쓴다. 'int'/'long'만 화이트리스트에
+      // 있고 'integer'/'int64'가 빠져 있어서, ResolveWellKnownShortName이 이름을 그대로
+      // 돌려주고(else Result:=name) System.Type.GetType('integer')/('int64')가 실패해
+      // "외부 타입 integer를 찾을 수 없습니다" → (식 위치에서는) "알 수 없는 변수 integer"로
+      // 이어졌다. 'int'/'long'과 동일한 CLR 타입으로 매핑한다.
+      else if name='integer'             then Result:='System.Int32'
+      else if name='int64'               then Result:='System.Int64'
       else if name='uint'                then Result:='System.UInt32'
       else if name='long'                then Result:='System.Int64'
       else if name='ulong'               then Result:='System.UInt64'
@@ -5009,6 +5298,73 @@ type
         '해당 타입이 들어있는 어셈블리를 먼저 등록했는지 확인하세요.');
     end;
 
+    // [Stage 99 버그 수정] "System.Reflection.Assembly.GetExecutingAssembly.Location"처럼
+    // 정적 타입 경로 중간에 무인자 정적 메서드/프로퍼티 호출이 섞인 체인 — 예전에는
+    // TMethodCallExprNode의 ObjName 전체("System.Reflection.Assembly.GetExecutingAssembly")를
+    // 통째로 타입 이름으로 보고 ResolveExternalType을 호출해 항상 실패했다("...
+    // GetExecutingAssembly을(를) 찾을 수 없습니다" — GetExecutingAssembly은 타입이 아니라
+    // System.Reflection.Assembly의 무인자 정적 메서드이기 때문). 마지막 세그먼트(예: "Location")는
+    // 호출부(EmitExpr/InferType)가 이미 mc.MethodName으로 별도 처리하므로 여기서는 다루지 않는다.
+    //
+    // 점으로 구분된 세그먼트를 뒤에서부터 하나씩 떼어내며, "떼어낸 나머지가 실제 타입으로
+    // 해석되는지" 시도한다 — 해석되면 그 뒤에 남은 세그먼트들을 순서대로 무인자
+    // 정적/인스턴스 멤버(프로퍼티 우선, 아니면 메서드)로 적용해 최종 CLR 타입을 얻는다.
+    // aIL가 nil이 아니면 실제로 그 호출들의 IL도 함께 방출한다(InferType처럼 타입만
+    // 필요할 때는 nil로 호출해 방출 없이 타입만 알아낸다). 성공하면 isInstance를 true로
+    // 설정해 호출자에게 "이제 스택에 인스턴스가 로드된 상태"임을 알려준다 — 호출자가
+    // 이어서 mc.MethodName을 정적이 아니라 인스턴스 멤버로 조회해야 하기 때문이다.
+    function ResolveOrEmitStaticChain(aIL: ILGenerator; dottedPath: string; var isInstance: boolean): System.Type;
+    var segs: array of string; splitAt, i: integer; prefix, seg: string;
+        curType: System.Type; ok: boolean; emptyArgs: List<TExprNode>;
+        pi99: PropertyInfo; mi99: MethodInfo; isStaticStep: boolean;
+    begin
+      Result:=nil; isInstance:=false;
+      segs:=dottedPath.Split('.');
+      if segs.Length<2 then exit;
+      for splitAt:=segs.Length-1 downto 1 do
+      begin
+        prefix:=string.Join('.', segs, 0, splitAt);
+        try curType:=ResolveExternalType(prefix); except curType:=nil; end;
+        if curType=nil then continue;
+
+        isStaticStep:=true;
+        ok:=true;
+        emptyArgs:=new List<TExprNode>;
+        for i:=splitAt to segs.Length-1 do
+        begin
+          seg:=segs[i];
+          pi99:=SafeGetProperty(curType, seg);
+          if (pi99<>nil) and (pi99.GetGetMethod<>nil) then
+          begin
+            if aIL<>nil then
+            begin
+              if isStaticStep then aIL.Emit(OpCodes.Call, pi99.GetGetMethod)
+              else aIL.Emit(OpCodes.Callvirt, pi99.GetGetMethod);
+            end;
+            curType:=pi99.PropertyType;
+          end
+          else
+          begin
+            mi99:=ResolveMethodByArity(curType, seg, emptyArgs, isStaticStep);
+            if mi99=nil then begin ok:=false; break; end;
+            if aIL<>nil then
+            begin
+              if isStaticStep then aIL.Emit(OpCodes.Call, mi99)
+              else aIL.Emit(OpCodes.Callvirt, mi99);
+            end;
+            curType:=mi99.ReturnType;
+          end;
+          isStaticStep:=false;
+        end;
+        if ok then
+        begin
+          Result:=curType;
+          isInstance:=true; // splitAt<segs.Length이므로 세그먼트를 최소 1개는 소비함 — 항상 인스턴스 상태
+          exit;
+        end;
+      end;
+    end;
+
     // [Stage 86] "Dictionary" 처럼 네임스페이스 없이 쓴 이름을 CLR 제네릭 오픈 타입의
     // 정식 이름(예: "System.Collections.Generic.Dictionary`2")으로 바꿔 ResolveExternalType으로
     // 찾는다. 이미 점(.)이 포함된 이름(예: "My.Custom.Namespace.Foo")은 그대로 arity만 붙인다.
@@ -5045,6 +5401,18 @@ type
     begin
       tag:=tag.Trim;
       if tag.Contains('<') then begin Result:=ResolveExternalGenericType(tag); exit; end;
+      // [Stage 98 버그 수정] "string[]"/"integer[]"/"FileChangeWatcher[]" 등 — 제네릭 타입
+      // 인자 자리에 array of <T> 가 온 경우(ParseExternalGenericTypeArg가 "elemType[]" 형태의
+      // 문자열로 인코딩해 넘긴다). 이전에는 이 "[]" 접미사를 전혀 인식하지 못하고 그대로
+      // ResolveExternalType("string[]")을 호출해 "외부 타입 string[] 을(를) 찾을 수 없습니다"로
+      // 실패했다 — VTC의 vtObjArray 분기만 "[]" 접미사를 이해했고 여기는 몰랐다. 원소 타입을
+      // 재귀적으로 먼저 해석한 뒤 MakeArrayType으로 배열 CLR 타입을 조립한다.
+      if tag.EndsWith('[]') then
+      begin
+        var _elemTag:=tag.Substring(0, tag.Length-2);
+        Result:=ResolveGenericArgClrType(_elemTag).MakeArrayType;
+        exit;
+      end;
       if tag='integer' then Result:=typeof(integer)
       else if tag='string' then Result:=typeof(string)
       else if tag='boolean' then Result:=typeof(boolean)
@@ -5330,26 +5698,30 @@ type
       try
         Result := t.GetProperty(name);
       except
-        on E: System.Reflection.AmbiguousMatchException do
+        // [버그 수정] 이전에는 System.Reflection.AmbiguousMatchException만 잡았다. 그런데
+        // GroupCollection.Item처럼 이름은 같고 인자 타입만 다른(int/string) 인덱서가 두 개
+        // 이상 있을 때 t.GetProperty(name)이 실제로 AmbiguousMatchException을 던지는 게
+        // 맞지만, 만에 하나 여기서 그 특정 타입과 정확히 매치되지 않는 경우(어셈블리 로드
+        // 컨텍스트 차이 등) 예외가 이 on절을 통과하지 못하고 그대로 위로 전파되어, 이 함수를
+        // 부르는 GetExprClrType의 바깥쪽 포괄 except가 조용히 System.Object로 폴백해버린다
+        // (그 결과 m.Groups[2].Value처럼 실제로는 존재하는 멤버가 "System.Object에 멤버
+        // ...가 없습니다"로 잘못 보고된다). 어떤 예외든 동일한 DeclaredOnly 폴백을 타도록
+        // on절 없는 포괄 except로 넓힌다 — 아래 로직 자체는 기존 AmbiguousMatchException
+        // 대응과 동일하다(가장 파생된 타입에서 이름이 일치하는 첫 선언을 사용).
+        Result := nil;
+        curT91 := t;
+        while curT91 <> nil do
         begin
-          // [버그 수정 - Stage 93] 파생 타입이 'new'(Shadows)로 부모의 동일 이름 프로퍼티를
-          // 다른 반환 타입으로 가리는 경우(예: TableLayoutPanel.Controls가
-          // Control.Controls를 TableLayoutControlCollection으로 가림), 인자 없는
-          // GetProperty(name)은 두 선언을 동시에 찾아내 모호하다며 예외를 던진다.
-          // DeclaredOnly로 가장 파생된 타입부터 위로 올라가며 처음 찾은(=가장 파생된)
-          // 선언을 사용해 사람이 기대하는 동작(파생 클래스 쪽 선언 우선)과 맞춘다.
-          Result := nil;
-          curT91 := t;
-          while curT91 <> nil do
-          begin
+          try
             props91 := curT91.GetProperties(BindingFlags.Public or BindingFlags.NonPublic or
                                               BindingFlags.Instance or BindingFlags.Static or
                                               BindingFlags.DeclaredOnly);
             foreach p91 in props91 do
               if p91.Name = name then begin Result := p91; break; end;
-            if Result <> nil then break;
-            curT91 := curT91.BaseType;
+          except
           end;
+          if Result <> nil then break;
+          curT91 := curT91.BaseType;
         end;
       end;
     end;
@@ -5414,6 +5786,21 @@ type
     function EmitIndexerGet(aIL: ILGenerator; baseType: System.Type; idxExpr: TExprNode): System.Type;
     var idxArgType: System.Type; itemProp: PropertyInfo; bestScore: integer;
     begin
+      // [버그 수정] s[i] — Pascal 문자열 변수를 직접 인덱싱하는 경우(예: incName[1]).
+      // 두 가지가 배열/일반 컬렉션과 다르다: (1) Pascal 문자열은 1-based인데 .NET
+      // String의 실제 인덱서는 0-based이므로 인덱스에서 1을 빼야 한다. (2) System.String의
+      // 기본 인덱서는 [IndexerName("Chars")]로 선언되어 있어 프로퍼티 이름이 "Item"이
+      // 아니라 "Chars"다 — 아래의 범용 "Item" 프로퍼티 탐색은 String에서는 절대 못
+      // 찾으므로 여기서 먼저 처리한다.
+      if baseType=typeof(string) then
+      begin
+        EmitArgForParamType(aIL, idxExpr, typeof(integer));
+        aIL.Emit(OpCodes.Ldc_I4_1);
+        aIL.Emit(OpCodes.Sub);
+        aIL.Emit(OpCodes.Callvirt, typeof(string).GetMethod('get_Chars', [typeof(integer)]));
+        Result:=typeof(char);
+        exit;
+      end;
       // [Stage 96 버그 수정] baseType이 진짜 CLR 배열(T[], 예: "array of System.Type" 필드가
       // Dictionary 체인 인덱싱 뒤에 다시 인덱싱되는 경우, fMethodParamClrTypes[cn][mn][i])이면
       // 배열은 리플렉션 "Item" 프로퍼티를 노출하지 않으므로(IL 수준에서 ldelem으로 직접 처리되는
@@ -5581,6 +5968,18 @@ type
           qType:=FindExternalAncestorType(fLocalScope.GetClassName(mc.ObjName))
         else if fGlobalScope.Has(mc.ObjName) and fGlobalScope.HasClassName(mc.ObjName) then
           qType:=FindExternalAncestorType(fGlobalScope.GetClassName(mc.ObjName))
+        // [버그 수정] string/정수/실수 등 원시 타입 지역·전역 변수는 ClrType도 ClassName도
+        // 스코프에 기록되지 않는다(BuildStaticFunc 등의 지역변수 등록 루프가 vtObject/vtInterface일
+        // 때만 채워 넣기 때문 — GetVarType 자체는 항상 정확하다). 그래서 "dirText.Substring(1).Trim"
+        // 처럼 원시 타입 메서드 호출 결과 위에 체이닝이 이어지면, 이 함수가 무조건 nil로 빠져
+        // GetExprClrType이 System.Object로 폴백하고, 그 위에서 Trim을 찾다가 "타입
+        // System.Object에 멤버 Trim가 없습니다"로 실패했다. VTC(GetVarType(...), '')와 동일한
+        // 매핑으로 실제 CLR 타입을 채워준다.
+        else if (fLocalScope.Has(mc.ObjName) or fGlobalScope.Has(mc.ObjName))
+                and ((GetVarType(mc.ObjName)=vtString) or (GetVarType(mc.ObjName)=vtInteger)
+                     or (GetVarType(mc.ObjName)=vtInt64) or (GetVarType(mc.ObjName)=vtReal)
+                     or (GetVarType(mc.ObjName)=vtBoolean) or (GetVarType(mc.ObjName)=vtChar)) then
+          qType:=VTC(GetVarType(mc.ObjName), '')
         else
           exit;
 
@@ -5592,6 +5991,70 @@ type
         if mi<>nil then Result:=mi.ReturnType;
       except
         Result:=nil; // 무엇이든 실패하면 조용히 중립 폴백(기존 동작 유지)
+      end;
+    end;
+
+    // [진단] TExternalIndexExprNode(obj[i]) 타입 추론용 — EmitIndexerGet(5630행 부근)과 정확히
+    // 같은 "배열이면 원소 타입, 아니면 Item 인덱서 프로퍼티" 판별 로직이지만 IL을 방출하지
+    // 않고 결과 타입만 계산한다. GetExprClrType은 EmitExpr처럼 IL 스트림에 명령을 낼 수 없는
+    // 순수 타입 추론 함수라 EmitIndexerGet을 직접 재사용할 수 없어서 별도로 둔다.
+    function InferIndexerResultType(baseType: System.Type; idxExpr: TExprNode): System.Type;
+    var idxArgType97: System.Type; itemProp97: PropertyInfo; bestScore97: integer;
+    begin
+      Result:=nil;
+      if baseType=nil then exit;
+      if baseType=typeof(string) then begin Result:=typeof(char); exit; end;
+      if baseType.IsArray then begin Result:=baseType.GetElementType; exit; end;
+      idxArgType97:=InferArgClrType(idxExpr);
+      itemProp97:=nil; bestScore97:=System.Int32.MinValue;
+      foreach var cand97 in baseType.GetProperties(BindingFlags.Public or BindingFlags.Instance) do
+        if (cand97.Name='Item') and (cand97.GetIndexParameters.Length=1) and (cand97.GetGetMethod<>nil) then
+        begin
+          var score97:=ScoreParamMatch(cand97.GetIndexParameters()[0].ParameterType, idxArgType97);
+          if (itemProp97=nil) or (score97>bestScore97) then begin bestScore97:=score97; itemProp97:=cand97; end;
+        end;
+      if itemProp97<>nil then Result:=itemProp97.PropertyType;
+    end;
+
+    // [진단용] TStmtNode/TExprNode에는 소스 줄 번호가 없어서, "타입 System.Object에
+    // 멤버 X가 없습니다" 같은 런타임 예외만으로는 소스의 어느 식이 문제인지 전혀 알 수
+    // 없다(이번 오류가 바로 그 사례 — chType90가 System.Object로 폴백된 실제 원인 식을
+    // 특정할 방법이 없었다). 줄 번호 추적을 AST 전체에 새로 넣는 대신, 체인을 사람이
+    // 읽을 수 있는 형태(예: "dlg.Owner.Value", "self.fList[...]")로 재구성해 예외 메시지에
+    // 실어 보낸다 — 소스에서 grep으로 바로 위치를 찾을 수 있게 하려는 목적뿐이므로 완벽할
+    // 필요는 없고, 실패해도 조용히 "<?>"로 폴백한다.
+    function DescribeExprChain(e: TExprNode): string;
+    begin
+      try
+        if e = nil then begin Result:='<?>'; exit; end;
+        if e is TVarRefNode then Result:=TVarRefNode(e).VarName
+        else if e is TFieldReadExprNode then Result:='self.'+TFieldReadExprNode(e).FieldName
+        else if e is TResultRefNode then Result:='Result'
+        else if e is TChainedMemberExprNode then
+        begin
+          var _dc90:=TChainedMemberExprNode(e);
+          if _dc90.IsCall then Result:=DescribeExprChain(_dc90.Inner)+'.'+_dc90.MemberName+'(...)'
+          else Result:=DescribeExprChain(_dc90.Inner)+'.'+_dc90.MemberName;
+        end
+        else if e is TMethodCallExprNode then
+          Result:=TMethodCallExprNode(e).ObjName+'.'+TMethodCallExprNode(e).MethodName+'(...)'
+        else if e is TFuncCallExprNode then
+          Result:=TFuncCallExprNode(e).FuncName+'(...)'
+        else if e is TChainedIndexExprNode then
+          Result:=DescribeExprChain(TChainedIndexExprNode(e).Target)+'[...]'
+        else if e is TExternalIndexExprNode then
+        begin
+          var _dei90:=TExternalIndexExprNode(e);
+          Result:=_dei90.Qualifier+'[...]';
+          if _dei90.IndexExpr2<>nil then Result:=Result+'[...]';
+          if _dei90.MemberName<>'' then Result:=Result+'.'+_dei90.MemberName;
+        end
+        else if e is TExternalCastExprNode then
+          Result:=TExternalCastExprNode(e).TargetType+'('+DescribeExprChain(TExternalCastExprNode(e).InnerExpr)+')'
+        else if e is TStrLiteralNode then Result:='<문자열리터럴>'
+        else Result:='<'+e.GetType.Name+'>';
+      except
+        Result:='<?>';
       end;
     end;
 
@@ -5609,6 +6072,15 @@ type
         begin
           // [Stage 91] typeof(...)의 결과는 항상 System.Type.
           Result:=typeof(System.Type);
+        end
+        // [버그 수정] Result.Contains(x)처럼 함수 자신의 반환값(Result) 위에서 체이닝하는
+        // 식 — 지금까지 GetExprClrType에 TResultRefNode 분기가 아예 없어서 무조건
+        // System.Object로 폴백해 "타입 System.Object에 메서드 Contains가 없습니다"로
+        // 실패했다. EmitQualifierChainLoad의 'Result' 세그먼트 처리와 동일하게
+        // fResultLocal.LocalType을 그대로 돌려준다.
+        else if e is TResultRefNode then
+        begin
+          if fResultLocal<>nil then Result:=fResultLocal.LocalType;
         end
         else if e is TExternalCastExprNode then
         begin
@@ -5662,6 +6134,40 @@ type
             begin
               var _cixPi90:=SafeGetProperty(_cixT90, 'Item');
               if (_cixPi90<>nil) and (_cixPi90.GetGetMethod<>nil) then Result:=_cixPi90.PropertyType;
+            end;
+          end;
+        end
+        // [진단/버그 수정] Qualifier[Index] (obj[i], obj[i][j], obj[i].Field 등) — 지금까지
+        // GetExprClrType에 이 분기가 아예 없어서, obj[i] 뒤에 .Member가 체이닝되는 식(예:
+        // "map[key].Value")은 무조건 System.Object로 폴백해 "타입 System.Object에 멤버
+        // Value가 없습니다"로 실패했다(DescribeExprChain으로 처음 확인된 실제 사례).
+        // EmitExpr의 TExternalIndexExprNode 처리부와 동일한 순서로(Qualifier 체인 →
+        // 인덱싱 → IndexExpr2/ExtraIndices → MemberName) 타입만 추론한다.
+        else if e is TExternalIndexExprNode then
+        begin
+          var _eiG90:=TExternalIndexExprNode(e);
+          var _eiSegs90:=SplitByDot(_eiG90.Qualifier);
+          if IsChainStartSegment(_eiSegs90[0]) then
+          begin
+            var _eiBaseT90:=InferQualifierChainType(_eiSegs90);
+            var _eiResT90:=InferIndexerResultType(_eiBaseT90, _eiG90.IndexExpr);
+            if _eiG90.IndexExpr2<>nil then _eiResT90:=InferIndexerResultType(_eiResT90, _eiG90.IndexExpr2);
+            if _eiG90.ExtraIndices<>nil then
+              foreach var _eiExtra90 in _eiG90.ExtraIndices do
+                _eiResT90:=InferIndexerResultType(_eiResT90, _eiExtra90);
+            if _eiResT90<>nil then
+            begin
+              if _eiG90.MemberName='' then Result:=_eiResT90
+              else
+              begin
+                var _eiPi90:=SafeGetProperty(_eiResT90, _eiG90.MemberName);
+                if _eiPi90<>nil then Result:=_eiPi90.PropertyType
+                else
+                begin
+                  var _eiFi90:=_eiResT90.GetField(_eiG90.MemberName);
+                  if _eiFi90<>nil then Result:=_eiFi90.FieldType;
+                end;
+              end;
             end;
           end;
         end
@@ -7058,6 +7564,15 @@ type
       // 시그니처 계산(위 4017번째 줄 부근)과 동일하게 ReturnGenericName을 넘기도록 맞춘다.
       var retCn66b:='';
       if fOperatorFuncRetClass.ContainsKey(d.Name) then retCn66b:=fOperatorFuncRetClass[d.Name];
+      // [버그 수정] DeclareStaticFunc(시그니처 계산부)는 retCn66이 비어 있으면
+      // d.ReturnClassName(예: 'List<string>', 'ListViewItem')으로 채워 정확한 CLR 반환
+      // 타입을 얻는데, 여기(본문의 Result 지역변수 선언)는 그 폴백이 빠져 있었다. 그 결과
+      // "function ExtractUsesNames(...): List<string>;" 같은 함수의 MethodBuilder.ReturnType은
+      // 정확히 List<string>이지만, 본문 안의 Result 지역변수는 VTC(vtObject,'')가 방어적으로
+      // 돌려주는 System.Object로 선언되어 "Result.Contains(...)"가 "타입 System.Object에
+      // 메서드 Contains가 없습니다"로 실패했다. DeclareStaticFunc와 동일한 폴백을 추가한다.
+      if (retCn66b='') and (d.ReturnType=vtObject) and (d.ReturnClassName<>'') then
+        retCn66b:=d.ReturnClassName;
       if d.ReturnType=vtGeneric then retClrType:=VTC(vtGeneric, d.ReturnGenericName)
       else retClrType:=VTC(d.ReturnType, retCn66b);
       il:=mb.GetILGenerator;
@@ -7248,6 +7763,8 @@ type
       end;
       fFieldObjClassName:=new Dictionary<string, Dictionary<string, string>>;
       fLambdaCounter:=0; // [Stage 64]
+      fGlobalConstFields:=new Dictionary<string, FieldBuilder>; // [Stage 96]
+      fGlobalConstVTypes:=new Dictionary<string, TVarType>;     // [Stage 96]
       fLoadedAssemblies:=new List<Assembly>;
       fClassExternalParentType:=new Dictionary<string, System.Type>;
       fClassExternalInterfaceType:=new Dictionary<string, System.Type>;
@@ -7445,6 +7962,69 @@ type
       mainTB:=modB.DefineType('Program', TypeAttributes.Public);
       fMainTB:=mainTB; // [Stage 64] 람다가 EmitStatement에서도 static 메서드를 여기 추가할 수 있도록
 
+      // 2-1. [Stage 96] 전역 const를 Program 타입의 static readonly 필드로 정의한다.
+      // EmitConstDecl은 Main 메서드의 ILGenerator에 로컬 슬롯을 잡기 때문에 다른
+      // 함수/프로시저에서는 그 슬롯이 보이지 않는다 — static 필드로 올리면
+      // 모든 메서드에서 Ldsfld 한 번으로 값을 읽을 수 있다.
+      // cctor(정적 생성자, beforefieldinit)에서 초기화한다 — 가장 먼저 실행되어
+      // Main보다 앞서 값이 채워진다.
+      if (not fProg.IsLibrary) and (fProg.ConstDecls.Count > 0) then
+      begin
+        var cctorMB: MethodBuilder := mainTB.DefineMethod('.cctor',
+          MethodAttributes.Private or MethodAttributes.Static or
+          MethodAttributes.HideBySig or MethodAttributes.SpecialName or MethodAttributes.RTSpecialName,
+          typeof(System.Void), nil);
+        var cctorIL: ILGenerator := cctorMB.GetILGenerator;
+        // 각 const를 static 필드로 선언하고 cctor에서 초기화한다.
+        var savedLocalScope96: TScope := fLocalScope;
+        fLocalScope := new TScope('cctor_const', fGlobalScope);
+        foreach var cd96 in fProg.ConstDecls do
+        begin
+          // 필드 CLR 타입 결정 (EmitConstDecl과 동일한 로직)
+          var vt96: TVarType;
+          var clrType96: System.Type;
+          var clsName96: string := cd96.ClassName;
+          var isExt96: boolean := cd96.IsExternal;
+          if cd96.HasExplicitType then
+          begin
+            vt96 := cd96.VarType;
+            if (vt96 = vtObject) and isExt96 then clrType96 := ResolveExternalType(clsName96)
+            else clrType96 := VTC(vt96, clsName96);
+          end
+          else
+          begin
+            vt96 := InferType(cd96.ValueExpr);
+            if cd96.ValueExpr is TNewObjectExprNode then
+            begin
+              var neo96 := TNewObjectExprNode(cd96.ValueExpr);
+              clsName96 := neo96.ClassName; isExt96 := neo96.IsExternalType;
+              if isExt96 then clrType96 := ResolveExternalType(clsName96)
+              else if fBuiltTypes.ContainsKey(clsName96) then clrType96 := fBuiltTypes[clsName96]
+              else if fTypeBuilders.ContainsKey(clsName96) then clrType96 := fTypeBuilders[clsName96]
+              else clrType96 := typeof(System.Object);
+            end
+            else if cd96.ValueExpr is TExternalCastExprNode then
+            begin
+              var extCast96 := TExternalCastExprNode(cd96.ValueExpr);
+              clrType96 := ResolveExternalType(extCast96.TargetType);
+              isExt96 := true;
+            end
+            else
+              clrType96 := VTC(vt96, '');
+          end;
+          // static readonly 필드 정의
+          var fb96: FieldBuilder := mainTB.DefineField(cd96.Name, clrType96,
+            FieldAttributes.Public or FieldAttributes.Static or FieldAttributes.InitOnly);
+          fGlobalConstFields[cd96.Name] := fb96;
+          fGlobalConstVTypes[cd96.Name] := vt96;
+          // cctor에서 초기화 값 emit 후 Stsfld
+          EmitValueForVType(cctorIL, cd96.ValueExpr, vt96);
+          cctorIL.Emit(OpCodes.Stsfld, fb96);
+        end;
+        fLocalScope := savedLocalScope96;
+        cctorIL.Emit(OpCodes.Ret);
+      end;
+
       // 3. 일반 static 함수/프로시저 빌드
       // [Stage 65b] 최상위 함수/프로시저도 선언 순서와 무관하게 서로 호출할 수
       // 있도록, 먼저 모든 시그니처를 등록한 뒤(3-1) 본문을 만든다(3-2).
@@ -7550,9 +8130,9 @@ type
             fGlobalScope.SetClassName(vd.Name, vd.ClassName);
         end;
 
-        // [Stage 61] 전역 const 선언 처리. var 슬롯이 모두 준비된 뒤,
-        // 최상위 begin...end 문장을 실행하기 전에 선언 순서대로 초기값을 대입한다.
-        foreach var cd61 in fProg.ConstDecls do EmitConstDecl(il, fGlobalScope, cd61);
+        // [Stage 96] 전역 const는 cctor(Program 타입의 정적 생성자)에서 static 필드로
+        // 초기화된다 — Main보다 먼저 실행되고 모든 함수에서 Ldsfld로 읽을 수 있다.
+        // 예전의 EmitConstDecl(Main 전용 로컬 슬롯) 루프는 제거한다.
 
         foreach st in fProg.Statements do EmitStatement(il, st);
 

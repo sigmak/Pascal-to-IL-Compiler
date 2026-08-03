@@ -157,6 +157,10 @@ type
       // [Stage 93] GetCurrentDir — 인자 없이 괄호 없이도 쓰는 표준 함수(파스칼 관례).
       // IsNiladicBuiltinFuncName에 등록된 이름만 괄호 없는 호출도 허용한다.
       else if lw='getcurrentdir' then Result:='GetCurrentDir'
+      // [Stage 96] ParamCount / ParamStr(n) — 커맨드라인 인자 접근. Main.pas의
+      // ResolveInputPath가 셀프호스팅 컴파일 대상에 새로 들어오면서 처음 필요해졌다.
+      else if lw='paramcount' then Result:='ParamCount'
+      else if lw='paramstr' then Result:='ParamStr'
       else Result:='';
     end;
 
@@ -167,7 +171,8 @@ type
     var lw3: string;
     begin
       lw3:=text.ToLower;
-      Result:=(lw3='getcurrentdir');
+      // [Stage 96] ParamCount는 괄호 없이 값처럼 쓰인다 (예: "if ParamCount >= 1 then").
+      Result:=(lw3='getcurrentdir') or (lw3='paramcount');
     end;
 
     // [Stage 92] byte(204) 처럼 .NET 원시 값 타입 이름을 캐스트 대상으로 쓰는 표현을 인식하기
@@ -210,10 +215,13 @@ type
     // 미리 알 수 없는(사용자 함수도 로컬 클래스도 아닌) 외부 타입 이름으로의 캐스트를
     // 인식하는 데 재사용한다. 찾으면 fullName에 "네임스페이스.타입이름"을 채우고 true.
     function TryResolveExternalTypeByUses(name: string; var fullName: string): boolean;
-    var _ns93: string; _full93: string; _t93: System.Type; _asm93: System.Reflection.Assembly;
+    var _ns93: string; _full93: string; _t93: System.Type; _asm93: System.Reflection.Assembly; _searchNs93: List<string>;
     begin
       fullName:='';
-      foreach _ns93 in fImportedNamespaces do
+      // [Stage 96] System은 uses 절에 명시적으로 없어도 항상 폴백으로 탐색한다 (ParseParamTypeExt와 동일한 이유).
+      _searchNs93:=new List<string>(fImportedNamespaces);
+      if not _searchNs93.Contains('System') then _searchNs93.Add('System');
+      foreach _ns93 in _searchNs93 do
       begin
         _full93:=_ns93+'.'+name;
         try
@@ -226,6 +234,33 @@ type
         end;
       end;
       Result:=fullName<>'';
+    end;
+
+    // [버그 수정] "obj.Method(arg).Member" (예: dirText.Substring(1).Trim) 패턴이 아래
+    // "TypeName(expr).member 캐스트" 분기(segs2.Count>1 and 다음 토큰이 '(')와 겉보기에
+    // 똑같아서, 지금까지는 인자가 단순 변수/필드가 아니면(예: 정수 리터럴 1) 무조건 캐스트로
+    // 오판해 "dirText.Substring"을 존재하지 않는 외부 타입으로 취급했다. 이 헬퍼로 실제
+    // segs2 전체(이미 점으로 합쳐진 이름)가 진짜 리플렉션 가능한 CLR 타입인지 먼저 확인해,
+    // 아니면 일반 메서드 호출 체인으로 폴백하도록 한다. 이미 로드된 어셈블리만 검색한다는
+    // 점에서 TryResolveExternalTypeByUses와 동일 — {$reference}/자동 GAC 로드는 Lexer가
+    // 토큰화 직후(Main.pas의 TryEarlyLoadAssembly) 이미 처리해 뒀으므로 이 시점엔 반영돼 있다.
+    function IsResolvableExternalTypeName(fullName: string): boolean;
+    var _t94: System.Type; _asm94: System.Reflection.Assembly;
+    begin
+      Result:=false;
+      try
+        _t94:=System.Type.GetType(fullName);
+        if _t94<>nil then begin Result:=true; exit; end;
+      except
+      end;
+      foreach _asm94 in System.AppDomain.CurrentDomain.GetAssemblies() do
+      begin
+        try
+          _t94:=_asm94.GetType(fullName);
+          if _t94<>nil then begin Result:=true; exit; end;
+        except
+        end;
+      end;
     end;
 
     // [Stage 70] LINQ 스타일 확장 메서드 체이닝(Source.Where(...).Select(...) 등) 인식을 위해
@@ -463,8 +498,12 @@ type
             or (_qn87v='SortedList') or (_qn87v='LinkedList') or (_qn87v='SortedDictionary')) then
         begin
           fPos:=fPos+1; // 컬렉션 이름 소비
-          fLastGenericName:='System.Collections.Generic.'+_qn87v; Result:=vtObject;
-          SkipGenericArgs; // <TToken> 등 타입 인자 소비
+          // [Stage 97 버그 수정] 파라미터 타입 파싱(ParseParamTypeExt)과 동일한 버그 —
+          // 이전에는 fLastGenericName에 arity/타입인자 없는 "System.Collections.Generic.List"만
+          // 남기고 SkipGenericArgs로 실제 타입 인자를 버렸다. ResolveExternalType은 이 이름으로
+          // System.Type.GetType을 시도하지만 실제 CLR 이름은 "List`1"(+타입인자)이라 항상 실패한다.
+          // ParseExternalGenericType으로 실제 타입 인자를 담아 "List<TToken>" 형태로 만든다.
+          fLastGenericName:=ParseExternalGenericType(_qn87v); Result:=vtObject;
         end
         else
         begin
@@ -491,10 +530,14 @@ type
         except
         end;
         // [Stage 87] 로컬 클래스도 아닌 단순 이름 — uses 절 네임스페이스에서 탐색
+        // [Stage 96] System은 uses 절에 없어도 항상 마지막 폴백으로 탐색한다.
         var _resolved87v:='';
         if _resolvedFull87v<>'' then _resolved87v:=_resolvedFull87v
         else
-        foreach var _ns87v in fImportedNamespaces do
+        begin
+        var _searchNs87v:=new List<string>(fImportedNamespaces);
+        if not _searchNs87v.Contains('System') then _searchNs87v.Add('System');
+        foreach var _ns87v in _searchNs87v do
         begin
           var _full87v:=_ns87v+'.'+_qnFull87v;
           try
@@ -505,6 +548,7 @@ type
             if _t87v<>nil then begin _resolved87v:=_full87v; break; end;
           except
           end;
+        end;
         end;
         if _resolved87v<>'' then
         begin
@@ -589,8 +633,14 @@ type
             or (qn4='IEnumerable') or (qn4='IList') or (qn4='IDictionary') or (qn4='ICollection')
             or (qn4='SortedList') or (qn4='LinkedList') or (qn4='SortedDictionary')) then
         begin
-          cn:='System.Collections.Generic.'+qn4; isExt:=true; Result:=vtObject;
-          SkipGenericArgs;
+          // [Stage 97 버그 수정] 예전에는 cn:='System.Collections.Generic.'+qn4 로 arity/타입인자가
+          // 없는 이름을 만들고 SkipGenericArgs로 실제 타입 인자(<TToken> 등)를 그냥 버렸다.
+          // 그 결과 CodeGen.ResolveExternalType이 System.Type.GetType("System.Collections.Generic.List")를
+          // 시도하는데, 실제 CLR 이름은 "List`1"(닫힌 제네릭이면 타입 인자까지 필요)이라 항상 실패
+          // ("외부 타입 ... List 을(를) 찾을 수 없습니다")했다. ParseExternalGenericType으로 실제
+          // 타입 인자를 그대로 파싱해 "List<TToken>" 형태로 만들면, ResolveExternalType이
+          // '<' 포함 여부로 ResolveExternalGenericType 경로를 타 정상적으로 닫힌 제네릭 타입을 조립한다.
+          cn:=ParseExternalGenericType(qn4); isExt:=true; Result:=vtObject;
         end
         else if Cur.Kind=tkDot then
         begin
@@ -603,8 +653,16 @@ type
           // [Stage 87] 점 없는 단순 이름 — uses 절 네임스페이스에서 탐색.
           // 예: EventArgs → System.EventArgs / System.Windows.Forms.EventArgs
           // CLR에 실제로 있는 첫 번째 완전 경로를 사용한다.
+          // [Stage 96 버그 수정] "ex: Exception"처럼 System 네임스페이스의 흔한 타입(Exception,
+          // Object, String, Array 등)을 매개변수/필드 타입으로 쓸 때, 소스의 uses 절에 정작
+          // "System"이 없으면(대개 System.IO/System.Text처럼 하위 네임스페이스만 있음)
+          // 이 탐색이 전부 실패해 "타입이 와야 합니다"로 죽었다. System은 항상 로드되어 있는
+          // mscorlib의 기본 네임스페이스이므로, uses 절에 명시되어 있지 않아도 마지막
+          // 폴백으로 항상 시도한다.
+          var _searchNs87:=new List<string>(fImportedNamespaces);
+          if not _searchNs87.Contains('System') then _searchNs87.Add('System');
           var _resolved87:='';
-          foreach var _ns87 in fImportedNamespaces do
+          foreach var _ns87 in _searchNs87 do
           begin
             var _full87:=_ns87+'.'+qn4;
             try
@@ -1136,7 +1194,14 @@ type
       else if t.Kind=tkNew then
       begin
         fPos:=fPos+1; // 'new' 소비
-        var newTn:=Expect(tkIdent).Text;
+        // [Stage 96 수정] 'new string(ch, count)'처럼 내장 타입 키워드가 new 뒤에 오는 경우.
+        // Lexer는 'string'을 tkIdent가 아니라 tkStringType으로 토큰화하므로, 기존
+        // Expect(tkIdent) 하나만으로는 "예상 tkIdent 실제 tkStringType" 오류가 났다.
+        // System.String에는 new string(char, int)(문자를 count번 반복) 등 유용한 생성자가
+        // 있으므로 'string'을 외부 타입 이름으로 그대로 통과시킨다.
+        var newTn: string;
+        if Cur.Kind=tkStringType then begin newTn:='string'; fPos:=fPos+1; end
+        else newTn:=Expect(tkIdent).Text;
         if (Cur.Kind=tkLt) and fGenericClassNames.Contains(newTn) then
           newTn:=ResolveGenericInstantiation(newTn)
         else if Cur.Kind=tkLt then // [Stage 86] new Dictionary<string, FileChangeWatcher> 같은 외부 제네릭 타입 생성
@@ -1348,7 +1413,8 @@ type
               while Cur.Kind=tkComma do begin fPos:=fPos+1; castArgs2.Add(ParseExpr); end;
             end;
             Expect(tkRParen);
-            if (castArgs2.Count=1) and (Cur.Kind=tkDot) then
+            if IsResolvableExternalTypeName(string.Join('.', segs2))
+               and (castArgs2.Count=1) and (Cur.Kind=tkDot) then
             begin
               var castType2:=string.Join('.', segs2);
               var innerName2:='';
@@ -1385,7 +1451,11 @@ type
             end
             else
             begin
-              // 캐스트 패턴이 아니면 정적(static) 메서드 호출로 간주한다
+              // [버그 수정] segs2(예: "dirText.Substring")가 실제로 리플렉션 가능한 외부 타입이
+              // 아니면 캐스트일 수 없다 — 그냥 obj.Method(args) 형태의 일반 메서드 호출이다
+              // (예: dirText.Substring(1).Trim — dirText는 지역변수, Substring은 그 위의
+              // 인스턴스 메서드). 뒤에 이어지는 ".Trim"은 ParsePrimary 끝의 범용 체이닝 루프가
+              // 이 mc4 결과 위에 TChainedMemberExprNode로 자동으로 얹어준다.
               // (예: System.Windows.Forms.MessageBox.Show(...) 를 식으로 사용).
               var staticQualifier:=string.Join('.', segs2.GetRange(0, segs2.Count-1));
               var staticMname:=segs2[segs2.Count-1];
@@ -1919,24 +1989,42 @@ type
     begin
       if Cur.Kind=tkWriteln then
       begin
-        fPos:=fPos+1; Expect(tkLParen); rhs:=ParseExpr;
-        // [Stage 90] writeln(a, b, c, ...) — 콤마로 이어지는 추가 인자 지원.
-        // (기존에는 인자를 정확히 1개만 받았고, 콤마가 나오면 "예상 tkRParen 실제 tkComma" 에러.)
-        if Cur.Kind=tkComma then
+        fPos:=fPos+1;
+        // [Stage 96 수정] 'Writeln;' (괄호 자체가 없음) 과 'Writeln();' (빈 괄호) 모두
+        // 표준 Pascal에서 "인자 없이 줄바꿈만 출력"하는 유효한 호출이다. 기존 코드는
+        // Expect(tkLParen)을 무조건 요구해서 'Writeln;'이 "예상 tkLParen 실제
+        // tkSemicolon" 파스 오류로 실패했다. 이제 괄호가 없거나 바로 닫히면 빈 줄
+        // 출력(TWritelnStringStmtNode(''))으로 처리한다.
+        if (Cur.Kind<>tkLParen) then
         begin
-          var wArgs:=new List<TExprNode>; wArgs.Add(rhs);
-          while Cur.Kind=tkComma do begin fPos:=fPos+1; wArgs.Add(ParseExpr); end;
-          Expect(tkRParen);
-          var wNode90:=new TWritelnArgsStmtNode;
-          wNode90.Args:=wArgs;
-          Result:=wNode90;
+          Result:=new TWritelnStringStmtNode('');
+        end
+        else if (fPos+1<fTokens.Count) and (fTokens[fPos+1].Kind=tkRParen) then
+        begin
+          fPos:=fPos+2; // '(' 와 ')' 소비
+          Result:=new TWritelnStringStmtNode('');
         end
         else
         begin
-          Expect(tkRParen);
-          if rhs is TStrLiteralNode then
-            Result:=new TWritelnStringStmtNode(TStrLiteralNode(rhs).Value)
-          else Result:=new TWritelnExprStmtNode(rhs);
+          fPos:=fPos+1; rhs:=ParseExpr;
+          // [Stage 90] writeln(a, b, c, ...) — 콤마로 이어지는 추가 인자 지원.
+          // (기존에는 인자를 정확히 1개만 받았고, 콤마가 나오면 "예상 tkRParen 실제 tkComma" 에러.)
+          if Cur.Kind=tkComma then
+          begin
+            var wArgs:=new List<TExprNode>; wArgs.Add(rhs);
+            while Cur.Kind=tkComma do begin fPos:=fPos+1; wArgs.Add(ParseExpr); end;
+            Expect(tkRParen);
+            var wNode90:=new TWritelnArgsStmtNode;
+            wNode90.Args:=wArgs;
+            Result:=wNode90;
+          end
+          else
+          begin
+            Expect(tkRParen);
+            if rhs is TStrLiteralNode then
+              Result:=new TWritelnStringStmtNode(TStrLiteralNode(rhs).Value)
+            else Result:=new TWritelnExprStmtNode(rhs);
+          end;
         end;
       end
 
