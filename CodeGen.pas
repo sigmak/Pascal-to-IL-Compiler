@@ -13,10 +13,112 @@ uses
   System.Collections.Generic,
   System.Reflection,
   System.Reflection.Emit,
+  System.Globalization,
   AST,
   Scope;
 
 type
+  // [Stage 99 버그 수정] TypeBuilderInstantiation(예: List<TToken>처럼, 원소 타입이 아직
+  // CreateType되지 않은 로컬 클래스인 BCL 제네릭 컬렉션)의 프로퍼티(Count, Item 등)에
+  // 접근하려면 .NET Reflection.Emit의 공식 우회법 — 열린 제네릭 정의(List<>)에서 멤버를
+  // 찾고 TypeBuilder.GetMethod로 그 접근자(get_.../set_...)만 닫힌 버전에 바인딩 — 이
+  // 필요하다(SafeGetMethods/SafeGetConstructor(s)가 이미 메서드/생성자에 이 방식을 쓰고
+  // 있음, 아래 참고). 다만 PropertyInfo 자체는 공개 API로 직접 만들 수 없는 추상 클래스라,
+  // 바인딩된 get/set MethodInfo만 감싸는 최소 래퍼가 필요하다. CodeGen.pas 안에서 실제로
+  // 쓰이는 멤버는 PropertyType/GetGetMethod/GetSetMethod/Name/DeclaringType 뿐이고,
+  // GetValue/SetValue(런타임 호출)나 커스텀 특성 조회는 IL 방출 중에는 쓰이지 않으므로
+  // 지원하지 않는다(호출 시 예외).
+  TBoundGenericPropertyInfo = class(PropertyInfo)
+  private
+    fName: string;
+    fDeclType, fPropType: System.Type;
+    fGetter, fSetter: MethodInfo;
+    fIndexParams: array of ParameterInfo;
+    fAttrs: PropertyAttributes;
+    function GetCanRead0: boolean;
+    begin Result := fGetter <> nil; end;
+    function GetCanWrite0: boolean;
+    begin Result := fSetter <> nil; end;
+  public
+    constructor Create(openProp: PropertyInfo; declType: System.Type; getter, setter: MethodInfo);
+    begin
+      fName := openProp.Name;
+      fDeclType := declType;
+      fGetter := getter;
+      fSetter := setter;
+      fAttrs := openProp.Attributes;
+      if getter <> nil then
+      begin
+        fPropType := getter.ReturnType;
+        fIndexParams := getter.GetParameters;
+      end
+      else if setter <> nil then
+      begin
+        var sp99 := setter.GetParameters;
+        if sp99.Length > 0 then fPropType := sp99[sp99.Length - 1].ParameterType
+        else fPropType := typeof(System.Object);
+        var res99 := new List<ParameterInfo>;
+        for var ip99 := 0 to sp99.Length - 2 do res99.Add(sp99[ip99]);
+        fIndexParams := res99.ToArray;
+      end
+      else
+      begin
+        fPropType := typeof(System.Object);
+        fIndexParams := new ParameterInfo[0];
+      end;
+    end;
+
+    property Name: string read fName; override;
+    property DeclaringType: System.Type read fDeclType; override;
+    property ReflectedType: System.Type read fDeclType; override;
+    property PropertyType: System.Type read fPropType; override;
+    property Attributes: PropertyAttributes read fAttrs; override;
+    property CanRead: boolean read GetCanRead0; override;
+    property CanWrite: boolean read GetCanWrite0; override;
+
+    function GetAccessors(nonPublic: boolean): array of MethodInfo; override;
+    begin
+      var lst99 := new List<MethodInfo>;
+      if fGetter <> nil then lst99.Add(fGetter);
+      if fSetter <> nil then lst99.Add(fSetter);
+      Result := lst99.ToArray;
+    end;
+
+    function GetGetMethod(nonPublic: boolean): MethodInfo; override;
+    begin Result := fGetter; end;
+
+    function GetSetMethod(nonPublic: boolean): MethodInfo; override;
+    begin Result := fSetter; end;
+
+    function GetIndexParameters: array of ParameterInfo; override;
+    begin Result := fIndexParams; end;
+
+    // [버그 수정] PropertyInfo에서 실제로 추상인 오버로드는 이 5개짜리(BindingFlags/Binder/
+    // CultureInfo까지 받는) 버전이다 — 2/3개짜리 GetValue(obj,index)/SetValue(obj,value,index)는
+    // 이 버전을 호출하는 비추상 편의 메서드일 뿐이라, 그것만 override해서는 추상 멤버가
+    // 여전히 남아 "추상 클래스는 인스턴스화할 수 없습니다" 오류가 난다.
+    function GetValue(obj: System.Object; invokeAttr: BindingFlags; binder: Binder;
+      index: array of System.Object; culture: CultureInfo): System.Object; override;
+    begin
+      raise new System.NotSupportedException('TBoundGenericPropertyInfo.GetValue는 지원되지 않습니다 (코드생성 전용 래퍼입니다).');
+    end;
+
+    procedure SetValue(obj: System.Object; value: System.Object; invokeAttr: BindingFlags; binder: Binder;
+      index: array of System.Object; culture: CultureInfo); override;
+    begin
+      raise new System.NotSupportedException('TBoundGenericPropertyInfo.SetValue는 지원되지 않습니다 (코드생성 전용 래퍼입니다).');
+    end;
+
+    function GetCustomAttributes(inherit: boolean): array of System.Object; override;
+    begin Result := new System.Object[0]; end;
+
+    function GetCustomAttributes(attributeType: System.Type; inherit: boolean): array of System.Object; override;
+    begin Result := new System.Object[0]; end;
+
+    function IsDefined(attributeType: System.Type; inherit: boolean): boolean; override;
+    begin Result := false; end;
+  end;
+
   TCodeGenerator = class
   private
     fProg: TProgramNode;
@@ -64,6 +166,14 @@ type
     fInstanceMethods: Dictionary<string, Dictionary<string, MethodBuilder>>; // 클래스명 → 메서드명 → MB
     fAbstractMethods: Dictionary<string, List<string>>; // [Stage 53] 클래스명 → abstract로 선언된 메서드명 목록
     fClassParents: Dictionary<string, string>; // 클래스명 → 부모 클래스명 ('' 이면 없음)
+    // [성능] SafeGetMethods/SafeGetConstructors의 "완성된(외부 CLR) 타입"용 GetMethods/
+    // GetConstructors 결과 캐시. ResolveMethodByArity/ResolveConstructorByArity가 오버로드를
+    // 고를 때마다 같은 타입(예: System.Windows.Forms.Form처럼 멤버가 수백 개인 외부 타입)에
+    // 대해 리플렉션 전체 스캔을 매번 새로 하던 것을 1회로 줄인다. TypeBuilder/
+    // TypeBuilderInstantiation(아직 CreateType 전인 우리 자신의 로컬 클래스)은 멤버가 계속
+    // 늘어날 수 있어 캐시하면 stale해질 수 있으므로, 이미 완성된 외부 타입 분기에서만 쓴다.
+    fMethodsCache: Dictionary<string, array of MethodInfo>; // key: 타입.AssemblyQualifiedName+"|"+flags
+    fCtorsCache: Dictionary<string, array of ConstructorInfo>; // key: 타입.AssemblyQualifiedName
     // [진단] StackOverflowException은 .NET에서 절대 catch할 수 없고 어느 위치인지도 전혀
     // 남기지 않는다(프로세스가 그냥 강제 종료됨). EmitExpr/EmitStatement가 예상 밖으로
     // 깊게(또는 무한히) 재귀할 때, 실제 OS 스택이 터지기 훨씬 전인 안전한 문턱값에서 먼저
@@ -373,6 +483,58 @@ type
       raise new Exception('필드를 찾을 수 없음: '+startClass+'.'+fname);
     end;
 
+    // [Stage 100 버그 수정] "외부 CLR 타입이겠거니" 하고 SafeGetProperty/ResolveMethodByArity
+    // (순수 리플렉션 경로)로 넘기기 전에, 사실은 우리가 직접 만들고 있는(아직 CreateType 안
+    // 된) 로컬 클래스인지부터 확인해야 한다 — 그렇지 않으면 TypeBuilder.GetMethods 등이
+    // "유형이 만들어지기 전에 호출된 멤버는 지원되지 않습니다"(NotSupportedException)로
+    // 죽는다. 이 역조회는 원래 EmitExpr 안의 한 지점(TChainedIndexExprNode/체이닝 멤버
+    // 접근 처리부)에만 인라인으로 있었는데, fLocalScope/fGlobalScope에 저장된 ClrType이
+    // 로컬 클래스인 경우(예: "var t: TToken"으로 선언된 변수의 메서드 호출)에도 똑같이
+    // 필요해서 재사용 가능하게 뽑아냈다. 못 찾으면 빈 문자열.
+    function FindLocalClassNameForTypeBuilder(t: System.Type): string;
+    begin
+      Result:='';
+      if t is TypeBuilder then
+        foreach var _tbKvp100 in fTypeBuilders do
+          if _tbKvp100.Value = TypeBuilder(t) then
+          begin Result:=_tbKvp100.Key; break; end;
+    end;
+
+    // 위 FindLocalClassNameForTypeBuilder로 찾은 로컬 클래스에 대해, mc.MethodName을
+    // 필드(0-인자)/인스턴스 메서드/외부 상속 조상 타입 순으로 찾아 호출/로드하는 공통 로직.
+    // EmitExpr 여러 지점에서 "외부 타입인 줄 알았는데 사실 로컬 클래스였다"를 처리할 때
+    // 재사용한다.
+    procedure EmitLocalClassMemberAccess(aIL: ILGenerator; localCls: string; mc: TMethodCallExprNode);
+    var _imb100: MethodBuilder;
+    begin
+      if (mc.Args.Count=0) and fFieldBuilders.ContainsKey(localCls) and fFieldBuilders[localCls].ContainsKey(mc.MethodName) then
+        aIL.Emit(OpCodes.Ldfld, fFieldBuilders[localCls][mc.MethodName])
+      else if TryFindInstanceMethod(localCls, mc.MethodName, _imb100) then
+      begin
+        EmitArgsCoerced(aIL, mc.Args, FindInstanceMethodParamTypes(localCls, mc.MethodName));
+        aIL.Emit(OpCodes.Callvirt, _imb100);
+      end
+      else if FindExternalAncestorType(localCls)<>nil then
+      begin
+        var _extAnc100:=FindExternalAncestorType(localCls);
+        var _getP100:=SafeGetProperty(_extAnc100, mc.MethodName);
+        if (mc.Args.Count=0) and (_getP100<>nil) and (_getP100.GetGetMethod<>nil) then
+          aIL.Emit(OpCodes.Callvirt, _getP100.GetGetMethod)
+        else
+        begin
+          var _emi100:=ResolveMethodByArity(_extAnc100, mc.MethodName, mc.Args, false);
+          if _emi100=nil then
+            raise new Exception('로컬 클래스 "'+localCls+'"(외부 조상 "'+_extAnc100.FullName+'")에 메서드/필드 "'+mc.MethodName+'"가 없습니다 (인자 '+mc.Args.Count.ToString+'개).');
+          var _emi100Params:=_emi100.GetParameters;
+          for var _emi100Ai:=0 to mc.Args.Count-1 do
+            EmitArgForParamType(aIL, mc.Args[_emi100Ai], _emi100Params[_emi100Ai].ParameterType);
+          aIL.Emit(OpCodes.Callvirt, _emi100);
+        end;
+      end
+      else
+        raise new Exception('로컬 클래스 "'+localCls+'"에 메서드/필드 "'+mc.MethodName+'"가 없습니다.');
+    end;
+
     // 예외를 던지지 않는 버전 (외부 속성 폴백 판단용)
     function TryFindFieldBuilder(startClass, fname: string; var fb: FieldBuilder): boolean;
     var c: string;
@@ -385,6 +547,46 @@ type
         if fClassParents.ContainsKey(c) then c:=fClassParents[c] else c:='';
       end;
       Result:=false;
+    end;
+
+    // [Stage 96 버그 수정] TypeBuilder로 만들고 있는(아직 CreateType 안 된) 제네릭 클래스가
+    // 배열 필드의 원소 타입으로 들어가면, 그 FieldType이 완전한 배열 Type이 아니라
+    // System.Reflection.Emit 내부의 TypeBuilderInstantiation으로 남아있을 수 있다.
+    // TypeBuilderInstantiation은 배열이든 아니든 상관없이 GetElementType() 같은 대부분의
+    // Type 멤버를 구현하지 않고 무조건 NotSupportedException을 던진다(.NET Reflection.Emit의
+    // 알려진 제약 — CreateType()으로 완성되기 전까지는 "확정된" Type이 아니기 때문).
+    // 예전 코드는 이 호출 결과를 그대로 믿고 aiFb.FieldType.GetElementType을 두 번(nil 체크 +
+    // IsValueType 체크) 호출했는데, 이 예외가 나면 EmitExpr/EmitStatement 전체가 그대로
+    // 죽어버렸다(CodeGen.pas:2330, CodeGen.pas:3994). 여기서 예외를 흡수하고, 원소 타입
+    // 이름으로 값/참조 여부를 최대한 추정한다 — 판단이 안 서면 참조로 간주한다(정수 배열을
+    // 참조로 오판하면 Ldelem_Ref가 바로 실패해 눈에 띄지만, 반대로 참조 배열을 값 타입으로
+    // 오판하면 Ldelem_I4가 조용히 쓰레기 값을 읽어 디버깅이 훨씬 어려워지므로 더 안전한
+    // 쪽을 기본값으로 잡는다).
+    function IsRefElementType(fieldType: System.Type): boolean;
+    var elemT: System.Type; tn: string;
+    begin
+      try
+        elemT:=fieldType.GetElementType;
+        if elemT=nil then begin Result:=true; exit; end;
+        try
+          Result:=not elemT.IsValueType;
+        except
+          Result:=true; // 원소 타입 자체도 미완성 TypeBuilder라 IsValueType 조회가 실패하는 경우
+        end;
+      except
+        on E: System.NotSupportedException do
+        begin
+          // TypeBuilderInstantiation이라도 ToString은 보통 동작하므로, 이름에서 흔한 값
+          // 타입 원소가 보이면 값 배열로, 그 외에는 (클래스/제네릭 인스턴스 등) 참조 배열로 취급.
+          tn:=fieldType.ToString;
+          if tn.Contains('Int32') or tn.Contains('Int64') or tn.Contains('Double')
+            or tn.Contains('Single') or tn.Contains('Boolean') or tn.Contains('Char')
+            or tn.Contains('Byte') then
+            Result:=false
+          else
+            Result:=true;
+        end;
+      end;
     end;
 
     // startClass부터 지역 상속 체인을 따라 올라가며, "외부 어셈블리 타입을 직접
@@ -796,6 +998,18 @@ type
     function InferType(e: TExprNode): TVarType;
     var b: TBinOpNode;
     begin
+      // [Stage 96] EmitExpr/EmitStatement와 같은 재귀 깊이 카운터(fEmitDepth)를 공유한다 —
+      // InferType은 TBinOpNode에서 자기 자신을 여러 번 재귀 호출하므로(왼쪽/오른쪽 각각
+      // 여러 조건에서 반복 평가) 깊이 중첩된 식에서 스택을 크게 소모할 수 있다. 임계치를
+      // 넘으면 잡을 수 없는 StackOverflowException 대신 진단 가능한 예외를 던진다.
+      fEmitDepth:=fEmitDepth+1;
+      if fEmitDepth>5000 then
+      begin
+        fEmitDepth:=fEmitDepth-1;
+        raise new Exception('[진단] InferType 재귀 깊이 초과(5000) — 폭주 의심 노드: '+e.GetType.Name);
+      end;
+      try
+
       if e is TIntLiteralNode then Result:=vtInteger
       else if e is TRealLiteralNode  then Result:=vtReal   // [Phase 1]
       else if e is TCharLiteralNode  then Result:=vtChar   // [Phase 1]
@@ -1184,6 +1398,9 @@ type
         else Result:=vtObject;
       end
       else Result:=vtInteger;
+      finally
+        fEmitDepth:=fEmitDepth-1;
+      end;
     end;
 
     // [Stage 70] "시퀀스처럼 취급 가능한 식" e의 원소 Pascal 타입을 알아낸다.
@@ -1375,6 +1592,7 @@ type
       fb: FieldBuilder;
       ctor: ConstructorInfo; cn: string; vtVar: TVarType;
       _argIdx48: integer; // [Stage 48]
+      imbSelf100: MethodBuilder; // [버그 수정] Cur.Kind처럼 self의 무인자 메서드 호출 체인용
     begin
       fEmitDepth:=fEmitDepth+1;
       if fEmitDepth>5000 then
@@ -1774,6 +1992,20 @@ type
             _qType2:=ResolveExternalType(mc.ObjCastType);
             aIL.Emit(OpCodes.Castclass, _qType2);
           end;
+          // [Stage 100 버그 수정] "sender/e 같은 외부 타입 매개변수/지역변수"라는 주석과
+          // 달리, ClrType이 우리가 직접 만들고 있는(아직 CreateType 안 된) 로컬 클래스인
+          // 경우도 이 분기를 탄다(예: "var t: TToken; ... t.SomeMethod"). 그 상태에서
+          // SafeGetProperty/ResolveMethodByArity(순수 리플렉션 경로)로 넘기면 TypeBuilder가
+          // NotSupportedException("유형이 만들어지기 전에 호출된 멤버는 지원되지 않습니다")을
+          // 던진다 — TryFindFieldBuilder 분기(위쪽)에 이미 있던 것과 동일한 로컬 클래스
+          // 역조회로 먼저 걸러낸다.
+          var _localCls100:=FindLocalClassNameForTypeBuilder(_qType2);
+          if _localCls100<>'' then
+          begin
+            EmitLocalClassMemberAccess(aIL, _localCls100, mc);
+          end
+          else
+          begin
           var _pi6:=SafeGetProperty(_qType2, mc.MethodName);
           if (mc.Args.Count=0) and (_pi6<>nil) and (_pi6.GetGetMethod<>nil) then
           begin
@@ -1790,6 +2022,7 @@ type
               EmitArgForParamType(aIL, mc.Args[_emi6Ai], _emi6Params[_emi6Ai].ParameterType);
             if _isValType2 then aIL.Emit(OpCodes.Call, _emi6)
             else aIL.Emit(OpCodes.Callvirt, _emi6);
+          end;
           end;
         end
         else if fLocalScope.Has(mc.ObjName) or fGlobalScope.Has(mc.ObjName)
@@ -2080,12 +2313,50 @@ type
             end;
           end;
         end
+        // [버그 수정] Cur.Kind 처럼 ObjName 자체가 필드/지역변수가 아니라 self의 무인자
+        // (괄호 없이 부르는 관례) 인스턴스 메서드 호출(예: function Cur: TToken)이고,
+        // 그 반환값에 다시 멤버 접근(.Kind 등)을 하는 경우. 이전에는 필드/지역변수/외부
+        // 조상 프로퍼티 어디에도 안 걸려 곧장 "알 수 없는 변수"로 던져졌다.
+        // TryFindInstanceMethod가 돌려주는 MethodBuilder는 아직 CreateType 전이라
+        // GetParameters()가 NotSupportedException을 던지므로, "무인자인가"는 반드시
+        // FindInstanceMethodParamTypes(길이 0 또는 nil)로 판단해야 한다.
+        else if (fCurClassName<>'') and (mc.ObjCastType='')
+                and TryFindInstanceMethod(fCurClassName, mc.ObjName, imbSelf100)
+                and ((FindInstanceMethodParamTypes(fCurClassName, mc.ObjName)=nil)
+                     or (FindInstanceMethodParamTypes(fCurClassName, mc.ObjName).Length=0)) then
+        begin
+          aIL.Emit(OpCodes.Ldarg_0);
+          aIL.Emit(OpCodes.Callvirt, imbSelf100);
+          var _retT100:=imbSelf100.ReturnType;
+          // 반환 타입이 우리가 만든 로컬 클래스(TToken 등)면 EmitLocalClassMemberAccess를
+          // 재사용(필드/메서드/외부조상 순으로 이미 처리해 줌). 외부 CLR 타입이면 Reflection.
+          var _localClsSelf100:=FindLocalClassNameForTypeBuilder(_retT100);
+          if _localClsSelf100<>'' then
+            EmitLocalClassMemberAccess(aIL, _localClsSelf100, mc)
+          else
+          begin
+            var _piSelf100:=SafeGetProperty(_retT100, mc.MethodName);
+            if (mc.Args.Count=0) and (_piSelf100<>nil) and (_piSelf100.GetGetMethod<>nil) then
+              aIL.Emit(OpCodes.Callvirt, _piSelf100.GetGetMethod)
+            else
+            begin
+              var _emiSelf100:=ResolveMethodByArity(_retT100, mc.MethodName, mc.Args, false);
+              if _emiSelf100=nil then
+                raise new Exception('타입 "'+_retT100.FullName+'"에 메서드 "'+mc.MethodName
+                  +'"가 없습니다 (인자 '+mc.Args.Count.ToString+'개, 경로: '+mc.ObjName+'.'+mc.MethodName+').');
+              var _emiSelf100Params:=_emiSelf100.GetParameters;
+              for var _emiSelf100Ai:=0 to mc.Args.Count-1 do
+                EmitArgForParamType(aIL, mc.Args[_emiSelf100Ai], _emiSelf100Params[_emiSelf100Ai].ParameterType);
+              aIL.Emit(OpCodes.Callvirt, _emiSelf100);
+            end;
+          end;
+        end
         else
         begin
-          // [버그 수정] ObjName이 필드/지역변수/외부 조상 프로퍼티 어디에도 없으면,
-          // 마지막으로 점 없는 단일 이름의 외부 정적 타입(주로 enum, 예: ColumnHeaderStyle)일
-          // 가능성을 시도한다. 기존에는 이 케이스를 아예 시도하지 않고 곧장
-          // "알 수 없는 변수"로 던졌다 (ObjName 자체에 '.'이 있는 체인 케이스만
+          // [버그 수정] ObjName이 필드/지역변수/외부 조상 프로퍼티/self 무인자 메서드
+          // 어디에도 없으면, 마지막으로 점 없는 단일 이름의 외부 정적 타입(주로 enum, 예:
+          // ColumnHeaderStyle)일 가능성을 시도한다. 기존에는 이 케이스를 아예 시도하지
+          // 않고 곧장 "알 수 없는 변수"로 던졌다 (ObjName 자체에 '.'이 있는 체인 케이스만
           // 위쪽 1364번째 줄 분기에서 static 타입 경로를 탔었음).
           var _bareStaticT: System.Type := nil;
           try _bareStaticT := ResolveExternalType(mc.ObjName); except end;
@@ -2312,7 +2583,7 @@ type
           begin
             aIL.Emit(OpCodes.Ldarg_0);
             aIL.Emit(OpCodes.Ldfld, aiFb);
-            aiIsRefElem:=(aiFb.FieldType.GetElementType<>nil) and (not aiFb.FieldType.GetElementType.IsValueType);
+            aiIsRefElem:=IsRefElementType(aiFb.FieldType); // [Stage 96 버그 수정] TypeBuilderInstantiation 예외 흡수
           end
           else
             raise new Exception('알 수 없는 변수 "'+ai.ArrName+'" (배열 인덱싱 대상을 지역/전역 변수도, "'
@@ -3976,7 +4247,7 @@ type
         else if fLocalScope.Has(aa.ArrName) then at2:=fLocalScope.GetVType(aa.ArrName)
         else if TryFindFieldBuilder(fCurClassName, aa.ArrName, aaFb) then
         begin
-          if (aaFb.FieldType.GetElementType<>nil) and (not aaFb.FieldType.GetElementType.IsValueType) then
+          if IsRefElementType(aaFb.FieldType) then // [Stage 96 버그 수정] TypeBuilderInstantiation 예외 흡수
             at2:=vtStrArray
           else
             at2:=vtIntArray;
@@ -4546,14 +4817,15 @@ type
         Result:=ResolveExternalType(sig.ParamClassNames[i])
       else if sig.ParamTypes[i]=vtObject then
         Result:=VTC(vtObject, sig.ParamClassNames[i])
-      // [Stage 74] vtGeneric(예: x: T)이면 ParamClassNames[i]에 타입 매개변수 이름('T')이
-      // 들어있다 — 예전엔 ''을 넘겨 VTC가 fCurGenericSubst를 못 찾고 조용히 System.Object로
-      // 폴백했다(제네릭 메서드가 없던 시절엔 이 분기에 도달할 일이 없어 드러나지 않던 버그).
       else if sig.ParamTypes[i]=vtGeneric then
         Result:=VTC(vtGeneric, sig.ParamClassNames[i])
+      // [버그 수정] enum 타입 매개변수 — ClassName(열거형 이름)을 VTC에 넘겨야 fBuiltEnums에서
+      // 실제 Type을 찾는다. 이게 없으면 cn=''로 떨어져 typeof(integer)로 조용히 폴백하고,
+      // 이후 EmitExpr의 HasClrType 라우팅이 빠져 "알 수 없는 메서드 ".ToString"" 등으로 이어진다.
+      else if sig.ParamTypes[i]=vtEnum then
+        Result:=VTC(vtEnum, sig.ParamClassNames[i])
       else
         Result:=VTC(sig.ParamTypes[i], '');
-      // [Stage 100] var/const 매개변수 — ByRef 타입으로 감싼다.
       if (i<sig.ParamIsByRef.Count) and sig.ParamIsByRef[i] then Result:=Result.MakeByRefType;
     end;
 
@@ -5111,8 +5383,10 @@ type
         for i:=0 to sig.ParamNames.Count-1 do
           paramTypes[i]:=ResolveParamClrType(sig, i);
 
+        // [버그 수정] 반환 타입이 로컬 클래스(vtObject)면 sig.ReturnClassName을 VTC에 넘겨야
+        // 정확한 CLR 타입을 얻는다 — ''를 넘기면 System.Object로 조용히 폴백한다.
         if sig.IsFunction then
-          mb:=tb.DefineMethod(sig.Name, methAttrs, VTC(sig.ReturnType, ''), paramTypes)
+          mb:=tb.DefineMethod(sig.Name, methAttrs, VTC(sig.ReturnType, sig.ReturnClassName), paramTypes)
         else
           mb:=tb.DefineMethod(sig.Name, methAttrs, typeof(System.Void), paramTypes);
 
@@ -5692,7 +5966,28 @@ type
     begin
       if t.GetType().Name = 'TypeBuilderInstantiation' then
       begin
-        Result := nil;
+        // [Stage 99 버그 수정] 예전에는 여기서 곧바로 nil을 돌려줘서 List<TToken>.Count처럼
+        // 원소 타입이 아직 CreateType 안 된 로컬 클래스인 제네릭 컬렉션의 프로퍼티 접근이
+        // 전부 "메서드가 없습니다" 오류로 실패했다. SafeGetMethods/SafeGetConstructor(s)와
+        // 동일한 우회법(열린 제네릭 정의에서 멤버를 찾고 TypeBuilder.GetMethod로 그 접근자
+        // 만 닫힌 버전에 바인딩)을 get_/set_ 메서드에 적용해 TBoundGenericPropertyInfo로
+        // 감싸 돌려준다.
+        var openT99 := t.GetGenericTypeDefinition();
+        var openProp99: PropertyInfo := nil;
+        foreach var op99 in openT99.GetProperties(BindingFlags.Public or BindingFlags.NonPublic or
+                                                    BindingFlags.Instance or BindingFlags.Static) do
+          if (op99.Name = name) and (op99.DeclaringType = openT99) then
+          begin openProp99 := op99; break; end;
+        if openProp99 = nil then begin Result := nil; exit; end;
+
+        var boundGetter99: MethodInfo := nil;
+        var boundSetter99: MethodInfo := nil;
+        if openProp99.GetGetMethod(true) <> nil then
+          boundGetter99 := TypeBuilder.GetMethod(t, openProp99.GetGetMethod(true));
+        if openProp99.GetSetMethod(true) <> nil then
+          boundSetter99 := TypeBuilder.GetMethod(t, openProp99.GetSetMethod(true));
+
+        Result := new TBoundGenericPropertyInfo(openProp99, t, boundGetter99, boundSetter99);
         exit;
       end;
       try
@@ -5738,8 +6033,38 @@ type
             bound.Add(TypeBuilder.GetMethod(t, openMis[i86]));
         Result := bound.ToArray();
       end
+      // [Stage 100 버그 수정] TypeBuilderInstantiation이 아니라 "그냥" 아직 CreateType 안
+      // 된 로컬 클래스의 TypeBuilder 자체가 넘어온 경우도 t.GetMethods가 똑같이
+      // NotSupportedException을 던진다. 이런 경우는 우리가 이미 fInstanceMethods에
+      // 그 클래스의 메서드를 다 알고 있으니, 리플렉션 없이 바로 그걸 돌려준다.
+      else if (t.GetType().Name = 'TypeBuilder') and (FindLocalClassNameForTypeBuilder(t) <> '') then
+      begin
+        var _localCls100b := FindLocalClassNameForTypeBuilder(t);
+        var _bound100b := new System.Collections.Generic.List<MethodInfo>();
+        if fInstanceMethods.ContainsKey(_localCls100b) then
+          foreach var _mbKvp100b in fInstanceMethods[_localCls100b] do
+            _bound100b.Add(_mbKvp100b.Value);
+        Result := _bound100b.ToArray();
+      end
       else
-        Result := t.GetMethods(flags);
+      begin
+        // [성능] 완성된 외부 타입에서의 GetMethods(flags)는 같은 (타입,flags) 조합에 대해
+        // 결과가 변하지 않으므로 캐시한다. AssemblyQualifiedName이 nil인 특수한 경우(드묾)엔
+        // 캐시를 건너뛰고 항상 직접 조회한다.
+        if t.AssemblyQualifiedName <> nil then
+        begin
+          var _mCacheKey := t.AssemblyQualifiedName + '|' + flags.ToString;
+          if fMethodsCache.ContainsKey(_mCacheKey) then
+            Result := fMethodsCache[_mCacheKey]
+          else
+          begin
+            Result := t.GetMethods(flags);
+            fMethodsCache[_mCacheKey] := Result;
+          end;
+        end
+        else
+          Result := t.GetMethods(flags);
+      end;
     end;
 
     // GetConstructor(Type[]) 대용 — 인자 타입 배열로 생성자를 찾는다.
@@ -5775,7 +6100,21 @@ type
         Result := bound.ToArray();
       end
       else
-        Result := t.GetConstructors(BindingFlags.Public or BindingFlags.Instance);
+      begin
+        // [성능] SafeGetMethods와 동일한 이유로 완성된 외부 타입의 생성자 목록을 캐시한다.
+        if t.AssemblyQualifiedName <> nil then
+        begin
+          if fCtorsCache.ContainsKey(t.AssemblyQualifiedName) then
+            Result := fCtorsCache[t.AssemblyQualifiedName]
+          else
+          begin
+            Result := t.GetConstructors(BindingFlags.Public or BindingFlags.Instance);
+            fCtorsCache[t.AssemblyQualifiedName] := Result;
+          end;
+        end
+        else
+          Result := t.GetConstructors(BindingFlags.Public or BindingFlags.Instance);
+      end;
     end;
 
     // [버그 수정] obj[i] 형태의 외부 컬렉션 인덱서 getter 호출을 하나의 함수로 뽑아냈다 —
@@ -6605,7 +6944,8 @@ type
           for i:=0 to sig.ParamNames.Count-1 do paramTypes[i]:=ResolveParamClrType(sig, i);
           var retClrType74: System.Type;
           if sig.ReturnType=vtGeneric then retClrType74:=VTC(vtGeneric, sig.ReturnGenericName)
-          else if sig.IsFunction then retClrType74:=VTC(sig.ReturnType, '')
+          // [버그 수정] vtObject(로컬 클래스) 반환 타입도 ReturnClassName을 넘겨야 한다.
+          else if sig.IsFunction then retClrType74:=VTC(sig.ReturnType, sig.ReturnClassName)
           else retClrType74:=typeof(System.Void);
           mb.SetParameters(paramTypes);
           mb.SetReturnType(retClrType74);
@@ -6627,8 +6967,12 @@ type
             paramTypes[i]:=ResolveParamClrType(sig, i);
           var thisMethAttrs:=methAttrs;
           if sig.IsAbstract then thisMethAttrs:=thisMethAttrs or MethodAttributes.Abstract;
+          // [버그 수정] vtObject(로컬 클래스) 반환 타입도 ReturnClassName을 넘겨야 한다 —
+          // ''를 넘기면 fBuiltTypes/fTypeBuilders 조회가 실패해 System.Object로 조용히
+          // 폴백하고(예: function Cur: TToken), 이후 그 반환값에 체인 접근할 때
+          // "타입 System.Object에 메서드 X가 없습니다"로 실패한다.
           if sig.IsFunction then
-            mb:=tb.DefineMethod(sig.Name, thisMethAttrs, VTC(sig.ReturnType, ''), paramTypes)
+            mb:=tb.DefineMethod(sig.Name, thisMethAttrs, VTC(sig.ReturnType, sig.ReturnClassName), paramTypes)
           else
             mb:=tb.DefineMethod(sig.Name, thisMethAttrs, typeof(System.Void), paramTypes);
           fInstanceMethods[cd.Name][sig.Name]:=mb;
@@ -6886,7 +7230,13 @@ type
             fLocalScope.SetClassName(lv.Name, lv.ClassName)
           else
             fLocalScope.SetClrType(lv.Name, lvClrType);
-        end;
+        end
+        // [버그 수정] enum 타입 지역변수(예: vt: TVarType)는 여기서 ClassName/ClrType이 전혀
+        // 채워지지 않아 GetVarClassName이 ''을 돌려주고, EmitExpr의 cn='' 폴백 경로(원시타입
+        // 전용)에는 vtEnum이 없어 "알 수 없는 메서드 ".ToString"" 같은 오류로 이어졌다.
+        // ClrType을 채워 HasClrType 리플렉션 경로(값타입 Ldloca+Call 포함)로 라우팅한다.
+        else if lv.VarType=vtEnum then
+          fLocalScope.SetClrType(lv.Name, lvClrType);
         // [Stage 67] vtMatrix의 원소 타입 이름을 ClassName에 보존 (GetVarClassName이 참조)
         if (lv.VarType=vtMatrix) and (lv.ClassName<>'') then
           fLocalScope.SetClassName(lv.Name, lv.ClassName);
@@ -7005,8 +7355,12 @@ type
         // 예전 버그와 같은 종류).
         if impl.ReturnType=vtGeneric then
           fResultLocal:=il.DeclareLocal(VTC(vtGeneric, impl.ReturnGenericName))
+        // [버그 수정] vtObject(로컬 클래스) 반환 타입도 impl.ReturnClassName을 넘겨야 한다.
+        // ''를 넘기면 Result 지역변수가 System.Object로 선언되어, 메서드 시그니처의 실제
+        // 반환 타입(예: TToken)과 어긋나 IL이 깨지거나(스택 타입 불일치) 본문 안에서
+        // Result의 멤버 접근이 실패한다.
         else
-          fResultLocal:=il.DeclareLocal(VTC(impl.ReturnType, ''));
+          fResultLocal:=il.DeclareLocal(VTC(impl.ReturnType, impl.ReturnClassName));
       end
       else
       begin
@@ -7072,7 +7426,10 @@ type
             fLocalScope.SetClassName(lv.Name, lv.ClassName)
           else
             fLocalScope.SetClrType(lv.Name, lvClrType);
-        end;
+        end
+        // [버그 수정] enum 타입 지역변수 — ClrType을 채워 HasClrType 리플렉션 경로로 라우팅한다.
+        else if lv.VarType=vtEnum then
+          fLocalScope.SetClrType(lv.Name, lvClrType);
         // [Stage 67] vtMatrix 원소 타입 이름 보존
         if (lv.VarType=vtMatrix) and (lv.ClassName<>'') then
           fLocalScope.SetClassName(lv.Name, lv.ClassName);
@@ -7279,7 +7636,10 @@ type
             fLocalScope.SetClassName(pd69.Name, pd69.ClassName)
           else
             fLocalScope.SetClrType(pd69.Name, capFields[pd69.Name].FieldType);
-        end;
+        end
+        // [버그 수정] enum 타입 캡처 매개변수 — ClrType을 채워 HasClrType 리플렉션 경로로 라우팅한다.
+        else if pd69.ParamType=vtEnum then
+          fLocalScope.SetClrType(pd69.Name, capFields[pd69.Name].FieldType);
         il.Emit(OpCodes.Ldarg_0); il.Emit(OpCodes.Ldfld, capFields[pd69.Name]); il.Emit(OpCodes.Stloc, floc);
       end;
       foreach var lv69c in d.LocalVars do
@@ -7293,7 +7653,10 @@ type
             fLocalScope.SetClassName(lv69c.Name, lv69c.ClassName)
           else
             fLocalScope.SetClrType(lv69c.Name, lvClrType69);
-        end;
+        end
+        // [버그 수정] enum 타입 캡처 지역변수 — ClrType을 채워 HasClrType 리플렉션 경로로 라우팅한다.
+        else if lv69c.VarType=vtEnum then
+          fLocalScope.SetClrType(lv69c.Name, lvClrType69);
         if (lv69c.VarType=vtMatrix) and (lv69c.ClassName<>'') then fLocalScope.SetClassName(lv69c.Name, lv69c.ClassName);
         il.Emit(OpCodes.Ldarg_0); il.Emit(OpCodes.Ldfld, capFields[lv69c.Name]); il.Emit(OpCodes.Stloc, floc2);
       end;
@@ -7441,8 +7804,11 @@ type
         for i:=0 to d.Parameters.Count-1 do pt[i]:=ResolveTopParamClrType(d.Parameters[i]);
         // ReturnType=vtGeneric이면 ReturnGenericName이 그 타입 매개변수 이름 — 아니면(제네릭
         // 함수라도 반환 타입 자체는 구체적일 수 있다, 예: function IsEmpty<T>(x: T): boolean;) 그대로 VTC.
+        // [버그 수정] vtObject(로컬 클래스) 반환 타입도 d.ReturnClassName을 넘겨야 한다 —
+        // 아래 비제네릭 DeclareStaticFunc/BuildStaticFunc에는 이미 있던 폴백이 제네릭
+        // 함수 경로에는 빠져 있었다.
         if d.ReturnType=vtGeneric then retClrType:=VTC(vtGeneric, d.ReturnGenericName)
-        else retClrType:=VTC(d.ReturnType, '');
+        else retClrType:=VTC(d.ReturnType, d.ReturnClassName);
         mb.SetParameters(pt);
         mb.SetReturnType(retClrType);
 
@@ -7606,7 +7972,10 @@ type
         // 기록해 둔다 — GetVarClassName으로 되찾아 fCurGenericSubst[genName]을 다시 조회할
         // 수 있어야(예: Writeln(x)가 실제 T의 CLR 타입을 알아내 box하는 데) 쓸모가 있다.
         else if pdef.ParamType=vtGeneric then
-          fLocalScope.SetClassName(pdef.Name, pdef.ClassName);
+          fLocalScope.SetClassName(pdef.Name, pdef.ClassName)
+        // [버그 수정] enum 타입 매개변수 — ClrType을 채워 HasClrType 리플렉션 경로로 라우팅한다.
+        else if pdef.ParamType=vtEnum then
+          fLocalScope.SetClrType(pdef.Name, pt[i]);
         if i=0 then il.Emit(OpCodes.Ldarg_0) else if i=1 then il.Emit(OpCodes.Ldarg_1)
         else if i=2 then il.Emit(OpCodes.Ldarg_2) else if i=3 then il.Emit(OpCodes.Ldarg_3)
         else il.Emit(OpCodes.Ldarg_S, byte(i));
@@ -7626,7 +7995,10 @@ type
             fLocalScope.SetClassName(lv.Name, lv.ClassName)
           else
             fLocalScope.SetClrType(lv.Name, lvClrType);
-        end;
+        end
+        // [버그 수정] enum 타입 지역변수 — ClrType을 채워 HasClrType 리플렉션 경로로 라우팅한다.
+        else if lv.VarType=vtEnum then
+          fLocalScope.SetClrType(lv.Name, lvClrType);
         // [Stage 67] vtMatrix 원소 타입 이름 보존
         if (lv.VarType=vtMatrix) and (lv.ClassName<>'') then
           fLocalScope.SetClassName(lv.Name, lv.ClassName);
@@ -7683,7 +8055,10 @@ type
         end
         // [Stage 71] BuildStaticFunc와 동일한 이유 — vtGeneric 매개변수도 타입 매개변수 이름을 기록.
         else if pdef.ParamType=vtGeneric then
-          fLocalScope.SetClassName(pdef.Name, pdef.ClassName);
+          fLocalScope.SetClassName(pdef.Name, pdef.ClassName)
+        // [버그 수정] enum 타입 매개변수 — ClrType을 채워 HasClrType 리플렉션 경로로 라우팅한다.
+        else if pdef.ParamType=vtEnum then
+          fLocalScope.SetClrType(pdef.Name, pt[i]);
         if i=0 then il.Emit(OpCodes.Ldarg_0) else if i=1 then il.Emit(OpCodes.Ldarg_1)
         else if i=2 then il.Emit(OpCodes.Ldarg_2) else if i=3 then il.Emit(OpCodes.Ldarg_3)
         else il.Emit(OpCodes.Ldarg_S, byte(i));
@@ -7704,7 +8079,10 @@ type
             fLocalScope.SetClassName(lv.Name, lv.ClassName)
           else
             fLocalScope.SetClrType(lv.Name, lvClrType);
-        end;
+        end
+        // [버그 수정] enum 타입 지역변수 — ClrType을 채워 HasClrType 리플렉션 경로로 라우팅한다.
+        else if lv.VarType=vtEnum then
+          fLocalScope.SetClrType(lv.Name, lvClrType);
         // [Stage 67] vtMatrix 원소 타입 이름 보존
         if (lv.VarType=vtMatrix) and (lv.ClassName<>'') then
           fLocalScope.SetClassName(lv.Name, lv.ClassName);
@@ -7742,6 +8120,8 @@ type
       fBuiltTypes:=new Dictionary<string, System.Type>;
       fFieldBuilders:=new Dictionary<string, Dictionary<string, FieldBuilder>>;
       fInstanceMethods:=new Dictionary<string, Dictionary<string, MethodBuilder>>;
+      fMethodsCache:=new Dictionary<string, array of MethodInfo>; // [성능]
+      fCtorsCache:=new Dictionary<string, array of ConstructorInfo>; // [성능]
       fAbstractMethods:=new Dictionary<string, List<string>>; // [Stage 53]
       fClassParents:=new Dictionary<string, string>;
       fMethodReturnTypes:=new Dictionary<string, Dictionary<string, TVarType>>;
@@ -8115,6 +8495,15 @@ type
             else
               clrType:=typeof(System.Object);
             vdIsClassNamed:=true;
+          end
+          // [버그 수정] enum 타입 전역 변수 — 이전에는 vtObject/vtInterface만 처리해서
+          // ClassName/ClrType이 전혀 안 채워졌고, 그 변수에 .ToString() 등을 호출하면
+          // EmitExpr의 cn='' 폴백 경로(원시타입 전용)에 안 걸려 "알 수 없는 메서드" 오류가 났다.
+          // ClrType을 채워 HasClrType 리플렉션 경로(값타입 Ldloca+Call 포함)로 라우팅한다.
+          else if vd.VarType=vtEnum then
+          begin
+            clrType:=VTC(vd.VarType, vd.ClassName);
+            vdIsClrTyped:=true; vdClrType:=clrType;
           end
           // [Stage 27] string/boolean/array 전역 변수도 예전에는 무조건 typeof(integer)로
           // 선언되어 있었다 — fGlobalTypes만 올바르고 실제 LocalBuilder 슬롯 타입은 틀려서

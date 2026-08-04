@@ -705,6 +705,12 @@ type
     IsFunction: boolean;
     ReturnType: TVarType;
     ReturnGenericName: string;       // [Stage 32] ReturnType=vtGeneric일 때 어느 타입 매개변수(예: 'T'/'K'/'V')인지
+    // [버그 수정] ReturnType=vtObject일 때 반환 클래스/외부 타입 이름. TFuncDeclNode.ReturnClassName과
+    // 동일한 목적 — 예: "function Cur: TToken;" → ReturnClassName='TToken'. 이게 없으면 CodeGen이
+    // VTC(vtObject, '')로 떨어져 반환 타입이 조용히 System.Object가 되고(메서드 시그니처와 본문의
+    // Result 지역변수 모두), 나중에 그 반환값에 체인 접근(예: Cur.Kind)할 때
+    // "타입 System.Object에 메서드 X가 없습니다"로 실패한다.
+    ReturnClassName: string;
     ParamNames: List<string>;
     ParamTypes: List<TVarType>;
     // ParamTypes[i]=vtObject일 때는 클래스/외부타입 이름, vtGeneric일 때는 [Stage 32] 타입 매개변수 이름(예: 'K')
@@ -727,7 +733,7 @@ type
     GenericParamConstraints: List<string>;
     constructor Create(n: string; isFunc: boolean; ret: TVarType);
     begin
-      Name:=n; IsFunction:=isFunc; ReturnType:=ret; ReturnGenericName:='';
+      Name:=n; IsFunction:=isFunc; ReturnType:=ret; ReturnGenericName:=''; ReturnClassName:='';
       ParamNames:=new List<string>; ParamTypes:=new List<TVarType>;
       ParamClassNames:=new List<string>; ParamIsExternal:=new List<boolean>;
       ParamIsByRef:=new List<boolean>; // [Stage 100]
@@ -863,6 +869,10 @@ type
     ClassName: string; MethodName: string;
     IsFunction: boolean; ReturnType: TVarType;
     ReturnGenericName: string; // [Stage 32] ReturnType=vtGeneric일 때 어느 타입 매개변수인지 (예: 'T'/'K'/'V')
+    // [버그 수정] ReturnType=vtObject일 때 반환 클래스/외부 타입 이름 — TMethodSignature.ReturnClassName과
+    // 동일한 이유로 필요. BuildMethodBody가 Result 지역변수를 VTC(vtObject, ReturnClassName)으로
+    // 정확히 선언해야 메서드 시그니처(반환 타입)와 IL 스택 타입이 어긋나지 않는다.
+    ReturnClassName: string;
     ParamNames: List<string>; ParamTypes: List<TVarType>;
     ParamGenericNames: List<string>; // [Stage 32] ParamTypes[i]=vtGeneric일 때 그 타입 매개변수 이름, 아니면 ''
     ParamIsByRef: List<boolean>;     // [Stage 100] var/const 참조 매개변수 여부 — TMethodSignature.ParamIsByRef와 대응
@@ -876,7 +886,7 @@ type
     Body: TCompoundStmtNode;
     constructor Create(cn, mn: string; isFunc: boolean; ret: TVarType);
     begin
-      ClassName:=cn; MethodName:=mn; IsFunction:=isFunc; ReturnType:=ret; ReturnGenericName:='';
+      ClassName:=cn; MethodName:=mn; IsFunction:=isFunc; ReturnType:=ret; ReturnGenericName:=''; ReturnClassName:='';
       ParamNames:=new List<string>; ParamTypes:=new List<TVarType>;
       ParamGenericNames:=new List<string>;
       ParamIsByRef:=new List<boolean>; // [Stage 100]

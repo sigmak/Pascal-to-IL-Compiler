@@ -68,7 +68,12 @@ type
     fCurClass: string; // 현재 파싱 중인 메서드의 클래스 이름
     fCurParams: List<string>; // 현재 파싱 중인 메서드의 매개변수 이름 목록 (필드보다 우선) — 지역변수도 나중에 추가됨
     fCurMethodParamNames: List<string>; // [Stage 30] 순수 매개변수 이름만(지역변수 제외) — bare 'inherited;' 인자 전달용
-    fFuncNames, fProcNames, fArrayNames: List<string>;
+    // [성능] List<string> → HashSet<string>. 이 이름 테이블들은 식별자 하나를 파싱할 때마다
+    // .Contains()로 여러 번 조회되는(Parser.pas 전체에서 50곳 이상) 핫패스라, 심볼 수가
+    // 늘어날수록(자기컴파일처럼 함수/클래스 수백~수천 개) List의 O(n) 선형 탐색이 그대로
+    // 체감 컴파일 시간에 곱해진다. Contains/Add만 쓰고 순서·인덱스 접근이 없는 걸 확인했으므로
+    // O(1) 평균 조회의 HashSet으로 바꾼다 (ExportSymbols의 List.AddRange(HashSet)은 그대로 동작).
+    fFuncNames, fProcNames, fArrayNames: HashSet<string>;
     // [Stage 65, 1차] 현재 파싱 중인 최상위 함수/프로시저 안에 선언된 지역(중첩) 서브프로그램의
     // "소스에 쓰인 이름 → 맹글링된 실제 이름(Outer$Inner)" 매핑. 최상위 함수/프로시저에
     // 들어갈 때 새로 만들고 나올 때 이전 값(보통 nil)으로 복원한다 — 한 겹만 지원하므로
@@ -77,13 +82,13 @@ type
     // [Stage 87] uses 절에 나온 네임스페이스 목록 — System, System.Drawing, System.Windows.Forms 등.
     // ParseParamTypeExt/ParseVarType에서 단순 이름(EventArgs, Label 등)을 완전 경로로 해석할 때 사용.
     fImportedNamespaces: List<string>;
-    fClassNames: List<string>; // 선언된 클래스 이름 목록 (제네릭 템플릿 이름 + 단형화된 구체 이름 포함)
-    fInterfaceNames: List<string>; // 선언된 인터페이스 이름 목록
-    fEnumNames: List<string>; // [Phase 1] 선언된 열거형 이름 목록 (타입 파싱 시 vtEnum 분류용)
+    fClassNames: HashSet<string>; // 선언된 클래스 이름 목록 (제네릭 템플릿 이름 + 단형화된 구체 이름 포함) [성능] HashSet
+    fInterfaceNames: HashSet<string>; // 선언된 인터페이스 이름 목록 [성능] HashSet
+    fEnumNames: HashSet<string>; // [Phase 1] 선언된 열거형 이름 목록 (타입 파싱 시 vtEnum 분류용) [성능] HashSet
     // [Stage 62] 선언된 레코드 이름 목록. 레코드 이름은 fClassNames에도 함께 등록해서
     // (var/필드/매개변수 타입 인식 같은) 기존 "지역 클래스 이름" 인식 경로를 그대로 재사용한다 —
     // fRecordNames는 그중 "값 타입이라 new/상속이 금지된다" 같은 레코드 전용 규칙을 걸 때만 따로 확인한다.
-    fRecordNames: List<string>;
+    fRecordNames: HashSet<string>; // [성능] HashSet
     // [Stage 66] 이미 등록된 연산자 오버로딩 조합 집합 ("기호|타입이름"). 같은 조합이 두 번
     // 선언되는 것을 막는 용도로만 쓴다.
     fOperatorSigs: HashSet<string>;
@@ -105,13 +110,13 @@ type
     fClassInterface: Dictionary<string, string>;
     // Stage26: 제네릭(단형화) 지원
     fProg: TProgramNode; // ParseProgram 시작 시 설정 — 깊이 상관없이 GenericInstantiations에 접근하기 위함
-    fGenericClassNames: List<string>; // 제네릭 템플릿으로 선언된 클래스 이름 (예: 'TStack')
+    fGenericClassNames: HashSet<string>; // 제네릭 템플릿으로 선언된 클래스 이름 (예: 'TStack') [성능] HashSet
     // [Stage 32] 템플릿 이름 → 타입 매개변수 이름 목록 (예: 'TStack'→['T'], 'TPair'→['K','V'])
     fClassGenericParam: Dictionary<string, List<string>>;
     // [Stage 34] 템플릿 이름 → 타입 매개변수별 제약조건 목록 (fClassGenericParam과 같은 인덱스로 대응, ''=제약 없음)
     fClassGenericConstraint: Dictionary<string, List<string>>;
     // [Stage 36] 최상위 제네릭 함수/프로시저 지원 (클래스 제네릭과 동일한 패턴).
-    fGenericFuncNames, fGenericProcNames: List<string>; // 제네릭 템플릿으로 선언된 함수/프로시저 이름
+    fGenericFuncNames, fGenericProcNames: HashSet<string>; // 제네릭 템플릿으로 선언된 함수/프로시저 이름 [성능] HashSet
     fFuncGenericParam, fProcGenericParam: Dictionary<string, List<string>>;      // 템플릿 이름 → 타입 매개변수 이름 목록
     fFuncGenericConstraint, fProcGenericConstraint: Dictionary<string, List<string>>; // 템플릿 이름 → 제약조건 목록(같은 인덱스)
     // [Stage 74] 클래스 안의 자체 제네릭 메서드(TFoo.Bar<T>). 1차 제약: 클래스와 무관하게
@@ -1676,6 +1681,22 @@ type
           Expect(tkRParen); Result:=mc;
         end
 
+        // [버그 수정] 괄호 없이 호출된 자기 클래스의 무인자(니라딕) 메서드 —
+        // 예: Lexer.pas의 "function CC: char;"를 "while CC=' ' do Adv;"처럼
+        // 괄호 없이 값처럼 쓰는 파스칼 관용 표현. 위의 tkLParen 분기는 괄호가
+        // 붙어 있을 때만 반응하므로, 괄호 없는 이 경우는 그대로 else로 떨어져
+        // "필드 읽기"(TFieldReadExprNode)로 오인되었다 — CC는 필드가 아니라
+        // 메서드이므로 CodeGen이 필드 목록에서 못 찾아 "필드/속성을 찾을 수
+        // 없음: TLexer.CC" 예외로 이어졌다. 매개변수 이름이 아니면서 현재
+        // 클래스의 메서드 이름과 일치할 때만 이 분기가 반응하므로 진짜 필드
+        // 읽기 동작에는 영향이 없다.
+        else if (fCurClass<>'') and not fCurParams.Contains(t.Text)
+                and fClassMethods.ContainsKey(fCurClass)
+                and fClassMethods[fCurClass].ContainsKey(t.Text) then
+        begin
+          Result:=new TMethodCallExprNode('', t.Text);
+        end
+
         else
         begin
           // 메서드 본문 안에서의 식별자 읽기: 매개변수 이름이면 지역 변수 참조,
@@ -2948,7 +2969,12 @@ type
         Expect(tkRParen);
       end;
       if isFunc then
-      begin Expect(tkColon); sig.ReturnType:=ParseVarType; end;
+      begin
+        Expect(tkColon); sig.ReturnType:=ParseVarType;
+        // [버그 수정] 반환 타입이 로컬 클래스/외부 타입(vtObject)이면 이름을 보존해야
+        // CodeGen이 정확한 CLR 반환 타입을 만들 수 있다 (TFuncDeclNode.ReturnClassName과 동일한 이유).
+        if sig.ReturnType=vtObject then sig.ReturnClassName:=fLastGenericName;
+      end;
       Expect(tkSemicolon);
       Result:=sig;
     end;
@@ -3390,6 +3416,11 @@ type
               begin
                 Expect(tkColon); sig.ReturnType:=ParseVarType;
                 if (sig.ReturnType=vtGeneric) or (sig.ReturnType=vtGenericArray) then sig.ReturnGenericName:=fLastGenericName; // [Stage 32/37]
+                // [버그 수정] 반환 타입이 로컬 클래스/외부 타입(vtObject)이면 이름을 보존한다.
+                // 이게 없으면 CodeGen의 DefineMethod가 VTC(vtObject,'')로 떨어져 메서드의 실제
+                // CLR 반환 타입이 System.Object가 되고(예: function Cur: TToken;), 그 반환값에
+                // 체인 접근(Cur.Kind 등)할 때 "타입 System.Object에 메서드 X가 없습니다"로 실패한다.
+                if sig.ReturnType=vtObject then sig.ReturnClassName:=fLastGenericName;
               end;
               fCurGenericParams:=savedGP74sig; // [Stage 74]
 
@@ -3424,6 +3455,7 @@ type
 
                 var inlImpl:=new TMethodImplNode(cn, mname, isFunc, sig.ReturnType);
                 inlImpl.ReturnGenericName:=sig.ReturnGenericName;
+                inlImpl.ReturnClassName:=sig.ReturnClassName; // [버그 수정] BuildMethodBody의 Result 지역변수 타입 정확화
                 inlImpl.ParamNames.AddRange(sig.ParamNames);
                 inlImpl.ParamTypes.AddRange(sig.ParamTypes);
                 for var pgi88c:=0 to sig.ParamTypes.Count-1 do
@@ -3819,6 +3851,9 @@ type
       begin
         Expect(tkColon); impl.ReturnType:=ParseVarType;
         if (impl.ReturnType=vtGeneric) or (impl.ReturnType=vtGenericArray) then impl.ReturnGenericName:=fLastGenericName; // [Stage 32/37]
+        // [버그 수정] 반환 타입이 로컬 클래스/외부 타입(vtObject)이면 이름을 보존한다 —
+        // TMethodSignature 쪽과 동일한 이유(BuildMethodBody의 Result 지역변수 정확화).
+        if impl.ReturnType=vtObject then impl.ReturnClassName:=fLastGenericName;
       end;
       Expect(tkSemicolon);
 
@@ -4437,14 +4472,14 @@ type
       fOperatorSigs:=new HashSet<string>; // [Stage 66]
       fCurMethodParamNames:=new List<string>; // [Stage 30]
       fCurNestedAlias:=nil; // [Stage 65] 최상위 함수/프로시저 밖에서는 지역 서브프로그램 별칭이 없음
-      fFuncNames:=new List<string>;
-      fProcNames:=new List<string>;
-      fArrayNames:=new List<string>;
-      fClassNames:=new List<string>;
-      fInterfaceNames:=new List<string>;
-      fEnumNames:=new List<string>; // [Phase 1]
+      fFuncNames:=new HashSet<string>; // [성능] List→HashSet
+      fProcNames:=new HashSet<string>; // [성능] List→HashSet
+      fArrayNames:=new HashSet<string>; // [성능] List→HashSet
+      fClassNames:=new HashSet<string>; // [성능] List→HashSet
+      fInterfaceNames:=new HashSet<string>; // [성능] List→HashSet
+      fEnumNames:=new HashSet<string>; // [Phase 1] [성능] List→HashSet
       fImportedNamespaces:=new List<string>; // [Stage 87]
-      fRecordNames:=new List<string>; // [Stage 62]
+      fRecordNames:=new HashSet<string>; // [Stage 62] [성능] List→HashSet
       fEnumMemberEnumName:=new Dictionary<string, string>; // [Stage 51]
       fEnumMemberOrdinal:=new Dictionary<string, integer>; // [Stage 51]
       fEnumSize:=new Dictionary<string, integer>; // [Stage 63] 열거형명 → 멤버 개수 (set of X의 32비트 한도 검사용)
@@ -4453,11 +4488,11 @@ type
       fClassMethods:=new Dictionary<string, Dictionary<string, boolean>>;
       fClassParent:=new Dictionary<string, string>;
       fClassInterface:=new Dictionary<string, string>; // [Stage 34]
-      fGenericClassNames:=new List<string>;
+      fGenericClassNames:=new HashSet<string>; // [성능] List→HashSet
       fClassGenericParam:=new Dictionary<string, List<string>>;
       fClassGenericConstraint:=new Dictionary<string, List<string>>; // [Stage 34]
-      fGenericFuncNames:=new List<string>; // [Stage 36]
-      fGenericProcNames:=new List<string>; // [Stage 36]
+      fGenericFuncNames:=new HashSet<string>; // [Stage 36] [성능] List→HashSet
+      fGenericProcNames:=new HashSet<string>; // [Stage 36] [성능] List→HashSet
       fFuncGenericParam:=new Dictionary<string, List<string>>; // [Stage 36]
       fProcGenericParam:=new Dictionary<string, List<string>>; // [Stage 36]
       fFuncGenericConstraint:=new Dictionary<string, List<string>>; // [Stage 36]

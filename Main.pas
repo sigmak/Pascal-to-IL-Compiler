@@ -13,6 +13,9 @@ uses
   System.Text.RegularExpressions,
   System.Reflection,
   System.Collections.Generic,
+  System.Threading, // [Stage 96] 자기컴파일 시 EmitStatement/EmitExpr/GetExprClrType의 깊은 재귀가
+                     // 기본 스레드 스택(약 1MB)을 넘겨 StackOverflowException으로 죽는 문제를 막기
+                     // 위해, 실제 컴파일 로직(RunCompilerBody)을 스택을 크게 잡은 별도 스레드에서 돌린다.
   AST,
   Lexer,
   Parser,
@@ -725,6 +728,15 @@ begin
     if priorProcNames.Contains(pn) or fileProg.PublicProcNames.Contains(pn) then Result.ProcNames.Add(pn);
 end;
 
+// [Stage 96] 예전에는 이 로직이 프로그램의 최상위 begin...end. 블록에 그대로 있었다.
+// 자기컴파일 테스트(CodeGen.pas/Parser.pas 등 거대한 else-if 판별 사슬을 가진 파일들을
+// 컴파일러 스스로 컴파일)에서 EmitStatement/EmitExpr/GetExprClrType이 그 사슬 깊이만큼
+// 재귀하다가(각 프레임도 지역변수가 많아 큼) 기본 스레드 스택(~1MB)을 넘겨
+// StackOverflowException으로 프로세스가 그냥 죽는 문제가 있었다 — .NET에서
+// StackOverflowException은 원칙적으로 잡을 수 없으므로, 사후에 원인을 알아낼 방법이
+// 없다. 그래서 이 로직 전체를 별도 프로시저로 뽑아 스택 크기를 크게 지정한 전용
+// 스레드에서 실행하도록 바꿨다(맨 아래 최상위 begin...end. 참고).
+procedure RunCompilerBody;
 var
   inputPath, sourceCode, outputName, projOutputName: string;
   prog: TProgramNode;
@@ -1057,4 +1069,21 @@ begin
   Writeln;
   Writeln('아무 키나 누르면 종료합니다...');
   Readln;
+end; // RunCompilerBody
+
+// ------------------------------------------------------------
+// [Stage 96] 최상위 진입점 — 실제 로직은 스택을 크게 잡은 전용 스레드에서 실행한다.
+// ------------------------------------------------------------
+// 기본 스택(약 1MB)으로는 자기컴파일 시 EmitStatement/EmitExpr/GetExprClrType의 재귀
+// 깊이를 감당하지 못해 StackOverflowException으로 죽었다. 64MB로 우선 시도하고,
+// 그래도 죽으면 이 숫자(바이트 단위)를 128MB, 256MB로 늘려본다.
+const CompilerThreadStackSize = 256 * 1024 * 1024; // 256MB//64MB
+
+var
+  compileThread: System.Threading.Thread;
+
+begin
+  compileThread := new System.Threading.Thread(RunCompilerBody, CompilerThreadStackSize);
+  compileThread.Start;
+  compileThread.Join;
 end.
