@@ -15,7 +15,8 @@ uses
   System.Reflection.Emit,
   System.Globalization,
   AST,
-  Scope;
+  Scope,
+  Symbols;
 
 type
   // [Stage 99 버그 수정] TypeBuilderInstantiation(예: List<TToken>처럼, 원소 타입이 아직
@@ -165,7 +166,7 @@ type
     fFieldBuilders: Dictionary<string, Dictionary<string, FieldBuilder>>; // 클래스명 → 필드명 → FieldBuilder
     fInstanceMethods: Dictionary<string, Dictionary<string, MethodBuilder>>; // 클래스명 → 메서드명 → MB
     fAbstractMethods: Dictionary<string, List<string>>; // [Stage 53] 클래스명 → abstract로 선언된 메서드명 목록
-    fClassParents: Dictionary<string, string>; // 클래스명 → 부모 클래스명 ('' 이면 없음)
+    fClasses: TClassTable; // [Symbols.pas 1단계] 클래스명 → TClassSymbol. 현재는 ParentName만 이관됨(구 fClassParents)
     // [성능] SafeGetMethods/SafeGetConstructors의 "완성된(외부 CLR) 타입"용 GetMethods/
     // GetConstructors 결과 캐시. ResolveMethodByArity/ResolveConstructorByArity가 오버로드를
     // 고를 때마다 같은 타입(예: System.Windows.Forms.Form처럼 멤버가 수백 개인 외부 타입)에
@@ -478,7 +479,7 @@ type
       begin
         if fFieldBuilders.ContainsKey(c) and fFieldBuilders[c].ContainsKey(fname) then
         begin Result:=fFieldBuilders[c][fname]; exit; end;
-        if fClassParents.ContainsKey(c) then c:=fClassParents[c] else c:='';
+        c:=fClasses.GetParentName(c);
       end;
       raise new Exception('필드를 찾을 수 없음: '+startClass+'.'+fname);
     end;
@@ -544,7 +545,7 @@ type
       begin
         if fFieldBuilders.ContainsKey(c) and fFieldBuilders[c].ContainsKey(fname) then
         begin fb:=fFieldBuilders[c][fname]; Result:=true; exit; end;
-        if fClassParents.ContainsKey(c) then c:=fClassParents[c] else c:='';
+        c:=fClasses.GetParentName(c);
       end;
       Result:=false;
     end;
@@ -601,7 +602,7 @@ type
       begin
         if fClassExternalParentType.ContainsKey(c) then
         begin Result:=fClassExternalParentType[c]; exit; end;
-        if fClassParents.ContainsKey(c) then c:=fClassParents[c] else c:='';
+        c:=fClasses.GetParentName(c);
       end;
       Result:=nil;
     end;
@@ -643,6 +644,20 @@ type
       begin Result:=true; exit; end;
       if (FindExternalAncestorType(fCurClassName)<>nil)
          and (SafeGetProperty(FindExternalAncestorType(fCurClassName), first)<>nil) then
+      begin Result:=true; exit; end;
+      // [버그 수정] "Cur.Line.ToString"처럼 체인의 첫 세그먼트가 필드/변수가 아니라
+      // 괄호 없이 호출하는 인자 없는 로컬 인스턴스 메서드(예: function Cur: TToken;)인
+      // 경우도 체인 시작점으로 인정한다. 이게 없으면 "Cur"가 어디에도 걸리지 않아
+      // "Cur.Line" 전체가 외부 정적 타입 경로로 오인된다.
+      // [버그 수정/자기컴파일] fInstanceMethods[..][first].GetParameters()는 아직 CreateType되지
+      // 않은(우리가 만드는 중인) 타입의 MethodBuilder에 대해서는 NotSupportedException
+      // ("형식이 만들어지지 않았습니다")을 던진다 — FindInstanceMethodParamTypes와 동일한 이유로,
+      // 정의 시점에 이미 계산해 둔 fMethodParamClrTypes를 대신 사용해 리플렉션 호출을 피한다.
+      if fInstanceMethods.ContainsKey(fCurClassName)
+         and fInstanceMethods[fCurClassName].ContainsKey(first)
+         and fMethodParamClrTypes.ContainsKey(fCurClassName)
+         and fMethodParamClrTypes[fCurClassName].ContainsKey(first)
+         and (fMethodParamClrTypes[fCurClassName][first].Length=0) then
       begin Result:=true; exit; end;
       Result:=false;
     end;
@@ -732,6 +747,19 @@ type
           pi:=SafeGetProperty(extSelf, first);
           aIL.Emit(OpCodes.Callvirt, pi.GetGetMethod);
           curType:=pi.PropertyType;
+        end
+        else if fInstanceMethods.ContainsKey(fCurClassName)
+                and fInstanceMethods[fCurClassName].ContainsKey(first)
+                and fMethodParamClrTypes.ContainsKey(fCurClassName)
+                and fMethodParamClrTypes[fCurClassName].ContainsKey(first)
+                and (fMethodParamClrTypes[fCurClassName][first].Length=0) then
+        begin
+          // [버그 수정] IsChainStartSegment와 동일한 이유 — "Cur.Line"처럼 체인의
+          // 첫 세그먼트가 괄호 없이 호출하는 인자 없는 로컬 인스턴스 메서드인 경우.
+          // (GetParameters() 대신 fMethodParamClrTypes로 판별 — 미완성 TypeBuilder라 리플렉션 불가)
+          aIL.Emit(OpCodes.Ldarg_0);
+          aIL.Emit(OpCodes.Callvirt, fInstanceMethods[fCurClassName][first]);
+          curType:=fInstanceMethods[fCurClassName][first].ReturnType;
         end
         else
           raise new Exception('알 수 없는 한정자 "'+first+'" (연쇄 속성 접근의 시작점을 찾을 수 없습니다)');
@@ -859,6 +887,14 @@ type
       begin
         extSelf:=FindExternalAncestorType(fCurClassName);
         if (extSelf<>nil) and (SafeGetProperty(extSelf, first)<>nil) then curType:=SafeGetProperty(extSelf, first).PropertyType
+        // [버그 수정] EmitQualifierChainLoad/IsChainStartSegment와 동일 — "Cur.Line"처럼
+        // 체인 시작점이 인자 없는 로컬 인스턴스 메서드인 경우.
+        else if fInstanceMethods.ContainsKey(fCurClassName)
+                and fInstanceMethods[fCurClassName].ContainsKey(first)
+                and fMethodParamClrTypes.ContainsKey(fCurClassName)
+                and fMethodParamClrTypes[fCurClassName].ContainsKey(first)
+                and (fMethodParamClrTypes[fCurClassName][first].Length=0) then
+          curType:=fInstanceMethods[fCurClassName][first].ReturnType
         else raise new Exception('알 수 없는 한정자 "'+first+'" (연쇄 속성 접근의 시작점을 찾을 수 없습니다)');
       end;
 
@@ -919,7 +955,7 @@ type
       begin
         if fInstanceMethods.ContainsKey(c) and fInstanceMethods[c].ContainsKey(mname) then
         begin Result:=fInstanceMethods[c][mname]; exit; end;
-        if fClassParents.ContainsKey(c) then c:=fClassParents[c] else c:='';
+        c:=fClasses.GetParentName(c);
       end;
       raise new Exception('알 수 없는 메서드 "'+startClass+'.'+mname+'"');
     end;
@@ -933,7 +969,7 @@ type
       begin
         if fInstanceMethods.ContainsKey(c) and fInstanceMethods[c].ContainsKey(mname) then
         begin mb:=fInstanceMethods[c][mname]; Result:=true; exit; end;
-        if fClassParents.ContainsKey(c) then c:=fClassParents[c] else c:='';
+        c:=fClasses.GetParentName(c);
       end;
       Result:=false;
     end;
@@ -951,7 +987,7 @@ type
       begin
         if fMethodParamClrTypes.ContainsKey(c) and fMethodParamClrTypes[c].ContainsKey(mname) then
         begin Result:=fMethodParamClrTypes[c][mname]; exit; end;
-        if fClassParents.ContainsKey(c) then c:=fClassParents[c] else c:='';
+        c:=fClasses.GetParentName(c);
       end;
       Result:=nil;
     end;
@@ -980,7 +1016,7 @@ type
       begin
         if fMethodReturnTypes.ContainsKey(c) and fMethodReturnTypes[c].ContainsKey(mname) then
         begin Result:=fMethodReturnTypes[c][mname]; exit; end;
-        if fClassParents.ContainsKey(c) then c:=fClassParents[c] else c:='';
+        c:=fClasses.GetParentName(c);
       end;
       Result:=vtInteger;
     end;
@@ -1307,20 +1343,30 @@ type
       else if e is TBinOpNode then
       begin
         b:=TBinOpNode(e);
+        // [성능 수정 2026.08] 예전엔 이 분기에서 InferType(b.Left)/InferType(b.Right)를
+        // 조건마다(최대 5번씩, 총 최대 10회) 다시 호출했다. b.Left/b.Right 자체가 또
+        // TBinOpNode면 그 재귀 호출들이 각자 다시 최대 10개씩 하위 InferType을 부르므로
+        // 중첩된 이항식(예: 실제 컴파일러 소스에 흔한 a+b+c+d+... 나 여러 개의 and/or로
+        // 이어진 조건식)에서 호출 횟수가 트리 깊이에 대해 지수적으로 폭증했다
+        // (깊이 d일 때 대략 9^d 자릿수). 이게 "4단계 컴파일이 끝없이 오래 걸리는" 현상의
+        // 근본 원인이었다 — 심볼 테이블 문제가 아니라 캐싱 없는 재귀 타입 추론 문제.
+        // 좌/우 타입을 딱 한 번씩만 계산해서 지역변수에 담아두고 재사용한다.
+        var _binLt:=InferType(b.Left);
+        var _binRt:=InferType(b.Right);
         // [Stage 66] 두 피연산자 모두 vtObject면(연산자 오버로딩 대상) 결과도 vtObject —
         // 실제 오버로딩이 등록되어 있는지는 EmitExpr에서 검증하고, 여기서는 타입 모양만 전달한다.
-        if (InferType(b.Left)=vtObject) and (InferType(b.Right)=vtObject) then Result:=vtObject
+        if (_binLt=vtObject) and (_binRt=vtObject) then Result:=vtObject
         // [Stage 63] 피연산자 중 하나라도 집합이면 결과도 집합 (합집합/차집합/교집합)
-        else if (InferType(b.Left)=vtSet) or (InferType(b.Right)=vtSet) then Result:=vtSet
-        else if (InferType(b.Left)=vtString) or (InferType(b.Right)=vtString) then
+        else if (_binLt=vtSet) or (_binRt=vtSet) then Result:=vtSet
+        else if (_binLt=vtString) or (_binRt=vtString) then
           Result:=vtString
         // [버그 수정] 예전엔 이 분기가 없어서 real/int64가 섞인 이항연산(예: -3.7, 1.5+2)이
         // 전부 vtInteger로 잘못 추론됐다 — 실제 IL 생성(EmitExpr의 isReal 승격 로직, 이 파일
         // 위쪽)은 이미 올바르게 real로 처리하고 있었으니 InferType만 뒤처져 있던 것.
         // Writeln(-3.7)처럼 InferType 결과로 어떤 WriteLine 오버로드를 호출할지 고르는
         // 자리에서 int32 오버로드가 선택되어 스택의 double 값과 어긋나 런타임에 깨졌다.
-        else if (InferType(b.Left)=vtReal) or (InferType(b.Right)=vtReal) then Result:=vtReal
-        else if (InferType(b.Left)=vtInt64) or (InferType(b.Right)=vtInt64) then Result:=vtInt64
+        else if (_binLt=vtReal) or (_binRt=vtReal) then Result:=vtReal
+        else if (_binLt=vtInt64) or (_binRt=vtInt64) then Result:=vtInt64
         else Result:=vtInteger;
       end
       else if e is TSelfExprNode then Result:=vtObject // [Stage 30]
@@ -1334,8 +1380,7 @@ type
       else if e is TInheritedCallExprNode then // [Stage 30]
       begin
         var _ih:=TInheritedCallExprNode(e);
-        var _pc:='';
-        if fClassParents.ContainsKey(fCurClassName) then _pc:=fClassParents[fCurClassName];
+        var _pc:=fClasses.GetParentName(fCurClassName);
         if _pc<>'' then Result:=FindMethodReturnType(_pc, _ih.MethodName)
         else Result:=vtInteger;
       end
@@ -1449,8 +1494,7 @@ type
     procedure EmitInheritedCtorCall(aIL: ILGenerator; args: List<TExprNode>);
     var startCls3: string; parentCtor3: ConstructorInfo; extType3: System.Type; ae3: TExprNode;
     begin
-      startCls3:='';
-      if fClassParents.ContainsKey(fCurClassName) then startCls3:=fClassParents[fCurClassName];
+      startCls3:=fClasses.GetParentName(fCurClassName);
 
       aIL.Emit(OpCodes.Ldarg_0); // self
 
@@ -1505,8 +1549,7 @@ type
         exit;
       end;
 
-      startCls:='';
-      if fClassParents.ContainsKey(fCurClassName) then startCls:=fClassParents[fCurClassName];
+      startCls:=fClasses.GetParentName(fCurClassName);
       found:=false;
       if startCls<>'' then found:=TryFindInstanceMethod(startCls, mname, imb2);
 
@@ -3932,7 +3975,7 @@ type
           begin
             // [버그수정] cn(예: TAboutBox)이 자체적으로 mcs.MethodName(예: ShowDialog)을
             // 정의하지 않고 외부 조상 타입(Form 등)에서 상속받은 경우, FindInstanceMethod는
-            // 로컬(파스칼) 클래스 계층(fClassParents)만 훑고 예외를 던진다 — "암시적 self
+            // 로컬(파스칼) 클래스 계층(fClasses의 ParentName 체인)만 훑고 예외를 던진다 — "암시적 self
             // 호출" 분기(3144번째 줄 부근)에서 이미 쓰는 것과 동일한 외부 조상 타입 폴백을
             // 여기(지역변수를 통한 호출)에도 추가한다.
             if TryFindInstanceMethod(cn, mcs.MethodName, imb) then
@@ -7259,8 +7302,7 @@ type
       if not hasExplicitInherited then
       begin
         var autoParentCtor: ConstructorInfo;
-        var autoParentName: string:='';
-        if fClassParents.ContainsKey(impl.ClassName) then autoParentName:=fClassParents[impl.ClassName];
+        var autoParentName: string:=fClasses.GetParentName(impl.ClassName);
         if (autoParentName<>'') and fCtorBuilders.ContainsKey(autoParentName) then
         begin
           // [Stage 99] 부모도 생성자가 여러 개(오버로드)일 수 있으므로, 암묵적 자동
@@ -7279,7 +7321,7 @@ type
         else
           // [버그수정] cd.ParentName이 실은 인터페이스였던 경우(예: class(IDisposable))
           // BuildClassShell은 실제 CLR 부모를 System.Object로 두고 인터페이스는
-          // AddInterfaceImplementation으로 별도 등록한다 — fClassParents에는 여전히
+          // AddInterfaceImplementation으로 별도 등록한다 — fClasses에는 여전히
           // "IDisposable"이라는 원래 이름이 남아있어서, 그 이름으로 생성자를 찾으려 하면
           // (인터페이스는 생성자가 없으므로) 항상 실패했다. ParentName이 없거나 인터페이스로
           // 판명된 경우엔 진짜 부모인 System.Object의 기본 생성자를 쓴다.
@@ -8123,7 +8165,7 @@ type
       fMethodsCache:=new Dictionary<string, array of MethodInfo>; // [성능]
       fCtorsCache:=new Dictionary<string, array of ConstructorInfo>; // [성능]
       fAbstractMethods:=new Dictionary<string, List<string>>; // [Stage 53]
-      fClassParents:=new Dictionary<string, string>;
+      fClasses:=new TClassTable;
       fMethodReturnTypes:=new Dictionary<string, Dictionary<string, TVarType>>;
       fMethodParamClrTypes:=new Dictionary<string, Dictionary<string, array of System.Type>>;
       fCtorBuilders:=new Dictionary<string, List<ConstructorBuilder>>;
@@ -8279,6 +8321,16 @@ type
       fLoadedAssemblies.Add(asm);
     end;
 
+    // [진단용] [4/4] 코드생성 단계 진행 상황을 즉시 콘솔/리다이렉트된 로그 파일에 기록한다.
+    // Console.Out은 파일로 리다이렉트되면 버퍼링되어, Writeln만 호출해서는 실제로
+    // 로그 파일에 언제 쓰여질지 보장되지 않는다 — 매번 Flush를 강제해서, 컴파일이
+    // 도중에 멈추거나 예외로 죽어도 "어디까지 진행됐는지"가 로그에 즉시 남게 한다.
+    procedure LogGenStep(msg: string);
+    begin
+      Writeln('  [4/4 진행] ' + msg);
+      System.Console.Out.Flush;
+    end;
+
     procedure GenerateExe(outName: string);
     var
       an: AssemblyName; ab: AssemblyBuilder;
@@ -8317,26 +8369,64 @@ type
       end;
 
       // -2. [Phase 1] 열거형을 가장 먼저 빌드 (인터페이스·클래스 필드 타입으로 참조됨)
-      BuildEnumTypes(modB);
+      LogGenStep('열거형 빌드 시작');
+      try
+        BuildEnumTypes(modB);
+      except
+        on E: Exception do
+        begin
+          LogGenStep('실패 — 열거형 빌드 중: '+E.Message);
+          raise;
+        end;
+      end;
+      LogGenStep('열거형 빌드 완료');
 
       // -1.5. [Stage 62] 레코드(값 타입)를 열거형 다음, 인터페이스/클래스보다 먼저 완전히 빌드한다.
       // 메서드가 없어 클래스처럼 나중 단계를 기다릴 필요가 없으므로 여기서 CreateType까지 끝낸다.
-      BuildRecordTypes(modB);
+      LogGenStep('레코드 빌드 시작');
+      try
+        BuildRecordTypes(modB);
+      except
+        on E: Exception do
+        begin
+          LogGenStep('실패 — 레코드 빌드 중: '+E.Message);
+          raise;
+        end;
+      end;
+      LogGenStep('레코드 빌드 완료');
 
       // -1. 인터페이스 타입을 클래스보다 먼저 완전히 빌드 (CreateType까지)
       //     클래스의 AddInterfaceImplementation에는 완성된 Type이 필요하기 때문
       foreach id in fProg.InterfaceDecls do
+      try
         BuildInterfaceShell(modB, id);
+      except
+        on E: Exception do
+        begin
+          LogGenStep('실패 — 인터페이스 "'+id.Name+'" 빌드 중: '+E.Message);
+          raise;
+        end;
+      end;
 
       // 0. 클래스 상속 관계 등록 (부모가 먼저 선언되어 있어야 함)
       foreach cd in fProg.ClassDecls do
-        fClassParents[cd.Name]:=cd.ParentName;
+        fClasses.SetParentName(cd.Name, cd.ParentName);
 
       // 1. 클래스 TypeBuilder 생성 (껍데기 + 필드 + 메서드 시그니처)
       // ClassDecls는 소스에 선언된 순서(부모가 항상 자식보다 먼저)이므로
       // 부모 TypeBuilder가 자식보다 먼저 만들어짐이 보장된다.
+      LogGenStep('1단계 시작 — 클래스 껍데기 '+fProg.ClassDecls.Count.ToString+'개');
       foreach cd in fProg.ClassDecls do
+      try
         BuildClassShell(modB, cd);
+      except
+        on E: Exception do
+        begin
+          LogGenStep('실패 — 클래스 "'+cd.Name+'" 껍데기 빌드 중: '+E.Message);
+          raise;
+        end;
+      end;
+      LogGenStep('1단계 완료 — 클래스 껍데기 '+fProg.ClassDecls.Count.ToString+'개');
 
       // 2. 메인 프로그램 타입 (static 메서드들을 담을 타입)
       mainTB:=modB.DefineType('Program', TypeAttributes.Public);
@@ -8414,14 +8504,56 @@ type
         if fd.IsIterator then DeclareIteratorShell(fd);
       foreach fd in fProg.FuncDecls do DeclareStaticFunc(mainTB, fd);
       foreach pd in fProg.ProcDecls do DeclareStaticProc(mainTB, pd);
-      foreach fd in fProg.FuncDecls do BuildStaticFunc(mainTB, fd);
-      foreach pd in fProg.ProcDecls do BuildStaticProc(mainTB, pd);
+      LogGenStep('3단계 시작 — 최상위 함수/프로시저 본문 '
+        +fProg.FuncDecls.Count.ToString+'/'+fProg.ProcDecls.Count.ToString+'개');
+      foreach fd in fProg.FuncDecls do
+      try
+        BuildStaticFunc(mainTB, fd);
+      except
+        on E: Exception do
+        begin
+          LogGenStep('실패 — 함수 "'+fd.Name+'" 본문 생성 중: '+E.Message);
+          raise;
+        end;
+      end;
+      foreach pd in fProg.ProcDecls do
+      try
+        BuildStaticProc(mainTB, pd);
+      except
+        on E: Exception do
+        begin
+          LogGenStep('실패 — 프로시저 "'+pd.Name+'" 본문 생성 중: '+E.Message);
+          raise;
+        end;
+      end;
+      LogGenStep('3단계 완료 — 최상위 함수/프로시저 본문');
 
       // 4. 클래스 메서드 본문 IL 생성
-      foreach impl in fProg.MethodImpls do BuildMethodBody(impl);
+      LogGenStep('4단계 시작 — 클래스 메서드 본문 '+fProg.MethodImpls.Count.ToString+'개');
+      foreach impl in fProg.MethodImpls do
+      try
+        BuildMethodBody(impl);
+      except
+        on E: Exception do
+        begin
+          LogGenStep('실패 — 클래스 "'+impl.ClassName+'"의 메서드 "'+impl.MethodName+'" 본문 생성 중: '+E.Message);
+          raise;
+        end;
+      end;
+      LogGenStep('4단계 완료 — 클래스 메서드 본문 '+fProg.MethodImpls.Count.ToString+'개');
 
       // 4-1. [Stage 42] 사용자 정의 생성자 본문 IL 생성 (constructor Create; ... end;)
-      foreach ctorImpl in fProg.ConstructorImpls do BuildConstructorBody(ctorImpl);
+      LogGenStep('4-1단계 시작 — 생성자 본문 '+fProg.ConstructorImpls.Count.ToString+'개');
+      foreach ctorImpl in fProg.ConstructorImpls do
+      try
+        BuildConstructorBody(ctorImpl);
+      except
+        on E: Exception do
+        begin
+          LogGenStep('실패 — 클래스 "'+ctorImpl.ClassName+'"의 생성자 본문 생성 중: '+E.Message);
+          raise;
+        end;
+      end;
       // constructor Create;를 선언해 놓고 실제 구현(constructor ClassName.Create; begin...end;)을
       // 빠뜨리면 그 생성자의 IL에 Ret가 없는 채로 남는다 — CreateType 전에 미리 잡아준다.
       foreach cd in fProg.ClassDecls do
@@ -8434,12 +8566,21 @@ type
             raise new Exception('클래스 "'+cd.Name+'"에 "constructor Create;" 선언은 있지만 구현'
               +'("constructor '+cd.Name+'.Create; begin...end;")이 없습니다.');
         end;
+      LogGenStep('4-1단계 완료 — 생성자 본문');
 
       // 5. 클래스 타입 완성 (CreateType)
+      LogGenStep('5단계 시작 — CreateType '+fProg.ClassDecls.Count.ToString+'개');
       foreach cd in fProg.ClassDecls do
-      begin
+      try
         fBuiltTypes[cd.Name]:=fTypeBuilders[cd.Name].CreateType;
+      except
+        on E: Exception do
+        begin
+          LogGenStep('실패 — 클래스 "'+cd.Name+'" CreateType 중: '+E.Message);
+          raise;
+        end;
       end;
+      LogGenStep('5단계 완료 — CreateType');
 
       // 6. Main 메서드
       // [Stage 44] library는 진입점(Main)이 없다 — dll로 저장할 뿐 실행 파일이 아니다.
