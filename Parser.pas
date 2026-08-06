@@ -1714,6 +1714,28 @@ type
           Result:=new TExternalCastExprNode(extCastFull93, castArgExt94);
         end
 
+        // [자기컴파일 버그 수정] TVarRefNode(expr) 같은, 로컬(사용자 정의) 클래스 이름으로의
+        // 하드 캐스트. byte(204)/TabControl(sender)와 똑같은 모양이지만 대상이 이 프로젝트
+        // 안에서 선언된 클래스(fClassNames)일 때는 바로 위 두 분기 모두 "not
+        // fClassNames.Contains(t.Text)" 조건 때문에 걸러지고, 그대로 아래 "암시적 self 메서드
+        // 호출" 분기로 떨어져 "TVarRefNode"를 self의 메서드 이름으로 오인했다 — 그 결과
+        // CodeGen에서 "알 수 없는 메서드 "TParser.TVarRefNode""처럼 실패했다(Parser.pas
+        // 자신이 castArgs[0] is TVarRefNode then innerName:=TVarRefNode(castArgs[0]).VarName
+        // 같은 캐스트 표현을 여러 곳에서 쓰기 때문에 self-hosting 컴파일에서만 드러난 버그).
+        // 현재 클래스에 정말 같은 이름의 메서드가 있으면(드물지만 이름이 겹칠 수 있으니)
+        // 그쪽을 우선한다. Castclass로 구현되는 TAsCastExprNode(IsExternalType=false)를
+        // 그대로 재사용하면 fTypeBuilders 조회 로직(TAsCastExprNode 처리부)을 그대로 탄다.
+        else if (Cur.Kind=tkLParen) and fClassNames.Contains(t.Text)
+                and not ((fCurClass<>'') and fClassMethods.ContainsKey(fCurClass) and fClassMethods[fCurClass].ContainsKey(t.Text)) then
+        begin
+          fPos:=fPos+1; // '(' 소비
+          var castArgLocalCls:=ParseExpr;
+          Expect(tkRParen);
+          var localClsCast:=new TAsCastExprNode(castArgLocalCls, t.Text);
+          localClsCast.IsExternalType:=false;
+          Result:=localClsCast;
+        end
+
         // [Stage 93] 괄호 없이 부른 인자 0개 표준 라이브러리 함수 — 예: GetCurrentDir;
         // (Pascal 관례상 무인자 함수는 괄호 생략 가능). IsNiladicBuiltinFuncName 화이트리스트에
         // 있고 사용자가 같은 이름의 함수/필드를 직접 정의하지 않았을 때만 반응한다.

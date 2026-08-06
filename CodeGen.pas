@@ -6269,6 +6269,47 @@ type
       end;
     end;
 
+    // [Stage 101 버그 수정] baseType.GetProperties(...)를 직접 부르면, baseType이
+    // TypeBuilderInstantiation(예: List<TToken>처럼 원소 타입이 아직 CreateType되지
+    // 않은 로컬 클래스인 BCL 제네릭 컬렉션)일 때 System.NotSupportedException
+    // ("지정한 메서드가 지원되지 않습니다")을 던진다 — Reflection.Emit이 TypeBuilder로
+    // 만든 제네릭 인스턴스화에는 GetProperties/GetMethods 같은 조회 API를 직접 지원하지
+    // 않기 때문이다(SafeGetMethods/SafeGetConstructors/SafeGetProperty가 이미 이 문제를
+    // 우회하고 있음 — 바로 위 참고). EmitIndexerGet의 "Item" 프로퍼티 탐색(obj[i])만은
+    // 이 우회를 안 거치고 baseType.GetProperties를 그대로 불러 List<TToken>[i]처럼
+    // 로컬 클래스를 원소로 갖는 컬렉션을 인덱싱할 때 이 예외로 죽었다. SafeGetMethods와
+    // 동일한 패턴(열린 제네릭 정의에서 프로퍼티를 찾고 TypeBuilder.GetMethod로 그
+    // get/set 접근자만 닫힌 버전에 바인딩, TBoundGenericPropertyInfo로 감싸기)을 적용한다.
+    function SafeGetProperties(t: System.Type; flags: BindingFlags): array of PropertyInfo;
+    begin
+      if t.GetType().Name = 'TypeBuilderInstantiation' then
+      begin
+        var openT101 := t.GetGenericTypeDefinition();
+        var openProps101 := openT101.GetProperties(flags);
+        var bound101 := new System.Collections.Generic.List<PropertyInfo>();
+        for var i101 := 0 to openProps101.Length-1 do
+          if openProps101[i101].DeclaringType = openT101 then
+          begin
+            var g101: MethodInfo := nil;
+            var s101: MethodInfo := nil;
+            if openProps101[i101].GetGetMethod(true) <> nil then
+              g101 := TypeBuilder.GetMethod(t, openProps101[i101].GetGetMethod(true));
+            if openProps101[i101].GetSetMethod(true) <> nil then
+              s101 := TypeBuilder.GetMethod(t, openProps101[i101].GetSetMethod(true));
+            bound101.Add(new TBoundGenericPropertyInfo(openProps101[i101], t, g101, s101));
+          end;
+        Result := bound101.ToArray();
+      end
+      // [Stage 101] TypeBuilderInstantiation이 아니라 아직 CreateType 안 된 로컬 클래스의
+      // TypeBuilder 자체가 넘어온 경우(SafeGetMethods의 Stage 100 분기와 동일한 상황)도
+      // t.GetProperties가 똑같이 NotSupportedException을 던진다. 이 컴파일러가 만드는
+      // 로컬 클래스는 지금까지 인덱서(Item 프로퍼티)를 정의하지 않으므로 빈 배열로 충분하다.
+      else if (t.GetType().Name = 'TypeBuilder') and (FindLocalClassNameForTypeBuilder(t) <> '') then
+        Result := new PropertyInfo[0]
+      else
+        Result := t.GetProperties(flags);
+    end;
+
     // [버그 수정] obj[i] 형태의 외부 컬렉션 인덱서 getter 호출을 하나의 함수로 뽑아냈다 —
     // 기존에는 TExternalIndexExprNode 처리부에 이 로직이 한 번만 인라인돼 있었는데, a[i][j]
     // (이중 인덱싱) 지원을 위해 같은 로직을 두 번 적용해야 해서 재사용 가능하게 분리했다.
@@ -6311,7 +6352,7 @@ type
       end;
       idxArgType:=InferArgClrType(idxExpr);
       itemProp:=nil; bestScore:=System.Int32.MinValue;
-      foreach var cand in baseType.GetProperties(BindingFlags.Public or BindingFlags.Instance) do
+      foreach var cand in SafeGetProperties(baseType, BindingFlags.Public or BindingFlags.Instance) do
       begin
         if (cand.Name='Item') and (cand.GetIndexParameters.Length=1) and (cand.GetGetMethod<>nil) then
         begin
@@ -6481,9 +6522,39 @@ type
         // 선언됐다. 사용자 클래스의 외부 조상 타입(FindExternalAncestorType, 이미 완성된
         // 진짜 reflection Type이라 TypeBuilder 제약이 없다)에서 대신 찾는다.
         else if fLocalScope.Has(mc.ObjName) and fLocalScope.HasClassName(mc.ObjName) then
-          qType:=FindExternalAncestorType(fLocalScope.GetClassName(mc.ObjName))
+        begin
+          // [자기컴파일 버그 수정] cimpl89.Parameters처럼 로컬(우리가 만드는) 클래스 인스턴스의
+          // 필드/프로퍼티를 곧장 참조하는 식은, 여기서 곧장 FindExternalAncestorType으로
+          // 넘어가면(원래 이 분기는 "w.Title"처럼 외부 상속 타입의 멤버를 찾기 위한 것) 그
+          // 클래스 자신의 필드는 못 찾고 System.Object로 폴백해버린다(EmitExpr의 실제 방출
+          // 경로 — 2156행 부근 TryFindFieldBuilder(cn,...) — 는 이미 이걸 올바르게 처리하는데
+          // 타입 추론 전용인 이 함수만 그 경로가 없었다). TryFindFieldBuilder/fInstanceMethods로
+          // 먼저 로컬 클래스 자신의 필드/getter/메서드를 찾고, 없을 때만 기존처럼 외부 조상
+          // 타입에서 찾는다.
+          var _mcCn:=fLocalScope.GetClassName(mc.ObjName);
+          var _mcFb: FieldBuilder;
+          if (mc.Args.Count=0) and TryFindFieldBuilder(_mcCn, mc.MethodName, _mcFb) then
+          begin Result:=_mcFb.FieldType; exit; end;
+          if fInstanceMethods.ContainsKey(_mcCn) and fInstanceMethods[_mcCn].ContainsKey('get_'+mc.MethodName) then
+          begin Result:=fInstanceMethods[_mcCn]['get_'+mc.MethodName].ReturnType; exit; end;
+          var _mcMb: MethodBuilder;
+          if TryFindInstanceMethod(_mcCn, mc.MethodName, _mcMb) then
+          begin Result:=_mcMb.ReturnType; exit; end;
+          qType:=FindExternalAncestorType(_mcCn);
+        end
         else if fGlobalScope.Has(mc.ObjName) and fGlobalScope.HasClassName(mc.ObjName) then
-          qType:=FindExternalAncestorType(fGlobalScope.GetClassName(mc.ObjName))
+        begin
+          var _mcCnG:=fGlobalScope.GetClassName(mc.ObjName);
+          var _mcFbG: FieldBuilder;
+          if (mc.Args.Count=0) and TryFindFieldBuilder(_mcCnG, mc.MethodName, _mcFbG) then
+          begin Result:=_mcFbG.FieldType; exit; end;
+          if fInstanceMethods.ContainsKey(_mcCnG) and fInstanceMethods[_mcCnG].ContainsKey('get_'+mc.MethodName) then
+          begin Result:=fInstanceMethods[_mcCnG]['get_'+mc.MethodName].ReturnType; exit; end;
+          var _mcMbG: MethodBuilder;
+          if TryFindInstanceMethod(_mcCnG, mc.MethodName, _mcMbG) then
+          begin Result:=_mcMbG.ReturnType; exit; end;
+          qType:=FindExternalAncestorType(_mcCnG);
+        end
         // [버그 수정] string/정수/실수 등 원시 타입 지역·전역 변수는 ClrType도 ClassName도
         // 스코프에 기록되지 않는다(BuildStaticFunc 등의 지역변수 등록 루프가 vtObject/vtInterface일
         // 때만 채워 넣기 때문 — GetVarType 자체는 항상 정확하다). 그래서 "dirText.Substring(1).Trim"
@@ -6627,6 +6698,20 @@ type
         begin
           // [Stage 90] TargetType(inner) — 캐스트 결과의 CLR 타입은 항상 TargetType 자체.
           Result:=ResolveExternalType(TExternalCastExprNode(e).TargetType);
+        end
+        // [자기컴파일 버그 수정] <식> as <TypeName> 뿐 아니라 이제 Parser가 로컬 클래스로의
+        // TypeName(expr) 하드 캐스트도 TAsCastExprNode(IsExternalType=false)로 만든다
+        // (Parser.pas의 "TVarRefNode(x).VarName" 같은 패턴). 지금까지 GetExprClrType에
+        // TAsCastExprNode 분기가 아예 없어서 캐스트 결과가 무조건 System.Object로 폴백해
+        // 뒤이은 ".VarName" 멤버 접근이 실패했다. EmitExpr의 TAsCastExprNode 처리부(Castclass
+        // 대상 타입 조회)와 동일한 순서로 조회한다.
+        else if e is TAsCastExprNode then
+        begin
+          var _asc90:=TAsCastExprNode(e);
+          if _asc90.IsExternalType then Result:=ResolveExternalType(_asc90.TargetType)
+          else if fBuiltInterfaces.ContainsKey(_asc90.TargetType) then Result:=fBuiltInterfaces[_asc90.TargetType]
+          else if fBuiltTypes.ContainsKey(_asc90.TargetType) then Result:=fBuiltTypes[_asc90.TargetType]
+          else if fTypeBuilders.ContainsKey(_asc90.TargetType) then Result:=fTypeBuilders[_asc90.TargetType];
         end
         else if e is TChainedMemberExprNode then
         begin
