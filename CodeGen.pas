@@ -2538,7 +2538,37 @@ type
           aIL.Emit(OpCodes.Stloc, chTmp90);
           aIL.Emit(OpCodes.Ldloca, chTmp90);
         end;
-        if not ch90.IsCall then
+        // [Stage 101 버그 수정] chType90이 아직 CreateType되지 않은 로컬(자기 컴파일 대상) 클래스의
+        // TypeBuilder이면(예: "PeekAt(1).Kind" — PeekAt의 반환 타입 TToken이 아직 완성 전인 자기
+        // 컴파일 대상 클래스), 아래 SafeGetProperty/GetField/ResolveMethodByArity가 쓰는 리플렉션
+        // 조회는 TypeBuilder에 대해 NotSupportedException("유형이 만들어지기 전에 호출된 멤버는
+        // 지원되지 않습니다")을 던진다(셀프호스팅 컴파일 실제 사례) — EmitQualifierChainLoad와
+        // 동일하게 fInstanceMethods/fFieldBuilders에서 직접 가져오는 경로로 우회한다.
+        var chLocalCls101:=FindLocalClassNameForTypeBuilder(chType90);
+        if ch90.IsCall and (chLocalCls101<>'') and fInstanceMethods.ContainsKey(chLocalCls101)
+           and fInstanceMethods[chLocalCls101].ContainsKey(ch90.MemberName) then
+        begin
+          var chLocalMi101:=fInstanceMethods[chLocalCls101][ch90.MemberName];
+          EmitArgsCoerced(aIL, ch90.Args, FindInstanceMethodParamTypes(chLocalCls101, ch90.MemberName));
+          if chIsVal90 then aIL.Emit(OpCodes.Call, chLocalMi101)
+          else aIL.Emit(OpCodes.Callvirt, chLocalMi101);
+        end
+        else if (not ch90.IsCall) and (chLocalCls101<>'') and fInstanceMethods.ContainsKey(chLocalCls101)
+           and fInstanceMethods[chLocalCls101].ContainsKey('get_'+ch90.MemberName) then
+        begin
+          if chIsVal90 then aIL.Emit(OpCodes.Call, fInstanceMethods[chLocalCls101]['get_'+ch90.MemberName])
+          else aIL.Emit(OpCodes.Callvirt, fInstanceMethods[chLocalCls101]['get_'+ch90.MemberName]);
+        end
+        else if (not ch90.IsCall) and (chLocalCls101<>'') and fFieldBuilders.ContainsKey(chLocalCls101)
+           and fFieldBuilders[chLocalCls101].ContainsKey(ch90.MemberName) then
+          aIL.Emit(OpCodes.Ldfld, fFieldBuilders[chLocalCls101][ch90.MemberName])
+        else if (not ch90.IsCall) and (chLocalCls101<>'') and fInstanceMethods.ContainsKey(chLocalCls101)
+           and fInstanceMethods[chLocalCls101].ContainsKey(ch90.MemberName) then
+        begin
+          if chIsVal90 then aIL.Emit(OpCodes.Call, fInstanceMethods[chLocalCls101][ch90.MemberName])
+          else aIL.Emit(OpCodes.Callvirt, fInstanceMethods[chLocalCls101][ch90.MemberName]);
+        end
+        else if not ch90.IsCall then
         begin
           var chPi90:=SafeGetProperty(chType90, ch90.MemberName);
           if (chPi90<>nil) and (chPi90.GetGetMethod<>nil) then
@@ -3726,6 +3756,38 @@ type
           end
           else ivClrType:=VTC(ivVt, '');
         end
+        else if ivs.ValueExpr is TExternalIndexExprNode then
+        begin
+          // [버그 수정] "var x := dict[key];" 처럼 Dictionary/List 인덱서 결과를 담는
+          // 지역변수: 기존에는 InferType이 TExternalIndexExprNode를 못 알아채고 vtInteger로
+          // 폴백해 int32 슬롯으로 선언되었다 — 이후 x.Count 같은 호출이 "알 수 없는 메서드"로
+          // 실패했다. GetExprClrType은 이미 이 노드 타입을 정확히 추론하므로 재사용한다.
+          var ivIdxT:=GetExprClrType(ivs.ValueExpr);
+          if (ivIdxT<>nil) and (ivIdxT<>typeof(System.Object)) then
+          begin
+            ivClrType:=ivIdxT; ivIsExternal:=true; ivVt:=vtObject;
+          end
+          else ivClrType:=VTC(ivVt, '');
+        end
+        else if ivs.ValueExpr is TArrayIndexExprNode then
+        begin
+          // [버그 수정] "var x := someField[key];" — someField가 fArrayNames에 등록된
+          // List<T>/Dictionary<K,V> 등 외부 제네릭 컬렉션 "필드"(예: Parser.pas의
+          // fClassGenericConstraint: Dictionary<string,List<string>>)일 때, 파서는
+          // 이런 필드 인덱싱을 TExternalIndexExprNode가 아니라 TArrayIndexExprNode로
+          // 만든다(Parser.pas [Stage 98] fArrayNames 등록 참고). 기존에는 이 케이스가
+          // 여기서 분기되지 않아 InferType 폴백(vtInteger)으로 떨어져 x.Count가 "알 수
+          // 없는 메서드"로 실패했다(자기컴파일 중 Parser.ResolveGenericInstantiation의
+          // "var constraints:=fClassGenericConstraint[templateName];" 뒤 constraints.Count
+          // 에서 실제로 재현됨). GetExprClrType은 이미 TArrayIndexExprNode도 정확히
+          // 추론하므로(6718행 부근) 재사용한다.
+          var ivArrIdxT:=GetExprClrType(ivs.ValueExpr);
+          if (ivArrIdxT<>nil) and (ivArrIdxT<>typeof(System.Object)) then
+          begin
+            ivClrType:=ivArrIdxT; ivIsExternal:=true; ivVt:=vtObject;
+          end
+          else ivClrType:=VTC(ivVt, '');
+        end
         else
           ivClrType:=VTC(ivVt, '');
         end; // [자기컴파일] HasExplicitType else 종료
@@ -4604,7 +4666,19 @@ type
         var forVarLoc: LocalBuilder;
         if fLocalScope.Has(fs.VarName) then forVarLoc:=fLocalScope.GetLoc(fs.VarName)
         else if fGlobalScope.Has(fs.VarName) then forVarLoc:=fGlobalScope.GetLoc(fs.VarName)
-        else raise new Exception('for 변수 선언 안 됨: '+fs.VarName);
+        else
+        begin
+          // [Stage 102 버그 수정] "for var i:=A to B do" — Parser.pas가 카운터 변수를 var
+          // 섹션이 아니라 for문 자리에서 바로 선언하는 문법(Parser.pas Stage 101 주석 참고)을
+          // 지원하지만, 그 이름은 fCurParams(파서 자체의 이름 인식용 목록)에만 등록되고
+          // impl.LocalVars(실제 지역변수 선언 목록)에는 추가되지 않는다 — 그래서 CodeGen은
+          // 지금까지 "이 변수는 항상 미리 선언돼 있다"고 가정해 "for 변수 선언 안 됨"으로
+          // 실패했다(셀프호스팅 컴파일 실제 사례 — 이 파일 자체에 "for var X:=0 to N do"
+          // 형태가 수백 곳에 쓰인다). for 카운터는 언어 문법상 항상 정수이므로, 여기서
+          // 즉석으로 정수 로컬을 만들어 등록한다.
+          forVarLoc:=aIL.DeclareLocal(typeof(integer));
+          fLocalScope.Declare(fs.VarName, forVarLoc, vtInteger);
+        end;
         // end값을 임시 로컬에 저장 (매 반복 재평가 방지)
         var endValLoc:=aIL.DeclareLocal(typeof(integer));
         EmitExpr(aIL, fs.StartExpr);
@@ -4661,11 +4735,38 @@ type
         // 제거할 수 있다.)
         var fis:=TForInStmtNode(s);
         var forInVarLoc: LocalBuilder;
-        if fLocalScope.Has(fis.VarName) then forInVarLoc:=fLocalScope.GetLoc(fis.VarName)
-        else if fGlobalScope.Has(fis.VarName) then forInVarLoc:=fGlobalScope.GetLoc(fis.VarName)
-        else raise new Exception('for-in 변수 선언 안 됨: '+fis.VarName);
-
-        var forInVarClrType:=VTC(GetVarType(fis.VarName), GetVarClassName(fis.VarName));
+        var forInVarClrType: System.Type;
+        if fLocalScope.Has(fis.VarName) then
+        begin
+          forInVarLoc:=fLocalScope.GetLoc(fis.VarName);
+          forInVarClrType:=VTC(GetVarType(fis.VarName), GetVarClassName(fis.VarName));
+        end
+        else if fGlobalScope.Has(fis.VarName) then
+        begin
+          forInVarLoc:=fGlobalScope.GetLoc(fis.VarName);
+          forInVarClrType:=VTC(GetVarType(fis.VarName), GetVarClassName(fis.VarName));
+        end
+        else
+        begin
+          // [Stage 102 버그 수정] "foreach var x in y do" — 위 TForStmtNode와 동일한 사유로
+          // 순회 변수가 미리 선언돼 있지 않다. 이 변수의 타입은 카운터와 달리 컬렉션의 실제
+          // 원소 타입에서 추론해야 한다: 배열이면 GetElementType, 제네릭 컬렉션(List<T>/
+          // IEnumerable<T> 등, 예: "foreach var ns in namespaceList do")이면 첫 번째 타입
+          // 인자, 그 외(비제네릭 컬렉션 등)는 object로 폴백한다 — 아래의 기존 Current
+          // Unbox_Any/Castclass 로직이 forInVarClrType을 그대로 쓰므로 그것과 맞아떨어진다.
+          var forInCollType102:=GetExprClrType(fis.CollExpr);
+          if (forInCollType102<>nil) and forInCollType102.IsArray then
+            forInVarClrType:=forInCollType102.GetElementType
+          else if (forInCollType102<>nil) and forInCollType102.IsGenericType
+             and (forInCollType102.GetGenericArguments.Length>=1) then
+            forInVarClrType:=forInCollType102.GetGenericArguments()[0]
+          else
+            forInVarClrType:=typeof(System.Object);
+          forInVarLoc:=aIL.DeclareLocal(forInVarClrType);
+          var forInVt102:=VarTypeTagFromClrType(forInVarClrType);
+          fLocalScope.Declare(fis.VarName, forInVarLoc, forInVt102);
+          if forInVt102=vtObject then fLocalScope.SetClrType(fis.VarName, forInVarClrType);
+        end;
 
         EmitExpr(aIL, fis.CollExpr); // 컬렉션 참조를 스택에 올린다
         var getEnumMI:=typeof(System.Collections.IEnumerable).GetMethod('GetEnumerator');
@@ -5742,6 +5843,14 @@ type
         // 쓸 수 있으므로(Reflection.Emit이 허용) 완성된 타입을 우선하고, 없으면 TypeBuilder를 쓴다.
         if fBuiltTypes.ContainsKey(tag) then Result:=fBuiltTypes[tag]
         else if fTypeBuilders.ContainsKey(tag) then Result:=fTypeBuilders[tag]
+        // [버그 수정] "List<TVarType>"처럼 제네릭 타입 인자가 우리 컴파일러 자신이 빌드한
+        // 열거형(예: TVarType)인 경우 — 열거형은 클래스와 별도로 fBuiltEnums에 등록되므로
+        // (BuildEnumTypes/fBuiltEnums 참고) 위 fBuiltTypes/fTypeBuilders 조회에서는 항상 빠졌다.
+        // 그 결과 이 함수가 곧장 ResolveExternalType(tag)로 떨어져 "외부 타입 TVarType을(를)
+        // 찾을 수 없습니다"류의 실패(또는 상위에서 System.Object 폴백)로 이어졌다(셀프호스팅
+        // 컴파일 실제 사례 — Parser.pas의 "argTypes: List<TVarType>" 지역변수). VTC(216행
+        // 부근)가 이미 쓰는 것과 동일한 fBuiltEnums 조회를 여기도 추가한다.
+        else if fBuiltEnums.ContainsKey(tag) then Result:=fBuiltEnums[tag]
         else Result:=ResolveExternalType(tag); // 외부 타입 이름 (기본/짧은 이름/점으로 연결된 이름)
       end;
     end;
@@ -6302,8 +6411,10 @@ type
     // 경우엔 기존과 동일하게 nil을 돌려줘 호출부가 기존 폴백을 쓰도록 한다.
     function TryResolveMethodCallClrType(mc: TMethodCallExprNode): System.Type;
     var qType: System.Type; pi: PropertyInfo; mi: MethodInfo; fb52: FieldBuilder;
+        qTypeIsStatic92: boolean; // [버그 수정] 아래 static-chain 폴백(ResolveOrEmitStaticChain) 경로용 — 주석 참고
     begin
       Result:=nil;
+      qTypeIsStatic92:=true; // 기본값: 기존 동작(ObjName에 점이 있으면 정적 호출로 간주)과 동일
       try
         if mc.ObjCastType<>'' then
         begin
@@ -6330,6 +6441,29 @@ type
               var _castT92: System.Type := nil;
               try _castT92:=ResolveExternalType(mc.ObjName+'.'+mc.MethodName); except end;
               if _castT92<>nil then begin Result:=_castT92; exit; end;
+            end;
+            // [버그 수정] ObjName 자체가 타입이 아니라 "타입.정적프로퍼티" 형태의 다단계
+            // 정적 체인(예: "System.AppDomain.CurrentDomain" — AppDomain 타입의 CurrentDomain
+            // 정적 프로퍼티)이면 위 ResolveExternalType(mc.ObjName) 시도는 무조건 실패해
+            // qType이 nil로 남는다. 그 결과 이 함수 전체가 nil을 반환해 GetExprClrType이
+            // System.Object로 폴백하고, "System.AppDomain.CurrentDomain.GetAssemblies()"의
+            // 결과 타입(Assembly[])을 몰라 foreach 순회 변수가 System.Object로 선언되어
+            // 버렸다(_asm.GetType(name)처럼 1-인자 GetType 호출이 System.Object에는
+            // 없다는 오류로 이어짐 — 셀프호스팅 컴파일 실제 사례). EmitExpr의 정적 체인
+            // 호출 경로(1138행 부근)와 동일하게 ResolveOrEmitStaticChain으로 재시도한다
+            // (aIL=nil이면 IL을 방출하지 않고 타입만 계산한다).
+            if qType=nil then
+            begin
+              var _chainIsInst92: boolean;
+              try qType:=ResolveOrEmitStaticChain(nil, mc.ObjName, _chainIsInst92); except qType:=nil; end;
+              // ResolveOrEmitStaticChain은 성공하면 항상 "체인의 마지막 세그먼트가 프로퍼티/메서드를
+              // 거쳐 나온 인스턴스"를 돌려준다(예: AppDomain 타입 자체가 아니라 그 CurrentDomain
+              // 프로퍼티가 돌려주는 AppDomain 인스턴스) — 그 위의 mc.MethodName 호출은 항상 인스턴스
+              // 호출이어야 한다. 아래 481행 부근의 기존 판별식(mc.ObjName에 점이 있으면 무조건 정적
+              // 호출)을 그대로 쓰면 "System.AppDomain.CurrentDomain.GetAssemblies()"의 GetAssemblies를
+              // (존재하지 않는) 정적 메서드로 찾다가 실패해 nil을 반환 → GetExprClrType이 다시
+              // System.Object로 폴백하는 문제가 있었다.
+              if (qType<>nil) and _chainIsInst92 then qTypeIsStatic92:=false;
             end;
           end;
         end
@@ -6362,6 +6496,31 @@ type
                      or (GetVarType(mc.ObjName)=vtInt64) or (GetVarType(mc.ObjName)=vtReal)
                      or (GetVarType(mc.ObjName)=vtBoolean) or (GetVarType(mc.ObjName)=vtChar)) then
           qType:=VTC(GetVarType(mc.ObjName), '')
+        // [Stage 100 버그 수정] mc.ObjName=''인 암시적 self 메서드 호출(예: "PeekAt(1).Kind"의 PeekAt(1))은 여기서
+        // 전혀 처리되지 않아 그냥 마지막 else exit로 떨어지고(qType가 정해지지 않음) Result가 함수 첫줄의
+        // 기본값 typeof(System.Object)로 그대로 남아 버려진다 — 그 결과 "PeekAt(1).Kind"의 Inner 타입이 항상
+        // System.Object로 폴백되어 ".Kind"가 "타입 System.Object에 멤버 Kind가 없습니다"로 실패했다(셀프호스팅
+        // 컴파일 실제 사례). EmitExpr의 TMethodCallExprNode/ObjName='' 분기(위 1975행 부근)와 동일한 순서로
+        // "자기 클래스(상속 포함) 인스턴스 메서드" → "외부 상속 타입의 메서드/프로퍼티" 순서로 찾는다.
+        else if mc.ObjName='' then
+        begin
+          var _selfMb100: MethodBuilder;
+          if TryFindInstanceMethod(fCurClassName, mc.MethodName, _selfMb100) then
+          begin
+            Result:=_selfMb100.ReturnType;
+            exit;
+          end;
+          var _selfExtType100:=FindExternalAncestorType(fCurClassName);
+          if _selfExtType100<>nil then
+          begin
+            var _selfPi100:=SafeGetProperty(_selfExtType100, mc.MethodName);
+            if (mc.Args.Count=0) and (_selfPi100<>nil) and (_selfPi100.GetGetMethod<>nil) then
+            begin Result:=_selfPi100.PropertyType; exit; end;
+            var _selfMi100:=ResolveMethodByArity(_selfExtType100, mc.MethodName, mc.Args, false);
+            if _selfMi100<>nil then Result:=_selfMi100.ReturnType;
+          end;
+          exit;
+        end
         else
           exit;
 
@@ -6369,7 +6528,7 @@ type
         pi:=SafeGetProperty(qType, mc.MethodName);
         if (mc.Args.Count=0) and (pi<>nil) and (pi.GetGetMethod<>nil) then
         begin Result:=pi.PropertyType; exit; end;
-        mi:=ResolveMethodByArity(qType, mc.MethodName, mc.Args, mc.ObjName.IndexOf('.')>=0);
+        mi:=ResolveMethodByArity(qType, mc.MethodName, mc.Args, qTypeIsStatic92 and (mc.ObjName.IndexOf('.')>=0));
         if mi<>nil then Result:=mi.ReturnType;
       except
         Result:=nil; // 무엇이든 실패하면 조용히 중립 폴백(기존 동작 유지)
@@ -6474,6 +6633,20 @@ type
           var _ch90:=TChainedMemberExprNode(e);
           var _innerT90:=GetExprClrType(_ch90.Inner);
           if _innerT90=nil then exit;
+          // [Stage 101] _innerT90이 아직 CreateType되지 않은 로컬 클래스의 TypeBuilder이면
+          // 아래 SafeGetProperty/GetField가 예외를 던진다(이 함수 전체가 try/except로 감싸여
+          // 있어 크래시는 안 나지만, 그대로면 System.Object로 조용히 폴백해 타입 추론이
+          // 틀려버린다) — EmitExpr의 TChainedMemberExprNode와 동일하게 로컬 딕셔너리로 먼저 조회한다.
+          var _chLocalCls101:=FindLocalClassNameForTypeBuilder(_innerT90);
+          if (_chLocalCls101<>'') and fInstanceMethods.ContainsKey(_chLocalCls101) then
+          begin
+            if (not _ch90.IsCall) and fInstanceMethods[_chLocalCls101].ContainsKey('get_'+_ch90.MemberName) then
+            begin Result:=fInstanceMethods[_chLocalCls101]['get_'+_ch90.MemberName].ReturnType; exit; end;
+            if fFieldBuilders.ContainsKey(_chLocalCls101) and fFieldBuilders[_chLocalCls101].ContainsKey(_ch90.MemberName) then
+            begin Result:=fFieldBuilders[_chLocalCls101][_ch90.MemberName].FieldType; exit; end;
+            if fInstanceMethods[_chLocalCls101].ContainsKey(_ch90.MemberName) then
+            begin Result:=fInstanceMethods[_chLocalCls101][_ch90.MemberName].ReturnType; exit; end;
+          end;
           var _pi90:=SafeGetProperty(_innerT90, _ch90.MemberName);
           if (not _ch90.IsCall) and (_pi90<>nil) and (_pi90.GetGetMethod<>nil) then
           begin Result:=_pi90.PropertyType; exit; end;
@@ -6552,6 +6725,26 @@ type
               end;
             end;
           end;
+        end
+        // [버그 수정] Target[Index] 인덱싱 결과의 타입 — Target이 TArrayIndexExprNode(ArrName[Index]) 형태인
+        // 경우. 지금까지 GetExprClrType에 이 분기가 없어서 "fClassGenericParam[templateName].Count"처럼
+        // 필드에 담긴 Dictionary<string,List<string>> 등을 ArrName 인덱싱으로 표현한 식(자기컴파일 파서가
+        // 실제로 생성하는 패턴) 뒤에 ".Member"가 이어지면 System.Object로 폴백해 "타입 System.Object에
+        // 멤버 Count가 없습니다"로 실패했다(셀프호스팅 컴파일 실제 사례). EmitExpr의 TArrayIndexExprNode
+        // 처리부(2632행 부근)와 동일한 순서로 ArrName의 실제 CLR 타입을 찾은 뒤, 배열이면 원소 타입,
+        // 그 외(List<T>/Dictionary<K,V> 등)는 InferIndexerResultType의 Item 인덱서 판별 로직을 재사용한다.
+        else if e is TArrayIndexExprNode then
+        begin
+          var _aiG90:=TArrayIndexExprNode(e);
+          var _aiBaseT90: System.Type := nil;
+          var _aiFb90: FieldBuilder;
+          if fLocalScope.Has(_aiG90.ArrName) and fLocalScope.HasClrType(_aiG90.ArrName) then
+            _aiBaseT90:=fLocalScope.GetClrType(_aiG90.ArrName)
+          else if fGlobalScope.Has(_aiG90.ArrName) and fGlobalScope.HasClrType(_aiG90.ArrName) then
+            _aiBaseT90:=fGlobalScope.GetClrType(_aiG90.ArrName)
+          else if (fCurClassName<>'') and TryFindFieldBuilder(fCurClassName, _aiG90.ArrName, _aiFb90) then
+            _aiBaseT90:=_aiFb90.FieldType;
+          if _aiBaseT90<>nil then Result:=InferIndexerResultType(_aiBaseT90, _aiG90.Index);
         end
         else if e is TVarRefNode then
         begin

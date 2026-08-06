@@ -74,6 +74,16 @@ type
     // 체감 컴파일 시간에 곱해진다. Contains/Add만 쓰고 순서·인덱스 접근이 없는 걸 확인했으므로
     // O(1) 평균 조회의 HashSet으로 바꾼다 (ExportSymbols의 List.AddRange(HashSet)은 그대로 동작).
     fFuncNames, fProcNames, fArrayNames: HashSet<string>;
+    // [Stage 101 버그 수정] fArrayNames는 Stage 98부터 "진짜 array of T" 뿐 아니라
+    // List<T>/Dictionary<K,V> 같은 인덱서를 가진 외부 컬렉션 필드/변수도 함께 포함하게
+    // 넓어졌다. 그런데 "arr[i][j] — 두 번째 '['가 있으면 2차원 인덱스"(Stage 67) 분기가
+    // fArrayNames에 있다는 사실만으로 무조건 TMatrix2DIndexExprNode/TMatrix2DAssignStmtNode를
+    // 만들어버려서, fClassGenericParam[templateName][ci]처럼 Dictionary 필드를 이중
+    // 인덱싱하는 (진짜 2차원 배열이 아닌) 식/문장까지 "로컬/전역 2차원 배열 변수"로 오인해
+    // Scope.GetLoc에서 KeyNotFoundException으로 죽었다(자기컴파일 중 실제로 재현됨 —
+    // Parser.pas 자신의 ResolveGenericInstantiation). fMatrixNames는 진짜 vtMatrix로
+    // 선언된 이름만 담는 별도 세트로, "두 번째 '[' → 2차원" 판단을 이걸로만 좁힌다.
+    fMatrixNames: HashSet<string>;
     // [Stage 65, 1차] 현재 파싱 중인 최상위 함수/프로시저 안에 선언된 지역(중첩) 서브프로그램의
     // "소스에 쓰인 이름 → 맹글링된 실제 이름(Outer$Inner)" 매핑. 최상위 함수/프로시저에
     // 들어갈 때 새로 만들고 나올 때 이전 값(보통 nil)으로 복원한다 — 한 겹만 지원하므로
@@ -213,6 +223,48 @@ type
     end;
 
     function Cur: TToken; begin Result:=fTokens[fPos]; end;
+
+    // [Stage 102 버그 수정] 클래스 멤버를 위에서 아래로 단일 패스로 파싱하다 보니, 어떤
+    // 메서드의 본문이 "같은 클래스 안에서 자신보다 뒤에 선언된" 다른 무인자(니라딕) 메서드를
+    // 괄호 없이 호출하면(Pascal 관용 표현, 예: Lexer.pas의 CC) fClassMethods[cn]에 그 이름이
+    // 아직 등록되지 않아 "괄호 없이 호출된 자기 클래스의 무인자 메서드" 분기 조건이 실패하고
+    // 최종 else로 떨어져 TFieldReadExprNode(필드 읽기)로 오인된다 — 실제 사례: Parser.pas
+    // 자신의 ParsePrimary(앞쪽에 선언)가 뒤쪽에 선언된 ParseAddSub를
+    // "idxE:=ParseAddSub;"처럼 괄호 없이 부름. CodeGen은 이를 필드로 찾다가
+    // "필드/속성을 찾을 수 없음: TParser.ParseAddSub"로 실패한다.
+    // 본문을 실제로 파싱하기 전에, 이 클래스 안의 모든 procedure/function 이름을 가볍게
+    // (전체 문법을 따르지 않고 토큰만 훑어) 미리 fClassMethods[cn]에 등록해 이 순서 의존성을
+    // 원천적으로 없앤다. begin/case/try/record는 반드시 대응하는 end가 있으므로 깊이 카운터로
+    // 그 안(메서드 본문 등)을 건너뛰고, 깊이가 0인 상태에서 처음 만나는 end가 바로 이 클래스
+    // 자신의 닫는 end이므로 거기서 스캔을 멈춘다. fPos는 스캔 전후로 그대로 복원한다.
+    procedure PreRegisterClassMethodNames(cn: string);
+    var savedPos, depth: integer;
+    begin
+      savedPos:=fPos;
+      depth:=0;
+      while fPos<fTokens.Count do
+      begin
+        if (Cur.Kind=tkBegin) or (Cur.Kind=tkCase) or (Cur.Kind=tkTry) or (Cur.Kind=tkRecord) then
+          depth:=depth+1
+        else if Cur.Kind=tkEnd then
+        begin
+          if depth=0 then break; // 이 클래스 자신의 닫는 end — 스캔 종료
+          depth:=depth-1;
+        end
+        else if (depth=0) and ((Cur.Kind=tkFunction) or (Cur.Kind=tkProcedure)) then
+        begin
+          var _preIsFunc:=(Cur.Kind=tkFunction);
+          if (fPos+1<fTokens.Count) and (fTokens[fPos+1].Kind=tkIdent) then
+          begin
+            var _preName:=fTokens[fPos+1].Text;
+            if not fClassMethods[cn].ContainsKey(_preName) then
+              fClassMethods[cn][_preName]:=_preIsFunc;
+          end;
+        end;
+        fPos:=fPos+1;
+      end;
+      fPos:=savedPos;
+    end;
 
     // [Stage 94] ParseTypeName(필드/변수 선언 타입, Stage 87)이 쓰는 것과 같은 방식으로 —
     // uses 절에 나열된 네임스페이스들 + 이미 로드된 어셈블리 목록에서 name이 실제로 어떤
@@ -1549,8 +1601,15 @@ type
         else if (Cur.Kind=tkLBracket) and fArrayNames.Contains(t.Text) then
         begin
           fPos:=fPos+1; idxE:=ParseAddSub; Expect(tkRBracket);
-          // [Stage 67] arr[i][j] — 두 번째 '[' 가 있으면 2차원 인덱스
-          if Cur.Kind=tkLBracket then
+          // [Stage 67] arr[i][j] — 두 번째 '[' 가 있으면 2차원 인덱스.
+          // [Stage 101 버그 수정] fArrayNames에는 진짜 2차원 배열뿐 아니라(Stage 98부터)
+          // List/Dictionary 필드도 섞여 있으므로, 여기서는 fMatrixNames(진짜 vtMatrix만)로
+          // 좁혀 판단한다 — 아니면 fClassGenericParam[templateName][ci] 같은 Dictionary
+          // 이중 인덱싱까지 "2차원 배열"로 오인해 CodeGen에서 Scope.GetLoc이 죽는다.
+          // 매트릭스가 아니면 두 번째 '['는 여기서 소비하지 않고 그대로 남겨, 아래에서
+          // TArrayIndexExprNode를 만든 뒤 함수 끝의 범용 체이닝 루프(Stage 96)가
+          // TChainedIndexExprNode로 이어받게 한다.
+          if (Cur.Kind=tkLBracket) and fMatrixNames.Contains(t.Text) then
           begin
             fPos:=fPos+1;
             var idxE2:=ParseAddSub; Expect(tkRBracket);
@@ -2364,14 +2423,25 @@ type
         else if (Cur.Kind=tkLBracket) and fArrayNames.Contains(nt.Text) then
         begin
           fPos:=fPos+1; idx:=ParseExpr; Expect(tkRBracket);
-          // [Stage 67] arr[i][j] := val — 두 번째 '[' 가 있으면 2차원 대입
-          if Cur.Kind=tkLBracket then
+          // [Stage 67] arr[i][j] := val — 두 번째 '[' 가 있으면 2차원 대입.
+          // [Stage 101 버그 수정] fArrayNames에는 List/Dictionary 필드도 섞여 있으므로(Stage 98),
+          // 진짜 2차원 배열인지는 fMatrixNames로 좁혀 판단한다. 매트릭스가 아니면
+          // fClassMethods[cn][mname]:=isFunc; 같은 이중 인덱서 대입과 동일한 패턴이므로
+          // 아래 [Stage 88]의 TExternalDoubleIndexAssignStmtNode 경로를 그대로 재사용한다.
+          if (Cur.Kind=tkLBracket) and fMatrixNames.Contains(nt.Text) then
           begin
             fPos:=fPos+1;
             var idx2:=ParseExpr; Expect(tkRBracket);
             Expect(tkAssign); rhs:=ParseExpr;
             // 원소 타입은 CodeGen에서 스코프로 조회하므로 여기선 '' 전달
             Result:=new TMatrix2DAssignStmtNode(nt.Text, idx, idx2, rhs, '');
+          end
+          else if Cur.Kind=tkLBracket then // [Stage 101] 매트릭스가 아닌 이중 인덱서 대입 (예: Dictionary 필드)
+          begin
+            fPos:=fPos+1;
+            var idx2NonMat:=ParseExpr; Expect(tkRBracket);
+            Expect(tkAssign); rhs:=ParseExpr;
+            Result:=new TExternalDoubleIndexAssignStmtNode(nt.Text, idx, idx2NonMat, rhs);
           end
           // [자기컴파일] fClassFields[cn].Add(propName); 처럼 인덱싱 결과에 메서드 호출.
           // [Stage 98+] Entries[vn].ClassName := cn; 처럼 인덱싱 결과 필드 대입도 지원.
@@ -3207,6 +3277,10 @@ type
             fClassMethods[cn]:=new Dictionary<string, boolean>;
           end;
 
+          // [Stage 102] 본문을 파싱하기 전에 이 클래스의 모든 메서드 이름을 미리 등록 —
+          // 위쪽 메서드가 아래쪽에 선언된 무인자 메서드를 괄호 없이 호출하는 순방향 참조를 지원한다.
+          PreRegisterClassMethodNames(cn);
+
           // private/public 섹션 안의 필드와 메서드 시그니처 읽기
           // (본문 파싱 동안 fCurGenericParams를 설정해 T/K/V 등의 참조를 vtGeneric으로 인식시킨다)
           var savedGP1:=fCurGenericParams; fCurGenericParams:=genParamNames;
@@ -3648,6 +3722,7 @@ type
                 if fldType=vtMatrix then
                 begin
                   if not fArrayNames.Contains(fn) then fArrayNames.Add(fn);
+                  if not fMatrixNames.Contains(fn) then fMatrixNames.Add(fn); // [Stage 101]
                 end;
                 // [Stage 98] List<T>/Dictionary<K,V> 등 인덱서를 갖는 외부 제네릭 컬렉션 필드.
                 if fldIsExt and IsIndexerCapableExternalType(fldCn) then
@@ -3726,7 +3801,7 @@ type
         begin
           aList.Add(new TVarDecl(nm, vt, cn, isExt));
           if (vt=vtIntArray) or (vt=vtStrArray) or (vt=vtGenericArray) or (vt=vtObjArray) then fArrayNames.Add(nm); // [Stage 37/90]
-          if vt=vtMatrix then begin if not fArrayNames.Contains(nm) then fArrayNames.Add(nm); end; // [Stage 67]
+          if vt=vtMatrix then begin if not fArrayNames.Contains(nm) then fArrayNames.Add(nm); if not fMatrixNames.Contains(nm) then fMatrixNames.Add(nm); end; // [Stage 67/101]
           if isExt and IsIndexerCapableExternalType(cn) then // [Stage 98] List<T>/Dictionary<K,V> 지역변수 인덱싱 지원
             begin if not fArrayNames.Contains(nm) then fArrayNames.Add(nm); end;
         end;
@@ -4084,7 +4159,7 @@ type
             // 있어야 하는데, 이전에는 매개변수 이름이 fArrayNames에 등록되지 않아
             // 배열 인덱스 식으로 인식되지 않았다(별개 버그, 이번에 함께 수정).
             if (pt=vtIntArray) or (pt=vtStrArray) or (pt=vtGenericArray) or (pt=vtObjArray) then fArrayNames.Add(nm); // [Stage 37/90]
-            if pt=vtMatrix then begin if not fArrayNames.Contains(nm) then fArrayNames.Add(nm); end; // [Stage 67]
+            if pt=vtMatrix then begin if not fArrayNames.Contains(nm) then fArrayNames.Add(nm); if not fMatrixNames.Contains(nm) then fMatrixNames.Add(nm); end; // [Stage 67/101]
             if pIsExt5 and IsIndexerCapableExternalType(pCn5) then // [Stage 98] List<T>/Dictionary<K,V> 매개변수 인덱싱 지원
               begin if not fArrayNames.Contains(nm) then fArrayNames.Add(nm); end;
           end;
@@ -4402,7 +4477,7 @@ type
           vd93.InitExpr:=giveInit93; // 이름이 여러 개(a, b: T := expr;)면 각자 같은 초기화식을 공유
           aProg.VarDecls.Add(vd93);
           if (vt=vtIntArray) or (vt=vtStrArray) then fArrayNames.Add(nm);
-          if vt=vtMatrix then begin if not fArrayNames.Contains(nm) then fArrayNames.Add(nm); end; // [Stage 67]
+          if vt=vtMatrix then begin if not fArrayNames.Contains(nm) then fArrayNames.Add(nm); if not fMatrixNames.Contains(nm) then fMatrixNames.Add(nm); end; // [Stage 67/101]
           if isExt and IsIndexerCapableExternalType(cn) then // [Stage 98] List<T>/Dictionary<K,V> 전역변수 인덱싱 지원
             begin if not fArrayNames.Contains(nm) then fArrayNames.Add(nm); end;
         end;
@@ -4475,6 +4550,7 @@ type
       fFuncNames:=new HashSet<string>; // [성능] List→HashSet
       fProcNames:=new HashSet<string>; // [성능] List→HashSet
       fArrayNames:=new HashSet<string>; // [성능] List→HashSet
+      fMatrixNames:=new HashSet<string>; // [Stage 101]
       fClassNames:=new HashSet<string>; // [성능] List→HashSet
       fInterfaceNames:=new HashSet<string>; // [성능] List→HashSet
       fEnumNames:=new HashSet<string>; // [Phase 1] [성능] List→HashSet
