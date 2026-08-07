@@ -145,6 +145,21 @@ type
     // 구분하지 않으므로 소스의 표기(대문자든 소문자든)와 무관하게 항상 이 표의 정규화된
     // 표기를 돌려준다 — 화이트리스트에 없는 이름이면 빈 문자열('')을 돌려주고, 호출부는
     // 그 경우 기존 경로(사용자 정의 함수/변수 등)로 계속 진행한다.
+    // [버그 수정] PascalABC.NET은 and/or를 완전 평가(non-short-circuit)한다. 코드 곳곳에
+    // "outer.ContainsKey(k1) and outer[k1].ContainsKey(k2)" 형태로 중첩 Dictionary를
+    // 조회하던 자리들은, outer에 k1이 없을 때도 outer[k1]을 그대로 평가해
+    // KeyNotFoundException을 던졌다(자기컴파일 실제 사례 — CodeGen.pas/Scope.pas와 동일한
+    // 근본 원인). 이 제네릭 헬퍼로 통일해, k1이 없으면 k2를 아예 조회하지 않도록 한다.
+    function DictDictHas<TV>(d: Dictionary<string, Dictionary<string, TV>>; k1, k2: string): boolean;
+    var _ddHasKey: boolean;
+    begin
+      _ddHasKey:=d.ContainsKey(k1);
+      if _ddHasKey then
+        Result:=d[k1].ContainsKey(k2)
+      else
+        Result:=false;
+    end;
+
     function NormalizeBuiltinFuncName(text: string): string;
     var lw: string;
     begin
@@ -532,9 +547,14 @@ type
         fPos:=fPos+1; Expect(tkOf);
         if not ((Cur.Kind=tkIdent) and fEnumNames.Contains(Cur.Text)) then
           raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': set of 뒤에는 열거형 이름이 와야 합니다 (Stage 63)');
-        if fEnumSize.ContainsKey(Cur.Text) and (fEnumSize[Cur.Text]>32) then
-          raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': 열거형 "'+Cur.Text
-            +'"의 멤버가 32개를 넘어 집합으로 표현할 수 없습니다 (Stage 63은 32비트 비트마스크 사용)');
+        // [버그 수정] PascalABC.NET의 and 완전 평가 — Cur.Text가 fEnumSize에 없을 때도
+        // 인덱싱이 평가되어 KeyNotFoundException을 던지던 문제. 단계적 if로 교체.
+        if fEnumSize.ContainsKey(Cur.Text) then
+        begin
+          if fEnumSize[Cur.Text]>32 then
+            raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': 열거형 "'+Cur.Text
+              +'"의 멤버가 32개를 넘어 집합으로 표현할 수 없습니다 (Stage 63은 32비트 비트마스크 사용)');
+        end;
         fLastGenericName:=Cur.Text; fPos:=fPos+1; Result:=vtSet;
       end
       else if (Cur.Kind=tkIdent) and fClassNames.Contains(Cur.Text) then
@@ -656,9 +676,14 @@ type
         fPos:=fPos+1; Expect(tkOf);
         if not ((Cur.Kind=tkIdent) and fEnumNames.Contains(Cur.Text)) then
           raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': set of 뒤에는 열거형 이름이 와야 합니다 (Stage 63)');
-        if fEnumSize.ContainsKey(Cur.Text) and (fEnumSize[Cur.Text]>32) then
-          raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': 열거형 "'+Cur.Text
-            +'"의 멤버가 32개를 넘어 집합으로 표현할 수 없습니다 (Stage 63은 32비트 비트마스크 사용)');
+        // [버그 수정] PascalABC.NET의 and 완전 평가 — Cur.Text가 fEnumSize에 없을 때도
+        // 인덱싱이 평가되어 KeyNotFoundException을 던지던 문제. 단계적 if로 교체.
+        if fEnumSize.ContainsKey(Cur.Text) then
+        begin
+          if fEnumSize[Cur.Text]>32 then
+            raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': 열거형 "'+Cur.Text
+              +'"의 멤버가 32개를 넘어 집합으로 표현할 수 없습니다 (Stage 63은 32비트 비트마스크 사용)');
+        end;
         cn:=Cur.Text; fLastGenericName:=cn; fPos:=fPos+1; Result:=vtSet; exit;
       end;
       // [Stage 87] object — .NET System.Object 매개변수/필드 타입
@@ -702,8 +727,19 @@ type
         else if Cur.Kind=tkDot then
         begin
           while Cur.Kind=tkDot do begin fPos:=fPos+1; qn4:=qn4+'.'+ExpectQualNamePart; end;
-          cn:=qn4; isExt:=true; Result:=vtObject;
-          if Cur.Kind=tkLt then SkipGenericArgs; // [Stage 99] 예: System.Collections.Generic.List<T>
+          isExt:=true; Result:=vtObject;
+          // [셀프 컴파일 버그 수정] Stage 99에서는 점(.)으로 완전히 연결된 외부 타입 이름 뒤에
+          // 제네릭 타입 인자(예: System.Collections.Generic.KeyValuePair<string, TypeBuilder>)가
+          // 오면 SkipGenericArgs로 그냥 버렸다. 그 결과 cn이 arity/타입인자 없는
+          // "System.Collections.Generic.KeyValuePair"로만 남아 CodeGen.ResolveExternalType이
+          // "System.Collections.Generic.KeyValuePair`2"를 조립할 방법이 없어 "외부 타입을
+          // 찾을 수 없습니다"로 실패했다(List/Dictionary 같은 짧은 이름은 Stage 97에서 이미
+          // ParseExternalGenericType으로 고쳤지만, 점으로 연결된 완전한 이름 쪽은 빠져 있었다).
+          // 짧은 이름 경로와 동일하게 ParseExternalGenericType으로 실제 타입 인자를 그대로
+          // cn에 담아 "KeyValuePair<string,TypeBuilder>" 형태로 만들면, ResolveExternalType의
+          // '<' 포함 여부 분기가 ResolveExternalGenericType으로 정상적으로 닫힌 제네릭을 조립한다.
+          if Cur.Kind=tkLt then cn:=ParseExternalGenericType(qn4)
+          else cn:=qn4;
         end
         else
         begin
@@ -739,8 +775,12 @@ type
           end;
           if _resolved87<>'' then
           begin
-            cn:=_resolved87; isExt:=true; Result:=vtObject;
-            if Cur.Kind=tkLt then SkipGenericArgs; // [Stage 99] 예: List<TParamDef> — 단순 이름으로 해석된 경우
+            isExt:=true; Result:=vtObject;
+            // [셀프 컴파일 버그 수정] 위 점(.)-연결 분기와 같은 이유로, 네임스페이스 탐색으로
+            // 해석된 단순 이름 뒤에 제네릭 타입 인자가 오는 경우도 SkipGenericArgs로 버리지 않고
+            // ParseExternalGenericType으로 담아야 ResolveExternalType이 닫힌 제네릭을 조립할 수 있다.
+            if Cur.Kind=tkLt then cn:=ParseExternalGenericType(_resolved87)
+            else cn:=_resolved87;
           end
           else
           begin
@@ -782,8 +822,14 @@ type
       while cur<>'' do
       begin
         if cur=constraintName then begin Result:=true; exit; end;
-        if fClassInterface.ContainsKey(cur) and (fClassInterface[cur]=constraintName) then
-          begin Result:=true; exit; end;
+        // [버그 수정] PascalABC.NET의 and 완전 평가(non-short-circuit) 때문에 "X and Y"에서
+        // X가 false여도 Y는 그대로 평가된다 — cur가 fClassInterface에 없을 때도
+        // fClassInterface[cur]가 평가되어 KeyNotFoundException을 던지던 문제. and로 묶는 대신
+        // ContainsKey일 때만 값을 비교하는 단계적 if로 바꾼다.
+        if fClassInterface.ContainsKey(cur) then
+        begin
+          if fClassInterface[cur]=constraintName then begin Result:=true; exit; end;
+        end;
         if fClassParent.ContainsKey(cur) then cur:=fClassParent[cur] else cur:='';
       end;
       Result:=false;
@@ -1726,7 +1772,7 @@ type
         // 그쪽을 우선한다. Castclass로 구현되는 TAsCastExprNode(IsExternalType=false)를
         // 그대로 재사용하면 fTypeBuilders 조회 로직(TAsCastExprNode 처리부)을 그대로 탄다.
         else if (Cur.Kind=tkLParen) and fClassNames.Contains(t.Text)
-                and not ((fCurClass<>'') and fClassMethods.ContainsKey(fCurClass) and fClassMethods[fCurClass].ContainsKey(t.Text)) then
+                and not ((fCurClass<>'') and DictDictHas(fClassMethods, fCurClass, t.Text)) then
         begin
           fPos:=fPos+1; // '(' 소비
           var castArgLocalCls:=ParseExpr;

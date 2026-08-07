@@ -57,17 +57,36 @@ type
       Result:=Entries.ContainsKey(vn);
     end;
 
+    // [버그 수정] PascalABC.NET은 and/or를 완전 평가(non-short-circuit)한다 — 예전 코드
+    // "Entries.ContainsKey(vn) and (Entries[vn].ClrType<>nil)"는 vn이 없을 때도
+    // Entries[vn]을 그대로 평가해 KeyNotFoundException을 던졌다. 이 예외는 호출부인
+    // GetExprClrType의 try/except에 조용히 먹혀 Result가 System.Object로 잘못 폴백되고,
+    // 그 결과 "타입 System.Object에 멤버 X가 없습니다" 오류로 이어졌다(자기컴파일 실제
+    // 사례 — fTokens[fPos].Kind에서 fTokens는 지역변수가 아니라 필드라 Has()가 false인데도
+    // HasClrType() 내부에서 터짐). ContainsKey 결과를 먼저 변수에 담아 분기하는 단계적
+    // if로 바꿔 Entries[vn]이 키가 있을 때만 평가되도록 한다.
     function HasClrType(vn: string): boolean;
+    var _hcHasKey: boolean;
     begin
-      Result:=Entries.ContainsKey(vn) and (Entries[vn].ClrType<>nil);
+      _hcHasKey:=Entries.ContainsKey(vn);
+      if _hcHasKey then
+        Result:=(Entries[vn].ClrType<>nil)
+      else
+        Result:=false;
     end;
 
     // 예전의 별도 fLocalClass/fGlobalClass 딕셔너리는 "클래스 타입 변수만" 담고 있었다
     // (정수/문자열 등 지역변수는 아예 키가 없었음). Has()는 "이 이름이 스코프에 존재하는가"만
     // 보므로 의미가 다르다 — 반드시 ClassName이 실제로 채워졌는지까지 확인해야 한다.
+    // [버그 수정] HasClrType과 동일한 이유로 non-short-circuit and의 KeyNotFoundException을 피한다.
     function HasClassName(vn: string): boolean;
+    var _hcnHasKey: boolean;
     begin
-      Result:=Entries.ContainsKey(vn) and (Entries[vn].ClassName<>'');
+      _hcnHasKey:=Entries.ContainsKey(vn);
+      if _hcnHasKey then
+        Result:=(Entries[vn].ClassName<>'')
+      else
+        Result:=false;
     end;
 
     function GetLoc(vn: string): LocalBuilder;
