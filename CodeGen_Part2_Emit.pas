@@ -2313,6 +2313,17 @@
           end
           else ivClrType:=VTC(ivVt, '');
         end
+        else if ivs.ValueExpr is TTypeOfExprNode then
+        begin
+          // [Stage 101 버그 수정] "var pClrType:=typeof(integer);"처럼 typeof(...) 결과를
+          // 담는 지역 변수. InferType(TTypeOfExprNode)는 vtObject로만 태깅하고(vtType이
+          // 따로 없어서), 여기서 그 vtObject를 그대로 VTC(vtObject,'')에 넘기면 CLR 타입이
+          // System.Object로 폴백되어 버렸다 — 그 결과 이후 "pClrType.IsByRef" 같은 멤버
+          // 접근이 "타입 System.Object에 메서드 IsByRef가 없습니다"로 실패했다(자기컴파일
+          // 중 BuildMethodBody 자신의 소스에서 실제로 재현됨). typeof(...)의 결과는 항상
+          // 정확히 System.Type이므로 그대로 못박아 둔다.
+          ivClrType:=typeof(System.Type); ivIsExternal:=true; ivVt:=vtObject;
+        end
         else if ivs.ValueExpr is TChainedIndexExprNode then
         begin
           // [자기컴파일 버그 수정] "var _getMB4c:=fInstanceMethods[cn]['get_'+name];"처럼

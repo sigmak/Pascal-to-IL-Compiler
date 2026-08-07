@@ -3849,7 +3849,15 @@
       try
         var tfaCtor:=typeof(System.Runtime.Versioning.TargetFrameworkAttribute).GetConstructor([typeof(string)]);
         var tfaVersionString: string:='.NETFramework,Version=v4.7.2'; // 폴백값
-        var selfTfa:=System.Reflection.Assembly.GetExecutingAssembly().GetCustomAttribute(
+        // [Stage 102 버그 수정] 셀프호스팅 중인 구버전 컴파일러 바이너리의 파서가
+        // "정적타입.메서드(다른타입.메서드(), 인자2)" 형태를 정적 2-인자 호출로 못 읽고,
+        // 첫 인자(Assembly.GetExecutingAssembly())를 체인의 리시버로, GetCustomAttribute를
+        // 그 위의 1-인자 체인 호출로 잘못 재해석해 "System.Reflection.Assembly에
+        // 메서드 GetCustomAttribute가 없습니다"로 실패했다. 첫 인자를 지역변수로
+        // 먼저 뽑아 단순 식별자로 만들어 이 오인식 자체를 피한다.
+        var selfAsm:=System.Reflection.Assembly.GetExecutingAssembly();
+        var selfTfa:=System.Attribute.GetCustomAttribute(
+          selfAsm,
           typeof(System.Runtime.Versioning.TargetFrameworkAttribute))
           as System.Runtime.Versioning.TargetFrameworkAttribute;
         if selfTfa<>nil then
