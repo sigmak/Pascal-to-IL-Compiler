@@ -1396,6 +1396,26 @@
         else if _chT90=typeof(char) then Result:=vtChar
         else Result:=vtObject;
       end
+      // [자기컴파일 버그 수정] "var _getMB4c:=fInstanceMethods[cn]['get_'+name];"처럼 이중
+      // 인덱싱(Dictionary<string,Dictionary<string,MethodBuilder>> 등 — 바깥 인덱싱의
+      // 결과를 다시 인덱싱)으로 얻은 값을 담는 지역 변수의 초기화식은 TChainedIndexExprNode로
+      // 파싱된다. 지금까지 InferType에 이 노드 종류 자체가 없어 무조건 맨 아래
+      // "else Result:=vtInteger"로 폴백했다 — 그 결과 TInlineVarStmtNode가 int32 슬롯으로
+      // 선언해버려, 이후 "_getMB4c.ReturnType" 같은 멤버 접근이 cn=''인 원시타입 취급으로
+      // "알 수 없는 메서드 \".ReturnType\""로 실패했다(자기컴파일 InferType 자신의 본문에서
+      // 실제로 재현됨). TChainedMemberExprNode와 동일하게 GetExprClrType(이미 이 노드 종류를
+      // 정확히 추론함, 1082행 부근)을 재사용해 vtObject/원시타입을 가른다.
+      else if e is TChainedIndexExprNode then
+      begin
+        var _cixIT100:=GetExprClrType(e);
+        if _cixIT100=typeof(string) then Result:=vtString
+        else if _cixIT100=typeof(integer) then Result:=vtInteger
+        else if _cixIT100=typeof(int64) then Result:=vtInt64
+        else if _cixIT100=typeof(double) then Result:=vtReal
+        else if _cixIT100=typeof(boolean) then Result:=vtBoolean
+        else if _cixIT100=typeof(char) then Result:=vtChar
+        else Result:=vtObject;
+      end
       else Result:=vtInteger;
       finally
         fEmitDepth:=fEmitDepth-1;

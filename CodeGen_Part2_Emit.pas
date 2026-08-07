@@ -252,18 +252,55 @@
             end
             else
             begin
-              var _cpiE:=SafeGetProperty(_chainTypeE, mc.MethodName);
-              if (mc.Args.Count=0) and (_cpiE<>nil) and (_cpiE.GetGetMethod<>nil) then
-                aIL.Emit(OpCodes.Callvirt, _cpiE.GetGetMethod)
+              // [버그 수정] _chainTypeE가 아직 CreateType되지 않은 "로컬" 클래스의 TypeBuilder일
+              // 수 있다 — 예: "_sse.Lambda.ParamName" (Lambda: TExprLambdaNode, 이 컴파일러가
+              // 만드는 로컬 클래스). EmitQualifierChainLoad는 체인의 중간 세그먼트("_sse"→"Lambda")를
+              // 지나며 로컬 클래스 여부를 이미 확인하지만(localClsName78 역조회 → fFieldBuilders/
+              // fInstanceMethods), 체인의 "마지막" 세그먼트(mc.MethodName, 여기서는 "ParamName")는
+              // 이 분기까지 오면 무조건 SafeGetProperty/ResolveMethodByArity(순수 리플렉션 전용)로
+              // 넘어갔다 — TypeBuilder는 아직 완성되지 않아 리플렉션 조회가 안 되므로(또는 필드를
+              // 아예 못 찾으므로) "타입에 메서드가 없습니다"로 잘못 실패했다. EmitQualifierChainLoad
+              // 내부와 동일한 방식으로 먼저 로컬 클래스 멤버인지 확인한다.
+              var _localClsE:='';
+              if _chainTypeE is TypeBuilder then
+                foreach var _tbKvpE in fTypeBuilders do
+                  if _tbKvpE.Value = TypeBuilder(_chainTypeE) then
+                  begin _localClsE:=_tbKvpE.Key; break; end;
+
+              if (_localClsE<>'') and fInstanceMethods.ContainsKey(_localClsE)
+                 and fInstanceMethods[_localClsE].ContainsKey('get_'+mc.MethodName) and (mc.Args.Count=0) then
+              begin
+                aIL.Emit(OpCodes.Callvirt, fInstanceMethods[_localClsE]['get_'+mc.MethodName]);
+              end
+              else if (_localClsE<>'') and fFieldBuilders.ContainsKey(_localClsE)
+                 and fFieldBuilders[_localClsE].ContainsKey(mc.MethodName) and (mc.Args.Count=0) then
+              begin
+                aIL.Emit(OpCodes.Ldfld, fFieldBuilders[_localClsE][mc.MethodName]);
+              end
+              else if (_localClsE<>'') and fInstanceMethods.ContainsKey(_localClsE)
+                 and fInstanceMethods[_localClsE].ContainsKey(mc.MethodName) then
+              begin
+                var _localME:=fInstanceMethods[_localClsE][mc.MethodName];
+                var _localMEParams:=_localME.GetParameters;
+                for var _lmeAi:=0 to mc.Args.Count-1 do
+                  EmitArgForParamType(aIL, mc.Args[_lmeAi], _localMEParams[_lmeAi].ParameterType);
+                aIL.Emit(OpCodes.Callvirt, _localME);
+              end
               else
               begin
-                var _cmiE:=ResolveMethodByArity(_chainTypeE, mc.MethodName, mc.Args, false);
-                if _cmiE=nil then
-                  raise new Exception('타입 "'+_chainTypeE.FullName+'"에 메서드 "'+mc.MethodName+'"가 없습니다 (인자 '+mc.Args.Count.ToString+'개, 경로: '+mc.ObjName+'.'+mc.MethodName+')');
-                var _cmiEParams:=_cmiE.GetParameters;
-                for var _cmiEAi:=0 to mc.Args.Count-1 do
-                  EmitArgForParamType(aIL, mc.Args[_cmiEAi], _cmiEParams[_cmiEAi].ParameterType);
-                aIL.Emit(OpCodes.Callvirt, _cmiE);
+                var _cpiE:=SafeGetProperty(_chainTypeE, mc.MethodName);
+                if (mc.Args.Count=0) and (_cpiE<>nil) and (_cpiE.GetGetMethod<>nil) then
+                  aIL.Emit(OpCodes.Callvirt, _cpiE.GetGetMethod)
+                else
+                begin
+                  var _cmiE:=ResolveMethodByArity(_chainTypeE, mc.MethodName, mc.Args, false);
+                  if _cmiE=nil then
+                    raise new Exception('타입 "'+_chainTypeE.FullName+'"에 메서드 "'+mc.MethodName+'"가 없습니다 (인자 '+mc.Args.Count.ToString+'개, 경로: '+mc.ObjName+'.'+mc.MethodName+')');
+                  var _cmiEParams:=_cmiE.GetParameters;
+                  for var _cmiEAi:=0 to mc.Args.Count-1 do
+                    EmitArgForParamType(aIL, mc.Args[_cmiEAi], _cmiEParams[_cmiEAi].ParameterType);
+                  aIL.Emit(OpCodes.Callvirt, _cmiE);
+                end;
               end;
             end;
           end
@@ -329,7 +366,7 @@
               // 전용)는 의미가 없으므로 건너뛰고 바로 인스턴스 메서드로 조회한다.
               var _smiEI:=ResolveMethodByArity(_staticTE, mc.MethodName, mc.Args, false);
               if _smiEI=nil then
-                raise new Exception('타입 "'+_staticTE.FullName+'"에 인스턴스 멤버 "'+mc.MethodName+'"가 없습니다.');
+                raise new Exception('타입 "'+_staticTE.FullName+'"에 인스턴스 멤버 "'+mc.MethodName+'"가 없습니다 (경로: '+mc.ObjName+'.'+mc.MethodName+').');
               var _smiEIParams:=_smiEI.GetParameters;
               for var _smiEIAi:=0 to mc.Args.Count-1 do
                 EmitArgForParamType(aIL, mc.Args[_smiEIAi], _smiEIParams[_smiEIAi].ParameterType);
@@ -354,7 +391,7 @@
               begin
                 var _smiE:=ResolveMethodByArity(_staticTE, mc.MethodName, mc.Args, true);
                 if _smiE=nil then
-                  raise new Exception('외부 타입 "'+_staticTE.FullName+'"에 정적 멤버 "'+mc.MethodName+'"가 없습니다.');
+                  raise new Exception('외부 타입 "'+_staticTE.FullName+'"에 정적 멤버 "'+mc.MethodName+'"가 없습니다 (경로: '+mc.ObjName+'.'+mc.MethodName+').');
                 var _smiEParams:=_smiE.GetParameters;
                 for var _smiEAi:=0 to mc.Args.Count-1 do
                   EmitArgForParamType(aIL, mc.Args[_smiEAi], _smiEParams[_smiEAi].ParameterType);
@@ -386,7 +423,7 @@
               raise new Exception('알 수 없는 메서드 "'+fCurClassName+'.'+mc.MethodName+'"');
             var _emiEC93:=ResolveMethodByArity(_extTypeEC93, mc.MethodName, mc.Args, false);
             if _emiEC93=nil then
-              raise new Exception('외부 타입 "'+_extTypeEC93.FullName+'"에 메서드 "'+mc.MethodName+'"가 없습니다 (인자 '+mc.Args.Count.ToString+'개).');
+              raise new Exception('외부 타입 "'+_extTypeEC93.FullName+'"에 메서드 "'+mc.MethodName+'"가 없습니다 (인자 '+mc.Args.Count.ToString+'개, 경로: '+mc.ObjName+'.'+mc.MethodName+').');
             var _emiEC93Params:=_emiEC93.GetParameters;
             for var _emiEC93Ai:=0 to mc.Args.Count-1 do
               EmitArgForParamType(aIL, mc.Args[_emiEC93Ai], _emiEC93Params[_emiEC93Ai].ParameterType);
@@ -450,7 +487,7 @@
           begin
             var _emi6:=ResolveMethodByArity(_qType2, mc.MethodName, mc.Args, false);
             if _emi6=nil then
-              raise new Exception('타입 "'+_qType2.FullName+'"에 메서드 "'+mc.MethodName+'"가 없습니다 (인자 '+mc.Args.Count.ToString+'개).');
+              raise new Exception('타입 "'+_qType2.FullName+'"에 메서드 "'+mc.MethodName+'"가 없습니다 (인자 '+mc.Args.Count.ToString+'개, 경로: '+mc.ObjName+'.'+mc.MethodName+').');
             var _emi6Params:=_emi6.GetParameters;
             for var _emi6Ai:=0 to mc.Args.Count-1 do
               EmitArgForParamType(aIL, mc.Args[_emi6Ai], _emi6Params[_emi6Ai].ParameterType);
@@ -499,7 +536,7 @@
               begin
                 var _strMi79:=ResolveMethodByArity(typeof(string), mc.MethodName, mc.Args, false);
                 if _strMi79=nil then
-                  raise new Exception('타입 "System.String"에 메서드 "'+mc.MethodName+'"가 없습니다 (인자 '+mc.Args.Count.ToString+'개).');
+                  raise new Exception('타입 "System.String"에 메서드 "'+mc.MethodName+'"가 없습니다 (인자 '+mc.Args.Count.ToString+'개, 경로: '+mc.ObjName+'.'+mc.MethodName+').');
                 var _strMiParams79:=_strMi79.GetParameters;
                 for var _strAi79:=0 to mc.Args.Count-1 do
                   EmitArgForParamType(aIL, mc.Args[_strAi79], _strMiParams79[_strAi79].ParameterType);
@@ -537,6 +574,37 @@
               var _valToStr:=typeof(System.Convert).GetMethod('ToString', [_valToStrType]);
               aIL.Emit(OpCodes.Call, _valToStr);
             end
+            else if (fLocalScope.Has(mc.ObjName) and fLocalScope.HasClrType(mc.ObjName))
+                    or (fGlobalScope.Has(mc.ObjName) and fGlobalScope.HasClrType(mc.ObjName)) then
+            begin
+              // [자기컴파일 버그 수정] cn=''이지만 vtVar가 string/배열/원시 스칼라 중 어느 것도
+              // 아닌 경우 — 즉 TInlineVarStmtNode가 "var x:=SomeHelperCall(...)" 같은 식에서
+              // ivIsExternal=true로 판단해 ClassName 없이 SetClrType만으로 등록해 둔 vtObject
+              // 변수(예: "var _mi4:=ResolveMethodByArity(...)"가 담은 MethodInfo/MethodBuilder,
+              // 또는 FindInstanceMethod/SafeGetProperty 등 다른 헬퍼가 돌려주는 리플렉션 객체).
+              // 이런 변수는 사용자 정의 클래스도 아니고 위의 string/배열/원시타입 특수 케이스에도
+              // 안 걸려 곧장 "알 수 없는 메서드"로 오인됐다 — 실제로는 SetClrType으로 기록해 둔
+              // 실제 CLR 타입이 있으므로, FindExternalAncestorType 폴백(아래쪽 cn<>'' 분기)과
+              // 동일하게 SafeGetProperty/ResolveMethodByArity로 일반적인 리플렉션 조회를 하면 된다.
+              var _genClr100: System.Type;
+              if fLocalScope.Has(mc.ObjName) and fLocalScope.HasClrType(mc.ObjName) then
+                _genClr100:=fLocalScope.GetClrType(mc.ObjName)
+              else
+                _genClr100:=fGlobalScope.GetClrType(mc.ObjName);
+              var _genPi100:=SafeGetProperty(_genClr100, mc.MethodName);
+              if (mc.Args.Count=0) and (_genPi100<>nil) and (_genPi100.GetGetMethod<>nil) then
+                aIL.Emit(OpCodes.Callvirt, _genPi100.GetGetMethod)
+              else
+              begin
+                var _genMi100:=ResolveMethodByArity(_genClr100, mc.MethodName, mc.Args, false);
+                if _genMi100=nil then
+                  raise new Exception('타입 "'+_genClr100.FullName+'"에 메서드 "'+mc.MethodName+'"가 없습니다 (인자 '+mc.Args.Count.ToString+'개, 경로: '+mc.ObjName+'.'+mc.MethodName+').');
+                var _genMiParams100:=_genMi100.GetParameters;
+                for var _genAi100:=0 to mc.Args.Count-1 do
+                  EmitArgForParamType(aIL, mc.Args[_genAi100], _genMiParams100[_genAi100].ParameterType);
+                aIL.Emit(OpCodes.Callvirt, _genMi100);
+              end;
+            end
             else
               raise new Exception('알 수 없는 메서드 "'+cn+'.'+mc.MethodName+'"');
           end
@@ -565,7 +633,7 @@
               begin
                 var _extGetter:=_extPi.GetGetMethod;
                 if _extGetter=nil then
-                  raise new Exception('속성 "'+_extAnc.FullName+'.'+mc.MethodName+'"에 getter가 없습니다 (쓰기 전용).');
+                  raise new Exception('속성 "'+_extAnc.FullName+'.'+mc.MethodName+'"에 getter가 없습니다 (쓰기 전용, 경로: '+mc.ObjName+'.'+mc.MethodName+').');
                 aIL.Emit(OpCodes.Callvirt, _extGetter);
               end
               else
@@ -581,7 +649,7 @@
                   // 불가능했다. 마지막으로 인자 0개 메서드를 시도한다.
                   var _extMi77:=_extAnc.GetMethod(mc.MethodName, System.Type.EmptyTypes);
                   if _extMi77=nil then
-                    raise new Exception('외부 타입 "'+_extAnc.FullName+'"에 필드/속성/메서드 "'+mc.MethodName+'"가 없습니다.');
+                    raise new Exception('외부 타입 "'+_extAnc.FullName+'"에 필드/속성/메서드 "'+mc.MethodName+'"가 없습니다 (경로: '+mc.ObjName+'.'+mc.MethodName+').');
                   aIL.Emit(OpCodes.Callvirt, _extMi77);
                 end;
               end;
@@ -665,7 +733,7 @@
               begin
                 var _emiExpr98:=ResolveMethodByArity(_extAncExpr98, mc.MethodName, mc.Args, false);
                 if _emiExpr98=nil then
-                  raise new Exception('로컬 클래스 "'+_localClsExpr98+'"(외부 조상 "'+_extAncExpr98.FullName+'")에 메서드/필드 "'+mc.MethodName+'"가 없습니다 (인자 '+mc.Args.Count.ToString+'개).');
+                  raise new Exception('로컬 클래스 "'+_localClsExpr98+'"(외부 조상 "'+_extAncExpr98.FullName+'")에 메서드/필드 "'+mc.MethodName+'"가 없습니다 (인자 '+mc.Args.Count.ToString+'개, 경로: '+mc.ObjName+'.'+mc.MethodName+').');
                 var _emiParamsExpr98:=_emiExpr98.GetParameters;
                 for var _emiAiExpr98:=0 to mc.Args.Count-1 do
                   EmitArgForParamType(aIL, mc.Args[_emiAiExpr98], _emiParamsExpr98[_emiAiExpr98].ParameterType);
@@ -673,7 +741,7 @@
               end;
             end
             else
-              raise new Exception('로컬 클래스 "'+_localClsExpr98+'"에 메서드/필드 "'+mc.MethodName+'"가 없습니다.');
+              raise new Exception('로컬 클래스 "'+_localClsExpr98+'"에 메서드/필드 "'+mc.MethodName+'"가 없습니다 (경로: '+mc.ObjName+'.'+mc.MethodName+').');
           end
           else
           begin
@@ -684,7 +752,7 @@
             begin
               var _emi5:=ResolveMethodByArity(_qType, mc.MethodName, mc.Args, false);
               if _emi5=nil then
-                raise new Exception('타입 "'+_qType.FullName+'"에 메서드 "'+mc.MethodName+'"가 없습니다 (인자 '+mc.Args.Count.ToString+'개).');
+                raise new Exception('타입 "'+_qType.FullName+'"에 메서드 "'+mc.MethodName+'"가 없습니다 (인자 '+mc.Args.Count.ToString+'개, 경로: '+mc.ObjName+'.'+mc.MethodName+').');
               var _emi5Params:=_emi5.GetParameters;
               for var _emi5Ai:=0 to mc.Args.Count-1 do
                 EmitArgForParamType(aIL, mc.Args[_emi5Ai], _emi5Params[_emi5Ai].ParameterType);
@@ -723,7 +791,7 @@
             begin
               var _emi7v:=ResolveMethodByArity(_qType7, mc.MethodName, mc.Args, false);
               if _emi7v=nil then
-                raise new Exception('타입 "'+_qType7.FullName+'"에 메서드 "'+mc.MethodName+'"가 없습니다 (인자 '+mc.Args.Count.ToString+'개).');
+                raise new Exception('타입 "'+_qType7.FullName+'"에 메서드 "'+mc.MethodName+'"가 없습니다 (인자 '+mc.Args.Count.ToString+'개, 경로: '+mc.ObjName+'.'+mc.MethodName+').');
               var _emi7vParams:=_emi7v.GetParameters;
               for var _emi7vAi:=0 to mc.Args.Count-1 do
                 EmitArgForParamType(aIL, mc.Args[_emi7vAi], _emi7vParams[_emi7vAi].ParameterType);
@@ -739,7 +807,7 @@
             begin
               var _emi7:=ResolveMethodByArity(_qType7, mc.MethodName, mc.Args, false);
               if _emi7=nil then
-                raise new Exception('타입 "'+_qType7.FullName+'"에 메서드 "'+mc.MethodName+'"가 없습니다 (인자 '+mc.Args.Count.ToString+'개).');
+                raise new Exception('타입 "'+_qType7.FullName+'"에 메서드 "'+mc.MethodName+'"가 없습니다 (인자 '+mc.Args.Count.ToString+'개, 경로: '+mc.ObjName+'.'+mc.MethodName+').');
               var _emi7Params:=_emi7.GetParameters;
               for var _emi7Ai:=0 to mc.Args.Count-1 do
                 EmitArgForParamType(aIL, mc.Args[_emi7Ai], _emi7Params[_emi7Ai].ParameterType);
@@ -816,7 +884,7 @@
               begin
                 var _bareSmi := ResolveMethodByArity(_bareStaticT, mc.MethodName, mc.Args, true);
                 if _bareSmi=nil then
-                  raise new Exception('외부 타입 "'+_bareStaticT.FullName+'"에 정적 멤버 "'+mc.MethodName+'"가 없습니다.');
+                  raise new Exception('외부 타입 "'+_bareStaticT.FullName+'"에 정적 멤버 "'+mc.MethodName+'"가 없습니다 (경로: '+mc.ObjName+'.'+mc.MethodName+').');
                 var _bareSmiParams:=_bareSmi.GetParameters;
                 for var _bareSmiAi:=0 to mc.Args.Count-1 do
                   EmitArgForParamType(aIL, mc.Args[_bareSmiAi], _bareSmiParams[_bareSmiAi].ParameterType);
@@ -855,7 +923,7 @@
           // 일반 외부 메서드 호출과 동일한 리플렉션 기반 오버로드 해석/인자 강제변환을 적용한다.
           var eiMi95:=ResolveMethodByArity(eiResultType, eiN.MemberName, eiN.MethodArgs, false);
           if eiMi95=nil then
-            raise new Exception('타입 "'+eiResultType.FullName+'"에 메서드 "'+eiN.MemberName+'"가 없습니다 (인자 '+eiN.MethodArgs.Count.ToString+'개).');
+            raise new Exception('타입 "'+eiResultType.FullName+'"에 메서드 "'+eiN.MemberName+'"가 없습니다 (인자 '+eiN.MethodArgs.Count.ToString+'개, 경로: '+eiN.Qualifier+'.'+eiN.MemberName+').');
           var eiParams95:=eiMi95.GetParameters;
           for var eiAi95:=0 to eiN.MethodArgs.Count-1 do
             EmitArgForParamType(aIL, eiN.MethodArgs[eiAi95], eiParams95[eiAi95].ParameterType);
@@ -1855,6 +1923,24 @@
       end;
     end;
 
+    // [버그 수정] "foreach var x in y do" 원소 타입 추론에서, Dictionary<TKey,TValue>류를
+    // 실제로 KeyValuePair<TKey,TValue>를 순회하는 컬렉션으로 식별하기 위한 헬퍼.
+    // GetGenericTypeDefinition의 짧은 이름(Dictionary`2/SortedDictionary`2/SortedList`2/
+    // IDictionary`2/IReadOnlyDictionary`2)으로 판별한다 — 네임스페이스까지는 비교하지
+    // 않는다(전부 System.Collections.Generic 표준 컬렉션이므로 이름만으로 충분하고,
+    // 사용자 정의 "Dictionary<,>" 같은 오검출 가능성은 이 프로젝트 범위 밖으로 무시한다).
+    function IsDictionaryLikeType102(t: System.Type): boolean;
+    var defName: string;
+    begin
+      Result:=false;
+      if (t=nil) or (not t.IsGenericType) then exit;
+      defName:=t.GetGenericTypeDefinition.Name;
+      if (defName='Dictionary`2') or (defName='SortedDictionary`2')
+        or (defName='SortedList`2') or (defName='IDictionary`2')
+        or (defName='IReadOnlyDictionary`2') or (defName='ConcurrentDictionary`2') then
+        Result:=true;
+    end;
+
     procedure EmitStatement(aIL: ILGenerator; s: TStmtNode);
     var
       we: TWritelnExprStmtNode; ws: TWritelnStringStmtNode;
@@ -2119,6 +2205,15 @@
           else if fBuiltTypes.ContainsKey(ivClassName) then ivClrType:=fBuiltTypes[ivClassName]
           else if fTypeBuilders.ContainsKey(ivClassName) then ivClrType:=fTypeBuilders[ivClassName]
           else ivClrType:=typeof(System.Object);
+          // [자기컴파일 버그 수정] "var closedTypes74e:=new System.Type[n];"처럼 ArraySizeExpr가
+          // 있는 배열 생성(new Type[n])은 위에서 구한 게 원소 타입(예: System.Type)일 뿐인데,
+          // 이 분기가 ArraySizeExpr를 전혀 확인하지 않아 지역변수가 배열이 아니라 스칼라
+          // 원소 타입으로 선언됐다 — 그 결과 "closedTypes74e[i]:=x" 같은 배열 원소 대입이
+          // 인덱서 setter(set_Item) 호출로 오인되어 "타입 System.Type에 메서드 set_Item이
+          // 없습니다"로 실패했다(자기컴파일 중 실제 재현됨). GetExprClrType의 TNewObjectExprNode
+          // 처리(2033행 부근)와 동일하게 MakeArrayType으로 배열 타입으로 감싼다.
+          if (ivNeo.ArraySizeExpr<>nil) and (ivClrType<>nil) then
+            ivClrType:=ivClrType.MakeArrayType();
         end
         else if ivs.ValueExpr is TExternalCastExprNode then
         begin
@@ -2215,6 +2310,41 @@
           if (ivArrIdxT<>nil) and (ivArrIdxT<>typeof(System.Object)) then
           begin
             ivClrType:=ivArrIdxT; ivIsExternal:=true; ivVt:=vtObject;
+          end
+          else ivClrType:=VTC(ivVt, '');
+        end
+        else if ivs.ValueExpr is TChainedIndexExprNode then
+        begin
+          // [자기컴파일 버그 수정] "var _getMB4c:=fInstanceMethods[cn]['get_'+name];"처럼
+          // 이중 인덱싱(바깥 인덱싱 결과를 다시 인덱싱, 예: Dictionary<string,Dictionary
+          // <string,MethodBuilder>>)으로 얻은 값을 담는 지역 변수는 TChainedIndexExprNode로
+          // 파싱된다. 기존에는 이 케이스가 여기서 분기되지 않아 InferType 폴백(vtInteger)으로
+          // 떨어져 int32 슬롯으로 선언되고, 이후 "_getMB4c.ReturnType" 같은 멤버 접근이
+          // cn=''인 원시타입 취급으로 "알 수 없는 메서드 \".ReturnType\""로 실패했다
+          // (InferType 자기 자신의 본문에서 실제로 재현됨). GetExprClrType은 이미
+          // TChainedIndexExprNode를 정확히 추론하므로(TArrayIndexExprNode/TExternalIndexExprNode와
+          // 동일한 패턴) 재사용한다.
+          var ivCixT100:=GetExprClrType(ivs.ValueExpr);
+          if (ivCixT100<>nil) and (ivCixT100<>typeof(System.Object)) then
+          begin
+            ivClrType:=ivCixT100; ivIsExternal:=true; ivVt:=vtObject;
+          end
+          else ivClrType:=VTC(ivVt, '');
+        end
+        else if ivs.ValueExpr is TChainedMemberExprNode then
+        begin
+          // [자기컴파일 버그 수정] "var _strPi79:=typeof(string).GetProperty(mc.MethodName);"
+          // 처럼 체인 식(Inner.Member 또는 Inner.Method(args))의 결과를 담는 지역 변수는
+          // TChainedMemberExprNode로 파싱된다. 기존에는 이 케이스가 여기서 분기되지 않아
+          // VTC(vtObject,'') 폴백(System.Object)으로 떨어졌다 — 그 결과 바로 다음 줄의
+          // "_strPi79.GetGetMethod"가 "타입 System.Object에 메서드 GetGetMethod가 없습니다"로
+          // 실패했다(자기컴파일 중 EmitExpr 자신의 소스에서 실제로 재현됨). GetExprClrType은
+          // 이미 TChainedMemberExprNode를 정확히 추론하므로(TChainedIndexExprNode/TVarRefNode와
+          // 동일한 패턴) 재사용한다.
+          var ivChmT100:=GetExprClrType(ivs.ValueExpr);
+          if (ivChmT100<>nil) and (ivChmT100<>typeof(System.Object)) then
+          begin
+            ivClrType:=ivChmT100; ivIsExternal:=true; ivVt:=vtObject;
           end
           else ivClrType:=VTC(ivVt, '');
         end
@@ -2369,7 +2499,7 @@
               raise new Exception('알 수 없는 메서드 "'+fCurClassName+'.'+mcs.MethodName+'"');
             emi:=ResolveMethodByArity(extType, mcs.MethodName, mcs.Args, false);
             if emi=nil then
-              raise new Exception('외부 타입 "'+extType.FullName+'"에 메서드 "'+mcs.MethodName+'"가 없습니다 (인자 '+mcs.Args.Count.ToString+'개).');
+              raise new Exception('외부 타입 "'+extType.FullName+'"에 메서드 "'+mcs.MethodName+'"가 없습니다 (인자 '+mcs.Args.Count.ToString+'개, 경로: '+mcs.ObjName+'.'+mcs.MethodName+').');
             var _emiParams0:=emi.GetParameters;
             for var _emiAi0:=0 to mcs.Args.Count-1 do
               EmitArgForParamType(aIL, mcs.Args[_emiAi0], _emiParams0[_emiAi0].ParameterType);
@@ -2448,7 +2578,7 @@
           begin
             emi:=ResolveMethodByArity(qTargetType, mcs.MethodName, mcs.Args, false);
             if emi=nil then
-              raise new Exception('타입 "'+qTargetType.FullName+'"에 메서드 "'+mcs.MethodName+'"가 없습니다 (인자 '+mcs.Args.Count.ToString+'개).');
+              raise new Exception('타입 "'+qTargetType.FullName+'"에 메서드 "'+mcs.MethodName+'"가 없습니다 (인자 '+mcs.Args.Count.ToString+'개, 경로: '+mcs.ObjName+'.'+mcs.MethodName+').');
             var _emiParams2:=emi.GetParameters;
             for var _emiAi2:=0 to mcs.Args.Count-1 do
               EmitArgForParamType(aIL, mcs.Args[_emiAi2], _emiParams2[_emiAi2].ParameterType);
@@ -2466,7 +2596,39 @@
           if fLocalScope.Has(mcs.ObjName) then aIL.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(mcs.ObjName))
           else if fGlobalScope.Has(mcs.ObjName) then aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(mcs.ObjName))
           else aIL.Emit(OpCodes.Ldsfld, fGlobalConstFields[mcs.ObjName]);  // [Stage 96] 전역 const
-          if cn='' then raise new Exception('알 수 없는 메서드 "'+cn+'.'+mcs.MethodName+'"');
+          if (cn='') and ((fLocalScope.Has(mcs.ObjName) and fLocalScope.HasClrType(mcs.ObjName))
+                          or (fGlobalScope.Has(mcs.ObjName) and fGlobalScope.HasClrType(mcs.ObjName))) then
+          begin
+            // [자기컴파일 버그 수정] EmitExpr의 TMethodCallExprNode 쪽과 동일한 패턴 —
+            // cn=''이지만 SetClrType으로 실제 CLR 타입이 기록돼 있는 vtObject 변수(예:
+            // "var _mi4:=ResolveMethodByArity(...)"의 결과를 문장으로 호출하는 경우)는
+            // 곧장 "알 수 없는 메서드"로 오인하지 말고 그 CLR 타입 기준으로 일반
+            // 리플렉션 조회를 해야 한다.
+            var _genClrS100: System.Type;
+            if fLocalScope.Has(mcs.ObjName) and fLocalScope.HasClrType(mcs.ObjName) then
+              _genClrS100:=fLocalScope.GetClrType(mcs.ObjName)
+            else
+              _genClrS100:=fGlobalScope.GetClrType(mcs.ObjName);
+            var _genPiS100:=SafeGetProperty(_genClrS100, mcs.MethodName);
+            if (mcs.Args.Count=0) and (_genPiS100<>nil) and (_genPiS100.GetGetMethod<>nil) then
+            begin
+              aIL.Emit(OpCodes.Callvirt, _genPiS100.GetGetMethod);
+              aIL.Emit(OpCodes.Pop); // 프로퍼티 getter는 항상 값을 반환하므로 문장 컨텍스트에선 버림
+            end
+            else
+            begin
+              var _genMiS100:=ResolveMethodByArity(_genClrS100, mcs.MethodName, mcs.Args, false);
+              if _genMiS100=nil then
+                raise new Exception('타입 "'+_genClrS100.FullName+'"에 메서드 "'+mcs.MethodName+'"가 없습니다 (인자 '+mcs.Args.Count.ToString+'개, 경로: '+mcs.ObjName+'.'+mcs.MethodName+').');
+              var _genMiParamsS100:=_genMiS100.GetParameters;
+              for var _genAiS100:=0 to mcs.Args.Count-1 do
+                EmitArgForParamType(aIL, mcs.Args[_genAiS100], _genMiParamsS100[_genAiS100].ParameterType);
+              aIL.Emit(OpCodes.Callvirt, _genMiS100);
+              if _genMiS100.ReturnType<>typeof(System.Void) then aIL.Emit(OpCodes.Pop);
+            end;
+          end
+          else if cn='' then raise new Exception('알 수 없는 메서드 "'+cn+'.'+mcs.MethodName+'"')
+          else
           // 인터페이스 타입 변수면 인터페이스 메서드로, 아니면 클래스 상속 체인에서 탐색
           // (Stage 10에서는 fInstanceMethods[cn] 직접 조회 + Call만 사용해 상속받은
           //  메서드 호출 시 실패할 수 있었는데, FindInstanceMethod + Callvirt로 통일)
@@ -2515,7 +2677,7 @@
                 raise new Exception('알 수 없는 메서드 "'+cn+'.'+mcs.MethodName+'"');
               var cnEmi:=ResolveMethodByArity(cnExtType, mcs.MethodName, mcs.Args, false);
               if cnEmi=nil then
-                raise new Exception('외부 타입 "'+cnExtType.FullName+'"에 메서드 "'+mcs.MethodName+'"가 없습니다 (인자 '+mcs.Args.Count.ToString+'개).');
+                raise new Exception('외부 타입 "'+cnExtType.FullName+'"에 메서드 "'+mcs.MethodName+'"가 없습니다 (인자 '+mcs.Args.Count.ToString+'개, 경로: '+mcs.ObjName+'.'+mcs.MethodName+').');
               var cnEmiParams:=cnEmi.GetParameters;
               for var cnEmiAi:=0 to mcs.Args.Count-1 do
                 EmitArgForParamType(aIL, mcs.Args[cnEmiAi], cnEmiParams[cnEmiAi].ParameterType);
@@ -2583,7 +2745,7 @@
               begin
                 var _emiFB94:=ResolveMethodByArity(_extAncFB94, mcs.MethodName, mcs.Args, false);
                 if _emiFB94=nil then
-                  raise new Exception('로컬 클래스 "'+localClsNameFB+'"(외부 조상 "'+_extAncFB94.FullName+'")에 메서드/필드 "'+mcs.MethodName+'"가 없습니다 (인자 '+mcs.Args.Count.ToString+'개).');
+                  raise new Exception('로컬 클래스 "'+localClsNameFB+'"(외부 조상 "'+_extAncFB94.FullName+'")에 메서드/필드 "'+mcs.MethodName+'"가 없습니다 (인자 '+mcs.Args.Count.ToString+'개, 경로: '+mcs.ObjName+'.'+mcs.MethodName+').');
                 var _emiParamsFB94:=_emiFB94.GetParameters;
                 for var _emiAiFB94:=0 to mcs.Args.Count-1 do
                   EmitArgForParamType(aIL, mcs.Args[_emiAiFB94], _emiParamsFB94[_emiAiFB94].ParameterType);
@@ -2592,7 +2754,7 @@
               end;
             end
             else
-              raise new Exception('로컬 클래스 "'+localClsNameFB+'"에 메서드/필드 "'+mcs.MethodName+'"가 없습니다.');
+              raise new Exception('로컬 클래스 "'+localClsNameFB+'"에 메서드/필드 "'+mcs.MethodName+'"가 없습니다 (경로: '+mcs.ObjName+'.'+mcs.MethodName+').');
           end
           else
           begin
@@ -2606,7 +2768,7 @@
             begin
               emi:=ResolveMethodByArity(qTargetType, mcs.MethodName, mcs.Args, false);
               if emi=nil then
-                raise new Exception('타입 "'+qTargetType.FullName+'"에 메서드 "'+mcs.MethodName+'"가 없습니다 (인자 '+mcs.Args.Count.ToString+'개).');
+                raise new Exception('타입 "'+qTargetType.FullName+'"에 메서드 "'+mcs.MethodName+'"가 없습니다 (인자 '+mcs.Args.Count.ToString+'개, 경로: '+mcs.ObjName+'.'+mcs.MethodName+').');
               var _emiParams3:=emi.GetParameters;
               for var _emiAi3:=0 to mcs.Args.Count-1 do
                 EmitArgForParamType(aIL, mcs.Args[_emiAi3], _emiParams3[_emiAi3].ParameterType);
@@ -2637,7 +2799,7 @@
           begin
             emi:=ResolveMethodByArity(qTargetType, mcs.MethodName, mcs.Args, false);
             if emi=nil then
-              raise new Exception('타입 "'+qTargetType.FullName+'"에 메서드 "'+mcs.MethodName+'"가 없습니다 (인자 '+mcs.Args.Count.ToString+'개).');
+              raise new Exception('타입 "'+qTargetType.FullName+'"에 메서드 "'+mcs.MethodName+'"가 없습니다 (인자 '+mcs.Args.Count.ToString+'개, 경로: '+mcs.ObjName+'.'+mcs.MethodName+').');
             var _emiParams5:=emi.GetParameters;
             for var _emiAi5:=0 to mcs.Args.Count-1 do
               EmitArgForParamType(aIL, mcs.Args[_emiAi5], _emiParams5[_emiAi5].ParameterType);
@@ -2653,7 +2815,7 @@
           extType:=ResolveExternalType(mcs.ObjName);
           emi:=ResolveMethodByArity(extType, mcs.MethodName, mcs.Args, true);
           if emi=nil then
-            raise new Exception('외부 타입 "'+extType.FullName+'"에 정적 메서드 "'+mcs.MethodName+'"가 없습니다 (인자 '+mcs.Args.Count.ToString+'개).');
+            raise new Exception('외부 타입 "'+extType.FullName+'"에 정적 메서드 "'+mcs.MethodName+'"가 없습니다 (인자 '+mcs.Args.Count.ToString+'개, 경로: '+mcs.ObjName+'.'+mcs.MethodName+').');
           var _emiParams4:=emi.GetParameters;
           for var _emiAi4:=0 to mcs.Args.Count-1 do
             EmitArgForParamType(aIL, mcs.Args[_emiAi4], _emiParams4[_emiAi4].ParameterType);
@@ -2907,7 +3069,7 @@
         var eimcInnerType:=EmitIndexerGet(aIL, eimcBaseType, eimc.IndexExpr);
         var eimcMi:=ResolveMethodByArity(eimcInnerType, eimc.MethodName, eimc.Args, false);
         if eimcMi=nil then
-          raise new Exception('타입 "'+eimcInnerType.FullName+'"에 메서드 "'+eimc.MethodName+'"가 없습니다 (인자 '+eimc.Args.Count.ToString+'개).');
+          raise new Exception('타입 "'+eimcInnerType.FullName+'"에 메서드 "'+eimc.MethodName+'"가 없습니다 (인자 '+eimc.Args.Count.ToString+'개, 경로: '+eimc.Qualifier+'.'+eimc.MethodName+').');
         var eimcParams:=eimcMi.GetParameters;
         for var eimcAi:=0 to eimc.Args.Count-1 do
           EmitArgForParamType(aIL, eimc.Args[eimcAi], eimcParams[eimcAi].ParameterType);
@@ -3214,9 +3376,23 @@
           // IEnumerable<T> 등, 예: "foreach var ns in namespaceList do")이면 첫 번째 타입
           // 인자, 그 외(비제네릭 컬렉션 등)는 object로 폴백한다 — 아래의 기존 Current
           // Unbox_Any/Castclass 로직이 forInVarClrType을 그대로 쓰므로 그것과 맞아떨어진다.
+          //
+          // [버그 수정] Dictionary<TKey,TValue>(및 SortedDictionary/SortedList/IDictionary/
+          // IReadOnlyDictionary 등 TKey,TValue 2개짜리 딕셔너리류)는 실제로는
+          // KeyValuePair<TKey,TValue>를 순회한다 — "그 외 제네릭 컬렉션은 첫 번째 타입
+          // 인자" 규칙을 그대로 적용하면 원소 타입이 TKey(예: string)로 잘못 추론되어,
+          // 그 뒤 ".Value"/".Key" 접근이 "System.String에 메서드가 없습니다"로 깨진다
+          // (예: foreach var kv in fTypeBuilders do ... kv.Value ... — fTypeBuilders:
+          // Dictionary<string, TypeBuilder>). GetGenericArguments()[0]을 쓰기 전에
+          // 딕셔너리류인지 먼저 판별해 KeyValuePair<TKey,TValue>를 조립한다.
           var forInCollType102:=GetExprClrType(fis.CollExpr);
           if (forInCollType102<>nil) and forInCollType102.IsArray then
             forInVarClrType:=forInCollType102.GetElementType
+          else if (forInCollType102<>nil) and forInCollType102.IsGenericType
+             and (forInCollType102.GetGenericArguments.Length=2)
+             and IsDictionaryLikeType102(forInCollType102) then
+            forInVarClrType:=typeof(System.Collections.Generic.KeyValuePair<System.Object,System.Object>)
+              .GetGenericTypeDefinition.MakeGenericType(forInCollType102.GetGenericArguments)
           else if (forInCollType102<>nil) and forInCollType102.IsGenericType
              and (forInCollType102.GetGenericArguments.Length>=1) then
             forInVarClrType:=forInCollType102.GetGenericArguments()[0]

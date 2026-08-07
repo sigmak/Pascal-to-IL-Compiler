@@ -792,7 +792,15 @@ type
       else
       begin
         Result:=ParseVarType;
-        if Result=vtMatrix then cn:=fLastGenericName; // [Stage 67] array of array of <type> → cn에 원소 타입 보존
+        // [버그 수정] "gpBuilders: array of GenericTypeParameterBuilder"처럼 array of <외부 타입>
+        // (vtObjArray) 이거나 array of T / array of real·char·int64(vtGenericArray) 매개변수도
+        // vtMatrix와 마찬가지로 fLastGenericName에 원소 타입 이름을 담아 두는데, 예전에는
+        // vtMatrix일 때만 cn으로 복사해서 vtObjArray/vtGenericArray는 cn=''로 비워진 채
+        // 남았다. 그 결과 CodeGen의 VTC(vtObjArray, '')가 원소 타입을 몰라 조용히 object[]로
+        // 폴백해, 이후 그 배열 원소에 대한 메서드 호출이 항상 System.Object 기준으로 잘못
+        // 해석됐다(자기컴파일 중 실제 재현됨: ApplyGenericParamConstraints의
+        // "gpBuilders: array of GenericTypeParameterBuilder").
+        if (Result=vtMatrix) or (Result=vtObjArray) or (Result=vtGenericArray) then cn:=fLastGenericName;
       end;
     end;
 
@@ -2306,8 +2314,18 @@ type
             raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString
               +': 타입 없이 여러 변수를 한 번에 선언할 수 없습니다 (":=" 는 이름 하나만 지원)');
           Expect(tkAssign);
-          Result:=new TInlineVarStmtNode(ivNames[0], ParseExpr);
+          var ivInferExpr:=ParseExpr;
+          Result:=new TInlineVarStmtNode(ivNames[0], ivInferExpr);
           fCurParams.Add(ivNames[0]); // 이후 문장에서 이 이름을 필드로 오인하지 않도록 지역변수로 등록
+          // [버그 수정] "var closedTypes74e:=new System.Type[n];"처럼 타입 추론 분기에서도
+          // ArraySizeExpr가 있는 배열 생성식이면 진짜 배열이므로 fArrayNames에 등록해야 한다.
+          // 위 "타입 명시" 분기(2294행)만 등록을 하고 있어서, 이후 "closedTypes74e[i]:=x" 같은
+          // 대입이 fArrayNames.Contains 검사에 걸려 진짜 배열 대입(Stelem) 경로를 못 타고
+          // 외부 컬렉션 인덱서 대입(리플렉션 set_Item 탐색) 경로로 잘못 빠졌다 — 진짜 배열은
+          // 리플렉션에 set_Item을 노출하지 않으므로 "메서드 set_Item가 없습니다"로 실패했다
+          // (자기컴파일 중 실제 재현됨).
+          if (ivInferExpr is TNewObjectExprNode) and (TNewObjectExprNode(ivInferExpr).ArraySizeExpr<>nil) then
+            begin if not fArrayNames.Contains(ivNames[0]) then fArrayNames.Add(ivNames[0]); end;
         end;
       end
 

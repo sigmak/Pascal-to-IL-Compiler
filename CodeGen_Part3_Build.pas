@@ -27,8 +27,18 @@
       // 이후 EmitExpr의 HasClrType 라우팅이 빠져 "알 수 없는 메서드 ".ToString"" 등으로 이어진다.
       else if sig.ParamTypes[i]=vtEnum then
         Result:=VTC(vtEnum, sig.ParamClassNames[i])
+      // [버그 수정] vtObjArray("array of GenericTypeParameterBuilder" 같은 array of <외부 타입>)를
+      // 포함해 그 외 배열류(vtIntArray/vtStrArray/vtGenericArray/vtMatrix)도, 위 분기들처럼
+      // sig.ParamClassNames[i]를 그대로 넘겨야 한다. 예전에는 이 마지막 else가 무조건 ''를
+      // 넘겨서, VTC(vtObjArray, '')가 원소 타입 이름을 몰라 object[]로 조용히 폴백했다 — 그 결과
+      // "gpBuilders: array of GenericTypeParameterBuilder" 매개변수가 실제로는
+      // GenericTypeParameterBuilder[]가 아니라 object[]로 선언되어, 이후
+      // "gpBuilders[i].SetGenericParameterAttributes(...)"가 원소 타입을 System.Object로
+      // 오인해 "타입 System.Object에 메서드 SetGenericParameterAttributes가 없습니다"로
+      // 실패했다(자기컴파일 중 실제 재현됨). VTC 자체는 cn이 필요 없는 타입(vtIntArray 등)에서는
+      // cn을 무시하므로, 항상 넘겨도 다른 경우엔 영향이 없다.
       else
-        Result:=VTC(sig.ParamTypes[i], '');
+        Result:=VTC(sig.ParamTypes[i], sig.ParamClassNames[i]);
       if (i<sig.ParamIsByRef.Count) and sig.ParamIsByRef[i] then Result:=Result.MakeByRefType;
     end;
 
@@ -44,7 +54,11 @@
       // 이 분기가 없어 VTC(p.ParamType, '')로 떨어져 그 이름이 통째로 유실됐지만(당시엔 vtGeneric
       // 매개변수가 CodeGen까지 온 적이 없어 무해했다), true open generic 지원을 위해 명시한다.
       else if p.ParamType=vtGeneric then Result:=VTC(vtGeneric, p.ClassName)
-      else Result:=VTC(p.ParamType, '');
+      // [버그 수정] ResolveParamClrType과 동일한 이유 — array of <외부 타입>(vtObjArray)/
+      // array of T(vtGenericArray)/2차원 배열(vtMatrix) 매개변수도 p.ClassName(Parser가
+      // fLastGenericName으로 채워 둔 원소 타입 이름)을 넘겨야 한다. 예전처럼 무조건 ''를
+      // 넘기면 VTC가 원소 타입을 몰라 object[]로 조용히 폴백한다.
+      else Result:=VTC(p.ParamType, p.ClassName);
       // [Stage 100] var/const 매개변수 — ByRef 타입으로 감싼다.
       if p.IsByRef then Result:=Result.MakeByRefType;
     end;
@@ -1562,8 +1576,26 @@
         begin
           var chainSegs52:=SplitByDot(mc.ObjName);
           if IsChainStartSegment(chainSegs52[0]) then
-            exit // 체인(예: MainMenu.Items.xxx)은 미리 계산하려면 IL을 실제로 방출해야
-                 // 하므로(EmitQualifierChainLoad) 여기서는 다루지 않고 기존 폴백에 맡긴다.
+            // [버그 수정] "evInfo.EventHandlerType.GetMethod('Invoke')"처럼 ObjName 자체가
+            // 지역변수로 시작하는 체인(예: evInfo.EventHandlerType)인 경우, 예전에는 여기서
+            // 그냥 exit해 버려 Result가 nil로 남았다. 그러면 var 타입 추론 분기(TInlineVarStmtNode)가
+            // InferType(TMethodCallExprNode)의 기본 폴백(vtInteger→Int32)으로 지역변수
+            // "lamInvoke"를 System.Int32로 잘못 DeclareLocal 했고, 이후
+            // "lamInvoke.GetParameters"가 "타입 System.Int32에 메서드 GetParameters가
+            // 없습니다"로 실패했다(자기컴파일 중 실제 재현됨). EmitQualifierChainLoad와
+            // 완전히 같은 판별을 IL 방출 없이 수행하는 InferQualifierChainType이 정확히
+            // 이 목적으로 이미 존재하므로(1052행, 1945행에서 이미 재사용 중), 여기서도
+            // 재사용해 체인의 최종 타입(qType)을 구하고 아래 mc.MethodName 조회 로직으로
+            // 계속 이어간다 — 실패하면 이 함수를 감싼 try/except가 기존과 동일하게 nil로
+            // 조용히 폴백한다.
+            begin
+              qType:=InferQualifierChainType(chainSegs52);
+              // 체인의 시작점이 지역/전역 변수·필드(인스턴스)이므로, 아래 421행 부근의
+              // "ObjName에 점이 있으면 정적 호출"이라는 (진짜 정적 타입 체인만을 위한) 기본
+              // 가정이 이 경우엔 틀리다 — qType은 인스턴스이지 정적 타입 자체가 아니므로
+              // ResolveMethodByArity를 인스턴스 호출로 수행해야 한다.
+              qTypeIsStatic92:=false;
+            end
           else
           begin
             qType:=nil;
@@ -2681,7 +2713,18 @@
           pClrType:=_implCtorParamTypes99[i];
         var loc:=il.DeclareLocal(pClrType);
         fLocalScope.Declare(p, loc, impl.Parameters[i].ParamType);
-        if pClrType<>typeof(integer) then fLocalScope.SetClrType(p, pClrType);
+        // [버그 수정] BuildMethodBody의 인스턴스 메서드 매개변수 등록(위 2890행 부근)과 동일한
+        // 이유 — 생성자 매개변수도 우리 컴파일러 자신의 로컬 클래스(아직 CreateType되지 않은
+        // TypeBuilder)일 수 있으므로, 무조건 SetClrType하면 이후 그 매개변수를 통한 메서드
+        // 호출이 완성되지 않은 TypeBuilder를 리플렉션으로 조회하다가 "형식이 만들어지지
+        // 않았습니다"로 실패할 수 있다. FindLocalClassNameForTypeBuilder로 로컬 클래스인지
+        // 먼저 확인한다.
+        if pClrType<>typeof(integer) then
+        begin
+          var pLocalCls99c:=FindLocalClassNameForTypeBuilder(pClrType);
+          if pLocalCls99c<>'' then fLocalScope.SetClassName(p, pLocalCls99c)
+          else fLocalScope.SetClrType(p, pClrType);
+        end;
         if i=0 then il.Emit(OpCodes.Ldarg_1)
         else if i=1 then il.Emit(OpCodes.Ldarg_2)
         else if i=2 then il.Emit(OpCodes.Ldarg_3)
@@ -2869,7 +2912,23 @@
         // 이미 채워 둔 impl.ParamTypes[i](구체 타입)를 그대로 사용한다.
         if i<impl.ParamTypes.Count then fLocalScope.Declare(p, loc, impl.ParamTypes[i])
         else fLocalScope.Declare(p, loc, vtInteger);
-        if pElemType100<>typeof(integer) then fLocalScope.SetClrType(p, pElemType100); // [Stage 100] pClrType→pElemType100
+        if pElemType100<>typeof(integer) then
+        begin
+          // [버그 수정] "aScope: TScope" 처럼 매개변수가 우리 컴파일러 자신이 짓고 있는
+          // 로컬 클래스(아직 CreateType되지 않은 TypeBuilder)이면, 무조건 SetClrType으로
+          // 등록해서는 안 된다 — 지역변수 등록 루프(2919행 부근)는 이미 이 구분(fTypeBuilders/
+          // fBuiltTypes면 SetClassName, 아니면 SetClrType)을 하고 있는데 매개변수 등록
+          // 루프만 빠져 있었다. ClrType으로 등록되면 이후 "aScope.Declare(...)" 같은 호출이
+          // EmitStatement의 "ClrType이 알려진 외부 타입 인스턴스" 경로로 잘못 빠져
+          // ResolveMethodByArity가 완성되지 않은 TypeBuilder에서 MethodBuilder를 찾고,
+          // 그 MethodBuilder.GetParameters()가 "형식이 만들어지지 않았습니다"
+          // (NotSupportedException)로 실패했다(자기컴파일 중 실제 재현됨: EmitConstDecl의
+          // aScope 매개변수). 로컬 클래스면 FindLocalClassNameForTypeBuilder로 클래스명을
+          // 되찾아 SetClassName(메타데이터 기반 경로)으로 등록한다.
+          var pLocalCls100:=FindLocalClassNameForTypeBuilder(pElemType100);
+          if pLocalCls100<>'' then fLocalScope.SetClassName(p, pLocalCls100)
+          else fLocalScope.SetClrType(p, pElemType100); // [Stage 100] pClrType→pElemType100
+        end;
         // [Stage 74] vtGeneric 매개변수(x: T)도 ClassName에 타입 매개변수 이름을 기록해 둔다 —
         // GetVarClassName으로 되찾아 fCurGenericSubst[genName]을 다시 조회할 수 있어야
         // (예: Writeln(x)가 실제 T의 CLR 타입을 알아내 box하는 데) 쓸모가 있다.
