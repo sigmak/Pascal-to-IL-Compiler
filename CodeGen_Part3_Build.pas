@@ -1503,6 +1503,56 @@
           end;
         end;
       Result:=bestMi;
+      // [Stage 104] t에 인스턴스/정적 메서드로 mname(args)가 없으면, .NET 확장 메서드
+      // (this 매개변수를 첫 인자로 받는 정적 메서드 — 예: Assembly.GetCustomAttribute)에서
+      // 한 번 더 찾는다. PascalABC.NET/C#은 "instance.ExtensionMethod(args)" 호출 문법을
+      // 정식 지원하지만, 우리 리졸버는 여태 t 타입에 직접 선언된 멤버만 리플렉션으로
+      // 찾았기 때문에 확장 메서드는 전부 "메서드가 없습니다"로 실패했었다(자기호스팅
+      // 실제 사례: GetExecutingAssembly().GetCustomAttribute(typeof(X))).
+      if Result=nil then
+        Result:=TryResolveExtensionMethod(t, mname, args);
+    end;
+
+    // [Stage 104] 확장 메서드 폴백 — 반환된 MethodInfo.IsStatic=true이므로, 호출부는
+    // 이미 스택에 올라간 인스턴스를 그대로 첫 인자로 삼아 Call(정적 호출)로 방출하면
+    // 된다(별도 인자 재배치 불필요). 단, 파라미터 목록을 읽을 때는 첫 번째(this) 파라미터를
+    // 건너뛰고 나머지를 실제 호출 인자(args)와 맞춰야 한다 — 호출부에서 처리.
+    function TryResolveExtensionMethod(t: System.Type; mname: string; args: List<TExprNode>): MethodInfo;
+    var
+      extClasses: array of System.Type;
+      ec: System.Type; mi: MethodInfo;
+      argCount, i: integer; ps: array of ParameterInfo;
+      bestScore: integer; bestMi: MethodInfo; found: boolean;
+      score: integer;
+    begin
+      Result:=nil;
+      // 실전 코드에서 마주치는 확장 메서드 컨테이너 클래스를 여기 계속 추가해 나간다.
+      extClasses:=[
+        typeof(System.Reflection.CustomAttributeExtensions),
+        typeof(System.Linq.Enumerable)
+      ];
+      argCount:=args.Count;
+      bestScore:=System.Int32.MinValue; bestMi:=nil; found:=false;
+      foreach ec in extClasses do
+        foreach mi in ec.GetMethods(BindingFlags.Public or BindingFlags.Static) do
+          if (mi.Name=mname) and mi.IsDefined(typeof(System.Runtime.CompilerServices.ExtensionAttribute), false)
+             and (not mi.IsGenericMethodDefinition) then // 제네릭 확장메서드(Select 등)는 이후 별도 처리
+          begin
+            ps:=mi.GetParameters;
+            if (ps.Length=argCount+1) and ps[0].ParameterType.IsAssignableFrom(t) then
+            begin
+              score:=0;
+              i:=0;
+              while i<argCount do
+              begin
+                score:=score+ScoreParamMatch(ps[i+1].ParameterType, InferArgClrType(args[i]));
+                i:=i+1;
+              end;
+              if (not found) or (score>bestScore) then
+              begin bestScore:=score; bestMi:=mi; found:=true; end;
+            end;
+          end;
+      Result:=bestMi;
     end;
 
     // [Stage 40] 외부 타입에서 인자 개수로 생성자를 찾는다. [Stage 50] 메서드와 동일하게
@@ -3849,19 +3899,24 @@
       try
         var tfaCtor:=typeof(System.Runtime.Versioning.TargetFrameworkAttribute).GetConstructor([typeof(string)]);
         var tfaVersionString: string:='.NETFramework,Version=v4.7.2'; // 폴백값
-        // [Stage 102 버그 수정] 셀프호스팅 중인 구버전 컴파일러 바이너리의 파서가
-        // "정적타입.메서드(다른타입.메서드(), 인자2)" 형태를 정적 2-인자 호출로 못 읽고,
-        // 첫 인자(Assembly.GetExecutingAssembly())를 체인의 리시버로, GetCustomAttribute를
-        // 그 위의 1-인자 체인 호출로 잘못 재해석해 "System.Reflection.Assembly에
-        // 메서드 GetCustomAttribute가 없습니다"로 실패했다. 첫 인자를 지역변수로
-        // 먼저 뽑아 단순 식별자로 만들어 이 오인식 자체를 피한다.
+        // [Stage 103 버그 수정] Stage 102에서 "System.Attribute.GetCustomAttribute(selfAsm,
+        // typeof(...))" 형태(정적 타입에 점이 2개, 인자 2개)로 바꿔봤지만 여전히 같은
+        // "System.Reflection.Assembly에 메서드 GetCustomAttribute가 없습니다 (인자 1개)"
+        // 오류가 재현되었다 — 셀프호스팅 파서가 다중 점(.) 정적 타입 경로 + 다중 인자
+        // 정적 호출 조합 자체를 여전히 불안정하게 처리하는 것으로 보인다. 아예 그 조합을
+        // 타지 않도록, 이미 이 컴파일러 소스 다른 곳(CodeGen.pas의 GetCustomAttributes
+        // override)에서도 검증된 "인스턴스.GetCustomAttributes(typeof(X), bool)" — 단수가
+        // 아니라 복수형 — 인스턴스 메서드 체인으로 완전히 바꾼다. selfAsm은 평범한 지역
+        // 변수이고 체인은 "selfAsm.GetCustomAttributes(...)" 한 단계뿐이라, 다중 점 정적
+        // 경로도 다중 인자 정적 호출도 전혀 발생하지 않는다.
         var selfAsm:=System.Reflection.Assembly.GetExecutingAssembly();
-        var selfTfa:=System.Attribute.GetCustomAttribute(
-          selfAsm,
-          typeof(System.Runtime.Versioning.TargetFrameworkAttribute))
-          as System.Runtime.Versioning.TargetFrameworkAttribute;
-        if selfTfa<>nil then
-          tfaVersionString:=selfTfa.FrameworkName;
+        var selfAttrs:=selfAsm.GetCustomAttributes(typeof(System.Runtime.Versioning.TargetFrameworkAttribute), false);
+        // [Stage 103] 캐스트와 .FrameworkName 읽기를 한 식으로 합쳐 "TypeName(expr).member"
+        // 캐스트-읽기 패턴(Parser.pas의 System.Windows.Forms.Button(sender).Text 예시와 동일
+        // 모양)으로 만든다 — 별도 지역변수(selfTfa)에 "as" 캐스트로 담지 않으므로 그 변수의
+        // 타입 추론에 기대지 않는다.
+        if selfAttrs.Length>0 then
+          tfaVersionString:=System.Runtime.Versioning.TargetFrameworkAttribute(selfAttrs[0]).FrameworkName;
         var tfaArgs: array of object:=new object[1];
         tfaArgs[0]:=tfaVersionString;
         ab.SetCustomAttribute(new CustomAttributeBuilder(tfaCtor, tfaArgs));

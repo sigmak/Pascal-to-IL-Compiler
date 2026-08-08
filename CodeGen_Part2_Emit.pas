@@ -1071,9 +1071,15 @@
             raise new Exception('타입 "'+chType90.FullName+'"에 메서드 "'+ch90.MemberName+'"가 없습니다 (인자 '+ch90.Args.Count.ToString
               +'개). (식: '+DescribeExprChain(ch90.Inner)+'.'+ch90.MemberName+'(...))');
           var chMiParams90:=chMi90.GetParameters;
+          // [Stage 104] chMi90이 확장 메서드(IsStatic=true)면 첫 파라미터는 "this"(이미
+          // 스택에 올라간 인스턴스)이므로 건너뛰고, 실제 호출 인자(ch90.Args)는
+          // 두 번째 파라미터부터 대응시킨다.
+          var chParamOff90:=0;
+          if chMi90.IsStatic then chParamOff90:=1;
           for var chAi90:=0 to ch90.Args.Count-1 do
-            EmitArgForParamType(aIL, ch90.Args[chAi90], chMiParams90[chAi90].ParameterType);
-          if chIsVal90 then aIL.Emit(OpCodes.Call, chMi90)
+            EmitArgForParamType(aIL, ch90.Args[chAi90], chMiParams90[chAi90+chParamOff90].ParameterType);
+          if chMi90.IsStatic then aIL.Emit(OpCodes.Call, chMi90) // 확장 메서드는 항상 정적 Call
+          else if chIsVal90 then aIL.Emit(OpCodes.Call, chMi90)
           else aIL.Emit(OpCodes.Callvirt, chMi90);
         end;
       end
@@ -1161,6 +1167,15 @@
           aIL.Emit(OpCodes.Ldsfld, fGlobalConstFields[vr.VarName])
         else if fLocalScope.Has(vr.VarName) then aIL.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(vr.VarName))
         else if fGlobalScope.Has(vr.VarName) then aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(vr.VarName))
+        // [Stage 106 버그 수정] Object Pascal은 인자 0개 함수를 괄호 없이 호출하는 문법을
+        // 허용한다(예: "inputPath := ResolveInputPath;"). Parser는 이 패턴을 사용자 정의
+        // 함수(fFuncNames)에 대해서는 TFuncCallExprNode로 승격하는 분기가 없어(Stage 93은
+        // 표준 라이브러리 니라딕 함수만 처리) 그냥 TVarRefNode로 만들어버린다 — 그 결과
+        // 여기서 "선언되지 않은 변수"로 잘못 실패했다. vr.VarName이 지역/전역 변수도 아니고
+        // 매개변수 0개짜리 최상위 함수로 등록돼 있으면, 변수 로드 대신 그 함수를 호출한다.
+        else if fMethods.ContainsKey(vr.VarName) and
+           ((not fTopParamClrTypes.ContainsKey(vr.VarName)) or (fTopParamClrTypes[vr.VarName].Length=0)) then
+          aIL.Emit(OpCodes.Call, fMethods[vr.VarName])
         else raise new Exception('선언되지 않은 변수 "'+vr.VarName+'"');
       end
 
@@ -1418,6 +1433,35 @@
 
       else if e is TBuiltinCallExprNode then // [Stage 72]
         EmitBuiltinCall(aIL, TBuiltinCallExprNode(e))
+
+      else if e is TArrayLiteralExprNode then
+      begin
+        // [Stage 105 버그 수정] TArrayLiteralExprNode는 여태 EmitArgForParamType(함수 호출
+        // 인자 자리)에서만 처리됐다 — "extClasses := [typeof(A), typeof(B)];"처럼 대입문의
+        // 우변(EmitValueForVType → EmitExpr 경로)이나 그 밖의 일반 식 위치에 오면 여기까지
+        // 떨어지지 않고 "알 수 없는 식 노드"로 실패했다(자기컴파일 실제 사례:
+        // TCodeGenerator 생성자 안의 "array of System.Type" 필드 대입). EmitExpr은 대입
+        // 대상의 정확한 CLR 원소 타입을 모르므로, 원소 자신의 CLR 타입(주로 typeof(...)이면
+        // System.Type)을 InferArgClrType으로 추정해 그 타입의 배열을 만든다 — 원소가
+        // 비어있거나 타입을 못 정하면 System.Object로 폴백한다.
+        var al105:=TArrayLiteralExprNode(e);
+        var alElemT105:=typeof(System.Object);
+        if al105.Elements.Count>0 then
+        begin
+          var alFirstT105:=InferArgClrType(al105.Elements[0]);
+          if alFirstT105<>nil then alElemT105:=alFirstT105;
+        end;
+        aIL.Emit(OpCodes.Ldc_I4, al105.Elements.Count);
+        aIL.Emit(OpCodes.Newarr, alElemT105);
+        for var alI105:=0 to al105.Elements.Count-1 do
+        begin
+          aIL.Emit(OpCodes.Dup);
+          aIL.Emit(OpCodes.Ldc_I4, alI105);
+          EmitArgForParamType(aIL, al105.Elements[alI105], alElemT105);
+          if alElemT105.IsValueType then aIL.Emit(OpCodes.Stelem, alElemT105)
+          else aIL.Emit(OpCodes.Stelem_Ref);
+        end;
+      end
 
       else raise new Exception('알 수 없는 식 노드: '+e.GetType.Name);
       finally
