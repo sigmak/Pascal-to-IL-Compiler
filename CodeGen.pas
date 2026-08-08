@@ -56,6 +56,10 @@ type
   public
     constructor Create(openProp: PropertyInfo; declType: System.Type; getter, setter: MethodInfo);
     begin
+      // [버그 수정] PropertyInfo의 무인자 생성자는 protected라 자동 체이닝이 안 됨 — 명시 호출 필요.
+      // [추가 수정] 괄호 없는 "inherited Create;" 형태를 BuildConstructorBody의 hasExplicitInherited
+      // 감지 로직이 놓치는 문제가 재현되어(자기컴파일 실제 사례), 괄호를 붙인 형태로 바꿔 우회한다.
+      inherited Create();
       fName := openProp.Name;
       fDeclType := declType;
       fGetter := getter;

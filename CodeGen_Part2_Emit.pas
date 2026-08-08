@@ -2869,15 +2869,47 @@
           // 로컬/전역 변수가 아니면 System.Windows.Forms.Application.Run(f) 처럼
           // 외부 타입의 정적(static) 멤버 호출로 간주한다. 정적 호출은 인스턴스를
           // 먼저 로드하지 않고 인자만 쌓은 뒤 Call(비가상)로 호출한다.
-          extType:=ResolveExternalType(mcs.ObjName);
-          emi:=ResolveMethodByArity(extType, mcs.MethodName, mcs.Args, true);
-          if emi=nil then
-            raise new Exception('외부 타입 "'+extType.FullName+'"에 정적 메서드 "'+mcs.MethodName+'"가 없습니다 (인자 '+mcs.Args.Count.ToString+'개, 경로: '+mcs.ObjName+'.'+mcs.MethodName+').');
-          var _emiParams4:=emi.GetParameters;
-          for var _emiAi4:=0 to mcs.Args.Count-1 do
-            EmitArgForParamType(aIL, mcs.Args[_emiAi4], _emiParams4[_emiAi4].ParameterType);
-          aIL.Emit(OpCodes.Call, emi);
-          if emi.ReturnType<>typeof(System.Void) then aIL.Emit(OpCodes.Pop);
+          // [버그 수정] "System.Console.Out.Flush;"처럼 한정자 경로 중간에 무인자
+          // 정적 프로퍼티/메서드(Out)가 섞인 문장 호출은, ObjName 전체("System.Console.Out")가
+          // 그 자체로는 타입이 아니라서 ResolveExternalType이 곧장 실패했다(자기컴파일 중
+          // TCodeGenerator.LogGenStep의 "System.Console.Out.Flush;"에서 실제 재현됨). EmitExpr의
+          // TMethodCallExprNode 쪽(약 354행, _staticTE=nil일 때 ResolveOrEmitStaticChain 재시도)과
+          // 동일한 로직을 문장 위치에도 적용한다 — 성공하면 이미 체인 앞부분의 IL(Out 프로퍼티
+          // getter 호출 등)이 방출되어 스택에 인스턴스가 로드된 상태이므로, 이후 mcs.MethodName은
+          // 정적이 아니라 인스턴스 멤버로 호출해야 한다.
+          var _stmtStaticT: System.Type := nil;
+          try _stmtStaticT:=ResolveExternalType(mcs.ObjName); except end;
+          var _stmtIsInst: boolean := false;
+          if _stmtStaticT=nil then
+            try _stmtStaticT:=ResolveOrEmitStaticChain(aIL, mcs.ObjName, _stmtIsInst); except _stmtStaticT:=nil; end;
+
+          if _stmtStaticT=nil then
+            raise new Exception('외부 타입 "'+mcs.ObjName+'"을(를) 찾을 수 없습니다. 기본 프레임워크(WinForms/WPF/System.*)가 아니라면 {$reference 어셈블리명.dll} 지시문으로 해당 타입이 들어있는 어셈블리를 먼저 등록했는지 확인하세요.');
+
+          extType:=_stmtStaticT;
+          var _stmtGetP:=SafeGetProperty(extType, mcs.MethodName);
+          if (mcs.Args.Count=0) and (_stmtGetP<>nil) and (_stmtGetP.GetGetMethod<>nil) then
+          begin
+            if _stmtIsInst then aIL.Emit(OpCodes.Callvirt, _stmtGetP.GetGetMethod)
+            else aIL.Emit(OpCodes.Call, _stmtGetP.GetGetMethod);
+            if _stmtGetP.PropertyType<>typeof(System.Void) then aIL.Emit(OpCodes.Pop);
+          end
+          else
+          begin
+            emi:=ResolveMethodByArity(extType, mcs.MethodName, mcs.Args, not _stmtIsInst);
+            if emi=nil then
+            begin
+              var _stmtKindDesc:='';
+              if not _stmtIsInst then _stmtKindDesc:='정적 ';
+              raise new Exception('외부 타입 "'+extType.FullName+'"에 '+_stmtKindDesc+'메서드 "'+mcs.MethodName+'"가 없습니다 (인자 '+mcs.Args.Count.ToString+'개, 경로: '+mcs.ObjName+'.'+mcs.MethodName+').');
+            end;
+            var _emiParams4:=emi.GetParameters;
+            for var _emiAi4:=0 to mcs.Args.Count-1 do
+              EmitArgForParamType(aIL, mcs.Args[_emiAi4], _emiParams4[_emiAi4].ParameterType);
+            if _stmtIsInst then aIL.Emit(OpCodes.Callvirt, emi)
+            else aIL.Emit(OpCodes.Call, emi);
+            if emi.ReturnType<>typeof(System.Void) then aIL.Emit(OpCodes.Pop);
+          end;
         end;
       end
 
@@ -3163,6 +3195,55 @@
             raise new Exception('타입 "'+eifaInnerType.FullName+'"에 필드/프로퍼티 "'+eifa.FieldName+'"가 없습니다.');
           EmitArgForParamType(aIL, eifa.ValueExpr, eifaPi.PropertyType);
           aIL.Emit(OpCodes.Callvirt, eifaPi.GetSetMethod);
+        end;
+      end
+
+      // [자기컴파일 버그 수정] 인자 있는 암시적 self 메서드 호출의 반환값에 필드/프로퍼티
+      // 대입: GetOrCreate(cn).ParentName := pn; — 위 TExternalIndexFieldAssignStmtNode와
+      // 형제 노드다. self(Ldarg_0)로 로컬 메서드를 호출해 반환값을 스택에 남겨 두고,
+      // 그 반환 타입(아직 CreateType 안 된 로컬 클래스일 수 있음 — SafeGetField/
+      // SafeGetProperty로 우회)에서 필드를 먼저 찾고 없으면 프로퍼티 세터로 폴백한다.
+      // 로컬 메서드가 아니면(외부 상속 타입 메서드) FindExternalAncestorType로 폴백한다.
+      else if s is TSelfCallFieldAssignStmtNode then
+      begin
+        var scfa:=TSelfCallFieldAssignStmtNode(s);
+        aIL.Emit(OpCodes.Ldarg_0); // self
+        var scfaRetType: System.Type;
+        if TryFindInstanceMethod(fCurClassName, scfa.MethodName, imb) then
+        begin
+          EmitArgsCoerced(aIL, scfa.Args, FindInstanceMethodParamTypes(fCurClassName, scfa.MethodName));
+          aIL.Emit(OpCodes.Callvirt, imb);
+          scfaRetType:=imb.ReturnType;
+        end
+        else
+        begin
+          extType:=FindExternalAncestorType(fCurClassName);
+          if extType=nil then
+            raise new Exception('알 수 없는 메서드 "'+fCurClassName+'.'+scfa.MethodName+'"');
+          emi:=ResolveMethodByArity(extType, scfa.MethodName, scfa.Args, false);
+          if emi=nil then
+            raise new Exception('외부 타입 "'+extType.FullName+'"에 메서드 "'+scfa.MethodName+'"가 없습니다 (인자 '+scfa.Args.Count.ToString+'개).');
+          var scfaParams:=emi.GetParameters;
+          for var scfaAi:=0 to scfa.Args.Count-1 do
+            EmitArgForParamType(aIL, scfa.Args[scfaAi], scfaParams[scfaAi].ParameterType);
+          aIL.Emit(OpCodes.Callvirt, emi);
+          scfaRetType:=emi.ReturnType;
+        end;
+        if scfaRetType=typeof(System.Void) then
+          raise new Exception('메서드 "'+scfa.MethodName+'"는 반환값이 없어 그 결과의 필드/프로퍼티에 대입할 수 없습니다.');
+        var scfaFi:=SafeGetField(scfaRetType, scfa.FieldName);
+        if scfaFi<>nil then
+        begin
+          EmitArgForParamType(aIL, scfa.ValueExpr, scfaFi.FieldType);
+          aIL.Emit(OpCodes.Stfld, scfaFi);
+        end
+        else
+        begin
+          var scfaPi:=SafeGetProperty(scfaRetType, scfa.FieldName);
+          if (scfaPi=nil) or (scfaPi.GetSetMethod=nil) then
+            raise new Exception('타입 "'+scfaRetType.FullName+'"에 필드/프로퍼티 "'+scfa.FieldName+'"가 없습니다.');
+          EmitArgForParamType(aIL, scfa.ValueExpr, scfaPi.PropertyType);
+          aIL.Emit(OpCodes.Callvirt, scfaPi.GetSetMethod);
         end;
       end
 

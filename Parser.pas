@@ -1130,6 +1130,14 @@ type
         begin
           toName:=Expect(tkIdent).Text;
           while Cur.Kind=tkDot do begin fPos:=fPos+1; toName:=toName+'.'+ExpectQualNamePart; end;
+          // [자기컴파일 버그 수정] typeof(System.Collections.Generic.KeyValuePair<System.Object,System.Object>)
+          // 처럼 typeof 안의 타입 이름이 외부 제네릭 타입일 수 있다 — 예전에는 점(.) 체이닝만
+          // 처리하고 바로 Expect(tkRParen)으로 넘어가서, 뒤따르는 '<'가 "예상 tkRParen 실제
+          // tkLt"로 튕겨나갔다. ParseExternalGenericType/ParseExternalGenericTypeArg(위에서
+          // Dictionary<string,T> 같은 필드/매개변수 타입에 이미 쓰이는 것과 동일한 로직)를
+          // 재사용해 "Base<Arg1,Arg2>" 형태의 문자열로 완성한다 — CodeGen의 ResolveExternalType이
+          // 이미 이 표기를 인식해 재귀적으로 CLR 타입을 조립한다(ResolveExternalGenericType).
+          if Cur.Kind=tkLt then toName:=ParseExternalGenericType(toName);
         end;
         Expect(tkRParen);
         Result:=new TTypeOfExprNode(toName);
@@ -2489,7 +2497,34 @@ type
             mcs.Args.Add(ParseExpr);
             while Cur.Kind=tkComma do begin fPos:=fPos+1; mcs.Args.Add(ParseExpr); end;
           end;
-          Expect(tkRParen); Result:=mcs;
+          Expect(tkRParen);
+          // [자기컴파일 버그 수정] GetOrCreate(cn).ParentName := pn; 처럼, 인자 있는
+          // 암시적 self 메서드 호출 바로 뒤에 '.'이 오면 그 반환값의 필드/프로퍼티에
+          // 대입(또는 접근)하는 문장이다 — 예전에는 이 경우를 전혀 처리하지 않고
+          // Result:=mcs로 끝내버려서, 뒤에 남은 '.ParentName:=pn'이 다음 ParseStatement
+          // 호출에서 "알 수 없는 문장 (\".\")"으로 실패했다.
+          if Cur.Kind=tkDot then
+          begin
+            fPos:=fPos+1; // '.' 소비
+            var scfaField:=ExpectMemberName;
+            if Cur.Kind=tkAssign then
+            begin
+              fPos:=fPos+1;
+              var scfaVal:=ParseExpr;
+              var scfaNode:=new TSelfCallFieldAssignStmtNode(mcs.MethodName, scfaField, scfaVal);
+              scfaNode.Args:=mcs.Args;
+              Result:=scfaNode;
+            end
+            else
+            begin
+              // GetOrCreate(cn).Foo(...) — 반환값에 이어서 메서드 호출하는 경우는 아직
+              // 실제 사례가 없어 지원하지 않는다; 명확한 오류로 알린다(무음 실패 방지).
+              raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString
+                +': 메서드 호출 결과에 대한 "." 다음에는 대입(:=)만 지원합니다 ("'+scfaField+'")');
+            end;
+          end
+          else
+            Result:=mcs;
         end
 
         // 암시적 self 메서드 호출 (괄호 없음, 인자 없음): 예) Show; Close;
@@ -3129,7 +3164,7 @@ type
         Expect(tkColon); sig.ReturnType:=ParseVarType;
         // [버그 수정] 반환 타입이 로컬 클래스/외부 타입(vtObject)이면 이름을 보존해야
         // CodeGen이 정확한 CLR 반환 타입을 만들 수 있다 (TFuncDeclNode.ReturnClassName과 동일한 이유).
-        if sig.ReturnType=vtObject then sig.ReturnClassName:=fLastGenericName;
+        if (sig.ReturnType=vtObject) or (sig.ReturnType=vtObjArray) or (sig.ReturnType=vtMatrix) then sig.ReturnClassName:=fLastGenericName;
       end;
       Expect(tkSemicolon);
       Result:=sig;
@@ -3508,6 +3543,19 @@ type
                 ps.WriteName:=Expect(tkIdent).Text;
               end;
               Expect(tkSemicolon);
+              // [자기컴파일 버그 수정] property 지시자: override;/virtual;/abstract; — 외부
+              // 추상 타입(예: System.Reflection.PropertyInfo)을 상속해 그 추상 프로퍼티를
+              // 오버라이드할 때 쓰인다(CodeGen.pas의 TBoundGenericPropertyInfo 실제 사례).
+              // 메서드 지시자(위 3663번째 줄 근처)와 동일한 문법 — 순서·조합 무관, 지시자마다
+              // 세미콜론이 따라온다. CodeGen이 만드는 getter/setter는 이미 항상
+              // MethodAttributes.Virtual로 정의되므로(Stage 85) 파서 단계에서는 구문만 허용하고
+              // 소비하면 된다 — 이름·시그니처가 일치하는 상속 가상/추상 멤버가 있으면 CLR이
+              // 기본 슬롯 재사용 규칙으로 알아서 오버라이드로 연결한다.
+              while (Cur.Kind=tkVirtual) or (Cur.Kind=tkOverride) or (Cur.Kind=tkAbstract) do
+              begin
+                fPos:=fPos+1;
+                Expect(tkSemicolon);
+              end;
               cd.Properties.Add(ps);
               // 프로퍼티는 클래스 필드 목록에 이름을 추가한다.
               // 이를 통해 메서드 본문에서 Self.PropName 접근이 필드처럼 인식된다.
@@ -3580,7 +3628,7 @@ type
                 // 이게 없으면 CodeGen의 DefineMethod가 VTC(vtObject,'')로 떨어져 메서드의 실제
                 // CLR 반환 타입이 System.Object가 되고(예: function Cur: TToken;), 그 반환값에
                 // 체인 접근(Cur.Kind 등)할 때 "타입 System.Object에 메서드 X가 없습니다"로 실패한다.
-                if sig.ReturnType=vtObject then sig.ReturnClassName:=fLastGenericName;
+                if (sig.ReturnType=vtObject) or (sig.ReturnType=vtObjArray) or (sig.ReturnType=vtMatrix) then sig.ReturnClassName:=fLastGenericName;
               end;
               fCurGenericParams:=savedGP74sig; // [Stage 74]
 
@@ -3680,6 +3728,60 @@ type
                 if not fGenericMethodNames.Contains(mname) then fGenericMethodNames.Add(mname);
                 fMethodGenericParam[mname]:=sig.GenericParamNames;
                 fMethodGenericConstraint[mname]:=sig.GenericParamConstraints;
+              end;
+              // [자기컴파일 버그 수정] virtual;/override;/abstract; 지시자 "다음"에도
+              // [Stage 88c]처럼 곧바로 본문(begin...end;)이 올 수 있다 — 예:
+              // "function GetAccessors(nonPublic: boolean): array of MethodInfo; override;
+              //  begin ... end;" (CodeGen.pas의 TBoundGenericPropertyInfo 실제 사례).
+              // 위 [Stage 88c] 분기는 지시자가 오기 "전"에 tkBegin인지만 확인해서, 지시자가
+              // 하나라도 있으면 이 경로(else)로 빠지고 그 뒤엔 본문 검사가 아예 없어 시그니처만
+              // 등록한 채 끝나버렸다 — 그 결과 뒤따르는 "begin"이 클래스 멤버로 잘못 해석되어
+              // "클래스 선언 안에서 알 수 없는 토큰 begin" 오류로 이어졌다. abstract 메서드는
+              // 원래 본문이 없어야 하므로(위 fAbstractMethods 표시), 이 분기는 사실상
+              // virtual/override 뒤에 본문이 오는 경우를 위한 것이다.
+              if (Cur.Kind=tkBegin) or (Cur.Kind=tkVar) or (Cur.Kind=tkConst) then
+              begin
+                var inlImplMod:=new TMethodImplNode(cn, mname, isFunc, sig.ReturnType);
+                inlImplMod.ReturnGenericName:=sig.ReturnGenericName;
+                inlImplMod.ReturnClassName:=sig.ReturnClassName;
+                inlImplMod.ParamNames.AddRange(sig.ParamNames);
+                inlImplMod.ParamTypes.AddRange(sig.ParamTypes);
+                for var pgiMod:=0 to sig.ParamTypes.Count-1 do
+                begin
+                  if (sig.ParamTypes[pgiMod]=vtGeneric) or (sig.ParamTypes[pgiMod]=vtGenericArray) then
+                    inlImplMod.ParamGenericNames.Add(sig.ParamClassNames[pgiMod])
+                  else
+                    inlImplMod.ParamGenericNames.Add('');
+                  if (sig.ParamTypes[pgiMod]=vtIntArray) or (sig.ParamTypes[pgiMod]=vtStrArray) or (sig.ParamTypes[pgiMod]=vtGenericArray) or (sig.ParamTypes[pgiMod]=vtObjArray) then
+                    if not fArrayNames.Contains(sig.ParamNames[pgiMod]) then fArrayNames.Add(sig.ParamNames[pgiMod]);
+                  if sig.ParamIsExternal[pgiMod] and IsIndexerCapableExternalType(sig.ParamClassNames[pgiMod]) then
+                    if not fArrayNames.Contains(sig.ParamNames[pgiMod]) then fArrayNames.Add(sig.ParamNames[pgiMod]);
+                end;
+
+                var savedClassMod:=fCurClass; var savedFuncMod:=fCurFunc;
+                var savedParamsMod:=fCurParams; var savedMethodParamNamesMod:=fCurMethodParamNames;
+                fCurClass:=cn; fCurFunc:=mname;
+                fCurParams:=new List<string>;
+                foreach var pnCpMod in inlImplMod.ParamNames do fCurParams.Add(pnCpMod);
+                fCurMethodParamNames:=new List<string>;
+                foreach var pnCpMod2 in inlImplMod.ParamNames do fCurMethodParamNames.Add(pnCpMod2);
+
+                if (Cur.Kind=tkVar) or (Cur.Kind=tkConst) then
+                begin
+                  ParseLocalDeclSections(inlImplMod.LocalVars, inlImplMod.ConstDecls);
+                  foreach var lvcpMod in inlImplMod.LocalVars do fCurParams.Add(lvcpMod.Name);
+                  foreach var lccpMod in inlImplMod.ConstDecls do fCurParams.Add(lccpMod.Name);
+                end;
+
+                Expect(tkBegin);
+                var inlCompMod:=new TCompoundStmtNode;
+                ParseStatementsUntilEnd(inlCompMod.Statements); // [Stage 58] panic-mode 오류 복구
+                Expect(tkEnd); Expect(tkSemicolon);
+                inlImplMod.Body:=inlCompMod;
+                fProg.MethodImpls.Add(inlImplMod);
+
+                fCurClass:=savedClassMod; fCurFunc:=savedFuncMod;
+                fCurParams:=savedParamsMod; fCurMethodParamNames:=savedMethodParamNamesMod;
               end;
               end;
             end
@@ -4014,7 +4116,7 @@ type
         if (impl.ReturnType=vtGeneric) or (impl.ReturnType=vtGenericArray) then impl.ReturnGenericName:=fLastGenericName; // [Stage 32/37]
         // [버그 수정] 반환 타입이 로컬 클래스/외부 타입(vtObject)이면 이름을 보존한다 —
         // TMethodSignature 쪽과 동일한 이유(BuildMethodBody의 Result 지역변수 정확화).
-        if impl.ReturnType=vtObject then impl.ReturnClassName:=fLastGenericName;
+        if (impl.ReturnType=vtObject) or (impl.ReturnType=vtObjArray) or (impl.ReturnType=vtMatrix) then impl.ReturnClassName:=fLastGenericName;
       end;
       Expect(tkSemicolon);
 
@@ -4307,7 +4409,7 @@ type
         // [버그 수정] vtObject 반환 타입이면 fLastGenericName에 클래스/외부 타입 이름이 들어있다
         // (ParseVarType의 로컬 클래스 분기와 외부 타입 분기 모두 fLastGenericName을 채운다).
         // DeclareStaticFunc가 VTC(vtObject, ReturnClassName)으로 정확한 CLR 반환 타입을 얻는다.
-        if d.ReturnType=vtObject then d.ReturnClassName:=fLastGenericName;
+        if (d.ReturnType=vtObject) or (d.ReturnType=vtObjArray) or (d.ReturnType=vtMatrix) then d.ReturnClassName:=fLastGenericName;
       end;
       Expect(tkSemicolon);
       sv:=fCurFunc; fCurFunc:=d.Name;
@@ -4476,7 +4578,7 @@ type
       ParseParams(d.Parameters);
       Expect(tkColon); d.ReturnType:=ParseVarType;
       if (d.ReturnType=vtGeneric) or (d.ReturnType=vtGenericArray) then d.ReturnGenericName:=fLastGenericName;
-      if d.ReturnType=vtObject then d.ReturnClassName:=fLastGenericName; // [버그 수정]
+      if (d.ReturnType=vtObject) or (d.ReturnType=vtObjArray) or (d.ReturnType=vtMatrix) then d.ReturnClassName:=fLastGenericName; // [버그 수정]
       Expect(tkSemicolon);
       sv:=fCurFunc; fCurFunc:=mangled;
       if (Cur.Kind=tkVar) or (Cur.Kind=tkConst) then ParseLocalDeclSections(d.LocalVars, d.ConstDecls);

@@ -553,6 +553,18 @@ type
     begin FieldName:=f; ValueExpr:=v; Qualifier:=''; QualifierCastType:=''; end;
   end;
 
+  // [자기컴파일 버그 수정] 인자 있는 암시적 self 메서드 호출의 반환값에 바로
+  // 필드/프로퍼티를 대입하는 문장: GetOrCreate(cn).ParentName := pn;
+  // (Symbols.pas의 TClassTable.SetParentName에서 실제 재현됨 — 기존에는 "괄호 있는
+  // 암시적 self 호출" 뒤에 '.'이 오는 경우를 파서가 전혀 처리하지 않아 "알 수 없는
+  // 문장" 오류로 실패했다.) 위 TExternalIndexFieldAssignStmtNode(인덱서 결과에 필드
+  // 대입)와 형제 노드 — 첫 단계가 인덱싱이 아니라 인자 있는 메서드 호출이라는 점만 다르다.
+  TSelfCallFieldAssignStmtNode = class(TStmtNode)
+  public MethodName: string; Args: List<TExprNode>; FieldName: string; ValueExpr: TExprNode;
+    constructor Create(mth: string; f: string; v: TExprNode);
+    begin MethodName:=mth; Args:=new List<TExprNode>; FieldName:=f; ValueExpr:=v; end;
+  end;
+
   // Qualifier.EventName += HandlerName;  (예: Button1.Click += Button1_Click;)
   // [Stage 64] TEventSubscribeStmtNode/TLambdaExprNode 정의는 TParamDef 선언 뒤로 옮겨져
   // 있다 — 람다가 List<TParamDef>를 담는데, 제네릭 인스턴스화는 클래스 필드 전방 참조와

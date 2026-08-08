@@ -924,6 +924,19 @@
         // 컴파일 실제 사례 — Parser.pas의 "argTypes: List<TVarType>" 지역변수). VTC(216행
         // 부근)가 이미 쓰는 것과 동일한 fBuiltEnums 조회를 여기도 추가한다.
         else if fBuiltEnums.ContainsKey(tag) then Result:=fBuiltEnums[tag]
+        // [버그 수정] "Dictionary<string, Dictionary<string, TV>>"처럼 현재 빌드 중인
+        // 제네릭 메서드/함수 자신의 타입 매개변수(TV 등)가 다른 외부 제네릭 타입의
+        // 인자 자리에 "중첩"되어 나타나는 경우 — 이 함수는 지금까지 fCurGenericSubst
+        // (BuildClassShell의 sig.IsGeneric 분기, ApplyGenericParamConstraints 등이
+        // 미리 채워 둔 "타입 매개변수 이름 → GenericTypeParameterBuilder" 표)를 전혀
+        // 확인하지 않고 곧장 ResolveExternalType(tag)로 떨어졌다. 타입 매개변수가
+        // 매개변수 자리에 직접 오는 경우(x: TV)는 ResolveParamClrType의 vtGeneric
+        // 분기가 VTC를 통해 fCurGenericSubst를 이미 확인하지만, 이렇게 다른 제네릭
+        // 타입 안에 인자로 중첩된 경우는 이 함수가 유일한 경로라 그 확인이 빠져 있었다
+        // (자기컴파일 실제 사례 — Parser.pas의
+        // "DictDictHas<TV>(d: Dictionary<string, Dictionary<string, TV>>; ...)").
+        // ResolveExternalType을 시도하기 전에 먼저 fCurGenericSubst부터 확인한다.
+        else if (fCurGenericSubst<>nil) and fCurGenericSubst.ContainsKey(tag) then Result:=fCurGenericSubst[tag]
         else Result:=ResolveExternalType(tag); // 외부 타입 이름 (기본/짧은 이름/점으로 연결된 이름)
       end;
     end;
@@ -2438,6 +2451,7 @@
       fTypeBuilders[cd.Name]:=tb;
       fFieldBuilders[cd.Name]:=new Dictionary<string, FieldBuilder>;
       fInstanceMethods[cd.Name]:=new Dictionary<string, MethodBuilder>;
+      fInstanceMethodsByArity[cd.Name]:=new Dictionary<string, MethodBuilder>; // [버그 수정] 오버로드 구분용
 
       // 인터페이스 구현 등록 (완성된 인터페이스 Type이 필요 — 이미 위에서 다 만들어둠)
       // 이 클래스의 public+virtual 메서드가 이름/시그니처로 인터페이스 메서드와
@@ -2507,6 +2521,7 @@
           mb.SetReturnType(retClrType74);
 
           fInstanceMethods[cd.Name][sig.Name]:=mb;
+          fInstanceMethodsByArity[cd.Name][sig.Name+'#'+sig.ParamNames.Count.ToString]:=mb; // [버그 수정] 오버로드 구분용
           if not fMethodReturnTypes.ContainsKey(cd.Name) then
             fMethodReturnTypes[cd.Name]:=new Dictionary<string, TVarType>;
           fMethodReturnTypes[cd.Name][sig.Name]:=sig.ReturnType;
@@ -2532,6 +2547,7 @@
           else
             mb:=tb.DefineMethod(sig.Name, thisMethAttrs, typeof(System.Void), paramTypes);
           fInstanceMethods[cd.Name][sig.Name]:=mb;
+          fInstanceMethodsByArity[cd.Name][sig.Name+'#'+sig.ParamNames.Count.ToString]:=mb; // [버그 수정] 오버로드 구분용
           if not fMethodReturnTypes.ContainsKey(cd.Name) then
             fMethodReturnTypes[cd.Name]:=new Dictionary<string, TVarType>;
           fMethodReturnTypes[cd.Name][sig.Name]:=sig.ReturnType;
@@ -2803,6 +2819,12 @@
         // 전용)에는 vtEnum이 없어 "알 수 없는 메서드 ".ToString"" 같은 오류로 이어졌다.
         // ClrType을 채워 HasClrType 리플렉션 경로(값타입 Ldloca+Call 포함)로 라우팅한다.
         else if lv.VarType=vtEnum then
+          fLocalScope.SetClrType(lv.Name, lvClrType)
+        // [버그 수정] array of <외부 타입>(vtObjArray) 지역변수 — ClrType을 채워야 GetExprClrType이
+        // 원소 접근(lv[i].Member) 시 원소의 실제 CLR 타입을 찾을 수 있다. 이게 빠지면 HasClrType이
+        // 항상 false로 남아 System.Object로 조용히 폴백한다(자기컴파일 실제 사례 — CodeGen.pas의
+        // "ps: array of ParameterInfo;" 지역변수, foreach var cand in ps do cand.Name 등).
+        else if lv.VarType=vtObjArray then
           fLocalScope.SetClrType(lv.Name, lvClrType);
         // [Stage 67] vtMatrix의 원소 타입 이름을 ClassName에 보존 (GetVarClassName이 참조)
         if (lv.VarType=vtMatrix) and (lv.ClassName<>'') then
@@ -2821,6 +2843,16 @@
       // 파생 클래스 생성자가 base(...)를 안 쓰면 컴파일러가 자동으로 부모의 매개변수
       // 없는 생성자를 호출해주는 것과 동일한 처리를 여기서 해준다.
       var hasExplicitInherited: boolean := false;
+      // [임시 진단] "inherited Create;"(괄호 없는 무인자 호출)가 명시적으로 있는데도
+      // hasExplicitInherited가 false로 나오는 사례(자기컴파일 중 TBoundGenericPropertyInfo에서
+      // 실제 재현)의 원인을 확정하기 위해, 문제되는 클래스의 생성자 본문 첫 문장 타입을
+      // 그대로 출력한다. 원인 확인 후 이 블록은 지워도 된다.
+      if impl.ClassName='TBoundGenericPropertyInfo' then
+      begin
+        Writeln('  [진단] ' + impl.ClassName + ' 생성자 본문 문장 수: ' + impl.Body.Statements.Count.ToString);
+        if impl.Body.Statements.Count>0 then
+          Writeln('  [진단] 첫 문장 타입: ' + impl.Body.Statements[0].GetType.Name);
+      end;
       foreach st in impl.Body.Statements do
         if st is TInheritedCallStmtNode then begin hasExplicitInherited:=true; break; end;
       if not hasExplicitInherited then
@@ -2841,7 +2873,17 @@
         else if fClassExternalParentType.ContainsKey(impl.ClassName) then
           // 실제 외부 부모 클래스(예: class(TSomeExternalBase)) — BuildClassShell이
           // 이미 리플렉션으로 확인해 둔 진짜 부모 타입을 그대로 쓴다.
-          autoParentCtor:=fClassExternalParentType[impl.ClassName].GetConstructor(System.Type.EmptyTypes)
+          // [버그 수정] GetConstructor(Type.EmptyTypes)만 쓰면 PUBLIC 생성자만 찾는다.
+          // System.Reflection.PropertyInfo처럼 무인자 생성자가 protected인 외부 타입은
+          // (자기컴파일 실제 사례 — TBoundGenericPropertyInfo : PropertyInfo) 이 호출이 nil을
+          // 돌려줘 "public 생성자가 없다"는 오류로 이어졌다 — 소스에 "inherited Create();"를
+          // 명시해도 파서의 감지 결과와 무관하게 항상 이 경로를 정확히 동작시키기 위해,
+          // BindingFlags에 NonPublic도 포함해 protected/internal 생성자까지 찾는다.
+          // IL의 OpCodes.Call은 C#과 달리 접근 제한자를 컴파일타임에 강제하지 않으므로
+          // ConstructorInfo만 얻으면 protected 생성자도 문제없이 호출할 수 있다.
+          autoParentCtor:=fClassExternalParentType[impl.ClassName].GetConstructor(
+            BindingFlags.Instance or BindingFlags.Public or BindingFlags.NonPublic,
+            nil, System.Type.EmptyTypes, nil)
         else
           // [버그수정] cd.ParentName이 실은 인터페이스였던 경우(예: class(IDisposable))
           // BuildClassShell은 실제 CLR 부모를 System.Object로 두고 인터페이스는
@@ -2896,7 +2938,18 @@
           raise new Exception('"'+impl.ClassName+'.'+impl.MethodName+'"은(는) abstract로 선언되어 본문(구현)을 가질 수 없습니다');
       end;
 
-      mb:=fInstanceMethods[impl.ClassName][impl.MethodName];
+      // [버그 수정] fInstanceMethods는 메서드명 하나에 MethodBuilder 하나만 저장하므로,
+      // 같은 이름의 오버로드(예: GetCustomAttributes(bool) / GetCustomAttributes(Type,bool))가
+      // 있으면 나중에 등록된 쪽이 앞의 것을 덮어써, 두 구현부(impl) 모두 같은 MethodBuilder를
+      // 가리키게 되고 다른 하나는 본문이 채워지지 않은 채 남아 CreateType이 "메서드 본문이
+      // 없습니다"로 실패했다(자기컴파일 실제 사례 — TBoundGenericPropertyInfo:PropertyInfo).
+      // fInstanceMethodsByArity("메서드명#매개변수개수")로 먼저 정확히 찾고, 오버로드가 없어
+      // 거기 없으면(절대다수의 경우) 기존 방식으로 그대로 폴백한다.
+      var _mbArityKey99d:=impl.MethodName+'#'+impl.ParamNames.Count.ToString;
+      if DictDictHas(fInstanceMethodsByArity, impl.ClassName, _mbArityKey99d) then
+        mb:=fInstanceMethodsByArity[impl.ClassName][_mbArityKey99d]
+      else
+        mb:=fInstanceMethods[impl.ClassName][impl.MethodName];
       il:=mb.GetILGenerator;
 
       savedLocalScope:=fLocalScope;
@@ -3015,6 +3068,9 @@
         end
         // [버그 수정] enum 타입 지역변수 — ClrType을 채워 HasClrType 리플렉션 경로로 라우팅한다.
         else if lv.VarType=vtEnum then
+          fLocalScope.SetClrType(lv.Name, lvClrType)
+        // [버그 수정] array of <외부 타입>(vtObjArray) 지역변수도 ClrType을 등록한다 (2819행 부근과 동일 이유).
+        else if lv.VarType=vtObjArray then
           fLocalScope.SetClrType(lv.Name, lvClrType);
         // [Stage 67] vtMatrix 원소 타입 이름 보존
         if (lv.VarType=vtMatrix) and (lv.ClassName<>'') then
@@ -3242,7 +3298,8 @@
         end
         // [버그 수정] enum 타입 캡처 지역변수 — ClrType을 채워 HasClrType 리플렉션 경로로 라우팅한다.
         else if lv69c.VarType=vtEnum then
-          fLocalScope.SetClrType(lv69c.Name, lvClrType69);
+          fLocalScope.SetClrType(lv69c.Name, lvClrType69)
+        else if lv69c.VarType=vtObjArray then fLocalScope.SetClrType(lv69c.Name, lvClrType69);
         if (lv69c.VarType=vtMatrix) and (lv69c.ClassName<>'') then fLocalScope.SetClassName(lv69c.Name, lv69c.ClassName);
         il.Emit(OpCodes.Ldarg_0); il.Emit(OpCodes.Ldfld, capFields[lv69c.Name]); il.Emit(OpCodes.Stloc, floc2);
       end;
@@ -3584,6 +3641,9 @@
         end
         // [버그 수정] enum 타입 지역변수 — ClrType을 채워 HasClrType 리플렉션 경로로 라우팅한다.
         else if lv.VarType=vtEnum then
+          fLocalScope.SetClrType(lv.Name, lvClrType)
+        // [버그 수정] array of <외부 타입>(vtObjArray) 지역변수도 ClrType을 등록한다 (2819행 부근과 동일 이유).
+        else if lv.VarType=vtObjArray then
           fLocalScope.SetClrType(lv.Name, lvClrType);
         // [Stage 67] vtMatrix 원소 타입 이름 보존
         if (lv.VarType=vtMatrix) and (lv.ClassName<>'') then
@@ -3668,6 +3728,9 @@
         end
         // [버그 수정] enum 타입 지역변수 — ClrType을 채워 HasClrType 리플렉션 경로로 라우팅한다.
         else if lv.VarType=vtEnum then
+          fLocalScope.SetClrType(lv.Name, lvClrType)
+        // [버그 수정] array of <외부 타입>(vtObjArray) 지역변수도 ClrType을 등록한다 (2819행 부근과 동일 이유).
+        else if lv.VarType=vtObjArray then
           fLocalScope.SetClrType(lv.Name, lvClrType);
         // [Stage 67] vtMatrix 원소 타입 이름 보존
         if (lv.VarType=vtMatrix) and (lv.ClassName<>'') then
@@ -3706,6 +3769,7 @@
       fBuiltTypes:=new Dictionary<string, System.Type>;
       fFieldBuilders:=new Dictionary<string, Dictionary<string, FieldBuilder>>;
       fInstanceMethods:=new Dictionary<string, Dictionary<string, MethodBuilder>>;
+      fInstanceMethodsByArity:=new Dictionary<string, Dictionary<string, MethodBuilder>>; // [버그 수정] 오버로드 구분용
       fMethodsCache:=new Dictionary<string, array of MethodInfo>; // [성능]
       fCtorsCache:=new Dictionary<string, array of ConstructorInfo>; // [성능]
       fAbstractMethods:=new Dictionary<string, List<string>>; // [Stage 53]

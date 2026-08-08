@@ -52,6 +52,17 @@
     fBuiltTypes:   Dictionary<string, System.Type>;  // 클래스명 → 완성된 Type
     fFieldBuilders: Dictionary<string, Dictionary<string, FieldBuilder>>; // 클래스명 → 필드명 → FieldBuilder
     fInstanceMethods: Dictionary<string, Dictionary<string, MethodBuilder>>; // 클래스명 → 메서드명 → MB
+    // [버그 수정] fInstanceMethods는 메서드명 하나에 MethodBuilder 하나만 저장할 수 있어서,
+    // 같은 이름의 오버로드 메서드(예: GetCustomAttributes(bool) / GetCustomAttributes(Type,bool) —
+    // System.Reflection.PropertyInfo를 상속하는 TBoundGenericPropertyInfo에서 자기컴파일 중
+    // 실제 재현됨)가 있으면 나중에 등록된 것이 먼저 것을 덮어써 버렸다. 그 결과 BuildMethodBody가
+    // 두 오버로드 본문을 채울 때 실제로는 같은 MethodBuilder에 두 번 채우게 되고, 원래 만들어졌던
+    // 다른 하나의 MethodBuilder는 본문이 채워지지 않은 채로 남아 CreateType이 "메서드 본문이
+    // 없습니다"로 실패했다. 클래스명 → "메서드명#매개변수개수" → MB 형태의 보조 딕셔너리를 두어,
+    // 오버로드가 있는 경우 매개변수 개수로 정확한 MethodBuilder를 구분해 찾는다(생성자 오버로드를
+    // FindLocalCtorIndex로 구분하는 것과 동일한 원리) — 기존 fInstanceMethods(이름만으로 찾는 조회)는
+    // 오버로드 없는 절대다수의 메서드를 위해 그대로 두고 하위호환을 유지한다.
+    fInstanceMethodsByArity: Dictionary<string, Dictionary<string, MethodBuilder>>; // 클래스명 → "메서드명#인자수" → MB
     fAbstractMethods: Dictionary<string, List<string>>; // [Stage 53] 클래스명 → abstract로 선언된 메서드명 목록
     fClasses: TClassTable; // [Symbols.pas 1단계] 클래스명 → TClassSymbol. 현재는 ParentName만 이관됨(구 fClassParents)
     // [성능] SafeGetMethods/SafeGetConstructors의 "완성된(외부 CLR) 타입"용 GetMethods/
