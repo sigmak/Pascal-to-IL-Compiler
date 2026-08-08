@@ -2682,7 +2682,8 @@
               if _genMiS100.ReturnType<>typeof(System.Void) then aIL.Emit(OpCodes.Pop);
             end;
           end
-          else if cn='' then raise new Exception('알 수 없는 메서드 "'+cn+'.'+mcs.MethodName+'"')
+          else if cn='' then raise new Exception('알 수 없는 메서드 "'+mcs.ObjName+'.'+mcs.MethodName
+            +'" (VarType='+GetVarType(mcs.ObjName).ToString+', 인자 '+mcs.Args.Count.ToString+'개)')
           else
           // 인터페이스 타입 변수면 인터페이스 메서드로, 아니면 클래스 상속 체인에서 탐색
           // (Stage 10에서는 fInstanceMethods[cn] 직접 조회 + Call만 사용해 상속받은
@@ -2729,7 +2730,8 @@
             begin
               var cnExtType:=FindExternalAncestorType(cn);
               if cnExtType=nil then
-                raise new Exception('알 수 없는 메서드 "'+cn+'.'+mcs.MethodName+'"');
+                raise new Exception('알 수 없는 메서드 "'+mcs.ObjName+'.'+mcs.MethodName
+                  +'" (cn="'+cn+'", 인자 '+mcs.Args.Count.ToString+'개)');
               var cnEmi:=ResolveMethodByArity(cnExtType, mcs.MethodName, mcs.Args, false);
               if cnEmi=nil then
                 raise new Exception('외부 타입 "'+cnExtType.FullName+'"에 메서드 "'+mcs.MethodName+'"가 없습니다 (인자 '+mcs.Args.Count.ToString+'개, 경로: '+mcs.ObjName+'.'+mcs.MethodName+').');

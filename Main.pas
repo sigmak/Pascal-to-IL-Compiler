@@ -139,7 +139,12 @@ begin
   else
   begin
     // 인자가 없으면 실행 파일 옆의 Examples\GenericBoxTest.pas 를 기본값으로 사용
-    exeDir := System.IO.Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly.Location);
+    //exeDir := System.IO.Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly.Location);
+    // [버그 수정] Assembly.GetExecutingAssembly.Location은 System.Reflection.Emit(AssemblyBuilder)으로
+    // 생성/저장된 어셈블리에서는 NotImplementedException을 던지는 경우가 있다(자기컴파일 결과물 exe에서
+    // 실제 재현됨). exeDir은 어차피 "실행파일이 있는 디렉터리"만 필요하므로, Location을 거치지 않는
+    // AppDomain.CurrentDomain.BaseDirectory로 대체한다 — 이쪽은 이런 제약이 없다.
+    exeDir := System.AppDomain.CurrentDomain.BaseDirectory;    
     candidate := System.IO.Path.Combine(exeDir, DefaultExampleDir, DefaultExampleFile);
     if System.IO.File.Exists(candidate) then
       Result := candidate

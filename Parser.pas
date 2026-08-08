@@ -4523,36 +4523,21 @@ type
         while Cur.Kind=tkComma do begin fPos:=fPos+1; ns.Add(Expect(tkIdent).Text); end;
         Expect(tkColon);
         cn:=''; isExt:=false;
-        // 클래스 타입 변수 처리
-        if (Cur.Kind=tkIdent) and fClassNames.Contains(Cur.Text) then
-        begin
-          cn:=Cur.Text; fPos:=fPos+1; vt:=vtObject;
-          if (Cur.Kind=tkLt) and fGenericClassNames.Contains(cn) then cn:=ResolveGenericInstantiation(cn);
-        end
-        // 인터페이스 타입 변수 처리
-        else if (Cur.Kind=tkIdent) and fInterfaceNames.Contains(Cur.Text) then
-        begin
-          cn:=Cur.Text; fPos:=fPos+1; vt:=vtInterface;
-        end
-        // [전역 var 버그 수정] 점(.)으로 연결된 외부 .NET 타입 (예: System.Text.StringBuilder).
-        // ParseParamTypeExt/ParseLocalVarSection에는 이미 있었는데 전역 var 섹션에만 빠져 있었다.
-        else if Cur.Kind=tkIdent then
-        begin
-          var savedPosV:=fPos;
-          var qnV:=Expect(tkIdent).Text;
-          if Cur.Kind=tkDot then
-          begin
-            while Cur.Kind=tkDot do begin fPos:=fPos+1; qnV:=qnV+'.'+ExpectQualNamePart; end;
-            cn:=qnV; isExt:=true; vt:=vtObject;
-          end
-          else
-          begin
-            fPos:=savedPosV;
-            vt:=ParseVarType;
-            if (vt=vtEnum) or (vt=vtSet) or (vt=vtMatrix) then cn:=fLastGenericName; // [Stage 63/67]
-          end;
-        end
-        else begin vt:=ParseVarType; if (vt=vtEnum) or (vt=vtSet) or (vt=vtMatrix) then cn:=fLastGenericName; end; // [Stage 67]
+        // [버그 수정] 전역 var 섹션도 지역 var/매개변수(ParseLocalVarSection/ParseParams)와
+        // 동일하게 ParseParamTypeExt로 통일한다. 기존 손파싱 코드는 클래스/인터페이스/
+        // 점(.)-연결 외부타입만 챙기고, List<T>/Dictionary<K,V>/HashSet<T> 같은 점 없는
+        // 짧은 이름의 BCL 제네릭 컬렉션은 전혀 몰라 ParseVarType 기본 폴백으로 떨어졌다
+        // (IsExternal=false, ClassName='') — 그 결과 "unitSearchDirs: List<string>;" 같은
+        // 전역 변수가 CodeGen에서 cn=''+ClrType 미등록 상태로 넘어가 "unitSearchDirs.Add"가
+        // "알 수 없는 메서드"로 실패했다(자기컴파일 중 Main.pas 자신의 소스에서 실제 재현됨).
+        // ParseParamTypeExt는 클래스/인터페이스/열거형/set of/object/짧은 이름 BCL 제네릭
+        // (List·Dictionary·HashSet·Queue·Stack·IEnumerable·IList·IDictionary·ICollection·
+        // SortedList·LinkedList·SortedDictionary)/점 연결 외부타입/네임스페이스 탐색/기본
+        // ParseVarType 폴백까지 이미 다 처리하는 상위 호환 함수라 기존 로직을 완전히
+        // 대체해도 안전하다.
+        vt:=ParseParamTypeExt(isExt, cn);
+        if (vt=vtGeneric) or (vt=vtGenericArray) then cn:=fLastGenericName;
+        if vt=vtMatrix then cn:=fLastGenericName;
         // [Stage 93] "Name: Type := expr;" — 전역 var 초기화식 (예: visualStates: VisualStates := new VisualStates();)
         var giveInit93: TExprNode := nil;
         if Cur.Kind=tkAssign then begin fPos:=fPos+1; giveInit93:=ParseExpr; end;
