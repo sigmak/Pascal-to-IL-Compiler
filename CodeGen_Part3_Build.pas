@@ -1114,6 +1114,23 @@
           Result:=nil;
         end;
       end
+      // [Stage 109 재적용] sb.Append(chars[i])처럼 배열 인덱싱 결과(chars[i])가 오버로드
+      // 함수의 인자로 직접 쓰이는 경우 — 지금까지 이 분기가 아예 없어서 InferArgClrType이
+      // nil(중립)을 돌려줬고, StringBuilder.Append처럼 오버로드가 많은 메서드에서
+      // ScoreParamMatch가 모든 후보를 동점 처리해 GetMethods() 나열 순서상 우연히 걸린
+      // (char가 아닌) 오버로드가 선택됐다 — 실제 스택엔 Ldelem_U2로 정확히 올라온 char
+      // 원시값 하나뿐인데 콜리는 다른 타입(예: object/string)을 기대해 그 작은 정수를
+      // 참조처럼 역참조하다가 NullReferenceException/AccessViolationException으로 죽었다
+      // (자기컴파일 실제 재현: StripCommentsForUsesScan, ExpandIncludes의 chars[i]).
+      // TChainedIndexExprNode와 동일한 패턴으로 GetExprClrType을 그대로 재사용한다.
+      else if e is TArrayIndexExprNode then
+      begin
+        try
+          Result:=GetExprClrType(e);
+        except
+          Result:=nil;
+        end;
+      end
       // [버그 수정] MakeItem(...) 처럼 최상위 함수 호출 결과를 직접 다른 메서드의 인자로
       // 넘길 때(예: dgvModules.Items.Add(MakeItem(...))) InferArgClrType에 TFuncCallExprNode
       // 분기가 없어 마지막 else 폴백으로 떨어졌다. InferType은 vtObject를 반환하지만
@@ -2098,10 +2115,27 @@
           var _aiG90:=TArrayIndexExprNode(e);
           var _aiBaseT90: System.Type := nil;
           var _aiFb90: FieldBuilder;
-          if fLocalScope.Has(_aiG90.ArrName) and fLocalScope.HasClrType(_aiG90.ArrName) then
-            _aiBaseT90:=fLocalScope.GetClrType(_aiG90.ArrName)
-          else if fGlobalScope.Has(_aiG90.ArrName) and fGlobalScope.HasClrType(_aiG90.ArrName) then
-            _aiBaseT90:=fGlobalScope.GetClrType(_aiG90.ArrName)
+          // [Stage 109 재적용] HasClrType은 SetClrType이 호출된 적 있는 변수만 true다 —
+          // "chars: array of char := s.ToCharArray" 같은 array-of 지역/전역 변수는
+          // 선언 시 SetClrType이 호출된 적이 없어 HasClrType이 항상 false였고, 그러면
+          // 아래 두 분기가 전부 스킵되어 _aiBaseT90이 nil로 남아 System.Object로
+          // 잘못 폴백했다(자기컴파일 실제 재현: StripCommentsForUsesScan/ExpandIncludes의
+          // chars[i]). HasClrType이 실패해도 Loc.LocalType(선언된 CLR 타입, 항상 존재)을
+          // 마지막 수단으로 직접 조회한다.
+          if fLocalScope.Has(_aiG90.ArrName) then
+          begin
+            if fLocalScope.HasClrType(_aiG90.ArrName) then
+              _aiBaseT90:=fLocalScope.GetClrType(_aiG90.ArrName)
+            else
+              _aiBaseT90:=fLocalScope.GetLoc(_aiG90.ArrName).LocalType;
+          end
+          else if fGlobalScope.Has(_aiG90.ArrName) then
+          begin
+            if fGlobalScope.HasClrType(_aiG90.ArrName) then
+              _aiBaseT90:=fGlobalScope.GetClrType(_aiG90.ArrName)
+            else
+              _aiBaseT90:=fGlobalScope.GetLoc(_aiG90.ArrName).LocalType;
+          end
           else if (fCurClassName<>'') and TryFindFieldBuilder(fCurClassName, _aiG90.ArrName, _aiFb90) then
             _aiBaseT90:=_aiFb90.FieldType;
           if _aiBaseT90<>nil then Result:=InferIndexerResultType(_aiBaseT90, _aiG90.Index);
@@ -2873,7 +2907,7 @@
         // 원소 접근(lv[i].Member) 시 원소의 실제 CLR 타입을 찾을 수 있다. 이게 빠지면 HasClrType이
         // 항상 false로 남아 System.Object로 조용히 폴백한다(자기컴파일 실제 사례 — CodeGen.pas의
         // "ps: array of ParameterInfo;" 지역변수, foreach var cand in ps do cand.Name 등).
-        else if lv.VarType=vtObjArray then
+        else if (lv.VarType=vtObjArray) or (lv.VarType=vtGenericArray) then // [버그 수정] array of char/real/int64(vtGenericArray)도 ClrType 등록 누락돼 있었음
           fLocalScope.SetClrType(lv.Name, lvClrType);
         // [Stage 67] vtMatrix의 원소 타입 이름을 ClassName에 보존 (GetVarClassName이 참조)
         if (lv.VarType=vtMatrix) and (lv.ClassName<>'') then
@@ -3119,7 +3153,7 @@
         else if lv.VarType=vtEnum then
           fLocalScope.SetClrType(lv.Name, lvClrType)
         // [버그 수정] array of <외부 타입>(vtObjArray) 지역변수도 ClrType을 등록한다 (2819행 부근과 동일 이유).
-        else if lv.VarType=vtObjArray then
+        else if (lv.VarType=vtObjArray) or (lv.VarType=vtGenericArray) then // [버그 수정] array of char/real/int64(vtGenericArray)도 ClrType 등록 누락돼 있었음
           fLocalScope.SetClrType(lv.Name, lvClrType);
         // [Stage 67] vtMatrix 원소 타입 이름 보존
         if (lv.VarType=vtMatrix) and (lv.ClassName<>'') then
@@ -3330,6 +3364,9 @@
         end
         // [버그 수정] enum 타입 캡처 매개변수 — ClrType을 채워 HasClrType 리플렉션 경로로 라우팅한다.
         else if pd69.ParamType=vtEnum then
+          fLocalScope.SetClrType(pd69.Name, capFields[pd69.Name].FieldType)
+        // [버그 수정] array of X(vtObjArray/vtGenericArray) 캡처 매개변수도 ClrType 등록 누락돼 있었음
+        else if (pd69.ParamType=vtObjArray) or (pd69.ParamType=vtGenericArray) then
           fLocalScope.SetClrType(pd69.Name, capFields[pd69.Name].FieldType);
         il.Emit(OpCodes.Ldarg_0); il.Emit(OpCodes.Ldfld, capFields[pd69.Name]); il.Emit(OpCodes.Stloc, floc);
       end;
@@ -3348,7 +3385,7 @@
         // [버그 수정] enum 타입 캡처 지역변수 — ClrType을 채워 HasClrType 리플렉션 경로로 라우팅한다.
         else if lv69c.VarType=vtEnum then
           fLocalScope.SetClrType(lv69c.Name, lvClrType69)
-        else if lv69c.VarType=vtObjArray then fLocalScope.SetClrType(lv69c.Name, lvClrType69);
+        else if (lv69c.VarType=vtObjArray) or (lv69c.VarType=vtGenericArray) then fLocalScope.SetClrType(lv69c.Name, lvClrType69); // [버그 수정] vtGenericArray 누락
         if (lv69c.VarType=vtMatrix) and (lv69c.ClassName<>'') then fLocalScope.SetClassName(lv69c.Name, lv69c.ClassName);
         il.Emit(OpCodes.Ldarg_0); il.Emit(OpCodes.Ldfld, capFields[lv69c.Name]); il.Emit(OpCodes.Stloc, floc2);
       end;
@@ -3673,6 +3710,10 @@
           fLocalScope.SetClassName(pdef.Name, pdef.ClassName)
         // [버그 수정] enum 타입 매개변수 — ClrType을 채워 HasClrType 리플렉션 경로로 라우팅한다.
         else if pdef.ParamType=vtEnum then
+          fLocalScope.SetClrType(pdef.Name, pElemType100)
+        // [버그 수정] array of X(vtObjArray/vtGenericArray) 매개변수도 ClrType 등록 누락돼 있었음 —
+        // chars.Length 같은 지역변수 버전과 동일한 원인의 버그가 매개변수에도 있었다.
+        else if (pdef.ParamType=vtObjArray) or (pdef.ParamType=vtGenericArray) then
           fLocalScope.SetClrType(pdef.Name, pElemType100);
         if i=0 then il.Emit(OpCodes.Ldarg_0) else if i=1 then il.Emit(OpCodes.Ldarg_1)
         else if i=2 then il.Emit(OpCodes.Ldarg_2) else if i=3 then il.Emit(OpCodes.Ldarg_3)
@@ -3699,7 +3740,7 @@
         else if lv.VarType=vtEnum then
           fLocalScope.SetClrType(lv.Name, lvClrType)
         // [버그 수정] array of <외부 타입>(vtObjArray) 지역변수도 ClrType을 등록한다 (2819행 부근과 동일 이유).
-        else if lv.VarType=vtObjArray then
+        else if (lv.VarType=vtObjArray) or (lv.VarType=vtGenericArray) then // [버그 수정] array of char/real/int64(vtGenericArray)도 ClrType 등록 누락돼 있었음
           fLocalScope.SetClrType(lv.Name, lvClrType);
         // [Stage 67] vtMatrix 원소 타입 이름 보존
         if (lv.VarType=vtMatrix) and (lv.ClassName<>'') then
@@ -3779,6 +3820,10 @@
           fLocalScope.SetClassName(pdef.Name, pdef.ClassName)
         // [버그 수정] enum 타입 매개변수 — ClrType을 채워 HasClrType 리플렉션 경로로 라우팅한다.
         else if pdef.ParamType=vtEnum then
+          fLocalScope.SetClrType(pdef.Name, pElemType100)
+        // [버그 수정] array of X(vtObjArray/vtGenericArray) 매개변수도 ClrType 등록 누락돼 있었음 —
+        // chars.Length 같은 지역변수 버전과 동일한 원인의 버그가 매개변수에도 있었다.
+        else if (pdef.ParamType=vtObjArray) or (pdef.ParamType=vtGenericArray) then
           fLocalScope.SetClrType(pdef.Name, pElemType100);
         if i=0 then il.Emit(OpCodes.Ldarg_0) else if i=1 then il.Emit(OpCodes.Ldarg_1)
         else if i=2 then il.Emit(OpCodes.Ldarg_2) else if i=3 then il.Emit(OpCodes.Ldarg_3)
@@ -3806,7 +3851,7 @@
         else if lv.VarType=vtEnum then
           fLocalScope.SetClrType(lv.Name, lvClrType)
         // [버그 수정] array of <외부 타입>(vtObjArray) 지역변수도 ClrType을 등록한다 (2819행 부근과 동일 이유).
-        else if lv.VarType=vtObjArray then
+        else if (lv.VarType=vtObjArray) or (lv.VarType=vtGenericArray) then // [버그 수정] array of char/real/int64(vtGenericArray)도 ClrType 등록 누락돼 있었음
           fLocalScope.SetClrType(lv.Name, lvClrType);
         // [Stage 67] vtMatrix 원소 타입 이름 보존
         if (lv.VarType=vtMatrix) and (lv.ClassName<>'') then

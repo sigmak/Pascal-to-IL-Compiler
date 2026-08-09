@@ -290,6 +290,32 @@
         if (fCurGenericSubst<>nil) and fCurGenericSubst.ContainsKey(cn) then Result:=fCurGenericSubst[cn]
         else Result:=typeof(System.Object); // 방어적 폴백(정상 경로라면 도달하지 않아야 함)
       end
+      // [버그 수정] vtGenericArray(array of char/real/int64, 그리고 아직 단형화되지 않은
+      // true open generic 함수 본문의 array of T)에 대한 분기가 이제까지 아예 없어서 이
+      // 함수 맨 끝의 else Result:=typeof(integer)로 조용히 떨어졌다. 그 결과 "chars: array
+      // of char" 같은 지역변수가 char[]가 아니라 그냥 System.Int32 스칼라 로컬 슬롯으로
+      // 선언되었고, 여기에 ToCharArray가 돌려준 char[] 힙 참조를 대입하면 4바이트 int32
+      // 슬롯에 참조 값(64비트에서는 8바이트)이 잘려 들어가며 포인터가 손상된다. 이후
+      // chars[i] 인덱싱이 이 손상된 값을 배열 참조인 것처럼 다시 사용해 잘못된 메모리
+      // 주소를 읽어 System.AccessViolationException으로 죽는다(자기컴파일 시
+      // StripCommentsForUsesScan에서 실제 재현됨). vtMatrix 분기와 동일한 방식으로
+      // cn(Parser가 fLastGenericName에 채워 둔 원소 타입 이름)을 보고 실제 원소 타입의
+      // 1차원 배열을 만든다. cn이 true open generic 타입 매개변수 이름(예: 'T')이면
+      // fCurGenericSubst에서 실제 타입을 찾고, 그마저 없으면 기존과 동일하게 integer로
+      // 방어적 폴백한다(동작은 예전과 같지만 최소한 배열 타입은 맞다: integer[]).
+      else if t=vtGenericArray then
+      begin
+        var elemClr: System.Type;
+        if (cn='real') or (cn='double') then elemClr:=typeof(double)
+        else if cn='char' then elemClr:=typeof(char)
+        else if cn='int64' then elemClr:=typeof(int64)
+        else if cn='string' then elemClr:=typeof(string)
+        else if cn='integer' then elemClr:=typeof(integer)
+        else if (cn<>'') and (fCurGenericSubst<>nil) and fCurGenericSubst.ContainsKey(cn) then
+          elemClr:=fCurGenericSubst[cn]
+        else elemClr:=typeof(integer); // 방어적 폴백(최소한 배열 타입은 맞춘다)
+        Result:=elemClr.MakeArrayType();
+      end
       else Result:=typeof(integer);
     end;
 
@@ -1237,7 +1263,29 @@
         if GetVarType(TArrayIndexExprNode(e).ArrName)=vtStrArray then Result:=vtString
         // [Stage 90] array of object 원소 읽기는 vtObject로 추론
         else if GetVarType(TArrayIndexExprNode(e).ArrName)=vtObjArray then Result:=vtObject
-        else Result:=vtInteger;
+        // [자기컴파일 버그 수정 2026.08] "order[order.Count-1]"처럼 ArrName이 네이티브 배열이
+        // 아니라 List<string> 같은 외부 제네릭 컬렉션이면 GetVarType이 vtStrArray/vtObjArray
+        // 어느 쪽도 아닌 vtObject를 돌려줘서, 지금까지는 무조건 아래 "else Result:=vtInteger"로
+        // 폴백했다. 그 결과 "'...' + order[i] + '...'" 같은 문자열 연결식에서 rt=vtInteger로
+        // 오판되어, EmitExpr이 실제로는 올바른 string 참조를 스택에 올렸는데도 바로 뒤에서
+        // Convert.ToString(Int32)가 그 참조를 정수로 재해석해버려 실행 시 쓰레기 숫자(예:
+        // "39815552")가 출력되는 조용한 버그가 있었다(자기컴파일 실제 재현 사례: Main.pas의
+        // DiscoverCompileOrder/VisitUnitForOrder에서 List<string> order를 인덱싱). 바로 아래
+        // TChainedIndexExprNode 분기가 이미 쓰고 있는 것과 동일한 처방 — GetExprClrType(이미
+        // List<T>/Dictionary<K,V> 등의 실제 원소 타입을 InferIndexerResultType으로 정확히
+        // 추적함)을 재사용해 원시 타입이면 정확한 TVarType으로, 그 외 참조 타입이면 vtObject로
+        // 바로잡는다.
+        else
+        begin
+          var _aiElemT101:=GetExprClrType(e);
+          if _aiElemT101=typeof(string) then Result:=vtString
+          else if _aiElemT101=typeof(integer) then Result:=vtInteger
+          else if _aiElemT101=typeof(int64) then Result:=vtInt64
+          else if _aiElemT101=typeof(double) then Result:=vtReal
+          else if _aiElemT101=typeof(boolean) then Result:=vtBoolean
+          else if _aiElemT101=typeof(char) then Result:=vtChar
+          else Result:=vtObject;
+        end;
       end
       // [Stage 67] 2차원 배열 원소 읽기 타입 추론
       else if e is TMatrix2DIndexExprNode then
@@ -1323,6 +1371,18 @@
         if (_binLt=vtObject) and (_binRt=vtObject) then Result:=vtObject
         // [Stage 63] 피연산자 중 하나라도 집합이면 결과도 집합 (합집합/차집합/교집합)
         else if (_binLt=vtSet) or (_binRt=vtSet) then Result:=vtSet
+        // [자기컴파일 버그 수정 — 실제 사례] boAnd/boOr(논리 and/or)의 결과 타입이 여기서
+        // 하나도 매칭되지 않아 맨 아래 기본값 vtInteger로 잘못 추론되고 있었다. 피연산자가
+        // 둘 다 boolean(비교식 등)인 흔한 경우, 그 결과는 명백히 vtBoolean이어야 하는데
+        // vtInteger로 나오면 EmitExpr의 단락평가 가드("정수/int64 피연산자면 진짜 비트
+        // and/or이니 완전평가 유지")가 이 boAnd/boOr 노드를 정수 비트 연산으로 오인해
+        // 단락평가를 건너뛰게 만든다 — 특히 "a and b and c"처럼 and가 중첩된 체인에서
+        // 안쪽 and 노드의 (잘못 추론된) 타입이 바깥쪽 and의 가드 판단에 그대로 전파되어,
+        // 자기컴파일 중 Main.pas의 StripCommentsForUsesScan("(chars[i]='/') and
+        // (i+1<Length) and (chars[i+1]='/')")에서 여전히 IndexOutOfRangeException으로
+        // 재현되었다. vtObject/vtSet(연산자 오버로딩) 판정보다는 뒤, 나머지 산술 타입
+        // 판정보다는 앞에 두어 boAnd/boOr는 항상 vtBoolean으로 확정한다.
+        else if (b.Op=boAnd) or (b.Op=boOr) then Result:=vtBoolean
         else if (_binLt=vtString) or (_binRt=vtString) then
           Result:=vtString
         // [버그 수정] 예전엔 이 분기가 없어서 real/int64가 섞인 이항연산(예: -3.7, 1.5+2)이

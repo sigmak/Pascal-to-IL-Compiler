@@ -2486,6 +2486,18 @@ type
           Expect(tkRParen); Result:=pcn;
         end
 
+        // [자기컴파일 버그 수정] 전역(비-클래스) 프로시저를 괄호 없이 인자 없이 호출:
+        // 예) RunCompilerBodyInner; — Main.pas의 RunCompilerBody가 같은 파일에 먼저
+        // 선언된 무인자 프로시저 RunCompilerBodyInner를 괄호 없이 호출하는 관용 표현.
+        // 바로 위 분기(2478)는 괄호가 있는 경우만 처리하고, 아래쪽의 무인자 self-call
+        // 분기(다음 항목)는 fCurClass<>''(메서드 본문)일 때만 반응한다 — 즉 지금까지는
+        // "클래스 밖 전역 프로시저 + 괄호 없음"인 조합만 아무 분기에도 안 걸려 맨 아래
+        // 대입문 분기로 떨어져 Expect(tkAssign)이 세미콜론을 만나 실패했다.
+        else if fProcNames.Contains(nt.Text) and
+                ((Cur.Kind=tkSemicolon) or (Cur.Kind=tkElse) or (Cur.Kind=tkEnd)
+                 or (Cur.Kind=tkUntil) or (Cur.Kind=tkEOF)) then
+          Result:=new TProcCallStmtNode(ResolveCallName(nt.Text))
+
         // 암시적 self 메서드 호출 (괄호 있음): 예) Show(); Close(42);
         // 메서드 본문 안에서만 의미 있음. 로컬 메서드면 그대로, 아니면 외부
         // 상속 타입(Reflection)에서 찾는다 — 실제 판별은 CodeGen 단계에서.

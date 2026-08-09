@@ -454,12 +454,23 @@ var
   sb: System.Text.StringBuilder;
   chars: array of char;
   i: integer;
+  _diagLastPrinted: integer; // [진단 2026.08] 크래시 지점 이분 탐색용
 begin
+  Writeln('[진단] StripCommentsForUsesScan 진입, sourceCode.Length=' + sourceCode.Length.ToString);
   sb := new System.Text.StringBuilder;
   chars := sourceCode.ToCharArray; // [Stage 75] PascalABC 문자열은 1-based라 0-based char 배열로 다룬다 (Lexer.pas와 동일 관례)
+  Writeln('[진단] ToCharArray 완료, chars.Length=' + chars.Length.ToString);
   i := 0;
+  _diagLastPrinted := -1000;
   while i < chars.Length do
   begin
+    // [진단 2026.08] 2000자마다 진행 상황을 찍어, 크래시가 나면 로그의 마지막 줄이
+    // 곧 크래시 시점의 i 값(±2000) — 다음 실행에서 정확한 문자 위치를 좁히는 데 쓴다.
+    if i - _diagLastPrinted >= 2000 then
+    begin
+      Writeln('[진단] StripComments 진행중 i=' + i.ToString + '/' + chars.Length.ToString);
+      _diagLastPrinted := i;
+    end;
     if (chars[i] = '/') and (i + 1 < chars.Length) and (chars[i + 1] = '/') then
     begin
       while (i < chars.Length) and (chars[i] <> #10) do i := i + 1;
@@ -475,7 +486,9 @@ begin
       i := i + 1;
     end;
   end;
+  Writeln('[진단] StripCommentsForUsesScan 루프 종료, i=' + i.ToString);
   Result := sb.ToString;
+  Writeln('[진단] StripCommentsForUsesScan 반환 완료, Result.Length=' + Result.Length.ToString);
 end;
 
 function ExtractUsesNames(sourceCode: string): List<string>;
@@ -483,8 +496,10 @@ var
   m: System.Text.RegularExpressions.Match;
   raw, nm: string; parts: array of string; p: string; scanSrc: string;
 begin
+  Writeln('[진단] ExtractUsesNames 진입, sourceCode.Length=' + sourceCode.Length.ToString);
   Result := new List<string>;
   scanSrc := StripCommentsForUsesScan(sourceCode); // [Stage 75]
+  Writeln('[진단] ExtractUsesNames: StripCommentsForUsesScan에서 복귀함, scanSrc.Length=' + scanSrc.Length.ToString);
   // [Stage 82] unit 파일도 의존성 탐색 대상이 되어야 한다(유닛이 또 다른 유닛을 uses하는
   // 경우 = 진짜 다중 파일 링크의 기본 시나리오). unit은 "unit Name; interface uses ...;"
   // 형태라 program/library와 달리 ';' 대신 'interface' 키워드가 uses 앞에 낀다 — 있어도
@@ -502,6 +517,7 @@ begin
     '\b(program|library|unit)\s+\w+\s*;\s*(?:interface\s+)?uses\s+(.*?);',
     System.Text.RegularExpressions.RegexOptions.Singleline or
     System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+  Writeln('[진단] ExtractUsesNames: 1차 정규식 매치 완료, Success=' + m.Success.ToString);
   if not m.Success then
   begin
     // [버그수정] 'program Name;' 헤더 자체가 없는 진입점 파일(예: 'uses uMain; begin ...
@@ -520,6 +536,7 @@ begin
   end
   else
     raw := m.Groups[2].Value;
+  Writeln('[진단] ExtractUsesNames: raw="' + raw + '"');
   parts := raw.Split(',');
   foreach p in parts do
   begin
@@ -528,6 +545,7 @@ begin
     if nm.Contains('.') then nm := nm.Substring(0, nm.IndexOf('.'));
     if not Result.Contains(nm) then Result.Add(nm);
   end;
+  Writeln('[진단] ExtractUsesNames 반환, Result.Count=' + Result.Count.ToString);
 end;
 
 // 유닛 이름 → 실제 파일 경로. searchDirs를 순서대로 뒤져 "<이름>.pas"가 있으면 그 경로,
@@ -569,8 +587,11 @@ begin
   visiting.Add(key);
   pathStack.Add(filePath);
 
+  Writeln('[진단] VisitUnitForOrder: ' + filePath + ' 읽는 중');
   src := System.IO.File.ReadAllText(filePath, Encoding.UTF8);
+  Writeln('[진단] VisitUnitForOrder: 읽기 완료, src.Length=' + src.Length.ToString + ' — ExtractUsesNames 호출');
   deps := ExtractUsesNames(src);
+  Writeln('[진단] VisitUnitForOrder: ExtractUsesNames 완료, deps.Count=' + deps.Count.ToString);
   foreach depName in deps do
   begin
     depPath := ResolveUnitFile(depName, searchDirs);
@@ -741,7 +762,15 @@ end;
 // StackOverflowException은 원칙적으로 잡을 수 없으므로, 사후에 원인을 알아낼 방법이
 // 없다. 그래서 이 로직 전체를 별도 프로시저로 뽑아 스택 크기를 크게 지정한 전용
 // 스레드에서 실행하도록 바꿨다(맨 아래 최상위 begin...end. 참고).
-procedure RunCompilerBody;
+// [버그 수정] 실제 컴파일 로직 본체. 이름을 RunCompilerBody에서 RunCompilerBodyInner로
+// 바꾸고, 이 절차를 최상위에서 한 번 더 감싸는 얇은 RunCompilerBody 래퍼를 아래(파일
+// 맨 끝, 스레드 시작 직전)에 새로 둔다 — 이 procedure 안의 개별 try/except들이 못
+// 잡는(=예상하지 못했던) 예외가 나오면 지금까지는 스레드가 그대로 죽어 "처리되지
+// 않은 예외: ... 위치: ..." 형태의 CLR 기본 출력만 남고, "아무 키나 누르면
+// 종료합니다" 프롬프트도 없이 창이 닫혀버렸다. 자기컴파일 디버깅 중에는 이런 "전혀
+// 예상 못한 곳에서 터지는 예외"가 계속 나올 수밖에 없으므로, 바깥 래퍼가 최소한
+// 무슨 예외가 어디서(StackTrace) 났는지는 항상 보여주고 정상 종료하게 한다.
+procedure RunCompilerBodyInner;
 var
   inputPath, sourceCode, outputName, projOutputName: string;
   prog: TProgramNode;
@@ -832,7 +861,9 @@ begin
     if System.IO.Directory.Exists(unitsDir) then unitSearchDirs.Add(unitsDir);
 
     try
+      Writeln('[진단] DiscoverCompileOrder 호출 직전: ' + inputPath);
       compileOrder := DiscoverCompileOrder(inputPath, unitSearchDirs);
+      Writeln('[진단] DiscoverCompileOrder 반환 완료, compileOrder.Count=' + compileOrder.Count.ToString);
       if compileOrder.Count > 1 then
       begin
         Writeln('[유닛탐색] 의존성 ' + (compileOrder.Count - 1).ToString + '개 파일 발견 — 컴파일 순서(의존성 먼저):');
@@ -866,6 +897,12 @@ begin
       on E: Exception do
       begin
         Writeln('[유닛탐색] 실패: ' + E.Message);
+        // [버그 수정] E.Message만 찍으면 IndexOutOfRangeException처럼 CLR이 붙여주는
+        // 정형화된 메시지("인덱스가 배열 범위를 벗어났습니다")뿐이라 ExtractUsesNames/
+        // StripCommentsForUsesScan/VisitUnitForOrder 중 정확히 어디서 났는지 알 수 없다.
+        // StackTrace를 같이 출력해 다음 진단을 쉽게 한다.
+        Writeln('  (진단용 StackTrace)');
+        Writeln(E.StackTrace);
         Writeln('  단일 파일(진입점만)로 컴파일을 계속합니다.');
         Writeln;
         compileOrder := new List<string>;
@@ -1071,6 +1108,28 @@ begin
     end;
   end;
 
+end; // RunCompilerBodyInner
+
+// [버그 수정] RunCompilerBodyInner를 감싸는 얇은 래퍼. 개별 단계(Lexer/Parser/CodeGen 등)의
+// try/except가 못 잡는 예상 밖 예외(예: 이번에 실제로 겪은 ArgumentNullException)까지 여기서
+// 한 번 더 잡아서, 최소한 예외 타입/메시지/StackTrace는 항상 화면에 남기고 "아무 키나 누르면
+// 종료합니다" 프롬프트까지 정상적으로 도달하게 한다. 스레드 진입점은 이제 이 절차를 가리킨다.
+procedure RunCompilerBody;
+begin
+  try
+    RunCompilerBodyInner;
+  except
+    on E: Exception do
+    begin
+      Writeln;
+      Writeln('=====================================================');
+      Writeln('처리되지 않은 예외(최상위에서 포착): ' + E.GetType.FullName);
+      Writeln('메시지: ' + E.Message);
+      Writeln('-----------------------------------------------------');
+      Writeln(E.StackTrace);
+      Writeln('=====================================================');
+    end;
+  end;
   Writeln;
   Writeln('아무 키나 누르면 종료합니다...');
   Readln;

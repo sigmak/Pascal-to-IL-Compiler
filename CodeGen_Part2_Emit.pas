@@ -1144,17 +1144,20 @@
         // 참조 타입인지는 FieldBuilder의 실제 CLR 배열 원소 타입(IsValueType)으로 판단한다.
         var aiIsRefElem: boolean;
         var aiElemClrType: System.Type; // [Stage 107 버그 수정]
+        var aiVarClrType: System.Type := nil; // [자기컴파일 버그 수정 2026.08] 진짜 배열인지 판별용
         if fLocalScope.Has(ai.ArrName) then
         begin
           aIL.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(ai.ArrName));
           aiIsRefElem:=(GetVarType(ai.ArrName)=vtStrArray) or (GetVarType(ai.ArrName)=vtObjArray);
-          aiElemClrType:=SafeArrayElemType(fLocalScope.GetLoc(ai.ArrName).LocalType);
+          aiVarClrType:=fLocalScope.GetLoc(ai.ArrName).LocalType;
+          aiElemClrType:=SafeArrayElemType(aiVarClrType);
         end
         else if fGlobalScope.Has(ai.ArrName) then
         begin
           aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(ai.ArrName));
           aiIsRefElem:=(GetVarType(ai.ArrName)=vtStrArray) or (GetVarType(ai.ArrName)=vtObjArray);
-          aiElemClrType:=SafeArrayElemType(fGlobalScope.GetLoc(ai.ArrName).LocalType);
+          aiVarClrType:=fGlobalScope.GetLoc(ai.ArrName).LocalType;
+          aiElemClrType:=SafeArrayElemType(aiVarClrType);
         end
         else
         begin
@@ -1164,40 +1167,55 @@
             aIL.Emit(OpCodes.Ldarg_0);
             aIL.Emit(OpCodes.Ldfld, aiFb);
             aiIsRefElem:=IsRefElementType(aiFb.FieldType); // [Stage 96 버그 수정] TypeBuilderInstantiation 예외 흡수
-            aiElemClrType:=SafeArrayElemType(aiFb.FieldType);
+            aiVarClrType:=aiFb.FieldType;
+            aiElemClrType:=SafeArrayElemType(aiVarClrType);
           end
           else
             raise new Exception('알 수 없는 변수 "'+ai.ArrName+'" (배열 인덱싱 대상을 지역/전역 변수도, "'
               +fCurClassName+'" 클래스의 필드도 아닌 곳에서 찾을 수 없습니다).');
         end;
-        EmitExpr(aIL, ai.Index);
-        // [Stage 37 버그 수정] 이전에는 배열 종류와 무관하게 항상 Ldelem_I4를 썼다 —
-        // array of integer는 우연히 맞았지만 array of string은 참조(포인터)를 4바이트
-        // 정수로 잘못 읽어 쓰레기 값이 나왔다. 원소를 쓰는 쪽(Stelem, 아래 TArrayAssignStmtNode)은
-        // 이미 배열 타입을 보고 Stelem_Ref/Stelem_I4를 갈라 쓰고 있었으므로 읽는 쪽도 맞춘다.
-        // [Stage 90] array of object도 문자열 배열과 마찬가지로 참조 타입 원소이므로 Ldelem_Ref.
-        //
-        // [Stage 107 버그 수정] 위 aiIsRefElem 분기는 "참조냐 아니냐"만 갈랐다 — 참조가 아닌
-        // 값 타입 원소는 전부 Ldelem_I4(4바이트 폭)로 읽었는데, char 배열(원소 2바이트, 예:
-        // sourceCode.ToCharArray로 만든 array of char)이나 real/int64 배열처럼 실제 CLR
-        // 원소 크기가 4바이트가 아니면 Ldelem_I4가 잘못된 stride(4바이트 간격)로 주소를
-        // 계산해 배열 실제 메모리 범위를 넘어 읽는다 — 작은 배열은 우연히 힙 안쪽이라
-        // 조용히 쓰레기 값만 나오지만, 큰 배열(자기컴파일 시 Main.pas 전체를 읽어들인
-        // chars: array of char 등)은 계산된 주소가 힙 세그먼트 밖으로 넘어가
-        // AccessViolationException으로 그대로 죽는다. aiElemClrType(로컬/전역 슬롯 또는
-        // 필드의 실제 CLR 배열 원소 타입)을 직접 보고 폭에 맞는 Ldelem_* opcode를 고른다.
-        if aiIsRefElem or ((aiElemClrType<>nil) and not aiElemClrType.IsValueType) then
-          aIL.Emit(OpCodes.Ldelem_Ref)
-        else if (aiElemClrType<>nil) and (aiElemClrType=typeof(char)) then
-          aIL.Emit(OpCodes.Ldelem_U2)
-        else if (aiElemClrType<>nil) and (aiElemClrType=typeof(double)) then
-          aIL.Emit(OpCodes.Ldelem_R8)
-        else if (aiElemClrType<>nil) and (aiElemClrType=typeof(single)) then
-          aIL.Emit(OpCodes.Ldelem_R4)
-        else if (aiElemClrType<>nil) and (aiElemClrType=typeof(int64)) then
-          aIL.Emit(OpCodes.Ldelem_I8)
+        // [자기컴파일 버그 수정 2026.08] ArrName이 진짜 CLR 배열(T[])이 아니라 List<T>/
+        // Dictionary 등 "Item" 인덱서를 쓰는 외부 제네릭 컬렉션이면(예: lst1[0], order[order.Count-1]),
+        // 지금까지는 이 사실을 전혀 확인하지 않고 아래에서 무조건 Ldelem_*를 방출해 컬렉션
+        // 객체 참조를 마치 SZArray인 것처럼 읽어들였다. 이는 CLR 검증기를 통과할 수 없는
+        // 잘못된 IL이라 실행 시 .NET 예외로 잡히지 못하고 그대로 네이티브 접근 위반
+        // (0xc0000005, clr.dll 크래시, 이벤트 뷰어 예외 코드 80131506)으로 프로세스가
+        // 죽는다 — 자기컴파일 실제 재현 사례(Test_ListBug.pas, Main.pas의 order[...] 등).
+        // TChainedIndexExprNode가 이미 쓰고 있는 EmitIndexerGet(배열이면 Ldelem, 아니면
+        // 리플렉션으로 Item 인덱서의 get을 Callvirt)으로 위임해 이 경우를 올바르게 처리한다.
+        if (aiVarClrType<>nil) and (not aiVarClrType.IsArray) then
+          EmitIndexerGet(aIL, aiVarClrType, ai.Index)
         else
-          aIL.Emit(OpCodes.Ldelem_I4);
+        begin
+          EmitExpr(aIL, ai.Index);
+          // [Stage 37 버그 수정] 이전에는 배열 종류와 무관하게 항상 Ldelem_I4를 썼다 —
+          // array of integer는 우연히 맞았지만 array of string은 참조(포인터)를 4바이트
+          // 정수로 잘못 읽어 쓰레기 값이 나왔다. 원소를 쓰는 쪽(Stelem, 아래 TArrayAssignStmtNode)은
+          // 이미 배열 타입을 보고 Stelem_Ref/Stelem_I4를 갈라 쓰고 있었으므로 읽는 쪽도 맞춘다.
+          // [Stage 90] array of object도 문자열 배열과 마찬가지로 참조 타입 원소이므로 Ldelem_Ref.
+          //
+          // [Stage 107 버그 수정] 위 aiIsRefElem 분기는 "참조냐 아니냐"만 갈랐다 — 참조가 아닌
+          // 값 타입 원소는 전부 Ldelem_I4(4바이트 폭)로 읽었는데, char 배열(원소 2바이트, 예:
+          // sourceCode.ToCharArray로 만든 array of char)이나 real/int64 배열처럼 실제 CLR
+          // 원소 크기가 4바이트가 아니면 Ldelem_I4가 잘못된 stride(4바이트 간격)로 주소를
+          // 계산해 배열 실제 메모리 범위를 넘어 읽는다 — 작은 배열은 우연히 힙 안쪽이라
+          // 조용히 쓰레기 값만 나오지만, 큰 배열(자기컴파일 시 Main.pas 전체를 읽어들인
+          // chars: array of char 등)은 계산된 주소가 힙 세그먼트 밖으로 넘어가
+          // AccessViolationException으로 그대로 죽는다. aiElemClrType(로컬/전역 슬롯 또는
+          // 필드의 실제 CLR 배열 원소 타입)을 직접 보고 폭에 맞는 Ldelem_* opcode를 고른다.
+          if aiIsRefElem or ((aiElemClrType<>nil) and not aiElemClrType.IsValueType) then
+            aIL.Emit(OpCodes.Ldelem_Ref)
+          else if (aiElemClrType<>nil) and (aiElemClrType=typeof(char)) then
+            aIL.Emit(OpCodes.Ldelem_U2)
+          else if (aiElemClrType<>nil) and (aiElemClrType=typeof(double)) then
+            aIL.Emit(OpCodes.Ldelem_R8)
+          else if (aiElemClrType<>nil) and (aiElemClrType=typeof(single)) then
+            aIL.Emit(OpCodes.Ldelem_R4)
+          else if (aiElemClrType<>nil) and (aiElemClrType=typeof(int64)) then
+            aIL.Emit(OpCodes.Ldelem_I8)
+          else
+            aIL.Emit(OpCodes.Ldelem_I4);
+        end;
       end
 
       // [Stage 67] 2차원 배열 원소 읽기: arr[i][j]
@@ -1257,7 +1275,54 @@
       else if e is TBinOpNode then
       begin
         b:=TBinOpNode(e); lt:=InferType(b.Left); rt:=InferType(b.Right);
-        if (lt=vtObject) and (rt=vtObject) then // [Stage 66] 연산자 오버로딩
+        // [자기컴파일 버그 수정 2026.08] 아래 단락평가(short-circuit) 분기는 진짜 Pascal
+        // boolean 식(예: "(i < chars.Length) and (chars[i] <> '}')")에서만 타야 한다.
+        // 그런데 이 조건이 b.Op만 보고 무조건 걸려서, "RegexOptions.Singleline or
+        // RegexOptions.IgnoreCase"처럼 enum 플래그를 비트 OR로 합치는 식도 똑같이
+        // Brtrue/Brfalse 단락평가를 태웠다 — enum 값(예: Singleline=16)은 0이 아니므로
+        // boOr의 Brtrue가 항상 "참"으로 판정해 오른쪽(IgnoreCase) 평가 자체를 생략하고
+        // 결과로 하드코딩된 Ldc_I4_1(그냥 리터럴 1)을 내놓는다 — 실제로는 어느 쪽 플래그도
+        // 아닌 값이 되어(우연히 IgnoreCase=1과 겹쳐 보일 뿐) Singleline이 통째로 사라진다
+        // (실제 재현: Main.pas의 ExtractUsesNames가 여러 줄에 걸친 uses 절을 못 찾고
+        // 엉뚱한 위치에 정규식이 매칭됨). 진짜 boolean(lt/rt 둘 다 vtBoolean)일 때만
+        // 단락평가로 가고, 그 외(enum/정수 비트 연산 등)는 아래 일반 분기의 완전평가
+        // And/Or(OpCodes.And/Or)로 흘러가게 한다.
+        if ((b.Op=boAnd) or (b.Op=boOr)) and (lt=vtBoolean) and (rt=vtBoolean) then
+        begin
+          // [버그 수정] 기존에는 이 분기까지 오지 못하고 아래쪽 일반 산술 처리 분기(현재
+          // 1330~1331행 근처의 "else if b.Op=boAnd then aIL.Emit(OpCodes.And)")에서 처리됐는데,
+          // 그 경로는 Left/Right를 항상 "둘 다" 먼저 평가한 뒤 비트 And/Or를 적용하는 완전
+          // 평가(non-short-circuit) 방식이었다. 이 컴파일러 자신의 실제 소스 코드
+          // (Main.pas의 StripCommentsForUsesScan 등)는
+          //   while (i < chars.Length) and (chars[i] <> '}') do i := i + 1;
+          // 처럼 "왼쪽 조건이 거짓이면 오른쪽은 평가되지 않는다"는 단락 평가(short-circuit)를
+          // 전제로 작성되어 있어서, 완전 평가로 실행하면 i가 배열 끝에 도달했을 때도
+          // chars[i]가 그대로 평가되어 IndexOutOfRangeException으로 죽는다(자기컴파일
+          // 2세대 실행 시 실제로 재현됨). if/while의 조건뿐 아니라 모든 and/or 표현식이
+          // EmitExpr의 이 지점을 거치므로, 여기서 진짜 단락 평가(Brfalse/Brtrue 분기)로
+          // 바꾼다.
+          var scShortL:=aIL.DefineLabel; var scEndL:=aIL.DefineLabel;
+          EmitExpr(aIL, b.Left);
+          if b.Op=boAnd then
+          begin
+            aIL.Emit(OpCodes.Brfalse, scShortL); // 왼쪽이 거짓 → 오른쪽 평가 생략, 결과=거짓(0)
+            EmitExpr(aIL, b.Right);
+            aIL.Emit(OpCodes.Br, scEndL);
+            aIL.MarkLabel(scShortL);
+            aIL.Emit(OpCodes.Ldc_I4_0);
+            aIL.MarkLabel(scEndL);
+          end
+          else
+          begin
+            aIL.Emit(OpCodes.Brtrue, scShortL); // 왼쪽이 참 → 오른쪽 평가 생략, 결과=참(1)
+            EmitExpr(aIL, b.Right);
+            aIL.Emit(OpCodes.Br, scEndL);
+            aIL.MarkLabel(scShortL);
+            aIL.Emit(OpCodes.Ldc_I4_1);
+            aIL.MarkLabel(scEndL);
+          end;
+        end
+        else if (lt=vtObject) and (rt=vtObject) then // [Stage 66] 연산자 오버로딩
         begin
           var _opLcn66, _opRcn66: string;
           if TryGetObjClassName(b.Left, _opLcn66) and TryGetObjClassName(b.Right, _opRcn66)
@@ -3140,15 +3205,18 @@
         // 참조/값 타입 여부(및 EmitValueForVType에 넘길 at2)를 판단한다.
         var aaFb: FieldBuilder;
         var aaElemClrType: System.Type; // [Stage 107 버그 수정]
+        var aaVarClrType: System.Type := nil; // [자기컴파일 버그 수정 2026.08] 진짜 배열인지 판별용
         if fGlobalScope.Has(aa.ArrName) then
         begin
           at2:=fGlobalScope.GetVType(aa.ArrName);
-          aaElemClrType:=SafeArrayElemType(fGlobalScope.GetLoc(aa.ArrName).LocalType);
+          aaVarClrType:=fGlobalScope.GetLoc(aa.ArrName).LocalType;
+          aaElemClrType:=SafeArrayElemType(aaVarClrType);
         end
         else if fLocalScope.Has(aa.ArrName) then
         begin
           at2:=fLocalScope.GetVType(aa.ArrName);
-          aaElemClrType:=SafeArrayElemType(fLocalScope.GetLoc(aa.ArrName).LocalType);
+          aaVarClrType:=fLocalScope.GetLoc(aa.ArrName).LocalType;
+          aaElemClrType:=SafeArrayElemType(aaVarClrType);
         end
         else if TryFindFieldBuilder(fCurClassName, aa.ArrName, aaFb) then
         begin
@@ -3156,7 +3224,8 @@
             at2:=vtStrArray
           else
             at2:=vtIntArray;
-          aaElemClrType:=SafeArrayElemType(aaFb.FieldType);
+          aaVarClrType:=aaFb.FieldType;
+          aaElemClrType:=SafeArrayElemType(aaVarClrType);
         end
         else
           raise new Exception('알 수 없는 변수 "'+aa.ArrName+'" (배열 대입 대상을 지역/전역 변수도, "'
@@ -3164,32 +3233,69 @@
         if fLocalScope.Has(aa.ArrName) then aIL.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(aa.ArrName))
         else if fGlobalScope.Has(aa.ArrName) then aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(aa.ArrName))
         else begin aIL.Emit(OpCodes.Ldarg_0); aIL.Emit(OpCodes.Ldfld, aaFb); end;
-        // [Stage 57] arr[i] := 'a'; 에서 arr가 문자열 배열이면 char 리터럴을 문자열로
-        // 승격해야 한다 — 안 그러면 정수(문자코드)가 그대로 Stelem_Ref로 들어가
-        // 힙 참조로 오인되어 GC/접근 시 크래시가 난다.
-        EmitExpr(aIL, aa.Index);
-        if at2=vtStrArray then EmitValueForVType(aIL, aa.ValueExpr, vtString)
-        else if (aaElemClrType<>nil) and (aaElemClrType=typeof(char)) then EmitValueForVType(aIL, aa.ValueExpr, vtChar)
-        else if (aaElemClrType<>nil) and (aaElemClrType=typeof(double)) then EmitValueForVType(aIL, aa.ValueExpr, vtReal)
-        else if (aaElemClrType<>nil) and (aaElemClrType=typeof(int64)) then EmitValueForVType(aIL, aa.ValueExpr, vtInt64)
-        else EmitExpr(aIL, aa.ValueExpr);
-        // [Stage 90] array of object 원소 쓰기도 문자열과 마찬가지로 참조 타입이라 Stelem_Ref.
-        // [Stage 107 버그 수정] 읽기 쪽(TArrayIndexExprNode)과 동일한 이유 — 값 타입 원소를
-        // 전부 Stelem_I4(4바이트 폭)로 쓰면 char/real/int64 배열은 stride가 틀어져 배열
-        // 밖의 메모리를 덮어써 힙을 손상시킨다(느리게 발현되는 AccessViolationException/
-        // 손상의 근본 원인이 되기 쉽다). 실제 CLR 원소 타입(aaElemClrType)을 보고 고른다.
-        if (at2=vtStrArray) or (at2=vtObjArray) or ((aaElemClrType<>nil) and not aaElemClrType.IsValueType) then
-          aIL.Emit(OpCodes.Stelem_Ref)
-        else if (aaElemClrType<>nil) and (aaElemClrType=typeof(char)) then
-          aIL.Emit(OpCodes.Stelem_I2)
-        else if (aaElemClrType<>nil) and (aaElemClrType=typeof(double)) then
-          aIL.Emit(OpCodes.Stelem_R8)
-        else if (aaElemClrType<>nil) and (aaElemClrType=typeof(single)) then
-          aIL.Emit(OpCodes.Stelem_R4)
-        else if (aaElemClrType<>nil) and (aaElemClrType=typeof(int64)) then
-          aIL.Emit(OpCodes.Stelem_I8)
+        // [자기컴파일 버그 수정 2026.08] ArrName이 진짜 CLR 배열(T[])이 아니라 List<T>/
+        // Dictionary 등 "Item" 인덱서를 쓰는 외부 제네릭 컬렉션이면(예: lst[0] := s;), 지금까지는
+        // 이 사실을 확인하지 않고 무조건 Stelem_*를 방출해 컬렉션 객체 참조를 마치 SZArray인
+        // 것처럼 덮어썼다. 이는 검증 불가능한 IL이라 실행 시 예외로 잡히지 못하고 네이티브
+        // 접근 위반(0xc0000005, clr.dll 크래시)으로 죽거나 힙을 조용히 손상시킨다. 읽기 쪽
+        // EmitIndexerGet과 대칭되는 "Item" 세터를 리플렉션으로 찾아 위임한다(패턴은 위
+        // TExternalDoubleIndexAssignStmtNode의 두 번째 단계 set_Item 처리와 동일).
+        if (aaVarClrType<>nil) and (not aaVarClrType.IsArray) then
+        begin
+          var aaIdxArgType:=InferArgClrType(aa.Index);
+          var aaItemProp: PropertyInfo := nil;
+          var aaBestScore:=System.Int32.MinValue;
+          if aaVarClrType.GetType().Name = 'TypeBuilderInstantiation' then
+          begin
+            var aaSafeProp:=SafeGetProperty(aaVarClrType, 'Item');
+            if (aaSafeProp<>nil) and (aaSafeProp.GetSetMethod<>nil) then aaItemProp:=aaSafeProp;
+          end
+          else
+            foreach var aaCand in aaVarClrType.GetProperties(BindingFlags.Public or BindingFlags.Instance) do
+            begin
+              if (aaCand.Name='Item') and (aaCand.GetIndexParameters.Length=1) and (aaCand.GetSetMethod<>nil) then
+              begin
+                var aaScore:=ScoreParamMatch(aaCand.GetIndexParameters()[0].ParameterType, aaIdxArgType);
+                if (aaItemProp=nil) or (aaScore>aaBestScore) then
+                begin aaBestScore:=aaScore; aaItemProp:=aaCand; end;
+              end;
+            end;
+          if aaItemProp=nil then
+            raise new Exception('타입 "'+aaVarClrType.FullName+'"에는 인덱서(Item) 세터가 없습니다. (변수 "'+aa.ArrName+'")');
+          var aaIdxParams:=aaItemProp.GetIndexParameters();
+          EmitArgForParamType(aIL, aa.Index, aaIdxParams[0].ParameterType);
+          EmitArgForParamType(aIL, aa.ValueExpr, aaItemProp.PropertyType);
+          aIL.Emit(OpCodes.Callvirt, aaItemProp.GetSetMethod);
+        end
         else
-          aIL.Emit(OpCodes.Stelem_I4);
+        begin
+          // [Stage 57] arr[i] := 'a'; 에서 arr가 문자열 배열이면 char 리터럴을 문자열로
+          // 승격해야 한다 — 안 그러면 정수(문자코드)가 그대로 Stelem_Ref로 들어가
+          // 힙 참조로 오인되어 GC/접근 시 크래시가 난다.
+          EmitExpr(aIL, aa.Index);
+          if at2=vtStrArray then EmitValueForVType(aIL, aa.ValueExpr, vtString)
+          else if (aaElemClrType<>nil) and (aaElemClrType=typeof(char)) then EmitValueForVType(aIL, aa.ValueExpr, vtChar)
+          else if (aaElemClrType<>nil) and (aaElemClrType=typeof(double)) then EmitValueForVType(aIL, aa.ValueExpr, vtReal)
+          else if (aaElemClrType<>nil) and (aaElemClrType=typeof(int64)) then EmitValueForVType(aIL, aa.ValueExpr, vtInt64)
+          else EmitExpr(aIL, aa.ValueExpr);
+          // [Stage 90] array of object 원소 쓰기도 문자열과 마찬가지로 참조 타입이라 Stelem_Ref.
+          // [Stage 107 버그 수정] 읽기 쪽(TArrayIndexExprNode)과 동일한 이유 — 값 타입 원소를
+          // 전부 Stelem_I4(4바이트 폭)로 쓰면 char/real/int64 배열은 stride가 틀어져 배열
+          // 밖의 메모리를 덮어써 힙을 손상시킨다(느리게 발현되는 AccessViolationException/
+          // 손상의 근본 원인이 되기 쉽다). 실제 CLR 원소 타입(aaElemClrType)을 보고 고른다.
+          if (at2=vtStrArray) or (at2=vtObjArray) or ((aaElemClrType<>nil) and not aaElemClrType.IsValueType) then
+            aIL.Emit(OpCodes.Stelem_Ref)
+          else if (aaElemClrType<>nil) and (aaElemClrType=typeof(char)) then
+            aIL.Emit(OpCodes.Stelem_I2)
+          else if (aaElemClrType<>nil) and (aaElemClrType=typeof(double)) then
+            aIL.Emit(OpCodes.Stelem_R8)
+          else if (aaElemClrType<>nil) and (aaElemClrType=typeof(single)) then
+            aIL.Emit(OpCodes.Stelem_R4)
+          else if (aaElemClrType<>nil) and (aaElemClrType=typeof(int64)) then
+            aIL.Emit(OpCodes.Stelem_I8)
+          else
+            aIL.Emit(OpCodes.Stelem_I4);
+        end;
       end
 
       // [Stage 67] 2차원 배열 원소 쓰기: arr[i][j] := val
