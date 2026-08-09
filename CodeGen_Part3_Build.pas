@@ -1279,9 +1279,23 @@
       begin
         var _localCls100b := FindLocalClassNameForTypeBuilder(t);
         var _bound100b := new System.Collections.Generic.List<MethodInfo>();
+        var _seenNames100b := new HashSet<string>;
         if fInstanceMethods.ContainsKey(_localCls100b) then
           foreach var _mbKvp100b in fInstanceMethods[_localCls100b] do
+          begin
             _bound100b.Add(_mbKvp100b.Value);
+            _seenNames100b.Add(_mbKvp100b.Key);
+          end;
+        // [자기컴파일 버그 수정] 위 목록은 이 로컬 클래스가 "직접 선언한" 메서드만 담는다 —
+        // GetType/ToString/Equals/GetHashCode처럼 System.Object에서 물려받아 재정의하지
+        // 않은 멤버는 여기 전혀 없어서, obj.GetType처럼 흔한 호출도 "메서드가 없습니다"로
+        // 실패했다(실제 사례: impl.Body.Statements[i].GetType). 이름이 겹치지 않는 한
+        // System.Object의 public 인스턴스 메서드를 폴백으로 추가한다(재정의된 이름은
+        // 이미 위에서 담겼으므로 중복 추가하지 않는다).
+        if flags = (BindingFlags.Public or BindingFlags.Instance) then
+          foreach var _objMi100b in typeof(System.Object).GetMethods(flags) do
+            if not _seenNames100b.Contains(_objMi100b.Name) then
+              _bound100b.Add(_objMi100b);
         Result := _bound100b.ToArray();
       end
       else
@@ -1985,8 +1999,21 @@
           begin Result:=_pi90.PropertyType; exit; end;
           if not _ch90.IsCall then
           begin
-            var _fi90:=_innerT90.GetField(_ch90.MemberName);
-            if _fi90<>nil then begin Result:=_fi90.FieldType; exit; end;
+            // [자기컴파일 버그 수정] EmitExpr의 동일 지점(위 993행대 주석 참고)과 같은 이유로
+            // raw _innerT90.GetField(...)는 아직 CreateType 안 된 로컬 TypeBuilder에서
+            // NotSupportedException을 던진다. 이 함수 전체가 try/except로 감싸여 있어 죽지는
+            // 않지만, 예외가 나는 즉시 Result가 기본값(System.Object)에 머물러 타입 추론이
+            // 틀려버린다(실제 사례: "X.GetType.Name"에서 "X.GetType"의 타입이 System.Type이
+            // 아니라 System.Object로 잘못 추론되어, 그 다음 ".Name" 단계가 "System.Object에
+            // 멤버 Name이 없습니다"로 실패). 부모 체인까지 훑는 TryFindFieldBuilder로 먼저
+            // 찾고, 그래도 없으면 예외를 삼키는 SafeGetField로 대체한다.
+            var _fbCh101: FieldBuilder;
+            var _fiCh101: FieldInfo;
+            if (_chLocalCls101<>'') and TryFindFieldBuilder(_chLocalCls101, _ch90.MemberName, _fbCh101) then
+              _fiCh101:=_fbCh101
+            else
+              _fiCh101:=SafeGetField(_innerT90, _ch90.MemberName);
+            if _fiCh101<>nil then begin Result:=_fiCh101.FieldType; exit; end;
           end;
           var _mi90:=ResolveMethodByArity(_innerT90, _ch90.MemberName, _ch90.Args, false);
           if _mi90<>nil then Result:=_mi90.ReturnType;
@@ -2169,6 +2196,28 @@
     procedure EmitArgForParamType(aIL: ILGenerator; argExpr: TExprNode; paramType: System.Type);
     var _vr48: TVarRefNode; _delCtor48: ConstructorInfo;
     begin
+      // [Stage 106 버그 수정] var/const 참조 매개변수(ByRef, 예: string&) 자리에 변수를
+      // 인자로 넘기는 호출부가 지금까지 EmitExpr로 그 변수의 "값"만 스택에 올렸다.
+      // 콜리(callee, BuildStaticProc/BuildMethodBody의 Stage 100 진입부)는 스택에 올라온
+      // 것을 무조건 "주소"로 여겨 Ldarg+Ldobj로 역참조하므로, 넘긴 지역/전역 변수가 아직
+      // 값이 대입되기 전(참조 타입이면 기본값 null)이면 그 진입부에서 곧바로
+      // NullReferenceException이 터진다 — 실제 재현 사례: Main.pas의
+      // ResolveProject(projPath, var mainFile, var outputFileName) 호출부에서
+      // projMainFile/projOutName이 호출 시점에 아직 미대입(null) 상태로 넘어가 크래시.
+      // paramType이 ByRef면 EmitExpr(값 로드) 대신 그 변수의 "주소"(Ldloca)를 올려야 한다.
+      if paramType.IsByRef then
+      begin
+        if argExpr is TVarRefNode then
+        begin
+          var _brName106:=TVarRefNode(argExpr).VarName;
+          if fLocalScope.Has(_brName106) then aIL.Emit(OpCodes.Ldloca, fLocalScope.GetLoc(_brName106))
+          else if fGlobalScope.Has(_brName106) then aIL.Emit(OpCodes.Ldloca, fGlobalScope.GetLoc(_brName106))
+          else raise new Exception('var/const 인자로 쓸 수 없는 변수 "'+_brName106+'"');
+        end
+        else
+          raise new Exception('var/const 매개변수에는 변수만 인자로 전달할 수 있습니다 (식은 불가).');
+        exit;
+      end;
       // [Stage 96] 일반 배열 리터럴([typeof(x), ...] 등)이 배열 매개변수 자리에 오는 경우 —
       // Newarr로 목표 매개변수의 실제 원소 타입(paramType.GetElementType)에 맞춰 배열을 만들고,
       // 각 원소는 재귀적으로 EmitArgForParamType에 맡긴다(원소 자체가 typeof(...)/문자열/변수 등
@@ -3530,7 +3579,7 @@
       svR: LocalBuilder; svRT: TVarType; st: TStmtNode; retClrType: System.Type; i: integer;
       savedGenSubst71: Dictionary<string, System.Type>; // [Stage 71]
       svExitLabel78: &Label; // [Stage 78]
-      bParamIsByRef100: List<boolean>; // [Stage 100]
+      pParamIsByRef100: List<boolean>; pParamElemType100: List<System.Type>; // [버그 수정, Stage 100과 동일 패턴]
     begin
       // [Stage 71] 이 함수가 true open generic이면(DeclareStaticFunc가 fOpenGenericSubstOf에
       // 저장해 둔 치환표가 있으면) 본문을 컴파일하는 동안 fCurGenericSubst를 그 표로 맞춰
@@ -3596,10 +3645,16 @@
       savedLocalScope:=fLocalScope; svR:=fResultLocal; svRT:=fResultType;
       fLocalScope:=new TScope('local(func)', fGlobalScope);
       fResultType:=d.ReturnType; fResultLocal:=il.DeclareLocal(retClrType);
+      // [버그 수정] BuildStaticProc과 동일한 이유 — 전역 function의 var/const 매개변수도
+      // 지금까지 호출자에게 값을 되돌려주지 못했다. 동일한 복사-진입/복사-반환 전략 적용.
+      pParamIsByRef100:=new List<boolean>; pParamElemType100:=new List<System.Type>;
       for i:=0 to d.Parameters.Count-1 do
       begin
-        var loc:=il.DeclareLocal(pt[i]);
         var pdef:=d.Parameters[i];
+        var pIsByRef100:=pt[i].IsByRef;
+        var pElemType100:=ElemTypeIfByRef(pt[i]);
+        pParamIsByRef100.Add(pIsByRef100); pParamElemType100.Add(pElemType100);
+        var loc:=il.DeclareLocal(pElemType100);
         fLocalScope.Declare(pdef.Name, loc, pdef.ParamType);
         // [Stage 31] 지역 변수(var 섹션)와 동일한 원칙: 우리 컴파일러가 만든 로컬 클래스면
         // 아직 CreateType() 전일 수 있으므로 fLocalClass(메타데이터 기반 조회)로,
@@ -3609,7 +3664,7 @@
           if fTypeBuilders.ContainsKey(pdef.ClassName) or fBuiltTypes.ContainsKey(pdef.ClassName) then
             fLocalScope.SetClassName(pdef.Name, pdef.ClassName)
           else
-            fLocalScope.SetClrType(pdef.Name, pt[i]);
+            fLocalScope.SetClrType(pdef.Name, pElemType100);
         end
         // [Stage 71] vtGeneric 매개변수(x: T)도 ClassName에 타입 매개변수 이름('T' 등)을
         // 기록해 둔다 — GetVarClassName으로 되찾아 fCurGenericSubst[genName]을 다시 조회할
@@ -3618,10 +3673,11 @@
           fLocalScope.SetClassName(pdef.Name, pdef.ClassName)
         // [버그 수정] enum 타입 매개변수 — ClrType을 채워 HasClrType 리플렉션 경로로 라우팅한다.
         else if pdef.ParamType=vtEnum then
-          fLocalScope.SetClrType(pdef.Name, pt[i]);
+          fLocalScope.SetClrType(pdef.Name, pElemType100);
         if i=0 then il.Emit(OpCodes.Ldarg_0) else if i=1 then il.Emit(OpCodes.Ldarg_1)
         else if i=2 then il.Emit(OpCodes.Ldarg_2) else if i=3 then il.Emit(OpCodes.Ldarg_3)
         else il.Emit(OpCodes.Ldarg_S, byte(i));
+        if pIsByRef100 then il.Emit(OpCodes.Ldobj, pElemType100); // [버그 수정] 주소 역참조 → 값
         il.Emit(OpCodes.Stloc, loc);
       end;
       foreach var lv in d.LocalVars do
@@ -3654,6 +3710,17 @@
       foreach var cd61 in d.ConstDecls do EmitConstDecl(il, fLocalScope, cd61);
       foreach st in d.Body.Statements do EmitStatement(il, st);
       il.MarkLabel(fMethodExitLabel); // [Stage 78] exit 문의 착지점
+      // [버그 수정] var/const 매개변수 복사-반환 — BuildStaticProc과 동일한 이유.
+      // Result를 스택에 올리기(Ldloc fResultLocal) 전에 먼저 처리해야 스택이 꼬이지 않는다.
+      for i:=0 to d.Parameters.Count-1 do
+        if (i<pParamIsByRef100.Count) and pParamIsByRef100[i] then
+        begin
+          if i=0 then il.Emit(OpCodes.Ldarg_0) else if i=1 then il.Emit(OpCodes.Ldarg_1)
+          else if i=2 then il.Emit(OpCodes.Ldarg_2) else if i=3 then il.Emit(OpCodes.Ldarg_3)
+          else il.Emit(OpCodes.Ldarg_S, byte(i));
+          il.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(d.Parameters[i].Name));
+          il.Emit(OpCodes.Stobj, pParamElemType100[i]);
+        end;
       il.Emit(OpCodes.Ldloc, fResultLocal); il.Emit(OpCodes.Ret);
       fLocalScope:=savedLocalScope; fResultLocal:=svR; fResultType:=svRT;
       fMethodExitLabel:=svExitLabel78; // [Stage 78]
@@ -3667,6 +3734,7 @@
       svR: LocalBuilder; svRT: TVarType; st: TStmtNode;
       savedGenSubst71: Dictionary<string, System.Type>; // [Stage 71]
       svExitLabel78: &Label; // [Stage 78]
+      pParamIsByRef100: List<boolean>; pParamElemType100: List<System.Type>; // [Stage 100 버그수정]
     begin
       // [Stage 71] BuildStaticFunc와 동일한 원리 — 자세한 설명은 그쪽 주석 참고.
       savedGenSubst71:=fCurGenericSubst;
@@ -3687,27 +3755,35 @@
       savedLocalScope:=fLocalScope; svR:=fResultLocal; svRT:=fResultType;
       fLocalScope:=new TScope('local(proc)', fGlobalScope);
       fResultLocal:=nil;
+      // [버그 수정] 전역 procedure의 var/const 매개변수(ByRef)가 지금까지 호출자에게
+      // 값을 되돌려주지 못하던 버그 수정 — 인스턴스 메서드(BuildMethodBody, Stage 100)와
+      // 동일한 "값 복사 진입(Ldobj) / 값 복사 반환(Stobj)" 전략을 그대로 적용한다.
+      pParamIsByRef100:=new List<boolean>; pParamElemType100:=new List<System.Type>;
       for i:=0 to d.Parameters.Count-1 do
       begin
-        var loc:=il.DeclareLocal(pt[i]);
         var pdef:=d.Parameters[i];
+        var pIsByRef100:=pt[i].IsByRef;
+        var pElemType100:=ElemTypeIfByRef(pt[i]);
+        pParamIsByRef100.Add(pIsByRef100); pParamElemType100.Add(pElemType100);
+        var loc:=il.DeclareLocal(pElemType100);
         fLocalScope.Declare(pdef.Name, loc, pdef.ParamType);
         if (pdef.ParamType=vtObject) or (pdef.ParamType=vtInterface) then
         begin
           if fTypeBuilders.ContainsKey(pdef.ClassName) or fBuiltTypes.ContainsKey(pdef.ClassName) then
             fLocalScope.SetClassName(pdef.Name, pdef.ClassName)
           else
-            fLocalScope.SetClrType(pdef.Name, pt[i]);
+            fLocalScope.SetClrType(pdef.Name, pElemType100);
         end
         // [Stage 71] BuildStaticFunc와 동일한 이유 — vtGeneric 매개변수도 타입 매개변수 이름을 기록.
         else if pdef.ParamType=vtGeneric then
           fLocalScope.SetClassName(pdef.Name, pdef.ClassName)
         // [버그 수정] enum 타입 매개변수 — ClrType을 채워 HasClrType 리플렉션 경로로 라우팅한다.
         else if pdef.ParamType=vtEnum then
-          fLocalScope.SetClrType(pdef.Name, pt[i]);
+          fLocalScope.SetClrType(pdef.Name, pElemType100);
         if i=0 then il.Emit(OpCodes.Ldarg_0) else if i=1 then il.Emit(OpCodes.Ldarg_1)
         else if i=2 then il.Emit(OpCodes.Ldarg_2) else if i=3 then il.Emit(OpCodes.Ldarg_3)
         else il.Emit(OpCodes.Ldarg_S, byte(i));
+        if pIsByRef100 then il.Emit(OpCodes.Ldobj, pElemType100); // [버그 수정] 주소 역참조 → 값
         il.Emit(OpCodes.Stloc, loc);
       end;
       // [Stage 28] 프로시저 본문의 지역 변수 선언(var 섹션) 처리.
@@ -3741,6 +3817,18 @@
       foreach var cd61 in d.ConstDecls do EmitConstDecl(il, fLocalScope, cd61);
       foreach st in d.Body.Statements do EmitStatement(il, st);
       il.MarkLabel(fMethodExitLabel); // [Stage 78] exit 문의 착지점
+      // [버그 수정] var/const 매개변수 복사-반환: 로컬 슬롯의 최종 값을 원래 주소에 다시 써준다
+      // (BuildMethodBody의 Stage 100과 동일한 전략 — exit 문으로 일찍 빠져나온 경우도
+      // fMethodExitLabel 착지점을 거치므로 여기 한 곳에서 처리하면 모든 경로를 커버한다).
+      for i:=0 to d.Parameters.Count-1 do
+        if (i<pParamIsByRef100.Count) and pParamIsByRef100[i] then
+        begin
+          if i=0 then il.Emit(OpCodes.Ldarg_0) else if i=1 then il.Emit(OpCodes.Ldarg_1)
+          else if i=2 then il.Emit(OpCodes.Ldarg_2) else if i=3 then il.Emit(OpCodes.Ldarg_3)
+          else il.Emit(OpCodes.Ldarg_S, byte(i));
+          il.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(d.Parameters[i].Name));
+          il.Emit(OpCodes.Stobj, pParamElemType100[i]);
+        end;
       il.Emit(OpCodes.Ret);
       fLocalScope:=savedLocalScope; fResultLocal:=svR; fResultType:=svRT;
       fMethodExitLabel:=svExitLabel78; // [Stage 78]

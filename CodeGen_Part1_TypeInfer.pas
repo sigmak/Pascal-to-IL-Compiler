@@ -1506,13 +1506,30 @@
         begin
           parentCtor3:=extType3.GetConstructor(System.Type.EmptyTypes);
           if parentCtor3=nil then
-            raise new Exception('외부 조상 타입 "'+extType3.FullName+'"에 매개변수 없는 public 생성자가 없습니다.');
+          begin
+            // [자기컴파일 버그 수정] 추상 기반 클래스(예: System.Reflection.PropertyInfo)는
+            // 흔히 무인자 생성자를 protected로만 노출한다 — 파생 클래스 생성자에서
+            // "inherited Create()"로 부르는 건 CLR에서 정상 허용되는 패턴이지만(Call로
+            // 방출, Newobj 아님), GetConstructor(Type[]) 기본 오버로드는 public만 찾는다.
+            // public에서 못 찾으면 NonPublic까지 포함해 무인자 생성자를 한 번 더 찾는다.
+            foreach var _pc3 in extType3.GetConstructors(BindingFlags.Instance or BindingFlags.Public or BindingFlags.NonPublic) do
+              if _pc3.GetParameters.Length=0 then begin parentCtor3:=_pc3; break; end;
+          end;
+          if parentCtor3=nil then
+            raise new Exception('외부 조상 타입 "'+extType3.FullName+'"에 매개변수 없는 생성자가 없습니다.');
         end
         else
         begin
           parentCtor3:=ResolveConstructorByArity(extType3, args);
           if parentCtor3=nil then
-            raise new Exception('외부 조상 타입 "'+extType3.FullName+'"에 인자 '+args.Count.ToString+'개짜리 public 생성자가 없습니다.');
+          begin
+            // 위와 동일한 이유로, public에서 인자 개수가 맞는 생성자를 못 찾으면
+            // NonPublic까지 포함해 한 번 더 찾는다.
+            foreach var _pc3b in extType3.GetConstructors(BindingFlags.Instance or BindingFlags.Public or BindingFlags.NonPublic) do
+              if _pc3b.GetParameters.Length=args.Count then begin parentCtor3:=_pc3b; break; end;
+          end;
+          if parentCtor3=nil then
+            raise new Exception('외부 조상 타입 "'+extType3.FullName+'"에 인자 '+args.Count.ToString+'개짜리 생성자가 없습니다.');
         end;
         var _parentCtorParams3b:=parentCtor3.GetParameters;
         for var _pcAi3b:=0 to args.Count-1 do

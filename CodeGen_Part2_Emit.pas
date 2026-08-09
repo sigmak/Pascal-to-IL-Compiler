@@ -9,6 +9,28 @@
 // 없습니다(TCodeGenerator의 필드/다른 부분에 의존).
 // ============================================================
 
+    // [Stage 108 버그 수정] 1차원 배열 원소 CLR 타입을 안전하게 얻는다. Stage 107에서
+    // 배열 인덱싱 읽기/쓰기에 LocalType.GetElementType/FieldType.GetElementType을 무조건
+    // 호출했는데, 아직 CreateType되지 않은 제네릭 인스턴스(예: 자기 자신의 미해결 제네릭
+    // 메서드 타입 매개변수를 포함한 Dictionary<string, Dictionary<string, TV>> 같은
+    // TypeBuilderInstantiation)는 배열이 전혀 아닌데도 GetElementType 호출 자체가
+    // System.NotSupportedException을 던진다(자기컴파일 실제 재현: TParser.DictDictHas<TV>의
+    // 매개변수 d — Parser.pas의 `d[k1]`이 배열 인덱싱 경로를 타면서 발생). 위쪽
+    // IsRefElementType(Stage 96)이 이미 같은 이유로 GetElementType 호출을 try/except로
+    // 감쌌던 것과 동일한 패턴 — 여기서도 IsArray를 먼저 확인하고, 그 확인 자체나
+    // GetElementType 호출이 예외를 던지면 조용히 nil(=원소 타입 모름, 기존 Ldelem_I4/
+    // Stelem_I4 기본값 경로로 폴백)을 돌려준다.
+    function SafeArrayElemType(t: System.Type): System.Type;
+    begin
+      Result:=nil;
+      if t=nil then exit;
+      try
+        if t.IsArray then Result:=t.GetElementType;
+      except
+        Result:=nil;
+      end;
+    end;
+
     procedure EmitExpr(aIL: ILGenerator; e: TExprNode);
     var
       lit: TIntLiteralNode; slit: TStrLiteralNode; vr: TVarRefNode;
@@ -1040,7 +1062,21 @@
           end
           else
           begin
-            var chFi90:=chType90.GetField(ch90.MemberName);
+            // [자기컴파일 버그 수정] chType90이 아직 CreateType되지 않은 로컬 TypeBuilder이고
+            // 그 필드가 chLocalCls101 자신이 아니라 부모 클래스에서 상속된 것이면(위 993행대
+            // 분기들은 chLocalCls101 자기 자신의 fFieldBuilders만 확인하고 부모는 안 봤다),
+            // 여기까지 떨어져 내려와 raw chType90.GetField(...)를 부르게 되는데 이건
+            // TypeBuilder.GetField(name, BindingFlags) 내부 오버로드로 위임되어
+            // NotSupportedException("유형이 만들어지기 전에 호출된 멤버는 지원되지 않습니다")을
+            // 던진다(실제 사례: TCodeGenerator 자신의 생성자 본문 생성 중). 먼저 부모 체인까지
+            // 훑는 TryFindFieldBuilder로 로컬 필드를 찾고, 그래도 없으면 예외를 삼키는
+            // SafeGetField로 리플렉션을 시도한다(raw GetField는 더 이상 직접 부르지 않는다).
+            var chFi90: FieldInfo;
+            var chFb90: FieldBuilder;
+            if (chLocalCls101<>'') and TryFindFieldBuilder(chLocalCls101, ch90.MemberName, chFb90) then
+              chFi90:=chFb90
+            else
+              chFi90:=SafeGetField(chType90, ch90.MemberName);
             if chFi90<>nil then
               aIL.Emit(OpCodes.Ldfld, chFi90)
             else
@@ -1107,15 +1143,18 @@
         // 전용이라 필드 이름은 모두 기본값 vtInteger로 오판)을 쓸 수 없으므로, 원소가
         // 참조 타입인지는 FieldBuilder의 실제 CLR 배열 원소 타입(IsValueType)으로 판단한다.
         var aiIsRefElem: boolean;
+        var aiElemClrType: System.Type; // [Stage 107 버그 수정]
         if fLocalScope.Has(ai.ArrName) then
         begin
           aIL.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(ai.ArrName));
           aiIsRefElem:=(GetVarType(ai.ArrName)=vtStrArray) or (GetVarType(ai.ArrName)=vtObjArray);
+          aiElemClrType:=SafeArrayElemType(fLocalScope.GetLoc(ai.ArrName).LocalType);
         end
         else if fGlobalScope.Has(ai.ArrName) then
         begin
           aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(ai.ArrName));
           aiIsRefElem:=(GetVarType(ai.ArrName)=vtStrArray) or (GetVarType(ai.ArrName)=vtObjArray);
+          aiElemClrType:=SafeArrayElemType(fGlobalScope.GetLoc(ai.ArrName).LocalType);
         end
         else
         begin
@@ -1125,6 +1164,7 @@
             aIL.Emit(OpCodes.Ldarg_0);
             aIL.Emit(OpCodes.Ldfld, aiFb);
             aiIsRefElem:=IsRefElementType(aiFb.FieldType); // [Stage 96 버그 수정] TypeBuilderInstantiation 예외 흡수
+            aiElemClrType:=SafeArrayElemType(aiFb.FieldType);
           end
           else
             raise new Exception('알 수 없는 변수 "'+ai.ArrName+'" (배열 인덱싱 대상을 지역/전역 변수도, "'
@@ -1136,8 +1176,28 @@
         // 정수로 잘못 읽어 쓰레기 값이 나왔다. 원소를 쓰는 쪽(Stelem, 아래 TArrayAssignStmtNode)은
         // 이미 배열 타입을 보고 Stelem_Ref/Stelem_I4를 갈라 쓰고 있었으므로 읽는 쪽도 맞춘다.
         // [Stage 90] array of object도 문자열 배열과 마찬가지로 참조 타입 원소이므로 Ldelem_Ref.
-        if aiIsRefElem then aIL.Emit(OpCodes.Ldelem_Ref)
-        else aIL.Emit(OpCodes.Ldelem_I4);
+        //
+        // [Stage 107 버그 수정] 위 aiIsRefElem 분기는 "참조냐 아니냐"만 갈랐다 — 참조가 아닌
+        // 값 타입 원소는 전부 Ldelem_I4(4바이트 폭)로 읽었는데, char 배열(원소 2바이트, 예:
+        // sourceCode.ToCharArray로 만든 array of char)이나 real/int64 배열처럼 실제 CLR
+        // 원소 크기가 4바이트가 아니면 Ldelem_I4가 잘못된 stride(4바이트 간격)로 주소를
+        // 계산해 배열 실제 메모리 범위를 넘어 읽는다 — 작은 배열은 우연히 힙 안쪽이라
+        // 조용히 쓰레기 값만 나오지만, 큰 배열(자기컴파일 시 Main.pas 전체를 읽어들인
+        // chars: array of char 등)은 계산된 주소가 힙 세그먼트 밖으로 넘어가
+        // AccessViolationException으로 그대로 죽는다. aiElemClrType(로컬/전역 슬롯 또는
+        // 필드의 실제 CLR 배열 원소 타입)을 직접 보고 폭에 맞는 Ldelem_* opcode를 고른다.
+        if aiIsRefElem or ((aiElemClrType<>nil) and not aiElemClrType.IsValueType) then
+          aIL.Emit(OpCodes.Ldelem_Ref)
+        else if (aiElemClrType<>nil) and (aiElemClrType=typeof(char)) then
+          aIL.Emit(OpCodes.Ldelem_U2)
+        else if (aiElemClrType<>nil) and (aiElemClrType=typeof(double)) then
+          aIL.Emit(OpCodes.Ldelem_R8)
+        else if (aiElemClrType<>nil) and (aiElemClrType=typeof(single)) then
+          aIL.Emit(OpCodes.Ldelem_R4)
+        else if (aiElemClrType<>nil) and (aiElemClrType=typeof(int64)) then
+          aIL.Emit(OpCodes.Ldelem_I8)
+        else
+          aIL.Emit(OpCodes.Ldelem_I4);
       end
 
       // [Stage 67] 2차원 배열 원소 읽기: arr[i][j]
@@ -1281,8 +1341,42 @@
 
       else if e is TCompareNode then
       begin
-        cmp:=TCompareNode(e); EmitExpr(aIL, cmp.Left); EmitExpr(aIL, cmp.Right);
-        if cmp.Op=cmpEq then aIL.Emit(OpCodes.Ceq)
+        cmp:=TCompareNode(e);
+        // [자기컴파일 버그 수정 — 실제 사례] 문자열 비교("System.IO.Path.GetExtension(x).ToLower
+        // = '.pabcproj'" 같은 식)를 지금까지는 숫자 비교와 똑같이 raw Ceq로 방출했다.
+        // Ceq는 값 타입엔 값 비교지만, string은 참조 타입이라 CLR의 ceq는 "참조가 같은가"만
+        // 본다 — 리터럴 문자열은 어셈블리 내에서 인턴되어 같은 참조를 공유하는 경우가
+        // 많아 우연히 맞는 것처럼 보이지만, ToLower/Trim/Substring/Concat 등 런타임에
+        // 새로 만들어진 문자열은 내용이 같아도 별개 인스턴스라 항상 false로 나온다.
+        // 이 때문에 자기컴파일된 실행파일의 ".pabcproj 확장자 검사" 같은 실제 조건문이
+        // 늘 거짓으로 평가되는 조용한 논리 오류가 있었다(컴파일 자체는 성공하니 지금까지
+        // 드러나지 않았다). 피연산자 중 하나라도 string이면 String.Equals(문자열,문자열)
+        // (동등)이나 String.CompareOrdinal(문자열,문자열)(대소 비교)을 대신 호출한다.
+        var _cmpLt90:=GetExprClrType(cmp.Left);
+        var _cmpRt90:=GetExprClrType(cmp.Right);
+        var _cmpIsStr90:=((_cmpLt90<>nil) and (_cmpLt90=typeof(string)))
+                       or ((_cmpRt90<>nil) and (_cmpRt90=typeof(string)));
+        EmitExpr(aIL, cmp.Left); EmitExpr(aIL, cmp.Right);
+        if _cmpIsStr90 and ((cmp.Op=cmpEq) or (cmp.Op=cmpNeq)) then
+        begin
+          var _seqMi90:=typeof(string).GetMethod('Equals', [typeof(string), typeof(string)]);
+          aIL.Emit(OpCodes.Call, _seqMi90);
+          if cmp.Op=cmpNeq then
+          begin aIL.Emit(OpCodes.Ldc_I4_0); aIL.Emit(OpCodes.Ceq); end;
+        end
+        else if _cmpIsStr90 and ((cmp.Op=cmpLt) or (cmp.Op=cmpGt) or (cmp.Op=cmpLe) or (cmp.Op=cmpGe)) then
+        begin
+          var _scmpMi90:=typeof(string).GetMethod('CompareOrdinal', [typeof(string), typeof(string)]);
+          aIL.Emit(OpCodes.Call, _scmpMi90);
+          aIL.Emit(OpCodes.Ldc_I4_0);
+          if cmp.Op=cmpLt then aIL.Emit(OpCodes.Clt)
+          else if cmp.Op=cmpGt then aIL.Emit(OpCodes.Cgt)
+          else if cmp.Op=cmpLe then
+            begin aIL.Emit(OpCodes.Cgt); aIL.Emit(OpCodes.Ldc_I4_0); aIL.Emit(OpCodes.Ceq); end
+          else if cmp.Op=cmpGe then
+            begin aIL.Emit(OpCodes.Clt); aIL.Emit(OpCodes.Ldc_I4_0); aIL.Emit(OpCodes.Ceq); end;
+        end
+        else if cmp.Op=cmpEq then aIL.Emit(OpCodes.Ceq)
         else if cmp.Op=cmpLt then aIL.Emit(OpCodes.Clt)
         else if cmp.Op=cmpGt then aIL.Emit(OpCodes.Cgt)
         else if cmp.Op=cmpNeq then
@@ -3045,14 +3139,24 @@
         // 전용이라 필드는 조회 불가)이 아니라 FieldBuilder의 실제 CLR 원소 타입으로
         // 참조/값 타입 여부(및 EmitValueForVType에 넘길 at2)를 판단한다.
         var aaFb: FieldBuilder;
-        if fGlobalScope.Has(aa.ArrName) then at2:=fGlobalScope.GetVType(aa.ArrName)
-        else if fLocalScope.Has(aa.ArrName) then at2:=fLocalScope.GetVType(aa.ArrName)
+        var aaElemClrType: System.Type; // [Stage 107 버그 수정]
+        if fGlobalScope.Has(aa.ArrName) then
+        begin
+          at2:=fGlobalScope.GetVType(aa.ArrName);
+          aaElemClrType:=SafeArrayElemType(fGlobalScope.GetLoc(aa.ArrName).LocalType);
+        end
+        else if fLocalScope.Has(aa.ArrName) then
+        begin
+          at2:=fLocalScope.GetVType(aa.ArrName);
+          aaElemClrType:=SafeArrayElemType(fLocalScope.GetLoc(aa.ArrName).LocalType);
+        end
         else if TryFindFieldBuilder(fCurClassName, aa.ArrName, aaFb) then
         begin
           if IsRefElementType(aaFb.FieldType) then // [Stage 96 버그 수정] TypeBuilderInstantiation 예외 흡수
             at2:=vtStrArray
           else
             at2:=vtIntArray;
+          aaElemClrType:=SafeArrayElemType(aaFb.FieldType);
         end
         else
           raise new Exception('알 수 없는 변수 "'+aa.ArrName+'" (배열 대입 대상을 지역/전역 변수도, "'
@@ -3065,10 +3169,27 @@
         // 힙 참조로 오인되어 GC/접근 시 크래시가 난다.
         EmitExpr(aIL, aa.Index);
         if at2=vtStrArray then EmitValueForVType(aIL, aa.ValueExpr, vtString)
+        else if (aaElemClrType<>nil) and (aaElemClrType=typeof(char)) then EmitValueForVType(aIL, aa.ValueExpr, vtChar)
+        else if (aaElemClrType<>nil) and (aaElemClrType=typeof(double)) then EmitValueForVType(aIL, aa.ValueExpr, vtReal)
+        else if (aaElemClrType<>nil) and (aaElemClrType=typeof(int64)) then EmitValueForVType(aIL, aa.ValueExpr, vtInt64)
         else EmitExpr(aIL, aa.ValueExpr);
         // [Stage 90] array of object 원소 쓰기도 문자열과 마찬가지로 참조 타입이라 Stelem_Ref.
-        if (at2=vtStrArray) or (at2=vtObjArray) then aIL.Emit(OpCodes.Stelem_Ref)
-        else aIL.Emit(OpCodes.Stelem_I4);
+        // [Stage 107 버그 수정] 읽기 쪽(TArrayIndexExprNode)과 동일한 이유 — 값 타입 원소를
+        // 전부 Stelem_I4(4바이트 폭)로 쓰면 char/real/int64 배열은 stride가 틀어져 배열
+        // 밖의 메모리를 덮어써 힙을 손상시킨다(느리게 발현되는 AccessViolationException/
+        // 손상의 근본 원인이 되기 쉽다). 실제 CLR 원소 타입(aaElemClrType)을 보고 고른다.
+        if (at2=vtStrArray) or (at2=vtObjArray) or ((aaElemClrType<>nil) and not aaElemClrType.IsValueType) then
+          aIL.Emit(OpCodes.Stelem_Ref)
+        else if (aaElemClrType<>nil) and (aaElemClrType=typeof(char)) then
+          aIL.Emit(OpCodes.Stelem_I2)
+        else if (aaElemClrType<>nil) and (aaElemClrType=typeof(double)) then
+          aIL.Emit(OpCodes.Stelem_R8)
+        else if (aaElemClrType<>nil) and (aaElemClrType=typeof(single)) then
+          aIL.Emit(OpCodes.Stelem_R4)
+        else if (aaElemClrType<>nil) and (aaElemClrType=typeof(int64)) then
+          aIL.Emit(OpCodes.Stelem_I8)
+        else
+          aIL.Emit(OpCodes.Stelem_I4);
       end
 
       // [Stage 67] 2차원 배열 원소 쓰기: arr[i][j] := val
