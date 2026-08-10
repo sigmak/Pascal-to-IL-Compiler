@@ -321,8 +321,33 @@ type
     constructor Create(src: string);
     begin
       Writeln('[MARK-A] TLexer.Create 진입, src.Length=' + src.Length.ToString);
-      fChars:=src.ToCharArray; fPos:=0; fLine:=1; fCol:=1;
-      Writeln('[MARK-B] fChars 대입 완료, fChars.Length=' + Length(fChars).ToString);
+
+      // [임시 진단 - 2차] 1차 진단(var tmpChars: array of char := src.ToCharArray;)에서
+      // MARK-A1조차 찍히지 않았다 — 즉 "그 한 문장 자체" 안에서 죽는다는 뜻이다.
+      // "array of char 지역변수 선언"과 "src.ToCharArray() 메서드 호출 평가"를 완전히
+      // 분리된 별도의 문장으로 쪼개서 어느 쪽이 원인인지 이분법으로 좁힌다.
+
+      var tmpChars: array of char; // 초기화식 없이 선언만
+      Writeln('[MARK-A0] array of char 지역변수 선언만 완료 (초기화 없음)');
+
+      var tcaResult := src.ToCharArray;
+      Writeln('[MARK-A0b] src.ToCharArray() 호출 완료 (지역변수 타입 추론), tcaResult.Length=' + Length(tcaResult).ToString);
+
+      tmpChars := tcaResult;
+      Writeln('[MARK-A1] tmpChars := tcaResult 대입 완료, tmpChars.Length=' + Length(tmpChars).ToString);
+
+      fChars := tmpChars;
+      Writeln('[MARK-A2] fChars := tmpChars 대입 완료, fChars.Length=' + Length(fChars).ToString);
+
+      fPos := 0;
+      Writeln('[MARK-A3] fPos 대입 완료');
+
+      fLine := 1;
+      Writeln('[MARK-A4] fLine 대입 완료');
+
+      fCol := 1;
+      Writeln('[MARK-B] fCol 대입 완료 (기존 지점)');
+
       LexErrors:=new List<string>;
       ReferenceDirectives:=new List<string>; // [Stage 45]
       AppTypeDirective:=''; // [Stage 69]

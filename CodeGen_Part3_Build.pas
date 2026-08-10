@@ -1166,6 +1166,34 @@
           end;
         end;
       end
+      // [버그 수정] "fChars:=src.ToCharArray;"처럼 obj.Method(...) 형태의 메서드 호출 식
+      // (TMethodCallExprNode)이 배열 매개변수/필드 대입 자리의 인자로 직접 쓰이는 경우 —
+      // 지금까지 InferArgClrType에 TMethodCallExprNode 분기가 전혀 없어서 항상 nil(중립)로
+      // 떨어졌다. EmitArgForParamType의 "paramType.IsArray and InferArgClrType(argExpr)=nil"
+      // 분기는 이걸 "배열이 아니라 스칼라 값 하나"로 오인해, char[] 등을 돌려주는 메서드
+      // 호출 결과(사실은 배열 참조)를 1개짜리 새 배열의 원소 자리에 억지로 Stelem으로
+      // 밀어넣는 손상된 IL을 방출했다 — 그 결과 fChars 필드에 잘못된(손상된) 배열이
+      // 대입되어 이후 fChars 참조 시점에 NullReferenceException으로 이어졌다
+      // (자기컴파일 실제 재현: TLexer.Create의 "fChars:=src.ToCharArray"). 이미 존재하는
+      // TryResolveMethodCallClrType(1658행)으로 메서드의 정확한 CLR 반환 타입을 구해
+      // 이 문제를 해결한다.
+      else if e is TMethodCallExprNode then
+      begin
+        try
+          Result:=TryResolveMethodCallClrType(TMethodCallExprNode(e));
+        except
+          Result:=nil;
+        end;
+        if Result=nil then
+        begin
+          vt:=InferType(e);
+          case vt of
+            vtString:  Result:=typeof(string);
+            vtBoolean: Result:=typeof(boolean);
+            vtInteger: Result:=typeof(integer);
+          end;
+        end;
+      end
       else
       begin
         vt:=InferType(e);
