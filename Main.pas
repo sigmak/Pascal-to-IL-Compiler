@@ -866,9 +866,16 @@ begin
       Writeln('[진단] DiscoverCompileOrder 반환 완료, compileOrder.Count=' + compileOrder.Count.ToString);
       if compileOrder.Count > 1 then
       begin
+        Writeln('[진단] compileOrder.Count>1 분기 진입');
         Writeln('[유닛탐색] 의존성 ' + (compileOrder.Count - 1).ToString + '개 파일 발견 — 컴파일 순서(의존성 먼저):');
         for oi := 0 to compileOrder.Count - 1 do
+        begin
+          // [진단] compileOrder[oi]가 null이거나 GetFileName 호출 자체가 실패하는 경우를
+          // 대비해 인덱스와 원본 문자열(null 여부)을 먼저 찍은 뒤 GetFileName을 부른다.
+          Writeln('[진단] compileOrder[' + oi.ToString + '] 원본="' + compileOrder[oi] + '"');
           Writeln('    ' + (oi + 1).ToString + '. ' + System.IO.Path.GetFileName(compileOrder[oi]));
+        end;
+        Writeln('[진단] compileOrder.Count>1 분기 완료');
       end
       else
       begin

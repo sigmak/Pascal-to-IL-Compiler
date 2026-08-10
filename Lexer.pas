@@ -2,7 +2,19 @@
 // Lexer.pas — 어휘 분석 (TTokenKind, TToken, TLexer)
 // 다른 프로젝트 unit에 의존하지 않음 (System.* 만 사용).
 // 이 unit이 몇 Stage째 안 바뀐다면 = 어휘 분석은 안정화됐다는 신호.
-// [Stage 35] 각 토큰에 시작 열(Column) 번호를 함께 기록해 진단 메시지에 사용한다.
+// [Stage 110 진단] 자기 컴파일본(test_self.exe)에서만 AST.pas 렉싱 중 NullReferenceException —
+//   기존 mod 50 진단 로그로는 iter=50에도 못 미쳐 죽어서 정확한 위치를 못 잡았다.
+//   그래서 이 버전은 임시로 mod 1(매 토큰마다)로 낮췄다 — 정확한 크래시 지점을 확인한 뒤
+//   다시 mod 50으로 되돌릴 것.
+// [Stage 111] 진단 결과, Tokenize 안의 "바깥 try(EOF 시 break 포함) 안에 안쪽 try(ReadIdent
+//   감싸는 것)가 중첩되고 두 catch가 같은 이름(E)의 예외 변수를 쓰는" 구조에서 self-compiled
+//   바이너리만 IL이 잘못 만들어지는 것으로 추정됨(진단용 try/except 자체가 전혀 작동하지 않음 —
+//   Writeln 한 줄도 안 찍히고 죽음). 우회책으로:
+//   1) ReadIdent를 감싸던 안쪽 try/except를 제거함 (어차피 진단 목적이었고 신뢰 불가로 확인됨)
+//   2) EOF 시의 break를 try 블록 "안"에서 바로 하지 않고, 플래그(_eof)로만 표시한 뒤
+//      try/except 블록이 끝난 "밖"에서 break하도록 바꿈 — 보호구역(try)을 벗어나는 분기를
+//      아예 없애서 Leave/Br 관련 IL 생성 문제를 원천적으로 피한다.
+//   두 수정 모두 동작 자체(토큰화 결과)는 이전과 동일해야 한다.
 // ============================================================
 unit Lexer;
 
@@ -308,20 +320,47 @@ type
   public
     constructor Create(src: string);
     begin
+      Writeln('[MARK-A] TLexer.Create 진입, src.Length=' + src.Length.ToString);
       fChars:=src.ToCharArray; fPos:=0; fLine:=1; fCol:=1;
+      Writeln('[MARK-B] fChars 대입 완료, fChars.Length=' + Length(fChars).ToString);
       LexErrors:=new List<string>;
       ReferenceDirectives:=new List<string>; // [Stage 45]
       AppTypeDirective:=''; // [Stage 69]
+      Writeln('[MARK-B2] TLexer.Create 종료');
     end;
 
     function Tokenize: List<TToken>;
-    var toks: List<TToken>; ch: char; sc: integer;
+    var toks: List<TToken>; ch: char; sc: integer; _sl0, _sc0, _sp0: integer; _iterN: integer; _eof: boolean;
     begin
+      Writeln('[MARK-C] Tokenize 진입');
       toks:=new List<TToken>;
+      _iterN:=0;
+      Writeln('[MARK-D] while 루프 진입 직전');
       while true do
       begin
+        // [진단] 예외 기반 진단(try/except)이 이 특정 구조(중첩 try + 루프 안 break)에서
+        // 예외를 못 잡는 것으로 확인됐다 — 예외 처리에 의존하지 않는 "무조건 찍히는"
+        // 순수 진행 로그로 바꾼다. 이 프로젝트의 StripComments 진행 로그와 같은 방식:
+        // 크래시가 나도 그 직전까지 출력된 로그는 이미 콘솔에 나가 있으므로, 마지막으로
+        // 찍힌 줄/열/fPos를 보면 정확히 어느 반복에서 멈췄는지 알 수 있다.
+        // [Stage 110 진단] mod 50으로는 self-compiled exe가 iter=50 이전에 죽어서 위치를
+        // 못 잡았다. mod 1(매 반복)은 출력량이 너무 많아 콘솔이 감당 못해 사실상 멈춘
+        // 것처럼 보였다 — 절충안: 앞쪽 60번은 무조건 찍어 조기 크래시 지점을 놓치지 않고,
+        // 그 이후엔 2000번마다만 찍어 총 출력량을 확 줄인다.
+        _iterN:=_iterN+1;
+        if (_iterN<=60) or ((_iterN mod 2000)=0) then
+          Writeln('[진단] Tokenize 진행중: iter=' + _iterN.ToString + ', fLine=' + fLine.ToString +
+            ', fCol=' + fCol.ToString + ', fPos=' + fPos.ToString + ', 토큰수=' + toks.Count.ToString);
+        _sl0:=fLine; _sc0:=fCol; _sp0:=fPos;
+        _eof:=false; // [Stage 111] try 안에서 곧장 break하지 않고, 플래그만 세운다.
+        try
+        begin
         SkipWS; ch:=CC; sc:=fCol;
-        if ch=#0 then begin toks.Add(new TToken(tkEOF,'',fLine,fCol)); break; end
+        if ch=#0 then begin toks.Add(new TToken(tkEOF,'',fLine,fCol)); _eof:=true; end
+        // [Stage 111] ReadIdent를 감싸던 안쪽 try/except를 제거했다 — 진단 목적으로 넣었던
+        // 것인데, "중첩 try + 루프 안 break" 구조 자체가 self-compiled 바이너리에서 문제를
+        // 일으키는 것으로 추정되어(진단 Writeln조차 안 찍히고 죽음) 오히려 원인 쪽에 가까웠다.
+        // 예외는 바깥쪽 try/except가 그대로 잡아 로그를 남긴다(아래 except 블록 참고).
         else if Char.IsLetter(ch) or (ch='_') then toks.Add(ReadIdent)
         // [Stage 88c] &Label 같은 이스케이프된 식별자 — Label처럼 예약어와 충돌하는
         // 이름을 강제로 "그냥 식별자"로 쓰겠다는 표시. & 다음에 글자/밑줄이 와야 진짜
@@ -406,6 +445,27 @@ type
           LexErrors.Add('줄 '+fLine.ToString+', 열 '+fCol.ToString+': 알 수 없는 문자 '+#39+ch.ToString+#39);
           Adv;
         end;
+        end; // [진단] try 시작(SkipWS 포함, 이번 반복 전체) 종료
+        except
+          on E: Exception do
+          begin
+            // [진단] SkipWS의 {$...} 지시문 파싱, 문자열 리터럴 처리, ReadIdent, ReadNum,
+            // ReadCharCode 등 이 반복에서 일어난 예외의 위치를 정확히 찍는다 — 반복
+            // "시작 시점"과 "예외 시점" 위치를 함께 보여줘서 어느 문자/구간에서 죽었는지
+            // 바로 드러나게 한다.
+            Writeln('[진단] Tokenize 반복 예외: 반복시작 line=' + _sl0.ToString + ', col=' + _sc0.ToString + ', pos=' + _sp0.ToString +
+              ' / 예외시점 fLine=' + fLine.ToString + ', fCol=' + fCol.ToString + ', fPos=' + fPos.ToString +
+              ', 현재CC=' + #39 + CC + #39 + '(코드 ' + integer(CC).ToString + '), 다음PC=' + #39 + PC + #39 + '(코드 ' + integer(PC).ToString + ')');
+            Writeln('[진단] 예외 타입: ' + E.GetType.FullName + ', 메시지: ' + E.Message);
+            Writeln('[진단] 지금까지 읽은 토큰 수: ' + toks.Count.ToString);
+            if toks.Count>0 then
+              Writeln('[진단] 마지막 성공 토큰: Kind=' + toks[toks.Count-1].Kind.ToString + ', Text="' + toks[toks.Count-1].Text + '"');
+            raise;
+          end;
+        end;
+        // [Stage 111] try/except 블록을 완전히 벗어난 지점에서 break한다 — 보호구역(try) 안에서
+        // 곧장 break하지 않도록 해서, 그로 인한 IL 생성 문제 가능성을 원천적으로 피한다.
+        if _eof then break;
       end;
 
       if LexErrors.Count>0 then

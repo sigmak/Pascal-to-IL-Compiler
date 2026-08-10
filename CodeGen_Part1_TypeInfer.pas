@@ -1118,7 +1118,17 @@
             begin
               var _sfi4:=_staticT4.GetField(_mc4.MethodName);
               if (_sfi4<>nil) and (_sfi4.FieldType=typeof(string)) then Result:=vtString
-              else Result:=vtInteger;
+              else
+              begin
+                // [버그 수정] 프로퍼티/필드가 아니라 "정적 메서드"인 경우(예:
+                // System.IO.Path.GetFileName(...))가 전혀 검사되지 않아 항상 vtInteger로
+                // 폴백했다. 그 결과 실제로는 string을 반환하는 외부 정적 메서드 호출이
+                // 정수로 오판되어, 문자열 연결식에서 string 참조값이 정수 변환 경로를 타
+                // 쓰레기(주소값에 가까운 숫자)로 찍히는 문제가 있었다.
+                var _smi4:=ResolveMethodByArity(_staticT4, _mc4.MethodName, _mc4.Args, true);
+                if (_smi4<>nil) and (_smi4.ReturnType=typeof(string)) then Result:=vtString
+                else Result:=vtInteger;
+              end;
             end;
           end;
         end

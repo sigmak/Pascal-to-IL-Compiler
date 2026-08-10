@@ -2190,6 +2190,28 @@
             else Result:=_no90ElemT;
           end;
         end
+        // [자기컴파일 버그 수정] (a - b).ToString / (a + b).Foo 처럼 산술 이항식 바로 뒤에
+        // 멤버/메서드가 체이닝되는 경우 — GetExprClrType에 TBinOpNode 분기가 아예 없어서
+        // 지금까지 무조건 맨 위 기본값 System.Object로 폴백했다. EmitExpr의
+        // TChainedMemberExprNode 처리부는 이 타입을 보고 "값 타입이면 지역변수에 담아
+        // 주소를 취해 Call, 아니면 Callvirt"를 결정하는데(1013행대), System.Object는
+        // IsValueType=false이므로 박싱/주소 취득 과정을 건너뛰고 스택에 그대로 남아있는
+        // 원시 int32 값 위에 곧바로 Callvirt를 걸어버렸다 — 참조가 아닌 원시값을 객체
+        // 포인터로 오인하는 손상된 IL이라, 실행 시 관리되는 예외조차 못 띄우고 프로세스가
+        // 아무 메시지 없이 죽는다(실제 재현: Main.pas의 "(compileOrder.Count - 1).ToString").
+        // InferType의 TBinOpNode 분기(문자열 > 실수 > int64 > 정수 승격, boAnd/boOr는
+        // 항상 논리형)와 동일한 규칙을 CLR 타입으로 그대로 옮긴다.
+        else if e is TBinOpNode then
+        begin
+          var _bo90:=TBinOpNode(e);
+          var _boLt90:=GetExprClrType(_bo90.Left);
+          var _boRt90:=GetExprClrType(_bo90.Right);
+          if (_bo90.Op=boAnd) or (_bo90.Op=boOr) then Result:=typeof(boolean)
+          else if (_boLt90=typeof(string)) or (_boRt90=typeof(string)) then Result:=typeof(string)
+          else if (_boLt90=typeof(double)) or (_boRt90=typeof(double)) then Result:=typeof(double)
+          else if (_boLt90=typeof(int64)) or (_boRt90=typeof(int64)) then Result:=typeof(int64)
+          else Result:=typeof(integer);
+        end
         else if e is TStrLiteralNode then Result:=typeof(string)
         else if e is TIntLiteralNode then Result:=typeof(integer)
         else if e is TRealLiteralNode then Result:=typeof(double)
@@ -2321,6 +2343,32 @@
         EmitExpr(aIL, argExpr);
         if _argVt76b=vtInteger then aIL.Emit(OpCodes.Conv_R8);
         exit;
+      end;
+      // [자기컴파일 버그 수정] params 배열 매개변수(예: string.Split(params char[] separator))
+      // 자리에 배열이 아니라 스칼라 값 하나(예: 문자 리터럴 ',')가 인자로 온 경우 — 지금까지
+      // 이 분기 위쪽 어디에도 걸리지 않고 그냥 맨 아래 EmitExpr(aIL, argExpr)로 흘러가,
+      // 문자 하나의 원시값(예: ','의 코드 44)을 그대로 스택에 얹은 채 char[] 배열 참조를
+      // 요구하는 Callvirt에 넘겨버렸다. 이는 검증 불가능한 IL이라 실행 시 어떤 관리되는
+      // 예외도 던지지 못하고(스택의 정수값을 배열 포인터로 역참조하려다) 프로세스가 아무
+      // 메시지도 없이 곧바로 죽는다 — 자기호스팅 컴파일 중 "raw.Split(',')" 호출부에서
+      // 실제로 재현된 증상(로그가 그 직전 줄에서 뚝 끊기고 셸 프롬프트로 복귀). 목표
+      // 매개변수가 배열이고 인자 식 자체가 배열 리터럴이 아니며, 인자의 CLR 타입이 그
+      // 배열 타입에 대입 불가능하면(=스칼라 원소 하나) 1개짜리 배열로 감싸서 넘긴다.
+      if paramType.IsArray and not (argExpr is TArrayLiteralExprNode) then
+      begin
+        var _argClrT48s:=InferArgClrType(argExpr);
+        if (_argClrT48s=nil) or (not paramType.IsAssignableFrom(_argClrT48s)) then
+        begin
+          var _elemT48s:=paramType.GetElementType;
+          aIL.Emit(OpCodes.Ldc_I4, 1);
+          aIL.Emit(OpCodes.Newarr, _elemT48s);
+          aIL.Emit(OpCodes.Dup);
+          aIL.Emit(OpCodes.Ldc_I4, 0);
+          EmitArgForParamType(aIL, argExpr, _elemT48s);
+          if _elemT48s.IsValueType then aIL.Emit(OpCodes.Stelem, _elemT48s)
+          else aIL.Emit(OpCodes.Stelem_Ref);
+          exit;
+        end;
       end;
       EmitExpr(aIL, argExpr);
       // [Stage 76 버그수정 #4] 방어적 안전망: 우리가 추적하는 인자의 CLR 타입(InferArgClrType)이
