@@ -337,7 +337,9 @@ type
     function Tokenize: List<TToken>;
     var toks: List<TToken>; ch: char; sc: integer; _sl0, _sc0, _sp0: integer; _iterN: integer;
     begin
+      Writeln('[MARK-T0] Tokenize 진입');
       toks:=new List<TToken>;
+      Writeln('[MARK-T1] toks:=new List<TToken> 완료');
       _iterN:=0;
       while true do
       begin

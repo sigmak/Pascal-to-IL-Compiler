@@ -1264,7 +1264,45 @@
                 and (_mc4.Args.Count=0) and (_mc4.ObjCastType='')
                 and (_mc4.MethodName.ToLower='tostring') then
           Result:=vtString
-        else Result:=vtInteger;
+        // [자기컴파일 버그 수정] "string.Join(...)"처럼 ObjName이 점(.) 없는 단일 세그먼트
+        // 외부 정적 타입 이름(예: "string", "Math")을 가리키는 정적 메서드/프로퍼티 호출은
+        // 위의 모든 분기(체인/self/지역CLR타입/클래스명변수/필드/ToString)에 하나도 걸리지
+        // 않고 곧장 else Result:=vtInteger로 폴백됐다. EmitExpr(실제 IL 방출)은
+        // ResolveOrEmitStaticChain 등을 통해 이런 이름을 정확히 System.String 등으로 풀어
+        // 제대로 된 string 값을 스택에 올리지만, InferType은 그 값을 여전히 vtInteger로
+        // 오판했다. 그 결과 "... + string.Join(#10, errs)" 같은 문자열 연결식에서 rt=vtInteger로
+        // 잘못 판정되어, 이미 스택에 올라온 string 참조 위에 Convert.ToString(Int32)가 다시
+        // 호출되면서 참조값이 정수로 재해석되어 쓰레기 숫자(예: "42635608")가 출력되는
+        // 조용한 버그가 있었다. 여기서 외부 타입 해석을 한 번 더 시도해 실제 반환 타입을 본다.
+        else
+        begin
+          var _bareStaticT4: System.Type := nil;
+          try _bareStaticT4:=ResolveExternalType(_mc4.ObjName); except _bareStaticT4:=nil; end;
+          if _bareStaticT4=nil then
+          begin
+            var _bareIsInst4: boolean;
+            try _bareStaticT4:=ResolveOrEmitStaticChain(nil, _mc4.ObjName, _bareIsInst4); except _bareStaticT4:=nil; end;
+          end;
+          if _bareStaticT4=nil then Result:=vtInteger
+          else
+          begin
+            var _barePi4:=SafeGetProperty(_bareStaticT4, _mc4.MethodName);
+            if (_barePi4<>nil) and (_barePi4.PropertyType=typeof(string)) then Result:=vtString
+            else
+            begin
+              var _bareFi4:=_bareStaticT4.GetField(_mc4.MethodName);
+              if (_bareFi4<>nil) and (_bareFi4.FieldType=typeof(string)) then Result:=vtString
+              else
+              begin
+                var _bareMi4:=ResolveMethodByArity(_bareStaticT4, _mc4.MethodName, _mc4.Args, true);
+                if (_bareMi4=nil) then
+                  _bareMi4:=ResolveMethodByArity(_bareStaticT4, _mc4.MethodName, _mc4.Args, false);
+                if (_bareMi4<>nil) and (_bareMi4.ReturnType=typeof(string)) then Result:=vtString
+                else Result:=vtInteger;
+              end;
+            end;
+          end;
+        end;
       end
       // [Stage 37 버그 수정] 이전에는 배열이 실제로 array of string이어도 무조건 vtInteger로
       // 추론해서, Writeln(strArr[i]) 같은 식이 Console.WriteLine(int) 오버로드로 잘못 디스패치됐다.

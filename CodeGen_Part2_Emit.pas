@@ -714,8 +714,8 @@
         begin
           // Button1.Text (필드를 통한 속성 읽기) 또는 Button1.SomeMethod() (필드를 통한 메서드 호출)
           aIL.Emit(OpCodes.Ldarg_0);
-          aIL.Emit(OpCodes.Ldfld, fb);
-          var _qType:=fb.FieldType;
+          aIL.Emit(OpCodes.Ldfld, fb);        // ← fLine 필드의 "원시 int32 값"을 스택에 직접 로드
+          var _qType:=fb.FieldType;           // = typeof(integer)
           if mc.ObjCastType<>'' then
           begin
             _qType:=ResolveExternalType(mc.ObjCastType);
@@ -767,18 +767,35 @@
           end
           else
           begin
-            var _pi5:=SafeGetProperty(_qType, mc.MethodName);
-            if (mc.Args.Count=0) and (_pi5<>nil) and (_pi5.GetGetMethod<>nil) then
-              aIL.Emit(OpCodes.Callvirt, _pi5.GetGetMethod)
+            if _qType.IsValueType then
+            begin
+              // [버그 수정] 필드가 값 타입(예: fLine: integer)이면 Ldfld로 올라온 원시값 위에
+              // 곧장 Callvirt하면 안 된다 — Box 후 System.Object 기준으로 메서드를 찾는다.
+              aIL.Emit(OpCodes.Box, _qType);
+              var _objType5:=typeof(System.Object);
+              var _emi5b:=ResolveMethodByArity(_objType5, mc.MethodName, mc.Args, false);
+              if _emi5b=nil then
+                raise new Exception('System.Object에 메서드 "'+mc.MethodName+'"가 없습니다 (값 타입 필드 Box 후 경로: '+mc.ObjName+'.'+mc.MethodName+')');
+              var _emi5bParams:=_emi5b.GetParameters;
+              for var _emi5bAi:=0 to mc.Args.Count-1 do
+                EmitArgForParamType(aIL, mc.Args[_emi5bAi], _emi5bParams[_emi5bAi].ParameterType);
+              aIL.Emit(OpCodes.Callvirt, _emi5b);
+            end
             else
             begin
-              var _emi5:=ResolveMethodByArity(_qType, mc.MethodName, mc.Args, false);
-              if _emi5=nil then
-                raise new Exception('타입 "'+_qType.FullName+'"에 메서드 "'+mc.MethodName+'"가 없습니다 (인자 '+mc.Args.Count.ToString+'개, 경로: '+mc.ObjName+'.'+mc.MethodName+').');
-              var _emi5Params:=_emi5.GetParameters;
-              for var _emi5Ai:=0 to mc.Args.Count-1 do
-                EmitArgForParamType(aIL, mc.Args[_emi5Ai], _emi5Params[_emi5Ai].ParameterType);
-              aIL.Emit(OpCodes.Callvirt, _emi5);
+              var _pi5:=SafeGetProperty(_qType, mc.MethodName);   // ToString은 프로퍼티가 아니므로 nil
+              if (mc.Args.Count=0) and (_pi5<>nil) and (_pi5.GetGetMethod<>nil) then
+                aIL.Emit(OpCodes.Callvirt, _pi5.GetGetMethod)
+              else
+              begin
+                var _emi5:=ResolveMethodByArity(_qType, mc.MethodName, mc.Args, false); // Int32.ToString() 찾음
+                if _emi5=nil then
+                  raise new Exception('타입 "'+_qType.FullName+'"에 메서드 "'+mc.MethodName+'"가 없습니다 (인자 '+mc.Args.Count.ToString+'개, 경로: '+mc.ObjName+'.'+mc.MethodName+').');
+                var _emi5Params:=_emi5.GetParameters;
+                for var _emi5Ai:=0 to mc.Args.Count-1 do
+                  EmitArgForParamType(aIL, mc.Args[_emi5Ai], _emi5Params[_emi5Ai].ParameterType);
+                aIL.Emit(OpCodes.Callvirt, _emi5);
+              end;
             end;
           end;
         end
