@@ -2245,7 +2245,10 @@
         else if e is TRealLiteralNode then Result:=typeof(double)
         else if e is TInt64LiteralNode then Result:=typeof(int64)
         else if e is TBoolLiteralNode then Result:=typeof(boolean)
-        else if e is TCharLiteralNode then Result:=typeof(char);
+        else if e is TCharLiteralNode then Result:=typeof(char)
+        else if e is TLengthExprNode then Result:=typeof(integer)   // ← 추가: Length(x).Method 체이닝 시 필요
+        else if e is TIntToStrNode then Result:=typeof(string)      // ← 추가: 
+        else if e is TBoolToStrNode then Result:=typeof(string);    // ← 추가: 
       except
         Result:=typeof(System.Object); // 실패하면 안전한 폴백(멤버를 못 찾으면 호출부가 명확한 예외를 던짐)
       end;
@@ -2385,6 +2388,40 @@
       if paramType.IsArray and not (argExpr is TArrayLiteralExprNode) then
       begin
         var _argClrT48s:=InferArgClrType(argExpr);
+        // [Stage 110 진단] EmitArgForParamType이 목표 타입=배열인데 인자 식의 실제 CLR
+        // 타입을 어떻게 추론했는지 컴파일 시점(self-compile 중 Lexer.pas를 컴파일하는
+        // 단계)에 그대로 콘솔에 찍는다. _argClrT48s가 NIL이거나 목표 타입과 다르면
+        // 바로 아래 "1개짜리 배열로 감싸기" 분기가 실행돼 손상된 IL이 나온다 — 어느 쪽인지
+        // 여기서 직접 확인한다. 확인 후엔 이 블록 전체를 지워도 된다.
+        if argExpr is TMethodCallExprNode then
+        begin
+          var _diagMc110:=TMethodCallExprNode(argExpr);
+          var _diagTypeName110: string;
+          if _argClrT48s=nil then _diagTypeName110:='NIL' else _diagTypeName110:=_argClrT48s.FullName;
+          Writeln('[진단-EAFPT] 메서드호출 인자: ObjName="' + _diagMc110.ObjName + '", MethodName="' +
+            _diagMc110.MethodName + '", 목표paramType=' + paramType.FullName + ', 추론된_argClrT48s=' +
+            _diagTypeName110);
+        end;
+        // [자기컴파일 버그 수정 - 배열 유형 불일치 안전장치] 인자의 추론된 CLR 타입이
+        // 이미 배열(예: string.ToCharArray()가 돌려주는 char[])인데 목표 매개변수/필드
+        // 타입과 원소 타입이 어긋나면(예: 필드가 실제로는 다른 원소 타입의 배열로 잘못
+        // 만들어진 경우), 예전 코드는 이 경우를 "배열이 아니라 스칼라 값 하나"로 오인해
+        // 1개짜리 배열에 억지로 감싸는 코드로 빠졌다 — 실제로는 배열 참조(포인터)인 값을
+        // 스칼라 원소값인 것처럼 Stelem으로 밀어넣어 검증 불가능한(unverifiable) IL이
+        // 됐고, 실행 시 필드가 손상된 배열로 채워져 그 필드를 다시 읽는 시점에 엉뚱한
+        // NullReferenceException/AccessViolationException으로 이어졌다 (실제 재현:
+        // TLexer.Create의 "fChars:=src.ToCharArray" — fChars 필드의 실제 CLR 타입이
+        // char[]가 아니게 잘못 만들어졌던 게 근본 원인). 그 근본 원인이 무엇이든, 여기서
+        // 미리 막아 손상된 IL 대신 명확한 컴파일 타임 예외로 원인을 즉시 드러낸다.
+        if (_argClrT48s<>nil) and _argClrT48s.IsArray and (not paramType.IsAssignableFrom(_argClrT48s)) then
+        begin
+          var _mismatchDesc48s:='(식 종류: '+argExpr.GetType.Name+')';
+          if argExpr is TMethodCallExprNode then
+            _mismatchDesc48s:='"'+TMethodCallExprNode(argExpr).ObjName+'.'+TMethodCallExprNode(argExpr).MethodName+'(...)"';
+          raise new Exception('[내부 오류] 배열 타입 불일치: 대상 타입 "'+paramType.FullName
+            +'"에 실제 배열 타입 "'+_argClrT48s.FullName+'"을(를) 대입할 수 없습니다 (원소 타입이 다름). '
+            +'식: '+_mismatchDesc48s+'. 필드/매개변수 선언에서 배열 원소 타입 해석(ClassName/VTC)을 확인하세요.');
+        end;
         if (_argClrT48s=nil) or (not paramType.IsAssignableFrom(_argClrT48s)) then
         begin
           var _elemT48s:=paramType.GetElementType;
@@ -2533,6 +2570,15 @@
     // 필드 선언의 실제 CLR 타입을 결정한다 (기본 타입/지역 클래스/외부 타입 모두 포함)
     function ResolveFieldClrType(fd: TFieldDeclNode): System.Type;
     begin
+      // [진단] "array of char/real/int64/object" 같은 클래스 필드는 VTC(vtGenericArray/
+      // vtObjArray, cn)가 원소 타입 이름(cn)을 알아야 정확한 배열 타입(예: char[])을
+      // 만든다. cn이 비어 있으면 VTC는 조용히 int32[]/object[]로 폴백한다 — 이게 바로
+      // "fChars: array of char" 필드가 char[]가 아니라 다른 배열로 잘못 만들어져
+      // "fChars:=src.ToCharArray"에서 손상된 IL로 이어졌던 유력한 원인이다. Parser 쪽
+      // 필드 선언 파싱에서 원소 타입 이름을 못 채워주는 경로가 남아있는지 바로 눈에
+      // 보이도록 경고를 남긴다(원인 확인 후 이 블록은 지워도 된다).
+      if ((fd.FieldType=vtGenericArray) or (fd.FieldType=vtObjArray)) and (fd.ClassName='') then
+        Writeln('[진단-경고] 필드 "'+fd.Name+'"이(가) 배열 타입인데 원소 타입 이름(ClassName)이 비어 있습니다 — VTC가 int32[]/object[]로 잘못 폴백할 수 있습니다.');
       if (fd.FieldType=vtObject) and fd.IsExternalType then
         Result:=ResolveExternalType(fd.ClassName)
       else

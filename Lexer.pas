@@ -314,8 +314,12 @@ type
     begin
       Writeln('[MARK-A] TLexer.Create 진입, src.Length=' + src.Length.ToString);
       Writeln('[MARK-A0] fChars:=src.ToCharArray 직전 (원본 코드와 동일하게 한 줄로 복원)');
+      Writeln('test--001--');
       fChars:=src.ToCharArray;
-      Writeln('[MARK-A1] fChars:=src.ToCharArray 완료, Length(fChars)=' + Length(fChars).ToString);
+      Writeln('test--002--');
+      Writeln('[MARK-A1] fChars:=src.ToCharArray 완료, Length(fChars)=' + Length(fChars).ToString); // 2차 컴파일에서는 제일처음은 여기서 튕기는게 맞음.
+      //Writeln('[MARK-A1] fChars:=src.ToCharArray 완료, Length(fChars)=' ); 
+      Writeln('test--003--');
       fPos:=0;
       Writeln('[MARK-A2] fPos:=0 완료');
       fLine:=1;

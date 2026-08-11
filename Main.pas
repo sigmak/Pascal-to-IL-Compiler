@@ -1106,6 +1106,42 @@ begin
       codegen.GenerateExe(outputName);
       Writeln('[4/4] 코드생성 완료: ' + outputName + ' 생성됨');
 
+      // [진단 2026.08-2] 방금 만든 어셈블리를 다시 로드해서 TLexer.fChars의 실제 CLR
+      // 타입을 즉시 확인한다 — 타입 불일치 가설을 정적 분석 대신 실측으로 확정한다.
+      try
+        var _diagAsmPath := System.IO.Path.GetFullPath(outputName);
+        var _diagAsm := System.Reflection.Assembly.LoadFrom(_diagAsmPath);
+        var _diagLexerType := _diagAsm.GetType('TLexer');
+        if _diagLexerType = nil then
+          Writeln('[진단-필드타입] TLexer 타입을 어셈블리에서 찾지 못했습니다.')
+        else
+        begin
+          var _diagField := _diagLexerType.GetField('fChars',
+            System.Reflection.BindingFlags.Public or System.Reflection.BindingFlags.NonPublic
+            or System.Reflection.BindingFlags.Instance);
+          if _diagField = nil then
+            Writeln('[진단-필드타입] TLexer에서 fChars 필드를 찾지 못했습니다.')
+          else
+            Writeln('[진단-필드타입] TLexer.fChars 실제 CLR 타입 = ' + _diagField.FieldType.FullName);
+
+          // [추가] 생성자(Create) 시그니처와 IL 본문 크기도 함께 — 시그니처가 예상과
+          // 다르면(예: string이 아닌 다른 타입) 여기서도 바로 드러난다.
+          var _diagCtors := _diagLexerType.GetConstructors(
+            System.Reflection.BindingFlags.Public or System.Reflection.BindingFlags.Instance);
+          foreach var _dc in _diagCtors do
+          begin
+            var _dcParams := _dc.GetParameters;
+            var _dcParamDesc := '';
+            foreach var _dp in _dcParams do
+              _dcParamDesc := _dcParamDesc + _dp.ParameterType.FullName + ' ' + _dp.Name + ', ';
+            Writeln('[진단-생성자] TLexer.Create(' + _dcParamDesc + ')');
+          end;
+        end;
+      except
+        on E2: Exception do
+          Writeln('[진단-필드타입] 검사 실패: ' + E2.GetType.FullName + ' - ' + E2.Message);
+      end;
+
       Writeln;
       Writeln('=====================================================');
       Writeln('성공! "' + outputName + '" 이 생성되었습니다.');
