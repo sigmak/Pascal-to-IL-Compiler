@@ -4319,7 +4319,10 @@
         var cctorMB: MethodBuilder := mainTB.DefineMethod('.cctor',
           MethodAttributes.Private or MethodAttributes.Static or
           MethodAttributes.HideBySig or MethodAttributes.SpecialName or MethodAttributes.RTSpecialName,
-          typeof(System.Void), nil);
+          // [Stage 111 버그 수정] .NET Framework에서는 nil(=null)을 "매개변수 없음"으로 관대하게
+          // 받아줬지만, 이 프로젝트가 돌아가는 .NET(Core/5+)의 TypeBuilder.DefineMethod는 null을
+          // 그대로 거부하고 ArgumentNullException(parameterTypes)을 던진다 — 빈 배열을 명시해야 한다.
+          typeof(System.Void), System.Type.EmptyTypes);
         var cctorIL: ILGenerator := cctorMB.GetILGenerator;
         // 각 const를 static 필드로 선언하고 cctor에서 초기화한다.
         var savedLocalScope96: TScope := fLocalScope;
@@ -4477,7 +4480,8 @@
       begin
         mm:=mainTB.DefineMethod('Main',
           MethodAttributes.Public or MethodAttributes.Static,
-          typeof(System.Void), nil);
+          // [Stage 111 버그 수정] 위 .cctor와 동일한 이유 — nil 대신 빈 배열을 명시한다.
+          typeof(System.Void), System.Type.EmptyTypes);
         // WinForm/WPF의 Application.Run 등 STA(단일 스레드 아파트먼트)가 필요한 호출을
         // 위해 항상 [STAThread]를 붙여둔다 (콘솔/일반 프로그램에는 영향 없음).
         mm.SetCustomAttribute(new CustomAttributeBuilder(
