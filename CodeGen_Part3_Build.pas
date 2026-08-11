@@ -4478,14 +4478,62 @@
       end
       else
       begin
-        mm:=mainTB.DefineMethod('Main',
-          MethodAttributes.Public or MethodAttributes.Static,
-          // [Stage 111 버그 수정] 위 .cctor와 동일한 이유 — nil 대신 빈 배열을 명시한다.
-          typeof(System.Void), System.Type.EmptyTypes);
+        // [진단] self-host gen1에서 GenerateExe 안 ArrayTypeMismatchException 위치를
+        // 좁히기 위한 패치. "System.Type.EmptyTypes"를 함수 호출 인자 자리에 바로
+        // 인라인으로 넣던 것을, 지역변수로 분리하고 각 단계를 개별 try/except +
+        // LogGenStep으로 감싸서 정확히 어느 줄에서 터지는지 다음 self-compile
+        // 로그에서 바로 드러나게 한다. (기존 STAThread try/except와 동일한 패턴)
+        var mainParamTypes: array of System.Type;
+        try
+          mainParamTypes:=System.Type.EmptyTypes;
+          LogGenStep('6단계 진행 — mainParamTypes:=System.Type.EmptyTypes 완료, Length='
+            +mainParamTypes.Length.ToString);
+        except
+          on E6p: Exception do
+          begin
+            LogGenStep('실패 — mainParamTypes(System.Type.EmptyTypes) 초기화 중: '
+              +E6p.GetType.FullName+': '+E6p.Message);
+            raise;
+          end;
+        end;
+        
+        try
+          mm:=mainTB.DefineMethod('Main',
+            MethodAttributes.Public or MethodAttributes.Static,
+            // [Stage 111 버그 수정] 위 .cctor와 동일한 이유 — nil 대신 빈 배열을 명시한다.
+            typeof(System.Void), mainParamTypes);
+          LogGenStep('6단계 진행 — mainTB.DefineMethod(Main) 완료');
+        except
+          on E6d: Exception do
+          begin
+            LogGenStep('실패 — mainTB.DefineMethod(Main) 중: '
+              +E6d.GetType.FullName+': '+E6d.Message);
+            raise;
+          end;
+        end;
+        
         // WinForm/WPF의 Application.Run 등 STA(단일 스레드 아파트먼트)가 필요한 호출을
         // 위해 항상 [STAThread]를 붙여둔다 (콘솔/일반 프로그램에는 영향 없음).
-        mm.SetCustomAttribute(new CustomAttributeBuilder(
-          typeof(System.STAThreadAttribute).GetConstructor(System.Type.EmptyTypes), []));
+        // [진단] STAThread 커스텀 속성 부여 — ArrayTypeMismatchException 등 진단을 위해
+        // 개별 try/except로 감싸서 정확히 이 지점에서 터지는지 확인한다. 여기서도
+        // System.Type.EmptyTypes와 빈 args 배열([])을 지역변수로 분리해 동일하게 진단한다.
+        var staCtorParamTypes: array of System.Type;
+        var staCtorArgs: array of System.Object;
+        try
+          staCtorParamTypes:=System.Type.EmptyTypes;
+          staCtorArgs:=new System.Object[0];
+          LogGenStep('6단계 진행 — STA 생성자 파라미터/인자 배열 준비 완료');
+          mm.SetCustomAttribute(new CustomAttributeBuilder(
+            typeof(System.STAThreadAttribute).GetConstructor(staCtorParamTypes), staCtorArgs));
+        except
+          on E6a: Exception do
+          begin
+            LogGenStep('실패 — STAThread 커스텀 속성 부여 중: '+E6a.GetType.FullName+': '+E6a.Message);
+            raise;
+          end;
+        end;
+        LogGenStep('6단계 진행 — STAThread 속성 부여 완료');
+
         il:=mm.GetILGenerator;
 
         foreach vd in fProg.VarDecls do
@@ -4539,12 +4587,29 @@
           if (vd.VarType=vtMatrix) and (vd.ClassName<>'') then
             fGlobalScope.SetClassName(vd.Name, vd.ClassName);
         end;
+        LogGenStep('6단계 진행 — 전역 var 루프 완료 ('+fProg.VarDecls.Count.ToString+'개)');
 
         // [Stage 96] 전역 const는 cctor(Program 타입의 정적 생성자)에서 static 필드로
         // 초기화된다 — Main보다 먼저 실행되고 모든 함수에서 Ldsfld로 읽을 수 있다.
         // 예전의 EmitConstDecl(Main 전용 로컬 슬롯) 루프는 제거한다.
 
-        foreach st in fProg.Statements do EmitStatement(il, st);
+        // [진단] 최상위 begin...end 문장을 하나씩 이미트하며, 몇 번째 문장에서
+        // 어떤 예외 타입이 나는지 정확히 찍는다 (ArrayTypeMismatchException 등).
+        for var stIdx6:=0 to fProg.Statements.Count-1 do
+        begin
+          try
+            EmitStatement(il, fProg.Statements[stIdx6]);
+          except
+            on E6b: Exception do
+            begin
+              LogGenStep('실패 — 최상위 문장 #'+stIdx6.ToString+' ('
+                +fProg.Statements[stIdx6].GetType.Name+') 이미트 중: '
+                +E6b.GetType.FullName+': '+E6b.Message);
+              raise;
+            end;
+          end;
+        end;
+        LogGenStep('6단계 진행 — 최상위 문장 이미트 완료 ('+fProg.Statements.Count.ToString+'개)');
 
         // [Stage 69] windows 앱(예: WinForms)은 콘솔이 아예 없거나(콘솔창 자체를 안 만드는 경우)
         // Application.Run이 이미 사용자 입력을 다 처리했으므로, 여기서 ReadKey로 다시
@@ -4555,18 +4620,48 @@
           il.Emit(OpCodes.Call, rk); il.Emit(OpCodes.Pop);
         end;
         il.Emit(OpCodes.Ret);
+        LogGenStep('6단계 완료 — Main 메서드 IL 생성 완료');
       end;
 
-      mainTB.CreateType;
+      try
+        mainTB.CreateType;
+      except
+        on E7: Exception do
+        begin
+          LogGenStep('실패 — Program(mainTB) CreateType 중: '+E7.GetType.FullName+': '+E7.Message);
+          raise;
+        end;
+      end;
+      LogGenStep('7단계 — Program(mainTB) CreateType 완료');
+
       if not fProg.IsLibrary then
       begin
         // [Stage 69] {$apptype windows}면 WindowApplication으로 저장 — PE 서브시스템이
         // GUI로 표시되어 탐색기에서 실행해도 콘솔(도스) 창이 뜨지 않는다.
         // 지시문이 없으면(기본값 'console') 기존과 동일하게 콘솔 앱으로 생성한다.
-        if fProg.AppType='windows' then
-          ab.SetEntryPoint(mm, PEFileKinds.WindowApplication)
-        else
-          ab.SetEntryPoint(mm, PEFileKinds.ConsoleApplication);
+        try
+          if fProg.AppType='windows' then
+            ab.SetEntryPoint(mm, PEFileKinds.WindowApplication)
+          else
+            ab.SetEntryPoint(mm, PEFileKinds.ConsoleApplication);
+        except
+          on E8: Exception do
+          begin
+            LogGenStep('실패 — SetEntryPoint 중: '+E8.GetType.FullName+': '+E8.Message);
+            raise;
+          end;
+        end;
       end;
-      ab.Save(outName);
+      LogGenStep('8단계 — SetEntryPoint 완료');
+
+      try
+        ab.Save(outName);
+      except
+        on E9: Exception do
+        begin
+          LogGenStep('실패 — ab.Save("'+outName+'") 중: '+E9.GetType.FullName+': '+E9.Message);
+          raise;
+        end;
+      end;
+      LogGenStep('9단계 — ab.Save 완료: '+outName);
     end;

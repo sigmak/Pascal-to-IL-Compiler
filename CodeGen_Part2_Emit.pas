@@ -2607,7 +2607,16 @@
             fLocalScope.SetClassName(ivs.VarName, ivClassName)
           else
             fLocalScope.SetClrType(ivs.VarName, ivClrType);
-        end;
+        end
+        // [버그 수정] array of <외부 타입>(vtObjArray)/array of char·real·int64 등(vtGenericArray)으로
+        // 명시적 타입 선언된 인라인 var("var mainParamTypes: array of System.Type;")는 위 분기가
+        // vtObject/vtInterface만 걸러 SetClrType이 전혀 호출되지 않았다 — impl.LocalVars 등록
+        // 루프(생성자/메서드/이터레이터/전역함수/전역프로시저 5곳)에 이미 적용한 것과 동일한
+        // 이유로, 여기서도 등록이 빠지면 IsChainStartSegment가 이 변수를 체인 시작점으로
+        // 인식 못해 "mainParamTypes.Length" 전체를 외부 정적 타입 이름으로 오인해 실패한다
+        // (self-compile 중 TCodeGenerator.GenerateExe 자신의 소스에서 실제로 재현됨).
+        else if (ivVt=vtObjArray) or (ivVt=vtGenericArray) then
+          fLocalScope.SetClrType(ivs.VarName, ivClrType);
         // [자기컴파일] "var x: Type;" (초기화식 없음)이면 대입을 생략한다 — CLR 로컬은
         // 기본적으로 0/false/nil로 초기화되므로(.locals init) Pascal의 "선언만" 의미와 일치한다.
         if ivs.ValueExpr<>nil then
