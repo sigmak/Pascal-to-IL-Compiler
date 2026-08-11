@@ -2054,7 +2054,7 @@ type
         except
           on ex: Exception do
           begin
-            ParseErrors.Add(ex.Message);
+            ParseErrors.Add('[ParseStatementsUntilEnd] '+ex.ToString());
             // 무한루프 방지: 문장 파싱이 토큰을 하나도 전진시키지 못했다면 최소 한 개는 건너뛴다.
             if fPos=stmtStartPos then fPos:=fPos+1;
             // 다음 동기화 지점(';' 또는 'end' 또는 파일 끝)까지 건너뛴다.
@@ -2092,7 +2092,7 @@ type
         except
           on ex: Exception do
           begin
-            ParseErrors.Add(ex.Message);
+            ParseErrors.Add('[ParseStatementsUntilRepeat] '+ex.ToString());
             if fPos=stmtStartPos then fPos:=fPos+1;
             syncDepth:=0;
             while Cur.Kind<>tkEOF do
@@ -2908,7 +2908,7 @@ type
           except
             on exCase: Exception do
             begin
-              ParseErrors.Add(exCase.Message);
+              ParseErrors.Add('[ParseStatement-Case] '+exCase.ToString());
               if fPos=caseBranchStart then fPos:=fPos+1;
               // 다음 동기화 지점(';' 또는 'else' 또는 'end')까지 건너뜀.
               // 중첩된 begin/try/case의 안쪽 'end'를 이 case 자신의 끝으로 착각하지 않도록 깊이 추적.
@@ -2983,7 +2983,7 @@ type
           except
             on ex2: Exception do
             begin
-              ParseErrors.Add(ex2.Message);
+              ParseErrors.Add('[ParseStatement-TryBody] '+ex2.ToString());
               if fPos=tryBodyStart then fPos:=fPos+1;
               while (Cur.Kind<>tkSemicolon) and (Cur.Kind<>tkExcept) and
                     (Cur.Kind<>tkFinally) and (Cur.Kind<>tkEnd) and (Cur.Kind<>tkEOF) do
@@ -3023,7 +3023,7 @@ type
               except
                 on ex3: Exception do
                 begin
-                  ParseErrors.Add(ex3.Message);
+                  ParseErrors.Add('[ParseStatement-BareExcept] '+ex3.ToString());
                   if fPos=bareExStart then fPos:=fPos+1;
                   while (Cur.Kind<>tkSemicolon) and (Cur.Kind<>tkEnd) and
                         (Cur.Kind<>tkFinally) and (Cur.Kind<>tkEOF) do
@@ -3047,7 +3047,7 @@ type
               except
                 on ex4: Exception do
                 begin
-                  ParseErrors.Add(ex4.Message);
+                  ParseErrors.Add('[ParseStatement-Finally1] '+ex4.ToString());
                   if fPos=fin1Start then fPos:=fPos+1;
                   while (Cur.Kind<>tkSemicolon) and (Cur.Kind<>tkEnd) and (Cur.Kind<>tkEOF) do
                     fPos:=fPos+1;
@@ -3071,7 +3071,7 @@ type
             except
               on ex5: Exception do
               begin
-                ParseErrors.Add(ex5.Message);
+                ParseErrors.Add('[ParseStatement-Finally2] '+ex5.ToString());
                 if fPos=fin2Start then fPos:=fPos+1;
                 while (Cur.Kind<>tkSemicolon) and (Cur.Kind<>tkEnd) and (Cur.Kind<>tkEOF) do
                   fPos:=fPos+1;
@@ -3285,7 +3285,7 @@ type
             except
               on ex: Exception do
               begin
-                ParseErrors.Add(ex.Message);
+                ParseErrors.Add('[ParseTypeSection-Member] '+ex.ToString());
                 SkipToMemberBoundary;
               end;
             end;
@@ -3938,7 +3938,7 @@ type
             except
               on ex: Exception do
               begin
-                ParseErrors.Add(ex.Message);
+                ParseErrors.Add('[ParseTypeSection-MemberBoundary] '+ex.ToString());
                 if fPos=memberStartPos then fPos:=fPos+1;
                 SkipToMemberBoundary;
               end;
@@ -3953,7 +3953,7 @@ type
         except
           on ex: Exception do
           begin
-            ParseErrors.Add(ex.Message);
+            ParseErrors.Add('[ParseTypeSection-Outer] '+ex.ToString());
             // 무한루프 방지: 최소 한 토큰은 전진.
             if fPos=typeDeclStartPos then fPos:=fPos+1;
             // [버그 수정] 예전 정지 토큰 집합(tkSemicolon/tkVar/tkConst/tkFunction/tkProcedure/
@@ -4670,7 +4670,7 @@ type
         except
           on ex: Exception do
           begin
-            ParseErrors.Add(ex.Message);
+            ParseErrors.Add('[ParseVarSection] '+ex.ToString());
             if fPos=varDeclStartPos then fPos:=fPos+1;
             while (Cur.Kind<>tkSemicolon) and (Cur.Kind<>tkBegin) and (Cur.Kind<>tkFunction)
               and (Cur.Kind<>tkProcedure) and (Cur.Kind<>tkConst) and (Cur.Kind<>tkEOF)
@@ -4714,7 +4714,7 @@ type
         except
           on ex: Exception do
           begin
-            ParseErrors.Add(ex.Message);
+            ParseErrors.Add('[ParseConstSection] '+ex.ToString());
             if fPos=constDeclStartPos then fPos:=fPos+1;
             while (Cur.Kind<>tkSemicolon) and (Cur.Kind<>tkBegin) and (Cur.Kind<>tkFunction)
               and (Cur.Kind<>tkProcedure) and (Cur.Kind<>tkVar) and (Cur.Kind<>tkEOF) do
@@ -5034,7 +5034,7 @@ type
         except
           on ex: Exception do
           begin
-            ParseErrors.Add(ex.Message);
+            ParseErrors.Add('[ParseProgram-Impl] '+ex.ToString());
             if fPos=implStartPos then fPos:=fPos+1;
             // 다음 안전 지점: 새 함수/프로시저/생성자 선언, var 섹션, 또는 메인 begin.
             // [주의] 깨진 선언 자신의 begin...end 본문을 통째로 건너뛰어야 한다 — 그렇지 않으면
