@@ -1090,376 +1090,16 @@ type
 
     // ---- 식 파싱 (ParsePrimary 안에서는 ParseAddSub만 호출) ----
 
-    function ParsePrimary: TExprNode;
-    var t: TToken; inner, argE, idxE: TExprNode;
+    // [Stage 111 리팩터] ParsePrimary가 self-compile 시 System.BadImageFormatException으로
+    // 로드 자체가 안 되는 문제(메서드가 너무 크고 분기가 많아 self-compile 코드생성기가 통째로
+    // 손상된 IL을 만드는 것으로 추정)를 완화하기 위해, 가장 큰 단일 분기(tkIdent 식별자 처리,
+    // 원래 ParsePrimary 안에 400줄 가까이 인라인되어 있던 부분)를 별도 함수로 분리했다.
+    // 로직은 원본과 완전히 동일하다(t 매개변수만 추가).
+    function ParsePrimaryIdent(t: TToken): TExprNode;
+    var inner, argE, idxE: TExprNode;
         cn: TFuncCallExprNode; mc: TMethodCallExprNode;
         extCastFull93: string;
     begin
-      t:=Cur;
-
-      // [버그 수정] 단항 마이너스(-x). 예전에는 이 분기 자체가 없어서 i := -7; 처럼 식
-      // 맨 앞에 오는 '-'는 무조건 "식이 와야 하는데 -" 파싱 에러였다(이항 뺄셈은
-      // ParseAddSub에 있었지만, 단항으로 쓰는 경우는 아무도 처리하지 않았음). 0-피연산자로
-      // 접어(fold) 기존 TBinOpNode(boSub)를 그대로 재사용한다 — integer/real 승격 등
-      // 기존 이항 뺄셈의 타입 처리 전부를 공짜로 물려받는다. 가장 강하게 묶이도록(즉
-      // -x*y가 (-x)*y가 되도록) 피연산자는 재귀적으로 ParsePrimary 하나만 소비한다.
-      if t.Kind=tkMinus then
-      begin
-        fPos:=fPos+1; // '-' 소비
-        Result:=new TBinOpNode(boSub, new TIntLiteralNode(0), ParsePrimary);
-      end
-
-      // [Stage 91] typeof(TypeName) — .NET typeof 연산자. System.Type 값을 만든다(주로
-      // GetCustomAttributes(Type, bool) 같은 리플렉션 API 인자로 쓰인다). 괄호 안이 "값 식"이
-      // 아니라 "타입 이름"이라 일반 ParseExpr로는 못 다룬다(변수/필드가 아니므로) — 그래서
-      // 등록 안 된 평범한 식별자로 오인되어 typeof만 홀로 소비되고 뒤의 "(...)"가 그대로
-      // 남아 "예상 tkRParen 실제 tkLParen" 에러로 이어졌다. 일반 tkIdent 분기보다 먼저 검사.
-      else if (t.Kind=tkIdent) and (t.Text.ToLower='typeof') and (PeekAt(1).Kind=tkLParen) then
-      begin
-        fPos:=fPos+2; // 'typeof' '(' 소비
-        // [자기컴파일] typeof(string)/typeof(boolean)/typeof(integer) 처럼
-        // 괄호 안에 키워드 타입이 오는 경우 — Expect(tkIdent)는 키워드 토큰을 거부한다.
-        var toName: string;
-        if Cur.Kind=tkStringType then begin toName:='string'; fPos:=fPos+1; end
-        else if Cur.Kind=tkBoolean then begin toName:='boolean'; fPos:=fPos+1; end
-        else if Cur.Kind=tkInteger then begin toName:='integer'; fPos:=fPos+1; end
-        else if (Cur.Kind=tkReal) or (Cur.Kind=tkDouble) then begin toName:='double'; fPos:=fPos+1; end
-        else if Cur.Kind=tkChar then begin toName:='char'; fPos:=fPos+1; end
-        else if Cur.Kind=tkInt64 then begin toName:='int64'; fPos:=fPos+1; end
-        else
-        begin
-          toName:=Expect(tkIdent).Text;
-          while Cur.Kind=tkDot do begin fPos:=fPos+1; toName:=toName+'.'+ExpectQualNamePart; end;
-          // [자기컴파일 버그 수정] typeof(System.Collections.Generic.KeyValuePair<System.Object,System.Object>)
-          // 처럼 typeof 안의 타입 이름이 외부 제네릭 타입일 수 있다 — 예전에는 점(.) 체이닝만
-          // 처리하고 바로 Expect(tkRParen)으로 넘어가서, 뒤따르는 '<'가 "예상 tkRParen 실제
-          // tkLt"로 튕겨나갔다. ParseExternalGenericType/ParseExternalGenericTypeArg(위에서
-          // Dictionary<string,T> 같은 필드/매개변수 타입에 이미 쓰이는 것과 동일한 로직)를
-          // 재사용해 "Base<Arg1,Arg2>" 형태의 문자열로 완성한다 — CodeGen의 ResolveExternalType이
-          // 이미 이 표기를 인식해 재귀적으로 CLR 타입을 조립한다(ResolveExternalGenericType).
-          if Cur.Kind=tkLt then toName:=ParseExternalGenericType(toName);
-        end;
-        Expect(tkRParen);
-        Result:=new TTypeOfExprNode(toName);
-      end
-
-      else if t.Kind=tkIntLiteral then
-      begin
-        fPos:=fPos+1;
-        // [Phase 1] int32 범위(2^31-1 = 2147483647) 초과 시 int64로 자동 승격
-        var _iv: int64 := int64.Parse(t.Text);
-        if (_iv >= -2147483648) and (_iv <= 2147483647) then
-          Result:=new TIntLiteralNode(integer(_iv))
-        else
-          Result:=new TInt64LiteralNode(_iv);
-      end
-
-      // [Phase 1] 실수 리터럴
-      else if t.Kind=tkRealLiteral then
-        begin fPos:=fPos+1; Result:=new TRealLiteralNode(t.RealValue); end
-
-      // [Phase 1] 문자 리터럴 (#65 또는 'A')
-      // [Stage 95 버그 수정] 실제 Delphi/Object Pascal은 문자열·문자 리터럴을 연산자(+) 없이
-      // 그냥 나란히 적으면(예: 'abc'#10'def', '건 발견:'#10) 컴파일 타임에 하나의 문자열
-      // 상수로 암시적으로 이어붙인다(개행 등 제어문자를 문자열 리터럴 안에 끼워 넣는 매우 흔한
-      // 관용구). 이 파서는 그 규칙이 아예 없어서 '건 발견:'#10처럼 '+' 없이 문자 리터럴이
-      // 바로 뒤따르면 리터럴 하나만 소비하고 멈춰버렸고, 그 뒤(#10)는 여전히 인자 목록 안에
-      // 남아 있어 상위 호출부가 ')'를 기대하다 tkCharLiteral을 만나 "예상 tkRParen 실제
-      // tkCharLiteral" 파싱 오류로 이어졌다. 문자열/문자 리터럴 뒤에 또 문자열/문자 리터럴이
-      // 연산자 없이 바로 이어지면(원본 문법의 "겹치는 상수" 규칙) 전부 하나의 문자열로
-      // 접어(fold) TStrLiteralNode 하나로 만든다.
-      else if t.Kind=tkCharLiteral then
-      begin
-        fPos:=fPos+1;
-        if (Cur.Kind=tkString) or (Cur.Kind=tkCharLiteral) then
-        begin
-          var sb95:=new System.Text.StringBuilder;
-          sb95.Append(t.CharValue);
-          while (Cur.Kind=tkString) or (Cur.Kind=tkCharLiteral) do
-          begin
-            if Cur.Kind=tkString then sb95.Append(Cur.Text) else sb95.Append(Cur.CharValue);
-            fPos:=fPos+1;
-          end;
-          Result:=new TStrLiteralNode(sb95.ToString);
-        end
-        else
-          Result:=new TCharLiteralNode(t.CharValue);
-      end
-
-      else if t.Kind=tkString then
-      begin
-        fPos:=fPos+1;
-        if (Cur.Kind=tkString) or (Cur.Kind=tkCharLiteral) then // [Stage 95]
-        begin
-          var sb95b:=new System.Text.StringBuilder;
-          sb95b.Append(t.Text);
-          while (Cur.Kind=tkString) or (Cur.Kind=tkCharLiteral) do
-          begin
-            if Cur.Kind=tkString then sb95b.Append(Cur.Text) else sb95b.Append(Cur.CharValue);
-            fPos:=fPos+1;
-          end;
-          Result:=new TStrLiteralNode(sb95b.ToString);
-        end
-        else
-          Result:=new TStrLiteralNode(t.Text);
-      end
-
-      else if t.Kind=tkResult then
-        begin fPos:=fPos+1; Result:=new TResultRefNode; end
-
-      else if t.Kind=tkTrue then
-        begin fPos:=fPos+1; Result:=new TBoolLiteralNode(true); end
-
-      else if t.Kind=tkFalse then
-        begin fPos:=fPos+1; Result:=new TBoolLiteralNode(false); end
-
-      else if t.Kind=tkNil then
-        begin fPos:=fPos+1; Result:=new TNilLiteralNode; end // [Stage 29]
-
-      // [Stage 63] 집합 리터럴: [Red, Blue] 또는 빈 집합 []. 원소는 열거형 멤버 이름만
-      // 지원한다(정수 범위 집합 등은 아직 지원하지 않음). 모든 원소가 같은 열거형에
-      // 속해야 하며, 여기서 곧바로 32비트 비트마스크 상수로 접어(fold) 둔다 — 런타임에는
-      // 그냥 정수 하나일 뿐이라 CodeGen은 Ldc_I4 한 번이면 된다.
-      // [Stage 96] [...] 리터럴 일반화: Stage 63은 "원소가 전부 열거형 멤버 이름"인 경우만
-      // 지원했다(예: [Red, Blue]). 하지만 리플렉션 API 인자([typeof(integer)]), 문자열 배열
-      // (['a','b']), 임의의 식([propClrType]) 등도 같은 대괄호 문법을 쓴다 — 예전에는
-      // 무조건 "Expect(tkIdent) + 열거형 멤버인지 확인"으로 파싱했기 때문에 이런 경우들이
-      // 전부 "집합 리터럴의 원소 ... 는 열거형 멤버가 아닙니다"로 실패했다.
-      // 이제는 원소를 일단 일반 식(ParseAddSub)으로 파싱한 뒤 사후 판별한다:
-      // - 모든 원소가 "같은 열거형"의 TEnumValueExprNode이면(빈 리스트 포함) 기존과 동일하게
-      //   비트마스크 TSetLiteralExprNode로 접는다 — 'in' 연산 등 기존 집합 의미론을 그대로 유지.
-      // - 하나라도 아니면 TArrayLiteralExprNode(임의 원소 배열)로 만든다 — 실제 CLR 배열
-      //   타입은 CodeGen이 문맥(기대 매개변수 타입/대입 대상 타입)을 보고 정한다.
-      else if t.Kind=tkLBracket then
-      begin
-        fPos:=fPos+1; // '[' 소비
-        var arrElems96:=new List<TExprNode>;
-        if Cur.Kind<>tkRBracket then
-        begin
-          arrElems96.Add(ParseAddSub);
-          while Cur.Kind=tkComma do begin fPos:=fPos+1; arrElems96.Add(ParseAddSub); end;
-        end;
-        Expect(tkRBracket);
-
-        var allEnum96:=true; var setEnumName96:=''; var setMask96:=0;
-        var elm96: TExprNode; var ev96: TEnumValueExprNode;
-        foreach elm96 in arrElems96 do
-        begin
-          if not (elm96 is TEnumValueExprNode) then begin allEnum96:=false; break; end;
-          ev96:=TEnumValueExprNode(elm96);
-          if (setEnumName96<>'') and (setEnumName96<>ev96.EnumName) then begin allEnum96:=false; break; end;
-          setEnumName96:=ev96.EnumName;
-          setMask96:=setMask96 or (1 shl ev96.Ordinal);
-        end;
-
-        if allEnum96 then
-          Result:=new TSetLiteralExprNode(setEnumName96, setMask96)
-        else
-        begin
-          var arrLit96:=new TArrayLiteralExprNode;
-          arrLit96.Elements.AddRange(arrElems96);
-          Result:=arrLit96;
-        end;
-      end
-
-      else if t.Kind=tkSelf then // [Stage 30]
-      begin
-        fPos:=fPos+1;
-        if Cur.Kind=tkDot then
-        begin
-          // self.Xxx / self.Xxx(...) → 기존 암시적 self 필드읽기/메서드호출(ObjName='')로 환원.
-          // (self가 필드/외부 상속 타입 어느 쪽이든 CodeGen이 이미 판별해준다.)
-          fPos:=fPos+1;
-          var selfMname:=ExpectMemberName; // [Stage 41] 키워드 속성명(Length 등) 허용
-          if Cur.Kind=tkLParen then
-          begin
-            mc:=new TMethodCallExprNode('', selfMname); fPos:=fPos+1;
-            if Cur.Kind<>tkRParen then
-            begin
-              mc.Args.Add(ParseExpr);
-              while Cur.Kind=tkComma do begin fPos:=fPos+1; mc.Args.Add(ParseExpr); end;
-            end;
-            Expect(tkRParen);
-            Result:=mc;
-          end
-          else
-            Result:=new TFieldReadExprNode(selfMname);
-        end
-        else
-          Result:=new TSelfExprNode; // self 자체를 값으로 사용 (예: 인자로 전달, as 캐스트 대상)
-      end
-
-      else if t.Kind=tkInherited then // [Stage 30] 식으로 쓰이는 inherited (예: Result := inherited GetValue();)
-      begin
-        fPos:=fPos+1;
-        var imnE:=Expect(tkIdent).Text;
-        var iceN:=new TInheritedCallExprNode(imnE);
-        if Cur.Kind=tkLParen then
-        begin
-          fPos:=fPos+1;
-          if Cur.Kind<>tkRParen then
-          begin
-            iceN.Args.Add(ParseExpr);
-            while Cur.Kind=tkComma do begin fPos:=fPos+1; iceN.Args.Add(ParseExpr); end;
-          end;
-          Expect(tkRParen);
-        end;
-        Result:=iceN;
-      end
-
-      // [Stage 40] new TypeName(args) — PascalABC.NET 스타일 객체 생성 구문.
-      // 기존 "TypeName.Create" 관용구와 별개로, 인자 있는 생성자 호출을 지원하기 위해 추가.
-      // TypeName은 로컬 클래스(제네릭 인스턴스화 포함)이거나 점(.)으로 연결된 외부 .NET 타입.
-      else if t.Kind=tkNew then
-      begin
-        fPos:=fPos+1; // 'new' 소비
-        // [Stage 96 수정] 'new string(ch, count)'처럼 내장 타입 키워드가 new 뒤에 오는 경우.
-        // Lexer는 'string'을 tkIdent가 아니라 tkStringType으로 토큰화하므로, 기존
-        // Expect(tkIdent) 하나만으로는 "예상 tkIdent 실제 tkStringType" 오류가 났다.
-        // System.String에는 new string(char, int)(문자를 count번 반복) 등 유용한 생성자가
-        // 있으므로 'string'을 외부 타입 이름으로 그대로 통과시킨다.
-        var newTn: string;
-        if Cur.Kind=tkStringType then begin newTn:='string'; fPos:=fPos+1; end
-        else newTn:=Expect(tkIdent).Text;
-        if (Cur.Kind=tkLt) and fGenericClassNames.Contains(newTn) then
-          newTn:=ResolveGenericInstantiation(newTn)
-        else if Cur.Kind=tkLt then // [Stage 86] new Dictionary<string, FileChangeWatcher> 같은 외부 제네릭 타입 생성
-          newTn:=ParseExternalGenericType(newTn);
-        while Cur.Kind=tkDot do begin fPos:=fPos+1; newTn:=newTn+'.'+ExpectQualNamePart; end;
-        // [Stage 96] 위 tkLt 검사는 점(.)으로 연결되기 전(예: "Dictionary<...>")만 잡았다.
-        // "new System.Collections.Generic.List<MethodInfo>()"처럼 여러 단계 점으로 연결된
-        // 이름 뒤에 오는 제네릭 인자는 점 소비 루프가 끝난 뒤에야 비로소 '<'를 만나므로,
-        // 여기서도 한 번 더 확인해야 한다 — 안 그러면 '<...>'가 소비되지 않고 그대로 남아
-        // 뒤에서 비교 연산자로 오인되어 "알 수 없는 문장 (\">\")" 등으로 실패한다.
-        if Cur.Kind=tkLt then newTn:=ParseExternalGenericType(newTn);
-        if fRecordNames.Contains(newTn) then // [Stage 62]
-          raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': 레코드 "'+newTn
-            +'"는 new로 생성할 수 없습니다 — 변수 선언만으로 이미 필드가 기본값(0/빈 문자열 등)으로 초기화됩니다');
-        var neoN:=new TNewObjectExprNode(newTn);
-        neoN.IsExternalType:=not fClassNames.Contains(newTn);
-        if Cur.Kind=tkLBracket then
-        begin
-          // [Stage 92] new Type[SizeExpr](item1, item2, ...) — 배열 생성(+ 선택적 초기화 목록).
-          // WinForms 디자이너가 흔히 내보내는
-          // "new System.Windows.Forms.ToolStripItem[9](a, b, ..., i)" 패턴. CodeGen(EmitExpr의
-          // TNewObjectExprNode 처리)은 이미 ArraySizeExpr/Args를 보고 Newarr+Stelem을 내는
-          // 지원이 있었지만, Parser가 이 문법 자체를 인식 못 해 '['를 만나면 곧장
-          // "예상 tkRParen 실제 tkLBracket"으로 실패하고 있었다.
-          fPos:=fPos+1; // '[' 소비
-          neoN.ArraySizeExpr:=ParseExpr;
-          Expect(tkRBracket);
-          if Cur.Kind=tkLParen then
-          begin
-            fPos:=fPos+1;
-            if Cur.Kind<>tkRParen then
-            begin
-              neoN.Args.Add(ParseExpr);
-              while Cur.Kind=tkComma do begin fPos:=fPos+1; neoN.Args.Add(ParseExpr); end;
-            end;
-            Expect(tkRParen);
-          end;
-        end
-        else if Cur.Kind=tkLParen then
-        begin
-          fPos:=fPos+1;
-          if Cur.Kind<>tkRParen then
-          begin
-            neoN.Args.Add(ParseExpr);
-            while Cur.Kind=tkComma do begin fPos:=fPos+1; neoN.Args.Add(ParseExpr); end;
-          end;
-          Expect(tkRParen);
-        end;
-        Result:=neoN;
-      end
-
-      // [Stage 94+] Char.IsLetter(c) / double.Parse(s,...) / integer.Parse(s) / char(code) /
-      // string.Join(...) / string.Format(...) 등 내장 타입 키워드가 식(expression) 위치에서
-      // 정적 메서드 호출 수신자나 캐스트 대상으로 쓰이는 패턴.
-      // Lexer는 이 이름들을 tkChar/tkDouble/tkInteger/tkInt64/tkReal/tkStringType 으로 토큰화해서
-      // tkIdent 분기에 도달하지 못한다. 여기서 가로채서 처리한다.
-      // 패턴:
-      //   타입.메서드(args)  → TMethodCallExprNode('타입명', '메서드명')
-      //   char(expr)         → TExternalCastExprNode('char', expr)
-      // [중요] t:=Cur 이후 분기 진입 시 반드시 fPos:=fPos+1로 타입 키워드를 소비해야 함.
-      else if (t.Kind=tkChar) or (t.Kind=tkDouble) or (t.Kind=tkReal)
-           or (t.Kind=tkInteger) or (t.Kind=tkInt64) or (t.Kind=tkStringType) then
-      begin
-        fPos:=fPos+1; // 타입 키워드(Char/double/integer/int64/string) 소비 — 필수!
-        var _btn: string;
-        if t.Kind=tkChar       then _btn:='char'
-        else if t.Kind=tkDouble     then _btn:='double'
-        else if t.Kind=tkReal       then _btn:='double'
-        else if t.Kind=tkInteger    then _btn:='integer'
-        else if t.Kind=tkInt64      then _btn:='int64'
-        else _btn:='string'; // tkStringType
-
-        if Cur.Kind=tkDot then
-        begin
-          // Char.IsLetter(ch) / double.Parse(s,...) / string.Join(',', list) 등 — 정적 메서드 호출
-          fPos:=fPos+1; // '.' 소비
-          var _btMname:=Expect(tkIdent).Text;
-          var _btMc:=new TMethodCallExprNode(_btn, _btMname);
-          if Cur.Kind=tkLParen then
-          begin
-            fPos:=fPos+1;
-            if Cur.Kind<>tkRParen then
-            begin
-              _btMc.Args.Add(ParseExpr);
-              while Cur.Kind=tkComma do begin fPos:=fPos+1; _btMc.Args.Add(ParseExpr); end;
-            end;
-            Expect(tkRParen);
-          end;
-          Result:=_btMc;
-        end
-        else if Cur.Kind=tkLParen then
-        begin
-          // char(code) / integer(expr) / double(expr) 등 — 타입 캐스트
-          fPos:=fPos+1; // '(' 소비
-          var _btCastArg:=ParseExpr;
-          Expect(tkRParen);
-          Result:=new TExternalCastExprNode(_btn, _btCastArg);
-        end
-        else
-          raise new Exception('줄 '+t.Line.ToString+', 열 '+t.Column.ToString
-            +': 식이 와야 하는데 "'+t.Text+'" — 내장 타입은 "타입.메서드(...)" 또는 "타입(식)" 형태로만 쓸 수 있습니다');
-      end
-
-      else if t.Kind=tkNot then
-        begin fPos:=fPos+1; Result:=new TNotExprNode(ParsePrimary); end
-
-      else if t.Kind=tkIntToStr then
-      begin
-        fPos:=fPos+1; Expect(tkLParen);
-        argE:=ParseAddSub; Expect(tkRParen);
-        Result:=new TIntToStrNode(argE);
-      end
-
-      // [Stage 76] BoolToStr(expr) — boolean 식을 'True'/'False' 문자열로 변환.
-      // 인자에 비교식(= 등)이 올 수 있으므로 ParseAddSub가 아닌 ParseExpr로 파싱한다.
-      else if t.Kind=tkBoolToStr then
-      begin
-        fPos:=fPos+1; Expect(tkLParen);
-        argE:=ParseExpr; Expect(tkRParen);
-        Result:=new TBoolToStrNode(argE);
-      end
-
-      // [Stage 52] Length(x) — Lexer가 'length'를 tkIdent가 아니라 tkLength 키워드 토큰으로
-      // 분류하기 때문에(줄 174, Lexer.pas), 아래 tkIdent 분기 안의 'length' 특수 처리(712번째 줄)까지
-      // 내려가지 못하고 매칭 실패로 떨어지던 문제. .Length 멤버 접근(arr.Length)은 ExpectMemberName이
-      // tkLength를 허용해서 이미 됐지만, 독립 함수 호출 Length(s)/Length(arr) 형태가 빠져 있었다.
-      else if t.Kind=tkLength then
-      begin
-        fPos:=fPos+1; // 'length' 소비 (tkLength)
-        Expect(tkLParen);
-        var ntL2:=Expect(tkIdent); Expect(tkRParen);
-        Result:=new TLengthExprNode(ntL2.Text);
-      end
-
-      // [Stage 41] tkLength 단독 분기 제거 — 'length'는 이제 tkIdent로 내려오므로
-      // tkIdent 분기 안에서 텍스트로 구분한다 (아래 참조).
-
-      else if t.Kind=tkIdent then
-      begin
         fPos:=fPos+1;
 
         // [Stage 51] North, South 같은 열거형 멤버 이름 — 변수/필드가 아니라 정수 서수 리터럴로 취급.
@@ -1854,7 +1494,377 @@ type
         end;
 
         end; // [Stage 51] else 블록(열거형 멤버가 아닌 일반 식별자 처리) 종료
+    end;
+
+    function ParsePrimary: TExprNode;
+    var t: TToken; inner, argE, idxE: TExprNode;
+        cn: TFuncCallExprNode; mc: TMethodCallExprNode;
+        extCastFull93: string;
+    begin
+      t:=Cur;
+
+      // [버그 수정] 단항 마이너스(-x). 예전에는 이 분기 자체가 없어서 i := -7; 처럼 식
+      // 맨 앞에 오는 '-'는 무조건 "식이 와야 하는데 -" 파싱 에러였다(이항 뺄셈은
+      // ParseAddSub에 있었지만, 단항으로 쓰는 경우는 아무도 처리하지 않았음). 0-피연산자로
+      // 접어(fold) 기존 TBinOpNode(boSub)를 그대로 재사용한다 — integer/real 승격 등
+      // 기존 이항 뺄셈의 타입 처리 전부를 공짜로 물려받는다. 가장 강하게 묶이도록(즉
+      // -x*y가 (-x)*y가 되도록) 피연산자는 재귀적으로 ParsePrimary 하나만 소비한다.
+      if t.Kind=tkMinus then
+      begin
+        fPos:=fPos+1; // '-' 소비
+        Result:=new TBinOpNode(boSub, new TIntLiteralNode(0), ParsePrimary);
       end
+
+      // [Stage 91] typeof(TypeName) — .NET typeof 연산자. System.Type 값을 만든다(주로
+      // GetCustomAttributes(Type, bool) 같은 리플렉션 API 인자로 쓰인다). 괄호 안이 "값 식"이
+      // 아니라 "타입 이름"이라 일반 ParseExpr로는 못 다룬다(변수/필드가 아니므로) — 그래서
+      // 등록 안 된 평범한 식별자로 오인되어 typeof만 홀로 소비되고 뒤의 "(...)"가 그대로
+      // 남아 "예상 tkRParen 실제 tkLParen" 에러로 이어졌다. 일반 tkIdent 분기보다 먼저 검사.
+      else if (t.Kind=tkIdent) and (t.Text.ToLower='typeof') and (PeekAt(1).Kind=tkLParen) then
+      begin
+        fPos:=fPos+2; // 'typeof' '(' 소비
+        // [자기컴파일] typeof(string)/typeof(boolean)/typeof(integer) 처럼
+        // 괄호 안에 키워드 타입이 오는 경우 — Expect(tkIdent)는 키워드 토큰을 거부한다.
+        var toName: string;
+        if Cur.Kind=tkStringType then begin toName:='string'; fPos:=fPos+1; end
+        else if Cur.Kind=tkBoolean then begin toName:='boolean'; fPos:=fPos+1; end
+        else if Cur.Kind=tkInteger then begin toName:='integer'; fPos:=fPos+1; end
+        else if (Cur.Kind=tkReal) or (Cur.Kind=tkDouble) then begin toName:='double'; fPos:=fPos+1; end
+        else if Cur.Kind=tkChar then begin toName:='char'; fPos:=fPos+1; end
+        else if Cur.Kind=tkInt64 then begin toName:='int64'; fPos:=fPos+1; end
+        else
+        begin
+          toName:=Expect(tkIdent).Text;
+          while Cur.Kind=tkDot do begin fPos:=fPos+1; toName:=toName+'.'+ExpectQualNamePart; end;
+          // [자기컴파일 버그 수정] typeof(System.Collections.Generic.KeyValuePair<System.Object,System.Object>)
+          // 처럼 typeof 안의 타입 이름이 외부 제네릭 타입일 수 있다 — 예전에는 점(.) 체이닝만
+          // 처리하고 바로 Expect(tkRParen)으로 넘어가서, 뒤따르는 '<'가 "예상 tkRParen 실제
+          // tkLt"로 튕겨나갔다. ParseExternalGenericType/ParseExternalGenericTypeArg(위에서
+          // Dictionary<string,T> 같은 필드/매개변수 타입에 이미 쓰이는 것과 동일한 로직)를
+          // 재사용해 "Base<Arg1,Arg2>" 형태의 문자열로 완성한다 — CodeGen의 ResolveExternalType이
+          // 이미 이 표기를 인식해 재귀적으로 CLR 타입을 조립한다(ResolveExternalGenericType).
+          if Cur.Kind=tkLt then toName:=ParseExternalGenericType(toName);
+        end;
+        Expect(tkRParen);
+        Result:=new TTypeOfExprNode(toName);
+      end
+
+      else if t.Kind=tkIntLiteral then
+      begin
+        fPos:=fPos+1;
+        // [Phase 1] int32 범위(2^31-1 = 2147483647) 초과 시 int64로 자동 승격
+        var _iv: int64 := int64.Parse(t.Text);
+        if (_iv >= -2147483648) and (_iv <= 2147483647) then
+          Result:=new TIntLiteralNode(integer(_iv))
+        else
+          Result:=new TInt64LiteralNode(_iv);
+      end
+
+      // [Phase 1] 실수 리터럴
+      else if t.Kind=tkRealLiteral then
+        begin fPos:=fPos+1; Result:=new TRealLiteralNode(t.RealValue); end
+
+      // [Phase 1] 문자 리터럴 (#65 또는 'A')
+      // [Stage 95 버그 수정] 실제 Delphi/Object Pascal은 문자열·문자 리터럴을 연산자(+) 없이
+      // 그냥 나란히 적으면(예: 'abc'#10'def', '건 발견:'#10) 컴파일 타임에 하나의 문자열
+      // 상수로 암시적으로 이어붙인다(개행 등 제어문자를 문자열 리터럴 안에 끼워 넣는 매우 흔한
+      // 관용구). 이 파서는 그 규칙이 아예 없어서 '건 발견:'#10처럼 '+' 없이 문자 리터럴이
+      // 바로 뒤따르면 리터럴 하나만 소비하고 멈춰버렸고, 그 뒤(#10)는 여전히 인자 목록 안에
+      // 남아 있어 상위 호출부가 ')'를 기대하다 tkCharLiteral을 만나 "예상 tkRParen 실제
+      // tkCharLiteral" 파싱 오류로 이어졌다. 문자열/문자 리터럴 뒤에 또 문자열/문자 리터럴이
+      // 연산자 없이 바로 이어지면(원본 문법의 "겹치는 상수" 규칙) 전부 하나의 문자열로
+      // 접어(fold) TStrLiteralNode 하나로 만든다.
+      else if t.Kind=tkCharLiteral then
+      begin
+        fPos:=fPos+1;
+        if (Cur.Kind=tkString) or (Cur.Kind=tkCharLiteral) then
+        begin
+          var sb95:=new System.Text.StringBuilder;
+          sb95.Append(t.CharValue);
+          while (Cur.Kind=tkString) or (Cur.Kind=tkCharLiteral) do
+          begin
+            if Cur.Kind=tkString then sb95.Append(Cur.Text) else sb95.Append(Cur.CharValue);
+            fPos:=fPos+1;
+          end;
+          Result:=new TStrLiteralNode(sb95.ToString);
+        end
+        else
+          Result:=new TCharLiteralNode(t.CharValue);
+      end
+
+      else if t.Kind=tkString then
+      begin
+        fPos:=fPos+1;
+        if (Cur.Kind=tkString) or (Cur.Kind=tkCharLiteral) then // [Stage 95]
+        begin
+          var sb95b:=new System.Text.StringBuilder;
+          sb95b.Append(t.Text);
+          while (Cur.Kind=tkString) or (Cur.Kind=tkCharLiteral) do
+          begin
+            if Cur.Kind=tkString then sb95b.Append(Cur.Text) else sb95b.Append(Cur.CharValue);
+            fPos:=fPos+1;
+          end;
+          Result:=new TStrLiteralNode(sb95b.ToString);
+        end
+        else
+          Result:=new TStrLiteralNode(t.Text);
+      end
+
+      else if t.Kind=tkResult then
+        begin fPos:=fPos+1; Result:=new TResultRefNode; end
+
+      else if t.Kind=tkTrue then
+        begin fPos:=fPos+1; Result:=new TBoolLiteralNode(true); end
+
+      else if t.Kind=tkFalse then
+        begin fPos:=fPos+1; Result:=new TBoolLiteralNode(false); end
+
+      else if t.Kind=tkNil then
+        begin fPos:=fPos+1; Result:=new TNilLiteralNode; end // [Stage 29]
+
+      // [Stage 63] 집합 리터럴: [Red, Blue] 또는 빈 집합 []. 원소는 열거형 멤버 이름만
+      // 지원한다(정수 범위 집합 등은 아직 지원하지 않음). 모든 원소가 같은 열거형에
+      // 속해야 하며, 여기서 곧바로 32비트 비트마스크 상수로 접어(fold) 둔다 — 런타임에는
+      // 그냥 정수 하나일 뿐이라 CodeGen은 Ldc_I4 한 번이면 된다.
+      // [Stage 96] [...] 리터럴 일반화: Stage 63은 "원소가 전부 열거형 멤버 이름"인 경우만
+      // 지원했다(예: [Red, Blue]). 하지만 리플렉션 API 인자([typeof(integer)]), 문자열 배열
+      // (['a','b']), 임의의 식([propClrType]) 등도 같은 대괄호 문법을 쓴다 — 예전에는
+      // 무조건 "Expect(tkIdent) + 열거형 멤버인지 확인"으로 파싱했기 때문에 이런 경우들이
+      // 전부 "집합 리터럴의 원소 ... 는 열거형 멤버가 아닙니다"로 실패했다.
+      // 이제는 원소를 일단 일반 식(ParseAddSub)으로 파싱한 뒤 사후 판별한다:
+      // - 모든 원소가 "같은 열거형"의 TEnumValueExprNode이면(빈 리스트 포함) 기존과 동일하게
+      //   비트마스크 TSetLiteralExprNode로 접는다 — 'in' 연산 등 기존 집합 의미론을 그대로 유지.
+      // - 하나라도 아니면 TArrayLiteralExprNode(임의 원소 배열)로 만든다 — 실제 CLR 배열
+      //   타입은 CodeGen이 문맥(기대 매개변수 타입/대입 대상 타입)을 보고 정한다.
+      else if t.Kind=tkLBracket then
+      begin
+        fPos:=fPos+1; // '[' 소비
+        var arrElems96:=new List<TExprNode>;
+        if Cur.Kind<>tkRBracket then
+        begin
+          arrElems96.Add(ParseAddSub);
+          while Cur.Kind=tkComma do begin fPos:=fPos+1; arrElems96.Add(ParseAddSub); end;
+        end;
+        Expect(tkRBracket);
+
+        var allEnum96:=true; var setEnumName96:=''; var setMask96:=0;
+        var elm96: TExprNode; var ev96: TEnumValueExprNode;
+        foreach elm96 in arrElems96 do
+        begin
+          if not (elm96 is TEnumValueExprNode) then begin allEnum96:=false; break; end;
+          ev96:=TEnumValueExprNode(elm96);
+          if (setEnumName96<>'') and (setEnumName96<>ev96.EnumName) then begin allEnum96:=false; break; end;
+          setEnumName96:=ev96.EnumName;
+          setMask96:=setMask96 or (1 shl ev96.Ordinal);
+        end;
+
+        if allEnum96 then
+          Result:=new TSetLiteralExprNode(setEnumName96, setMask96)
+        else
+        begin
+          var arrLit96:=new TArrayLiteralExprNode;
+          arrLit96.Elements.AddRange(arrElems96);
+          Result:=arrLit96;
+        end;
+      end
+
+      else if t.Kind=tkSelf then // [Stage 30]
+      begin
+        fPos:=fPos+1;
+        if Cur.Kind=tkDot then
+        begin
+          // self.Xxx / self.Xxx(...) → 기존 암시적 self 필드읽기/메서드호출(ObjName='')로 환원.
+          // (self가 필드/외부 상속 타입 어느 쪽이든 CodeGen이 이미 판별해준다.)
+          fPos:=fPos+1;
+          var selfMname:=ExpectMemberName; // [Stage 41] 키워드 속성명(Length 등) 허용
+          if Cur.Kind=tkLParen then
+          begin
+            mc:=new TMethodCallExprNode('', selfMname); fPos:=fPos+1;
+            if Cur.Kind<>tkRParen then
+            begin
+              mc.Args.Add(ParseExpr);
+              while Cur.Kind=tkComma do begin fPos:=fPos+1; mc.Args.Add(ParseExpr); end;
+            end;
+            Expect(tkRParen);
+            Result:=mc;
+          end
+          else
+            Result:=new TFieldReadExprNode(selfMname);
+        end
+        else
+          Result:=new TSelfExprNode; // self 자체를 값으로 사용 (예: 인자로 전달, as 캐스트 대상)
+      end
+
+      else if t.Kind=tkInherited then // [Stage 30] 식으로 쓰이는 inherited (예: Result := inherited GetValue();)
+      begin
+        fPos:=fPos+1;
+        var imnE:=Expect(tkIdent).Text;
+        var iceN:=new TInheritedCallExprNode(imnE);
+        if Cur.Kind=tkLParen then
+        begin
+          fPos:=fPos+1;
+          if Cur.Kind<>tkRParen then
+          begin
+            iceN.Args.Add(ParseExpr);
+            while Cur.Kind=tkComma do begin fPos:=fPos+1; iceN.Args.Add(ParseExpr); end;
+          end;
+          Expect(tkRParen);
+        end;
+        Result:=iceN;
+      end
+
+      // [Stage 40] new TypeName(args) — PascalABC.NET 스타일 객체 생성 구문.
+      // 기존 "TypeName.Create" 관용구와 별개로, 인자 있는 생성자 호출을 지원하기 위해 추가.
+      // TypeName은 로컬 클래스(제네릭 인스턴스화 포함)이거나 점(.)으로 연결된 외부 .NET 타입.
+      else if t.Kind=tkNew then
+      begin
+        fPos:=fPos+1; // 'new' 소비
+        // [Stage 96 수정] 'new string(ch, count)'처럼 내장 타입 키워드가 new 뒤에 오는 경우.
+        // Lexer는 'string'을 tkIdent가 아니라 tkStringType으로 토큰화하므로, 기존
+        // Expect(tkIdent) 하나만으로는 "예상 tkIdent 실제 tkStringType" 오류가 났다.
+        // System.String에는 new string(char, int)(문자를 count번 반복) 등 유용한 생성자가
+        // 있으므로 'string'을 외부 타입 이름으로 그대로 통과시킨다.
+        var newTn: string;
+        if Cur.Kind=tkStringType then begin newTn:='string'; fPos:=fPos+1; end
+        else newTn:=Expect(tkIdent).Text;
+        if (Cur.Kind=tkLt) and fGenericClassNames.Contains(newTn) then
+          newTn:=ResolveGenericInstantiation(newTn)
+        else if Cur.Kind=tkLt then // [Stage 86] new Dictionary<string, FileChangeWatcher> 같은 외부 제네릭 타입 생성
+          newTn:=ParseExternalGenericType(newTn);
+        while Cur.Kind=tkDot do begin fPos:=fPos+1; newTn:=newTn+'.'+ExpectQualNamePart; end;
+        // [Stage 96] 위 tkLt 검사는 점(.)으로 연결되기 전(예: "Dictionary<...>")만 잡았다.
+        // "new System.Collections.Generic.List<MethodInfo>()"처럼 여러 단계 점으로 연결된
+        // 이름 뒤에 오는 제네릭 인자는 점 소비 루프가 끝난 뒤에야 비로소 '<'를 만나므로,
+        // 여기서도 한 번 더 확인해야 한다 — 안 그러면 '<...>'가 소비되지 않고 그대로 남아
+        // 뒤에서 비교 연산자로 오인되어 "알 수 없는 문장 (\">\")" 등으로 실패한다.
+        if Cur.Kind=tkLt then newTn:=ParseExternalGenericType(newTn);
+        if fRecordNames.Contains(newTn) then // [Stage 62]
+          raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': 레코드 "'+newTn
+            +'"는 new로 생성할 수 없습니다 — 변수 선언만으로 이미 필드가 기본값(0/빈 문자열 등)으로 초기화됩니다');
+        var neoN:=new TNewObjectExprNode(newTn);
+        neoN.IsExternalType:=not fClassNames.Contains(newTn);
+        if Cur.Kind=tkLBracket then
+        begin
+          // [Stage 92] new Type[SizeExpr](item1, item2, ...) — 배열 생성(+ 선택적 초기화 목록).
+          // WinForms 디자이너가 흔히 내보내는
+          // "new System.Windows.Forms.ToolStripItem[9](a, b, ..., i)" 패턴. CodeGen(EmitExpr의
+          // TNewObjectExprNode 처리)은 이미 ArraySizeExpr/Args를 보고 Newarr+Stelem을 내는
+          // 지원이 있었지만, Parser가 이 문법 자체를 인식 못 해 '['를 만나면 곧장
+          // "예상 tkRParen 실제 tkLBracket"으로 실패하고 있었다.
+          fPos:=fPos+1; // '[' 소비
+          neoN.ArraySizeExpr:=ParseExpr;
+          Expect(tkRBracket);
+          if Cur.Kind=tkLParen then
+          begin
+            fPos:=fPos+1;
+            if Cur.Kind<>tkRParen then
+            begin
+              neoN.Args.Add(ParseExpr);
+              while Cur.Kind=tkComma do begin fPos:=fPos+1; neoN.Args.Add(ParseExpr); end;
+            end;
+            Expect(tkRParen);
+          end;
+        end
+        else if Cur.Kind=tkLParen then
+        begin
+          fPos:=fPos+1;
+          if Cur.Kind<>tkRParen then
+          begin
+            neoN.Args.Add(ParseExpr);
+            while Cur.Kind=tkComma do begin fPos:=fPos+1; neoN.Args.Add(ParseExpr); end;
+          end;
+          Expect(tkRParen);
+        end;
+        Result:=neoN;
+      end
+
+      // [Stage 94+] Char.IsLetter(c) / double.Parse(s,...) / integer.Parse(s) / char(code) /
+      // string.Join(...) / string.Format(...) 등 내장 타입 키워드가 식(expression) 위치에서
+      // 정적 메서드 호출 수신자나 캐스트 대상으로 쓰이는 패턴.
+      // Lexer는 이 이름들을 tkChar/tkDouble/tkInteger/tkInt64/tkReal/tkStringType 으로 토큰화해서
+      // tkIdent 분기에 도달하지 못한다. 여기서 가로채서 처리한다.
+      // 패턴:
+      //   타입.메서드(args)  → TMethodCallExprNode('타입명', '메서드명')
+      //   char(expr)         → TExternalCastExprNode('char', expr)
+      // [중요] t:=Cur 이후 분기 진입 시 반드시 fPos:=fPos+1로 타입 키워드를 소비해야 함.
+      else if (t.Kind=tkChar) or (t.Kind=tkDouble) or (t.Kind=tkReal)
+           or (t.Kind=tkInteger) or (t.Kind=tkInt64) or (t.Kind=tkStringType) then
+      begin
+        fPos:=fPos+1; // 타입 키워드(Char/double/integer/int64/string) 소비 — 필수!
+        var _btn: string;
+        if t.Kind=tkChar       then _btn:='char'
+        else if t.Kind=tkDouble     then _btn:='double'
+        else if t.Kind=tkReal       then _btn:='double'
+        else if t.Kind=tkInteger    then _btn:='integer'
+        else if t.Kind=tkInt64      then _btn:='int64'
+        else _btn:='string'; // tkStringType
+
+        if Cur.Kind=tkDot then
+        begin
+          // Char.IsLetter(ch) / double.Parse(s,...) / string.Join(',', list) 등 — 정적 메서드 호출
+          fPos:=fPos+1; // '.' 소비
+          var _btMname:=Expect(tkIdent).Text;
+          var _btMc:=new TMethodCallExprNode(_btn, _btMname);
+          if Cur.Kind=tkLParen then
+          begin
+            fPos:=fPos+1;
+            if Cur.Kind<>tkRParen then
+            begin
+              _btMc.Args.Add(ParseExpr);
+              while Cur.Kind=tkComma do begin fPos:=fPos+1; _btMc.Args.Add(ParseExpr); end;
+            end;
+            Expect(tkRParen);
+          end;
+          Result:=_btMc;
+        end
+        else if Cur.Kind=tkLParen then
+        begin
+          // char(code) / integer(expr) / double(expr) 등 — 타입 캐스트
+          fPos:=fPos+1; // '(' 소비
+          var _btCastArg:=ParseExpr;
+          Expect(tkRParen);
+          Result:=new TExternalCastExprNode(_btn, _btCastArg);
+        end
+        else
+          raise new Exception('줄 '+t.Line.ToString+', 열 '+t.Column.ToString
+            +': 식이 와야 하는데 "'+t.Text+'" — 내장 타입은 "타입.메서드(...)" 또는 "타입(식)" 형태로만 쓸 수 있습니다');
+      end
+
+      else if t.Kind=tkNot then
+        begin fPos:=fPos+1; Result:=new TNotExprNode(ParsePrimary); end
+
+      else if t.Kind=tkIntToStr then
+      begin
+        fPos:=fPos+1; Expect(tkLParen);
+        argE:=ParseAddSub; Expect(tkRParen);
+        Result:=new TIntToStrNode(argE);
+      end
+
+      // [Stage 76] BoolToStr(expr) — boolean 식을 'True'/'False' 문자열로 변환.
+      // 인자에 비교식(= 등)이 올 수 있으므로 ParseAddSub가 아닌 ParseExpr로 파싱한다.
+      else if t.Kind=tkBoolToStr then
+      begin
+        fPos:=fPos+1; Expect(tkLParen);
+        argE:=ParseExpr; Expect(tkRParen);
+        Result:=new TBoolToStrNode(argE);
+      end
+
+      // [Stage 52] Length(x) — Lexer가 'length'를 tkIdent가 아니라 tkLength 키워드 토큰으로
+      // 분류하기 때문에(줄 174, Lexer.pas), 아래 tkIdent 분기 안의 'length' 특수 처리(712번째 줄)까지
+      // 내려가지 못하고 매칭 실패로 떨어지던 문제. .Length 멤버 접근(arr.Length)은 ExpectMemberName이
+      // tkLength를 허용해서 이미 됐지만, 독립 함수 호출 Length(s)/Length(arr) 형태가 빠져 있었다.
+      else if t.Kind=tkLength then
+      begin
+        fPos:=fPos+1; // 'length' 소비 (tkLength)
+        Expect(tkLParen);
+        var ntL2:=Expect(tkIdent); Expect(tkRParen);
+        Result:=new TLengthExprNode(ntL2.Text);
+      end
+
+      // [Stage 41] tkLength 단독 분기 제거 — 'length'는 이제 tkIdent로 내려오므로
+      // tkIdent 분기 안에서 텍스트로 구분한다 (아래 참조).
+
+      else if t.Kind=tkIdent then Result:=ParsePrimaryIdent(t)
 
       else if t.Kind=tkLParen then
       begin
