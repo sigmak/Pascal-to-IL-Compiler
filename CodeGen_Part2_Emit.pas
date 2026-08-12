@@ -2161,7 +2161,13 @@
         Result:=true;
     end;
 
-    procedure EmitStatement(aIL: ILGenerator; s: TStmtNode);
+    // [Stage 112 리팩터] EmitStatement가 self-compile 시 System.BadImageFormatException으로
+    // 로드조차 안 되는 문제(단일 try/finally 안에 33개의 s-is 분기, 1800줄 이상이 들어있어
+    // self-compile 코드생성기가 메서드 전체를 손상된 IL로 만드는 것으로 추정 — Stage 111의
+    // ParsePrimary와 동일한 증상/원인)을 완화하기 위해, 재귀호출(EmitStatement 자기 자신을
+    // 다시 부르는 제어흐름 분기)이 없는 분기들을 별도 함수로 분리했다. 로직은 원본과
+    // 완전히 동일하다 — 처리했으면 True, 이 함수가 담당하지 않는 문장이면 False를 돌려준다.
+    function EmitStatementDataOps1(aIL: ILGenerator; s: TStmtNode): boolean;
     var
       we: TWritelnExprStmtNode; ws: TWritelnStringStmtNode;
       asg: TAssignStmtNode; ra: TResultAssignStmtNode;
@@ -2176,12 +2182,7 @@
       setter, emi: MethodInfo; qfb: FieldBuilder; qTargetType: System.Type;
       evs: TEventSubscribeStmtNode; evInfo: EventInfo; delCtor: ConstructorInfo;
     begin
-      fEmitDepth:=fEmitDepth+1;
-      if fEmitDepth>5000 then
-        raise new Exception('[진단] EmitStatement 재귀 깊이 초과(5000) — 폭주 의심 노드: '+s.GetType.Name);
-      try
-      // [Stage 75] Readln; → Console.ReadLine() 호출 후 반환값 버림.
-      // Readln(v) → Console.ReadLine() 결과를 문자열 변수 v에 대입.
+      Result:=true;
       if s is TReadlnStmtNode then
       begin
         var rln := TReadlnStmtNode(s);
@@ -2644,8 +2645,32 @@
         end
         else raise new Exception('선언되지 않은 변수 "'+asg.VarName+'"');
       end
+      else Result:=false;
+    end;
 
-      else if s is TMethodCallStmtNode then
+    // [Stage 112 리팩터] EmitStatement가 self-compile 시 System.BadImageFormatException으로
+    // 로드조차 안 되는 문제(단일 try/finally 안에 33개의 s-is 분기, 1800줄 이상이 들어있어
+    // self-compile 코드생성기가 메서드 전체를 손상된 IL로 만드는 것으로 추정 — Stage 111의
+    // ParsePrimary와 동일한 증상/원인)을 완화하기 위해, 재귀호출(EmitStatement 자기 자신을
+    // 다시 부르는 제어흐름 분기)이 없는 분기들을 별도 함수로 분리했다. 로직은 원본과
+    // 완전히 동일하다 — 처리했으면 True, 이 함수가 담당하지 않는 문장이면 False를 돌려준다.
+    function EmitStatementMethodCall(aIL: ILGenerator; s: TStmtNode): boolean;
+    var
+      we: TWritelnExprStmtNode; ws: TWritelnStringStmtNode;
+      asg: TAssignStmtNode; ra: TResultAssignStmtNode;
+      comp: TCompoundStmtNode; ifs: TIfStmtNode; whs: TWhileStmtNode;
+      pc: TProcCallStmtNode; sl: TSetLengthStmtNode; aa: TArrayAssignStmtNode;
+      mcs: TMethodCallStmtNode; fas: TFieldAssignStmtNode;
+      loc: LocalBuilder; mb: MethodBuilder; imb: MethodBuilder;
+      ae: TExprNode; wlS, wlI, rm: MethodInfo;
+      et, at2: TVarType; fb: FieldBuilder; cn: string; vtVar: TVarType;
+      eL, endL, ckL, bdL: &Label;
+      extType: System.Type; propInfo: PropertyInfo; extFld: System.Reflection.FieldInfo;
+      setter, emi: MethodInfo; qfb: FieldBuilder; qTargetType: System.Type;
+      evs: TEventSubscribeStmtNode; evInfo: EventInfo; delCtor: ConstructorInfo;
+    begin
+      Result:=true;
+      if s is TMethodCallStmtNode then
       begin
         mcs:=TMethodCallStmtNode(s);
         // [Stage 76] "MainMenu.Items.Add(x)" 처럼 한정자 자체가 점(.)으로 연결된 체인이면
@@ -3097,8 +3122,32 @@
           end;
         end;
       end
+      else Result:=false;
+    end;
 
-      else if s is TEventSubscribeStmtNode then
+    // [Stage 112 리팩터] EmitStatement가 self-compile 시 System.BadImageFormatException으로
+    // 로드조차 안 되는 문제(단일 try/finally 안에 33개의 s-is 분기, 1800줄 이상이 들어있어
+    // self-compile 코드생성기가 메서드 전체를 손상된 IL로 만드는 것으로 추정 — Stage 111의
+    // ParsePrimary와 동일한 증상/원인)을 완화하기 위해, 재귀호출(EmitStatement 자기 자신을
+    // 다시 부르는 제어흐름 분기)이 없는 분기들을 별도 함수로 분리했다. 로직은 원본과
+    // 완전히 동일하다 — 처리했으면 True, 이 함수가 담당하지 않는 문장이면 False를 돌려준다.
+    function EmitStatementDataOps2(aIL: ILGenerator; s: TStmtNode): boolean;
+    var
+      we: TWritelnExprStmtNode; ws: TWritelnStringStmtNode;
+      asg: TAssignStmtNode; ra: TResultAssignStmtNode;
+      comp: TCompoundStmtNode; ifs: TIfStmtNode; whs: TWhileStmtNode;
+      pc: TProcCallStmtNode; sl: TSetLengthStmtNode; aa: TArrayAssignStmtNode;
+      mcs: TMethodCallStmtNode; fas: TFieldAssignStmtNode;
+      loc: LocalBuilder; mb: MethodBuilder; imb: MethodBuilder;
+      ae: TExprNode; wlS, wlI, rm: MethodInfo;
+      et, at2: TVarType; fb: FieldBuilder; cn: string; vtVar: TVarType;
+      eL, endL, ckL, bdL: &Label;
+      extType: System.Type; propInfo: PropertyInfo; extFld: System.Reflection.FieldInfo;
+      setter, emi: MethodInfo; qfb: FieldBuilder; qTargetType: System.Type;
+      evs: TEventSubscribeStmtNode; evInfo: EventInfo; delCtor: ConstructorInfo;
+    begin
+      Result:=true;
+      if s is TEventSubscribeStmtNode then
       begin
         // Button1.Click += Button1_Click;
         evs:=TEventSubscribeStmtNode(s);
@@ -3556,8 +3605,38 @@
         aIL.Emit(OpCodes.Br, _loopStart);
         aIL.MarkLabel(_loopEnd);
       end
+      else Result:=false;
+    end;
 
-      else if s is TCompoundStmtNode then
+    procedure EmitStatement(aIL: ILGenerator; s: TStmtNode);
+    var
+      we: TWritelnExprStmtNode; ws: TWritelnStringStmtNode;
+      asg: TAssignStmtNode; ra: TResultAssignStmtNode;
+      comp: TCompoundStmtNode; ifs: TIfStmtNode; whs: TWhileStmtNode;
+      pc: TProcCallStmtNode; sl: TSetLengthStmtNode; aa: TArrayAssignStmtNode;
+      mcs: TMethodCallStmtNode; fas: TFieldAssignStmtNode;
+      loc: LocalBuilder; mb: MethodBuilder; imb: MethodBuilder;
+      ae: TExprNode; wlS, wlI, rm: MethodInfo;
+      et, at2: TVarType; fb: FieldBuilder; cn: string; vtVar: TVarType;
+      eL, endL, ckL, bdL: &Label;
+      extType: System.Type; propInfo: PropertyInfo; extFld: System.Reflection.FieldInfo;
+      setter, emi: MethodInfo; qfb: FieldBuilder; qTargetType: System.Type;
+      evs: TEventSubscribeStmtNode; evInfo: EventInfo; delCtor: ConstructorInfo;
+      handled: boolean;
+    begin
+      fEmitDepth:=fEmitDepth+1;
+      if fEmitDepth>5000 then
+        raise new Exception('[진단] EmitStatement 재귀 깊이 초과(5000) — 폭주 의심 노드: '+s.GetType.Name);
+      try
+      // [Stage 112 리팩터] 재귀 없는 분기는 EmitStatementDataOps1/EmitStatementMethodCall/
+      // EmitStatementDataOps2로 이동했다 — 이 메서드에는 자기 자신을 재귀 호출하는
+      // 제어흐름 계열 분기만 남겨서 메서드 크기를 줄였다 (BadImageFormatException 대응).
+      handled:=EmitStatementDataOps1(aIL, s);
+      if not handled then handled:=EmitStatementMethodCall(aIL, s);
+      if not handled then handled:=EmitStatementDataOps2(aIL, s);
+      if not handled then
+      begin
+      if s is TCompoundStmtNode then
       begin
         comp:=TCompoundStmtNode(s);
         foreach var st in comp.Statements do EmitStatement(aIL, st);
@@ -3996,8 +4075,8 @@
         aIL.Emit(OpCodes.Ret);
         aIL.MarkLabel(yLabel);
       end
-
       else raise new Exception('알 수 없는 문장 노드: '+s.GetType.Name);
+      end;
       finally
         fEmitDepth:=fEmitDepth-1;
       end;

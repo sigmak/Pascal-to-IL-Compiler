@@ -4616,10 +4616,55 @@
         // 키 입력을 기다리면 창이 닫힌 뒤에도 프로세스가 멈춰있는 것처럼 보인다.
         if fProg.AppType<>'windows' then
         begin
-          rk:=typeof(Console).GetMethod('ReadKey', System.Type.EmptyTypes);
-          il.Emit(OpCodes.Call, rk); il.Emit(OpCodes.Pop);
+          try
+            // [진단] 위 mainParamTypes/staCtorParamTypes와 동일한 이유 — "System.Type.EmptyTypes"를
+            // GetMethod 호출 인자 자리에 바로 인라인으로 넣으면 gen1에서 ArrayTypeMismatchException이
+            // 난다. 지역변수로 분리해서 우회한다.
+            var readKeyParamTypes: array of System.Type;
+            readKeyParamTypes:=System.Type.EmptyTypes;
+            rk:=typeof(Console).GetMethod('ReadKey', readKeyParamTypes);
+            if rk=nil then
+              LogGenStep('6-2단계 — Console.ReadKey MethodInfo 획득 완료 (경고: nil!)')
+            else
+              LogGenStep('6-2단계 — Console.ReadKey MethodInfo 획득 완료');
+          except
+            on E6c: Exception do
+            begin
+              LogGenStep('실패 — Console.ReadKey GetMethod 조회 중: '+E6c.GetType.FullName+': '+E6c.Message);
+              raise;
+            end;
+          end;
+          try
+            il.Emit(OpCodes.Call, rk);
+            LogGenStep('6-3단계 — ReadKey Call 방출 완료');
+          except
+            on E6d: Exception do
+            begin
+              LogGenStep('실패 — ReadKey Call 방출 중: '+E6d.GetType.FullName+': '+E6d.Message);
+              raise;
+            end;
+          end;
+          try
+            il.Emit(OpCodes.Pop);
+            LogGenStep('6-4단계 — ReadKey 결과 Pop 방출 완료');
+          except
+            on E6e: Exception do
+            begin
+              LogGenStep('실패 — ReadKey 결과 Pop 방출 중: '+E6e.GetType.FullName+': '+E6e.Message);
+              raise;
+            end;
+          end;
         end;
-        il.Emit(OpCodes.Ret);
+        try
+          il.Emit(OpCodes.Ret);
+          LogGenStep('6-5단계 — Main Ret 방출 완료');
+        except
+          on E6f: Exception do
+          begin
+            LogGenStep('실패 — Main Ret 방출 중: '+E6f.GetType.FullName+': '+E6f.Message);
+            raise;
+          end;
+        end;
         LogGenStep('6단계 완료 — Main 메서드 IL 생성 완료');
       end;
 
