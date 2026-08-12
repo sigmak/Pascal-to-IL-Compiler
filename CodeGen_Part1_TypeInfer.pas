@@ -816,7 +816,9 @@
               // 메서드일 수 있다 (예: dirSb.ToString.Trim — StringBuilder.ToString()은 프로퍼티가
               // 아니라 메서드다). 로컬 클래스에는 이미 이 처리(위 [Stage 89])가 있었지만 외부
               // CLR 타입에는 빠져 있어서 곧장 "속성/필드가 없습니다"로 실패했다.
-              mi101:=_reflT100.GetMethod(segs[i], System.Type.EmptyTypes);
+              var _P1EmptyTypesLocal1: array of System.Type;
+              _P1EmptyTypesLocal1:=System.Type.EmptyTypes;
+              mi101:=_reflT100.GetMethod(segs[i], _P1EmptyTypesLocal1);
               if mi101=nil then
                 raise new Exception('타입 "'+_reflT100.FullName+'"에 속성/필드/무인자 메서드 "'+segs[i]+'"가 없습니다 (연쇄 접근 중 — 경로: '+string.Join('.', segs)+')');
               aIL.Emit(OpCodes.Callvirt, mi101);
@@ -908,7 +910,9 @@
             begin
               // [버그 수정] EmitQualifierChainLoad와 동일 — 프로퍼티/필드가 아니면 괄호 없는
               // 무인자 메서드일 수 있다 (예: dirSb.ToString.Trim).
-              mi101:=curType.GetMethod(segs[i], System.Type.EmptyTypes);
+              var _P1EmptyTypesLocal2: array of System.Type;
+              _P1EmptyTypesLocal2:=System.Type.EmptyTypes;
+              mi101:=curType.GetMethod(segs[i], _P1EmptyTypesLocal2);
               if mi101=nil then
                 raise new Exception('타입 "'+curType.FullName+'"에 속성/필드/무인자 메서드 "'+segs[i]+'"가 없습니다 (연쇄 접근 중 — 경로: '+string.Join('.', segs)+')');
               curType:=mi101.ReturnType;
@@ -1612,7 +1616,9 @@
           raise new Exception('inherited Create: 클래스 "'+fCurClassName+'"에서 부모/외부 조상 타입을 찾을 수 없습니다.');
         if args.Count=0 then
         begin
-          parentCtor3:=extType3.GetConstructor(System.Type.EmptyTypes);
+          var _P1EmptyTypesLocal3: array of System.Type;
+          _P1EmptyTypesLocal3:=System.Type.EmptyTypes;
+          parentCtor3:=extType3.GetConstructor(_P1EmptyTypesLocal3);
           if parentCtor3=nil then
           begin
             // [자기컴파일 버그 수정] 추상 기반 클래스(예: System.Reflection.PropertyInfo)는

@@ -192,7 +192,9 @@
           var _extCtorType:=ResolveExternalType(neo.ClassName);
           if neo.Args.Count=0 then
           begin
-            var _extCtor:=SafeGetConstructor(_extCtorType, System.Type.EmptyTypes);
+            var _P2EmptyTypesLocal1: array of System.Type;
+            _P2EmptyTypesLocal1:=System.Type.EmptyTypes;
+            var _extCtor:=SafeGetConstructor(_extCtorType, _P2EmptyTypesLocal1);
             if _extCtor=nil then
               raise new Exception('외부 타입 "'+_extCtorType.FullName+'"에 매개변수 없는 public 생성자가 없습니다.');
             aIL.Emit(OpCodes.Newobj, _extCtor);
@@ -669,7 +671,9 @@
                   // 상속받은 외부 조상 타입에서 호출하는 경우 — 지금까지는 GetProperty/GetField만
                   // 시도하고 둘 다 실패하면 곧장 "필드/속성 없음" 예외를 던져서 이런 호출 자체가
                   // 불가능했다. 마지막으로 인자 0개 메서드를 시도한다.
-                  var _extMi77:=_extAnc.GetMethod(mc.MethodName, System.Type.EmptyTypes);
+                  var _P2EmptyTypesLocal2: array of System.Type;
+                  _P2EmptyTypesLocal2:=System.Type.EmptyTypes;
+                  var _extMi77:=_extAnc.GetMethod(mc.MethodName, _P2EmptyTypesLocal2);
                   if _extMi77=nil then
                     raise new Exception('외부 타입 "'+_extAnc.FullName+'"에 필드/속성/메서드 "'+mc.MethodName+'"가 없습니다 (경로: '+mc.ObjName+'.'+mc.MethodName+').');
                   aIL.Emit(OpCodes.Callvirt, _extMi77);
@@ -1528,7 +1532,9 @@
         else if fGlobalScope.Has(rtn.VarName) then
           aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(rtn.VarName))
         else raise new Exception('선언되지 않은 변수 "'+rtn.VarName+'"');
-        var getTypeMI:=typeof(System.Object).GetMethod('GetType', System.Type.EmptyTypes);
+        var _P2EmptyTypesLocal3: array of System.Type;
+        _P2EmptyTypesLocal3:=System.Type.EmptyTypes;
+        var getTypeMI:=typeof(System.Object).GetMethod('GetType', _P2EmptyTypesLocal3);
         aIL.Emit(OpCodes.Callvirt, getTypeMI);
         var typeNamePropName:='Name';
         if rtn.WantFullName then typeNamePropName:='FullName';
@@ -1678,7 +1684,9 @@
         // 원소 타입은 그대로, 조건을 만족하는 것만 새 List에 담는다.
         listT:=listOpenT.MakeGenericType(srcElemClr);
         resultLoc:=aIL.DeclareLocal(listT);
-        aIL.Emit(OpCodes.Newobj, listT.GetConstructor(System.Type.EmptyTypes));
+        var _P2EmptyTypesLocal4: array of System.Type;
+        _P2EmptyTypesLocal4:=System.Type.EmptyTypes;
+        aIL.Emit(OpCodes.Newobj, listT.GetConstructor(_P2EmptyTypesLocal4));
         aIL.Emit(OpCodes.Stloc, resultLoc);
         elemLoc:=aIL.DeclareLocal(srcElemClr);
         hadParamEntry:=fLocalScope.Has(node.Lambda.ParamName);
@@ -1721,7 +1729,9 @@
         var dstElemClr:=VTC(dstElemType, '');
         listT:=listOpenT.MakeGenericType(dstElemClr);
         resultLoc:=aIL.DeclareLocal(listT);
-        aIL.Emit(OpCodes.Newobj, listT.GetConstructor(System.Type.EmptyTypes));
+        var _P2EmptyTypesLocal5: array of System.Type;
+        _P2EmptyTypesLocal5:=System.Type.EmptyTypes;
+        aIL.Emit(OpCodes.Newobj, listT.GetConstructor(_P2EmptyTypesLocal5));
         aIL.Emit(OpCodes.Stloc, resultLoc);
 
         ckL:=aIL.DefineLabel; bdL:=aIL.DefineLabel; endL:=aIL.DefineLabel;
@@ -1807,7 +1817,9 @@
           raise new Exception('ToArray()는 1차 제약으로 integer/string 원소 시퀀스만 지원합니다 (Stage 70)');
         listT:=listOpenT.MakeGenericType(srcElemClr);
         resultLoc:=aIL.DeclareLocal(listT);
-        aIL.Emit(OpCodes.Newobj, listT.GetConstructor(System.Type.EmptyTypes));
+        var _P2EmptyTypesLocal6: array of System.Type;
+        _P2EmptyTypesLocal6:=System.Type.EmptyTypes;
+        aIL.Emit(OpCodes.Newobj, listT.GetConstructor(_P2EmptyTypesLocal6));
         aIL.Emit(OpCodes.Stloc, resultLoc);
         elemLoc:=aIL.DeclareLocal(srcElemClr);
 
@@ -1894,11 +1906,15 @@
         // [1차 제약] 호출마다 새 System.Random 인스턴스를 만든다(공유 시드 필드를 두지
         // 않음) — 최신 .NET에서는 인스턴스 시드가 시각뿐 아니라 GUID 기반 엔트로피도
         // 섞이므로 짧은 시간에 여러 번 불러도 실제로 문제되는 경우는 드물다.
-        randCtor:=typeof(System.Random).GetConstructor(System.Type.EmptyTypes);
+        var _P2EmptyTypesLocal7: array of System.Type;
+        _P2EmptyTypesLocal7:=System.Type.EmptyTypes;
+        randCtor:=typeof(System.Random).GetConstructor(_P2EmptyTypesLocal7);
         if node.Args.Count=0 then
         begin
           aIL.Emit(OpCodes.Newobj, randCtor);
-          aIL.Emit(OpCodes.Callvirt, typeof(System.Random).GetMethod('NextDouble', System.Type.EmptyTypes));
+          var _P2EmptyTypesLocal8: array of System.Type;
+          _P2EmptyTypesLocal8:=System.Type.EmptyTypes;
+          aIL.Emit(OpCodes.Callvirt, typeof(System.Random).GetMethod('NextDouble', _P2EmptyTypesLocal8));
         end
         else
         begin
@@ -1913,21 +1929,27 @@
       begin
         if node.Args.Count<>1 then raise new Exception('UpperCase()는 인자가 1개 필요합니다 (Stage 72)');
         EmitExpr(aIL, node.Args[0]);
-        aIL.Emit(OpCodes.Callvirt, typeof(string).GetMethod('ToUpper', System.Type.EmptyTypes));
+        var _P2EmptyTypesLocal9: array of System.Type;
+        _P2EmptyTypesLocal9:=System.Type.EmptyTypes;
+        aIL.Emit(OpCodes.Callvirt, typeof(string).GetMethod('ToUpper', _P2EmptyTypesLocal9));
       end
 
       else if node.Name='LowerCase' then
       begin
         if node.Args.Count<>1 then raise new Exception('LowerCase()는 인자가 1개 필요합니다 (Stage 72)');
         EmitExpr(aIL, node.Args[0]);
-        aIL.Emit(OpCodes.Callvirt, typeof(string).GetMethod('ToLower', System.Type.EmptyTypes));
+        var _P2EmptyTypesLocal10: array of System.Type;
+        _P2EmptyTypesLocal10:=System.Type.EmptyTypes;
+        aIL.Emit(OpCodes.Callvirt, typeof(string).GetMethod('ToLower', _P2EmptyTypesLocal10));
       end
 
       else if node.Name='Trim' then
       begin
         if node.Args.Count<>1 then raise new Exception('Trim()는 인자가 1개 필요합니다 (Stage 72)');
         EmitExpr(aIL, node.Args[0]);
-        aIL.Emit(OpCodes.Callvirt, typeof(string).GetMethod('Trim', System.Type.EmptyTypes));
+        var _P2EmptyTypesLocal11: array of System.Type;
+        _P2EmptyTypesLocal11:=System.Type.EmptyTypes;
+        aIL.Emit(OpCodes.Callvirt, typeof(string).GetMethod('Trim', _P2EmptyTypesLocal11));
       end
 
       else if node.Name='Copy' then
@@ -1989,7 +2011,9 @@
       else if node.Name='ReadLn' then
       begin
         if node.Args.Count<>0 then raise new Exception('ReadLn()는 인자 없이 써야 합니다 (Stage 72, 1차 제약: 변수로 직접 읽어들이는 형태는 아직 미지원)');
-        aIL.Emit(OpCodes.Call, typeof(System.Console).GetMethod('ReadLine', System.Type.EmptyTypes));
+        var _P2EmptyTypesLocal12: array of System.Type;
+        _P2EmptyTypesLocal12:=System.Type.EmptyTypes;
+        aIL.Emit(OpCodes.Call, typeof(System.Console).GetMethod('ReadLine', _P2EmptyTypesLocal12));
       end
 
       else if node.Name='Format' then
@@ -2029,7 +2053,9 @@
         // [Stage 93] appPath := GetCurrentDir; — 괄호 없이 쓰는 무인자 표준 함수.
         // .NET에는 System.IO.Directory.GetCurrentDirectory()가 동일한 역할을 한다.
         if node.Args.Count<>0 then raise new Exception('GetCurrentDir()는 인자가 없어야 합니다 (Stage 93)');
-        aIL.Emit(OpCodes.Call, typeof(System.IO.Directory).GetMethod('GetCurrentDirectory', System.Type.EmptyTypes));
+        var _P2EmptyTypesLocal13: array of System.Type;
+        _P2EmptyTypesLocal13:=System.Type.EmptyTypes;
+        aIL.Emit(OpCodes.Call, typeof(System.IO.Directory).GetMethod('GetCurrentDirectory', _P2EmptyTypesLocal13));
       end
 
       // [Stage 96] ParamCount — 커맨드라인 인자 개수. Environment.GetCommandLineArgs()의
@@ -2038,7 +2064,9 @@
       else if node.Name='ParamCount' then
       begin
         if node.Args.Count<>0 then raise new Exception('ParamCount는 인자가 없어야 합니다 (Stage 96)');
-        aIL.Emit(OpCodes.Call, typeof(System.Environment).GetMethod('GetCommandLineArgs', System.Type.EmptyTypes));
+        var _P2EmptyTypesLocal14: array of System.Type;
+        _P2EmptyTypesLocal14:=System.Type.EmptyTypes;
+        aIL.Emit(OpCodes.Call, typeof(System.Environment).GetMethod('GetCommandLineArgs', _P2EmptyTypesLocal14));
         aIL.Emit(OpCodes.Ldlen);
         aIL.Emit(OpCodes.Conv_I4);
         aIL.Emit(OpCodes.Ldc_I4_1);
@@ -2050,7 +2078,9 @@
       else if node.Name='ParamStr' then
       begin
         if node.Args.Count<>1 then raise new Exception('ParamStr()는 인자가 1개 필요합니다 (Stage 96)');
-        aIL.Emit(OpCodes.Call, typeof(System.Environment).GetMethod('GetCommandLineArgs', System.Type.EmptyTypes));
+        var _P2EmptyTypesLocal15: array of System.Type;
+        _P2EmptyTypesLocal15:=System.Type.EmptyTypes;
+        aIL.Emit(OpCodes.Call, typeof(System.Environment).GetMethod('GetCommandLineArgs', _P2EmptyTypesLocal15));
         argT:=InferType(node.Args[0]);
         EmitExpr(aIL, node.Args[0]);
         if argT<>vtInteger then aIL.Emit(OpCodes.Call, typeof(System.Convert).GetMethod('ToInt32', [typeof(double)]));
@@ -2186,7 +2216,9 @@
       if s is TReadlnStmtNode then
       begin
         var rln := TReadlnStmtNode(s);
-        var rlnM: MethodInfo := typeof(Console).GetMethod('ReadLine', System.Type.EmptyTypes);
+        var _P2EmptyTypesLocal16: array of System.Type;
+        _P2EmptyTypesLocal16:=System.Type.EmptyTypes;
+        var rlnM: MethodInfo := typeof(Console).GetMethod('ReadLine', _P2EmptyTypesLocal16);
         aIL.Emit(OpCodes.Call, rlnM);
         if rln.Arg = nil then
           aIL.Emit(OpCodes.Pop) // 반환값(string) 버림 — 순수 Enter 대기
@@ -3872,6 +3904,25 @@
           var forInVt102:=VarTypeTagFromClrType(forInVarClrType);
           fLocalScope.Declare(fis.VarName, forInVarLoc, forInVt102);
           if forInVt102=vtObject then fLocalScope.SetClrType(fis.VarName, forInVarClrType);
+          // [버그 수정] foreach 원소 타입이 로컬(자기 자신 소스에 정의된) 클래스의
+          // TypeBuilder일 때 SetClrType만 등록하고 SetClassName은 등록하지 않아서,
+          // InferType이 HasClrType 분기(리플렉션 프로퍼티/메서드만 확인, 로컬 클래스의
+          // FieldBuilder 필드는 못 찾음)로 먼저 걸려버렸다. 그 결과 "foreach var ps in
+          // list_of_local_class do ... ps.StringField ..." 형태의 문자열 필드 읽기가
+          // vtInteger로 오판되어 Convert.ToString(int32)가 문자열 참조 위에 잘못 호출되고,
+          // self-host 빌드 시 그 메서드의 IL 자체가 스택 타입 불일치로 깨져
+          // BadImageFormatException을 유발했다 (실제 사례: BuildClassShell_Properties의
+          // "foreach var ps in cd.Properties do ... ps.Name ..."). 일반 매개변수/지역변수와
+          // 동일하게 SetClassName도 등록해 TryFindFieldBuilder 경로를 타게 한다.
+          if forInVarClrType is TypeBuilder then
+          begin
+            foreach var _kvpFor102 in fTypeBuilders do
+              if _kvpFor102.Value = TypeBuilder(forInVarClrType) then
+              begin
+                fLocalScope.SetClassName(fis.VarName, _kvpFor102.Key);
+                break;
+              end;
+          end;
         end;
 
         EmitExpr(aIL, fis.CollExpr); // 컬렉션 참조를 스택에 올린다

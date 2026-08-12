@@ -2611,13 +2611,14 @@
     end;
 
     // 클래스 TypeBuilder 생성 (필드 + 메서드 정의만, 본문은 아직)
-    procedure BuildClassShell(modBuilder: ModuleBuilder; cd: TClassDeclNode);
-    var
-      tb: TypeBuilder; fd: TFieldDeclNode; sig: TMethodSignature;
-      fb: FieldBuilder; mb: MethodBuilder;
-      paramTypes: array of System.Type; i: integer;
-      parentType: System.Type; parentCtor: ConstructorInfo;
-      methAttrs: MethodAttributes;
+    // [리팩터링] BuildClassShell이 로컬 50개, IL 4.8KB짜리 단일 메서드로 비대해지면서
+    // BadImageFormatException(메서드 호출 시점에 즉시 발생 — 본문이 한 줄도 실행되기 전에
+    // 터짐, 즉 IL 자체가 손상된 것으로 보임)을 유발하는 것으로 의심되어, 책임을 5개의
+    // 작은 프로시저로 쪼갰다. 로직/진단 로그는 전부 그대로 옮기기만 했고 변경하지 않았다.
+
+    // 1) 부모 타입 결정 + TypeBuilder.DefineType + 내부 딕셔너리 초기화 + 인터페이스 등록
+    function BuildClassShell_DefineType(modBuilder: ModuleBuilder; cd: TClassDeclNode; var parentTypeOut: System.Type): TypeBuilder;
+    var tb: TypeBuilder; parentType: System.Type;
     begin
       // 부모 클래스가 있으면 그 TypeBuilder를 기반 타입으로 사용
       // 로컬 클래스가 아니면(IsExternalParent) 참조된 외부 어셈블리에서 Reflection으로 찾는다
@@ -2652,11 +2653,14 @@
       var classTypeAttrs:=TypeAttributes.Public or TypeAttributes.Class;
       if classHasAbstractMethod then classTypeAttrs:=classTypeAttrs or TypeAttributes.Abstract;
 
+      Writeln('[MARK-BCS-1] parentType 결정 완료="'+parentType.FullName+'", classHasAbstractMethod='+classHasAbstractMethod.ToString+' — DefineType 호출 직전');
       tb:=modBuilder.DefineType(cd.Name, classTypeAttrs, parentType);
+      Writeln('[MARK-BCS-2] modBuilder.DefineType 완료');
       fTypeBuilders[cd.Name]:=tb;
       fFieldBuilders[cd.Name]:=new Dictionary<string, FieldBuilder>;
       fInstanceMethods[cd.Name]:=new Dictionary<string, MethodBuilder>;
       fInstanceMethodsByArity[cd.Name]:=new Dictionary<string, MethodBuilder>; // [버그 수정] 오버로드 구분용
+      Writeln('[MARK-BCS-3] 내부 딕셔너리 초기화 완료');
 
       // 인터페이스 구현 등록 (완성된 인터페이스 Type이 필요 — 이미 위에서 다 만들어둠)
       // 이 클래스의 public+virtual 메서드가 이름/시그니처로 인터페이스 메서드와
@@ -2674,10 +2678,22 @@
       if fClassExternalInterfaceType.ContainsKey(cd.Name) then
         tb.AddInterfaceImplementation(fClassExternalInterfaceType[cd.Name]);
 
-      // 필드
+      parentTypeOut:=parentType;
+      Result:=tb;
+    end;
+
+    // 2) 필드 정의
+    procedure BuildClassShell_Fields(tb: TypeBuilder; cd: TClassDeclNode);
+    var fd: TFieldDeclNode; fb: FieldBuilder;
+    begin
+      Writeln('[MARK-BCS-4] 필드 루프 시작, cd.Fields.Count='+cd.Fields.Count.ToString);
       foreach fd in cd.Fields do
       begin
-        fb:=tb.DefineField(fd.Name, ResolveFieldClrType(fd), FieldAttributes.Public);
+        Writeln('[MARK-BCS-4a] 필드 "'+fd.Name+'" ResolveFieldClrType 호출 직전');
+        var _fdClrType:=ResolveFieldClrType(fd);
+        Writeln('[MARK-BCS-4b] 필드 "'+fd.Name+'" ResolveFieldClrType 완료 -> "'+_fdClrType.FullName+'", DefineField 호출 직전');
+        fb:=tb.DefineField(fd.Name, _fdClrType, FieldAttributes.Public);
+        Writeln('[MARK-BCS-4c] 필드 "'+fd.Name+'" DefineField 완료');
         fFieldBuilders[cd.Name][fd.Name]:=fb;
         // [Stage 66] self.필드/obj.필드 형태의 연산자 오버로딩 대상 판별용
         if (fd.FieldType=vtObject) and (not fd.IsExternalType) and (fd.ClassName<>'') then
@@ -2687,21 +2703,28 @@
           fFieldObjClassName[cd.Name][fd.Name]:=fd.ClassName;
         end;
       end;
+    end;
 
+    // 3) 메서드 시그니처만 정의 (본문은 이후 BuildMethodBody가 채운다)
+    procedure BuildClassShell_Methods(tb: TypeBuilder; cd: TClassDeclNode);
+    var sig: TMethodSignature; mb: MethodBuilder;
+        paramTypes: array of System.Type; i: integer; methAttrs: MethodAttributes;
+    begin
       // [Stage 85] 프로퍼티(PropertyBuilder) 방출은 메서드 시그니처가 모두 정의된
       // 다음으로 옮겼다 — read/write 접근자가 필드가 아니라 메서드를 가리키는 경우
       // (예: property Enabled: boolean read FEnabled write SetEnabled;) 그 메서드의
       // MethodBuilder가 이미 존재해야 get/set 프로퍼티 메서드 본문에서 호출(Callvirt)할
       // 수 있기 때문이다. 실제 방출 코드는 아래 "메서드 시그니처만 정의" 블록 다음에 있다.
 
-      // 메서드 시그니처만 정의
       // 모두 Virtual + HideBySig로 정의: 자식 클래스에서 같은 이름/시그니처의
       // 메서드를 정의하면 CLR이 이름/시그니처 매칭으로 자동 override(슬롯 재사용) 처리한다.
       // (virtual/override 지시자는 이미 이 기본 동작과 일치하므로 별도 분기가 필요 없다.
       //  abstract만 실제로 다르다: 본문이 없으므로 MethodAttributes.Abstract를 추가한다.)
+      Writeln('[MARK-BCS-5] 필드 루프 종료, 메서드 시그니처 루프 시작, cd.Methods.Count='+cd.Methods.Count.ToString);
       methAttrs:=MethodAttributes.Public or MethodAttributes.Virtual or MethodAttributes.HideBySig;
       foreach sig in cd.Methods do
       begin
+        Writeln('[MARK-BCS-5a] 메서드 시그니처 "'+sig.Name+'" 처리 시작, IsGeneric='+sig.IsGeneric.ToString);
         // [Stage 74] 메서드 자신의 오픈 제네릭 타입 매개변수(function Foo<T>(...))가 있으면
         // Stage71의 top-level 제네릭 함수와 같은 원리로 DefineGenericParameters 이후에야
         // 매개변수/반환 타입을 알 수 있다 — SetParameters/SetReturnType으로 나중에 지정한다.
@@ -2770,13 +2793,19 @@
           end;
         end;
       end;
+    end;
 
+    // 4) 프로퍼티(PropertyBuilder + get/set 메서드 쌍) 방출
+    procedure BuildClassShell_Properties(tb: TypeBuilder; cd: TClassDeclNode);
+    begin
+      Writeln('[MARK-BCS-6] 메서드 시그니처 루프 종료, 프로퍼티 루프 시작, cd.Properties.Count='+cd.Properties.Count.ToString);
       // [Phase 1, Stage 85 확장] 프로퍼티 — CLR PropertyBuilder + get/set 메서드 쌍으로 방출.
       // 메서드 시그니처 정의가 끝난 뒤에 처리하므로, read/write가 필드가 아니라
       // 메서드 이름을 가리키는 경우(예: property Enabled: boolean read FEnabled
       // write SetEnabled;)에도 그 메서드의 MethodBuilder를 이미 찾을 수 있다.
       foreach var ps in cd.Properties do
       begin
+        Writeln('[MARK-BCS-6a] 프로퍼티 "'+ps.Name+'" 처리 시작');
         var propClrType: System.Type;
         if (ps.PropType=vtObject) and ps.IsExternalType then
           propClrType:=ResolveExternalType(ps.PropClassName)
@@ -2788,10 +2817,15 @@
         // getter
         if ps.ReadName<>'' then
         begin
+          // [진단] System.Type.EmptyTypes를 DefineMethod 인자 자리에 바로 인라인으로 넣으면
+          // gen1에서 newarr+stelem.ref로 잘못 감싸져서 ArrayTypeMismatchException이 난다
+          // (Console.ReadKey GetMethod 건과 동일한 근본 원인). 지역변수로 우회.
+          var getterParamTypes: array of System.Type;
+          getterParamTypes:=System.Type.EmptyTypes;
           var getM:=tb.DefineMethod('get_'+ps.Name,
             MethodAttributes.Public or MethodAttributes.SpecialName or
             MethodAttributes.HideBySig or MethodAttributes.Virtual,
-            propClrType, System.Type.EmptyTypes);
+            propClrType, getterParamTypes);
           var gIL:=getM.GetILGenerator;
           if DictDictHas(fFieldBuilders, cd.Name, ps.ReadName) then
           begin
@@ -2816,10 +2850,15 @@
         // setter
         if ps.WriteName<>'' then
         begin
+          // [진단] DefineMethod 인자 자리에 배열 리터럴을 바로 인라인으로 넣으면
+          // newarr+stelem.ref가 잘못 감싸져서 self-host 빌드 시 이 메서드 자체의 IL이
+          // 깨진다 (getter의 EmptyTypes 건과 동일 근본 원인). 지역변수로 우회.
+          var setterParamTypes: array of System.Type;
+          setterParamTypes:=[propClrType];
           var setM:=tb.DefineMethod('set_'+ps.Name,
             MethodAttributes.Public or MethodAttributes.SpecialName or
             MethodAttributes.HideBySig or MethodAttributes.Virtual,
-            typeof(System.Void), [propClrType]);
+            typeof(System.Void), setterParamTypes);
           var sIL:=setM.GetILGenerator;
           if DictDictHas(fFieldBuilders, cd.Name, ps.WriteName) then
           begin
@@ -2847,10 +2886,15 @@
           // 믿을 수 없다 — 여기서 미리 계산해 둔 propClrType을 등록해 재사용한다.
           if not fMethodParamClrTypes.ContainsKey(cd.Name) then
             fMethodParamClrTypes[cd.Name]:=new Dictionary<string, array of System.Type>;
-          fMethodParamClrTypes[cd.Name]['set_'+ps.Name]:=[propClrType];
+          fMethodParamClrTypes[cd.Name]['set_'+ps.Name]:=setterParamTypes;
         end;
       end;
+    end;
 
+    // 5) 생성자(오버로드 전부) 정의 + 사용자 생성자가 없으면 기본(부모 체이닝) 본문까지 방출
+    procedure BuildClassShell_Constructors(tb: TypeBuilder; cd: TClassDeclNode; parentType: System.Type);
+    var parentCtor: ConstructorInfo; i: integer;
+    begin
       // 기본 생성자 추가 (부모 생성자 호출로 체이닝)
       // [Stage 47] 클래스 선언부에 "constructor Create(...)"로 매개변수가 선언돼 있으면
       // 그 시그니처 그대로 정의한다 (선언 없으면 빈 매개변수 목록 → 기존과 동일).
@@ -2859,11 +2903,13 @@
       // 에서 이 클래스(cd.Name) 소유의 항목들을 그대로 가져와 "그 개수만큼" ConstructorBuilder를
       // 만든다 — Parser.pas Stage 99 수정 이후 각 impl은 자기 자신의 Parameters만 정확히
       // 갖고 있으므로 이게 곧 실제 오버로드 목록이다(순서=소스에 나온 순서).
+      Writeln('[MARK-BCS-7] 프로퍼티 루프 종료, 생성자 섹션 시작, cd.HasUserConstructor='+cd.HasUserConstructor.ToString);
       var thisClassCtorImpls:=new List<TConstructorImplNode>;
       if cd.HasUserConstructor then
         foreach var _ci99 in fProg.ConstructorImpls do
           if _ci99.ClassName=cd.Name then thisClassCtorImpls.Add(_ci99);
 
+      Writeln('[MARK-BCS-7a] thisClassCtorImpls.Count='+thisClassCtorImpls.Count.ToString);
       var ctorBuilderList:=new List<ConstructorBuilder>;
       var ctorParamTypeList:=new List<array of System.Type>;
 
@@ -2871,11 +2917,14 @@
       begin
         foreach var _ci99b in thisClassCtorImpls do
         begin
+          Writeln('[MARK-BCS-7b] 사용자 생성자 오버로드 처리, Parameters.Count='+_ci99b.Parameters.Count.ToString+' — 매개변수 CLR 타입 해석 직전');
           var _ctorParamTypes99:=new System.Type[_ci99b.Parameters.Count];
           for i:=0 to _ci99b.Parameters.Count-1 do
             _ctorParamTypes99[i]:=ResolveTopParamClrType(_ci99b.Parameters[i]);
+          Writeln('[MARK-BCS-7c] 매개변수 CLR 타입 해석 완료 — DefineConstructor 호출 직전');
           var _ctorBuilder99:=tb.DefineConstructor(
             MethodAttributes.Public, CallingConventions.Standard, _ctorParamTypes99);
+          Writeln('[MARK-BCS-7d] DefineConstructor 완료');
           ctorBuilderList.Add(_ctorBuilder99);
           ctorParamTypeList.Add(_ctorParamTypes99);
         end;
@@ -2891,6 +2940,7 @@
         ctorParamTypeList.Add(_ctorParamTypes99);
       end;
 
+      Writeln('[MARK-BCS-8] 생성자 오버로드 루프 종료, ctorBuilderList.Count='+ctorBuilderList.Count.ToString);
       fCtorBuilders[cd.Name]:=ctorBuilderList;
       fCtorParamClrTypes[cd.Name]:=ctorParamTypeList;
 
@@ -2919,7 +2969,10 @@
         begin
           // 로컬에서 만든 클래스가 아니면(System.Object 또는 외부 어셈블리 타입)
           // parentType에서 직접 매개변수 없는 public 생성자를 찾는다.
-          parentCtor:=parentType.GetConstructor(System.Type.EmptyTypes);
+          // [진단] System.Type.EmptyTypes 인라인 인자 우회 (동일 근본 원인, Console.ReadKey 건 참고)
+          var parentCtorParamTypes: array of System.Type;
+          parentCtorParamTypes:=System.Type.EmptyTypes;
+          parentCtor:=parentType.GetConstructor(parentCtorParamTypes);
           if parentCtor=nil then
             raise new Exception('부모 타입 "'+parentType.FullName+'"에 매개변수 없는 public 생성자가 없습니다.');
         end;
@@ -2934,7 +2987,20 @@
         fLocalScope:=svLocalScope83;
         fCurClassName:=svCurClass83;
         ctorIL.Emit(OpCodes.Ret);
+        Writeln('[MARK-BCS-9] 기본 생성자(부모 체이닝) IL 방출 완료');
       end;
+    end;
+
+    procedure BuildClassShell(modBuilder: ModuleBuilder; cd: TClassDeclNode);
+    var tb: TypeBuilder; parentType: System.Type;
+    begin
+      Writeln('[MARK-BCS-0] BuildClassShell 진입, cd.Name="'+cd.Name+'"');
+      tb:=BuildClassShell_DefineType(modBuilder, cd, parentType);
+      BuildClassShell_Fields(tb, cd);
+      BuildClassShell_Methods(tb, cd);
+      BuildClassShell_Properties(tb, cd);
+      BuildClassShell_Constructors(tb, cd, parentType);
+      Writeln('[MARK-BCS-10] BuildClassShell 정상 반환, cd.Name="'+cd.Name+'"');
     end;
 
     // [Stage 42] 사용자가 작성한 생성자 본문(constructor ClassName.Create; begin...end;)을
@@ -3086,9 +3152,14 @@
           // BindingFlags에 NonPublic도 포함해 protected/internal 생성자까지 찾는다.
           // IL의 OpCodes.Call은 C#과 달리 접근 제한자를 컴파일타임에 강제하지 않으므로
           // ConstructorInfo만 얻으면 protected 생성자도 문제없이 호출할 수 있다.
-          autoParentCtor:=fClassExternalParentType[impl.ClassName].GetConstructor(
-            BindingFlags.Instance or BindingFlags.Public or BindingFlags.NonPublic,
-            nil, System.Type.EmptyTypes, nil)
+          begin
+            // [진단] System.Type.EmptyTypes 인라인 인자 우회 (동일 근본 원인)
+            var _P3EmptyTypesLocalA: array of System.Type;
+            _P3EmptyTypesLocalA:=System.Type.EmptyTypes;
+            autoParentCtor:=fClassExternalParentType[impl.ClassName].GetConstructor(
+              BindingFlags.Instance or BindingFlags.Public or BindingFlags.NonPublic,
+              nil, _P3EmptyTypesLocalA, nil);
+          end
         else
           // [버그수정] cd.ParentName이 실은 인터페이스였던 경우(예: class(IDisposable))
           // BuildClassShell은 실제 CLR 부모를 System.Object로 두고 인터페이스는
@@ -3096,7 +3167,11 @@
           // "IDisposable"이라는 원래 이름이 남아있어서, 그 이름으로 생성자를 찾으려 하면
           // (인터페이스는 생성자가 없으므로) 항상 실패했다. ParentName이 없거나 인터페이스로
           // 판명된 경우엔 진짜 부모인 System.Object의 기본 생성자를 쓴다.
-          autoParentCtor:=typeof(System.Object).GetConstructor(System.Type.EmptyTypes);
+          begin
+            var _P3EmptyTypesLocalB: array of System.Type;
+            _P3EmptyTypesLocalB:=System.Type.EmptyTypes;
+            autoParentCtor:=typeof(System.Object).GetConstructor(_P3EmptyTypesLocalB);
+          end;
         if autoParentCtor=nil then
           raise new Exception('클래스 "'+impl.ClassName+'"의 부모 "'+autoParentName+'"에 매개변수 없는 public 생성자가 없어 자동으로 상속 생성자를 호출할 수 없습니다. 본문에 "inherited Create(...)"를 직접 써주세요.');
         il.Emit(OpCodes.Ldarg_0);
@@ -3369,7 +3444,9 @@
       ctorB:=clTB.DefineConstructor(MethodAttributes.Public, CallingConventions.Standard, ctorParamTypes);
       var cil:=ctorB.GetILGenerator;
       cil.Emit(OpCodes.Ldarg_0);
-      cil.Emit(OpCodes.Call, typeof(System.Object).GetConstructor(System.Type.EmptyTypes));
+      var _P3EmptyTypesLocalC1: array of System.Type;
+      _P3EmptyTypesLocalC1:=System.Type.EmptyTypes;
+      cil.Emit(OpCodes.Call, typeof(System.Object).GetConstructor(_P3EmptyTypesLocalC1));
       for i:=0 to fd.Parameters.Count-1 do
       begin
         cil.Emit(OpCodes.Ldarg_0);
@@ -3450,8 +3527,10 @@
       curFB:=fIterCurrentFieldOf[d.Name];
 
       // ---- MoveNext() ----
+      var _P3EmptyTypesLocalC2: array of System.Type;
+      _P3EmptyTypesLocalC2:=System.Type.EmptyTypes;
       mnb:=clTB.DefineMethod('MoveNext', MethodAttributes.Public or MethodAttributes.Virtual or MethodAttributes.HideBySig,
-        typeof(boolean), System.Type.EmptyTypes);
+        typeof(boolean), _P3EmptyTypesLocalC2);
       il:=mnb.GetILGenerator;
 
       // 컨텍스트 저장/복원 — 이터레이터는 중첩(재진입) 지원 대상이 아니지만(파서가 sequence of를
@@ -3543,9 +3622,11 @@
       // 타입이 다른 "제네릭" Current(T get_Current)도 함께 둬야 해서(IL은 반환타입까지 시그니처에
       // 포함하므로 공존 가능하지만, public으로 그냥 두 개를 만들면 어느 쪽이 어느 인터페이스용인지
       // CLR이 모호해한다 — C# 컴파일러가 명시적 인터페이스 구현에 쓰는 것과 동일한 패턴).
+      var _P3EmptyTypesLocalC3: array of System.Type;
+      _P3EmptyTypesLocalC3:=System.Type.EmptyTypes;
       var getCurNG:=clTB.DefineMethod('<>get_Current_NG', MethodAttributes.Private or MethodAttributes.Virtual or
         MethodAttributes.Final or MethodAttributes.NewSlot or MethodAttributes.HideBySig or MethodAttributes.SpecialName,
-        typeof(System.Object), System.Type.EmptyTypes);
+        typeof(System.Object), _P3EmptyTypesLocalC3);
       var ngIl:=getCurNG.GetILGenerator;
       ngIl.Emit(OpCodes.Ldarg_0); ngIl.Emit(OpCodes.Ldfld, curFB);
       if elemClrType.IsValueType then ngIl.Emit(OpCodes.Box, elemClrType);
@@ -3555,9 +3636,11 @@
       // ---- Current: IEnumerator<T>.Current — T 그대로 반환(박싱 없음) ----
       var ienumeratorOpenT2:=System.Type.GetType('System.Collections.Generic.IEnumerator`1');
       var ienumeratorT2:=ienumeratorOpenT2.MakeGenericType(elemClrType);
+      var _P3EmptyTypesLocalC4: array of System.Type;
+      _P3EmptyTypesLocalC4:=System.Type.EmptyTypes;
       var getCurG:=clTB.DefineMethod('<>get_Current_G', MethodAttributes.Private or MethodAttributes.Virtual or
         MethodAttributes.Final or MethodAttributes.NewSlot or MethodAttributes.HideBySig or MethodAttributes.SpecialName,
-        elemClrType, System.Type.EmptyTypes);
+        elemClrType, _P3EmptyTypesLocalC4);
       var gIl:=getCurG.GetILGenerator;
       gIl.Emit(OpCodes.Ldarg_0); gIl.Emit(OpCodes.Ldfld, curFB); gIl.Emit(OpCodes.Ret);
       clTB.DefineMethodOverride(getCurG, ienumeratorT2.GetProperty('Current').GetGetMethod);
@@ -3565,9 +3648,11 @@
       // ---- GetEnumerator: IEnumerable(비제네릭) — 1차 제약: 재사용 없이 자기 자신을 그대로 돌려준다
       // (한 번만 순회 가능 — 같은 시퀀스를 두 번 foreach하면 이미 소진된 상태를 공유한다. 다시 순회하려면
       //  원래 함수를 다시 호출해 새 시퀀스를 만들 것. 2차에서 상태 복제/Reset으로 개선 예정).
+      var _P3EmptyTypesLocalC5: array of System.Type;
+      _P3EmptyTypesLocalC5:=System.Type.EmptyTypes;
       var getEnumNG:=clTB.DefineMethod('<>GetEnumerator_NG', MethodAttributes.Private or MethodAttributes.Virtual or
         MethodAttributes.Final or MethodAttributes.NewSlot or MethodAttributes.HideBySig,
-        typeof(System.Collections.IEnumerator), System.Type.EmptyTypes);
+        typeof(System.Collections.IEnumerator), _P3EmptyTypesLocalC5);
       var geNgIl:=getEnumNG.GetILGenerator;
       geNgIl.Emit(OpCodes.Ldarg_0); geNgIl.Emit(OpCodes.Ret);
       clTB.DefineMethodOverride(getEnumNG, typeof(System.Collections.IEnumerable).GetMethod('GetEnumerator'));
@@ -3575,23 +3660,31 @@
       // ---- GetEnumerator: IEnumerable<T> ----
       var ienumOpenT2:=System.Type.GetType('System.Collections.Generic.IEnumerable`1');
       var ienumT2:=ienumOpenT2.MakeGenericType(elemClrType);
+      var _P3EmptyTypesLocalC6: array of System.Type;
+      _P3EmptyTypesLocalC6:=System.Type.EmptyTypes;
       var getEnumG:=clTB.DefineMethod('<>GetEnumerator_G', MethodAttributes.Private or MethodAttributes.Virtual or
         MethodAttributes.Final or MethodAttributes.NewSlot or MethodAttributes.HideBySig,
-        ienumeratorT2, System.Type.EmptyTypes);
+        ienumeratorT2, _P3EmptyTypesLocalC6);
       var geGIl:=getEnumG.GetILGenerator;
       geGIl.Emit(OpCodes.Ldarg_0); geGIl.Emit(OpCodes.Ret);
       clTB.DefineMethodOverride(getEnumG, ienumT2.GetMethod('GetEnumerator'));
 
       // ---- Reset() — 순방향 전용 lazy 시퀀스라 지원하지 않는다(BCL의 흔한 관례와 동일) ----
+      var _P3EmptyTypesLocalC7: array of System.Type;
+      _P3EmptyTypesLocalC7:=System.Type.EmptyTypes;
       var resetMB:=clTB.DefineMethod('Reset', MethodAttributes.Public or MethodAttributes.Virtual or MethodAttributes.HideBySig,
-        typeof(System.Void), System.Type.EmptyTypes);
+        typeof(System.Void), _P3EmptyTypesLocalC7);
       var rIl:=resetMB.GetILGenerator;
-      rIl.Emit(OpCodes.Newobj, typeof(System.NotSupportedException).GetConstructor(System.Type.EmptyTypes));
+      var _P3EmptyTypesLocalC8: array of System.Type;
+      _P3EmptyTypesLocalC8:=System.Type.EmptyTypes;
+      rIl.Emit(OpCodes.Newobj, typeof(System.NotSupportedException).GetConstructor(_P3EmptyTypesLocalC8));
       rIl.Emit(OpCodes.Throw);
 
       // ---- Dispose() — 정리할 외부 리소스가 없으므로 아무 것도 안 한다 ----
+      var _P3EmptyTypesLocalC9: array of System.Type;
+      _P3EmptyTypesLocalC9:=System.Type.EmptyTypes;
       var disposeMB:=clTB.DefineMethod('Dispose', MethodAttributes.Public or MethodAttributes.Virtual or MethodAttributes.HideBySig,
-        typeof(System.Void), System.Type.EmptyTypes);
+        typeof(System.Void), _P3EmptyTypesLocalC9);
       disposeMB.GetILGenerator.Emit(OpCodes.Ret);
 
       clTB.CreateType;
@@ -4316,13 +4409,15 @@
       // Main보다 앞서 값이 채워진다.
       if (not fProg.IsLibrary) and (fProg.ConstDecls.Count > 0) then
       begin
+        var _P3EmptyTypesLocalC10: array of System.Type;
+        _P3EmptyTypesLocalC10:=System.Type.EmptyTypes;
         var cctorMB: MethodBuilder := mainTB.DefineMethod('.cctor',
           MethodAttributes.Private or MethodAttributes.Static or
           MethodAttributes.HideBySig or MethodAttributes.SpecialName or MethodAttributes.RTSpecialName,
           // [Stage 111 버그 수정] .NET Framework에서는 nil(=null)을 "매개변수 없음"으로 관대하게
           // 받아줬지만, 이 프로젝트가 돌아가는 .NET(Core/5+)의 TypeBuilder.DefineMethod는 null을
           // 그대로 거부하고 ArgumentNullException(parameterTypes)을 던진다 — 빈 배열을 명시해야 한다.
-          typeof(System.Void), System.Type.EmptyTypes);
+          typeof(System.Void), _P3EmptyTypesLocalC10);
         var cctorIL: ILGenerator := cctorMB.GetILGenerator;
         // 각 const를 static 필드로 선언하고 cctor에서 초기화한다.
         var savedLocalScope96: TScope := fLocalScope;
