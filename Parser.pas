@@ -300,9 +300,21 @@ type
           _t93:=System.Type.GetType(_full93);
           if _t93=nil then
             foreach _asm93 in System.AppDomain.CurrentDomain.GetAssemblies() do
-            begin _t93:=_asm93.GetType(_full93); if _t93<>nil then break; end;
+            begin
+              try
+                _t93:=_asm93.GetType(_full93);
+              except
+                on exAsm93: Exception do
+                  Writeln('[진단] TryResolveExternalTypeByUses: asm.GetType("'+_full93
+                    +'") 실패, asm='+_asm93.FullName+', 예외='+exAsm93.GetType.FullName+': '+exAsm93.Message);
+              end;
+              if _t93<>nil then break;
+            end;
           if _t93<>nil then begin fullName:=_full93; break; end;
         except
+          on exOuter93: Exception do
+            Writeln('[진단] TryResolveExternalTypeByUses: Type.GetType("'+_full93
+              +'") 실패, 예외='+exOuter93.GetType.FullName+': '+exOuter93.Message);
         end;
       end;
       Result:=fullName<>'';
@@ -324,6 +336,9 @@ type
         _t94:=System.Type.GetType(fullName);
         if _t94<>nil then begin Result:=true; exit; end;
       except
+        on exOuter94: Exception do
+          Writeln('[진단] IsResolvableExternalTypeName: Type.GetType("'+fullName
+            +'") 실패, 예외='+exOuter94.GetType.FullName+': '+exOuter94.Message);
       end;
       foreach _asm94 in System.AppDomain.CurrentDomain.GetAssemblies() do
       begin
@@ -331,6 +346,9 @@ type
           _t94:=_asm94.GetType(fullName);
           if _t94<>nil then begin Result:=true; exit; end;
         except
+          on exAsm94: Exception do
+            Writeln('[진단] IsResolvableExternalTypeName: asm.GetType("'+fullName
+              +'") 실패, asm='+_asm94.FullName+', 예외='+exAsm94.GetType.FullName+': '+exAsm94.Message);
         end;
       end;
     end;
@@ -1095,28 +1113,14 @@ type
     // 손상된 IL을 만드는 것으로 추정)를 완화하기 위해, 가장 큰 단일 분기(tkIdent 식별자 처리,
     // 원래 ParsePrimary 안에 400줄 가까이 인라인되어 있던 부분)를 별도 함수로 분리했다.
     // 로직은 원본과 완전히 동일하다(t 매개변수만 추가).
-    function ParsePrimaryIdent(t: TToken): TExprNode;
-    var inner, argE, idxE: TExprNode;
-        cn: TFuncCallExprNode; mc: TMethodCallExprNode;
-        extCastFull93: string;
+    // [Stage 112] ParsePrimaryIdent가 다시 ~400줄로 커지면서 Stage 111과 동일한
+    // self-compile 전용 BadImageFormatException(메서드 크기/분기복잡도 한계)이 재발했다.
+    // 가장 큰 단일 블록인 "식별자 뒤에 점(.)이 이어지는 경우" 처리(원래
+    // ParsePrimaryIdent 1136~1322줄, 약 180줄)를 로직 변경 없이 그대로 별도 함수로
+    // 옮긴다. 이 함수는 Cur.Kind=tkDot일 때만 호출된다.
+    function ParsePrimaryIdentDotted(t: TToken; gcn: string): TExprNode;
+    var mc: TMethodCallExprNode;
     begin
-        fPos:=fPos+1;
-
-        // [Stage 51] North, South 같은 열거형 멤버 이름 — 변수/필드가 아니라 정수 서수 리터럴로 취급.
-        // (열거형 선언은 var/begin 섹션보다 항상 먼저 파싱되므로 이 시점에 이미 등록돼 있다.)
-        if fEnumMemberEnumName.ContainsKey(t.Text) then
-        begin
-          Result:=new TEnumValueExprNode(fEnumMemberEnumName[t.Text], t.Text, fEnumMemberOrdinal[t.Text]);
-        end
-
-        else
-        begin
-
-        // Stage26: TStack<integer> 처럼 제네릭 클래스 이름 뒤에 '<' 가 이어지면
-        // 그 자리에서 단형화 요청을 등록하고, 이후 로직은 구체 클래스 이름(gcn)으로 진행한다.
-        var gcn:=t.Text;
-        if (Cur.Kind=tkLt) and fGenericClassNames.Contains(gcn) then
-          gcn:=ResolveGenericInstantiation(gcn);
 
         // 클래스명.Create → TNewObjectExprNode (지역 클래스 또는 점(.)으로 연결된 외부 타입)
         if (Cur.Kind=tkDot) and fClassNames.Contains(gcn) then
@@ -1172,6 +1176,7 @@ type
               while Cur.Kind=tkComma do begin fPos:=fPos+1; castArgs2.Add(ParseExpr); end;
             end;
             Expect(tkRParen);
+            Writeln('[MARK-PPI-A] IsResolvableExternalTypeName 호출 직전, name="'+string.Join('.', segs2)+'"');
             if IsResolvableExternalTypeName(string.Join('.', segs2))
                and (castArgs2.Count=1) and (Cur.Kind=tkDot) then
             begin
@@ -1297,6 +1302,39 @@ type
               end;
             end;
           end;
+        end;
+    end;
+
+    function ParsePrimaryIdent(t: TToken): TExprNode;
+    var inner, argE, idxE: TExprNode;
+        cn: TFuncCallExprNode; mc: TMethodCallExprNode;
+        extCastFull93: string;
+    begin
+        // [진단] BadImageFormatException 위치를 좁히기 위해 — 정확히 어떤 식별자를
+        // 파싱하다가 터지는지 진입 시점에 찍는다.
+        Writeln('[MARK-PPI] ParsePrimaryIdent 진입, t.Text="'+t.Text+'", line='+t.Line.ToString+', col='+t.Column.ToString);
+        fPos:=fPos+1;
+
+        // [Stage 51] North, South 같은 열거형 멤버 이름 — 변수/필드가 아니라 정수 서수 리터럴로 취급.
+        // (열거형 선언은 var/begin 섹션보다 항상 먼저 파싱되므로 이 시점에 이미 등록돼 있다.)
+        if fEnumMemberEnumName.ContainsKey(t.Text) then
+        begin
+          Result:=new TEnumValueExprNode(fEnumMemberEnumName[t.Text], t.Text, fEnumMemberOrdinal[t.Text]);
+        end
+
+        else
+        begin
+
+        // Stage26: TStack<integer> 처럼 제네릭 클래스 이름 뒤에 '<' 가 이어지면
+        // 그 자리에서 단형화 요청을 등록하고, 이후 로직은 구체 클래스 이름(gcn)으로 진행한다.
+        var gcn:=t.Text;
+        if (Cur.Kind=tkLt) and fGenericClassNames.Contains(gcn) then
+          gcn:=ResolveGenericInstantiation(gcn);
+
+        // [Stage 112] 점(.)으로 시작하는 모든 처리를 ParsePrimaryIdentDotted로 위임.
+        if (Cur.Kind=tkDot) then
+        begin
+          Result:=ParsePrimaryIdentDotted(t, gcn);
         end
 
         // 배열 인덱스 (1차원 또는 2차원)
@@ -1373,12 +1411,29 @@ type
           Result:=new TLengthExprNode(ntL.Text);
         end
 
+        // [Stage 112 이분탐색] 여기서부터(builtin 호출/캐스트류/암시적 self 호출/fallback)는
+        // ParsePrimaryIdentB로 위임 — 앞의 배열 인덱스·함수 호출 분기들과 분리해서
+        // 어느 절반에서 self-compile IL 손상이 발생하는지 좁혀본다.
+        else
+        begin
+          Result:=ParsePrimaryIdentB(t);
+        end;
+
+        end; // [Stage 51] else 블록(열거형 멤버가 아닌 일반 식별자 처리) 종료
+    end;
+
+    function ParsePrimaryIdentB(t: TToken): TExprNode;
+    var cn: TFuncCallExprNode; mc: TMethodCallExprNode;
+        extCastFull93: string;
+    begin
+        Writeln('[MARK-PPIB] ParsePrimaryIdentB 진입, t.Text="'+t.Text+'"');
+
         // [Stage 72] PABCSystem 표준 라이브러리 함수(Abs/Sqrt/UpperCase/Copy/StrToInt/... 등).
         // fFuncNames(사용자 정의 함수)에 없을 때만 반응하므로, 혹시 사용자가 같은 이름으로
         // 직접 함수를 정의했다면(위의 "일반 함수 호출" 분기가 먼저 걸려) 그쪽이 우선한다.
         // 인자 개수는 여기서 검증하지 않고(0개부터 몇 개든 그대로 받아 둔다) CodeGen이
         // EmitBuiltinCall에서 함수별로 정확한 개수를 검사해 에러 메시지를 낸다.
-        else if (Cur.Kind=tkLParen) and (NormalizeBuiltinFuncName(t.Text)<>'') and (not fFuncNames.Contains(t.Text)) then
+        if (Cur.Kind=tkLParen) and (NormalizeBuiltinFuncName(t.Text)<>'') and (not fFuncNames.Contains(t.Text)) then
         begin
           var bcn:=new TBuiltinCallExprNode(NormalizeBuiltinFuncName(t.Text));
           fPos:=fPos+1; // '(' 소비
@@ -1492,8 +1547,6 @@ type
           else
             Result:=new TVarRefNode(t.Text);
         end;
-
-        end; // [Stage 51] else 블록(열거형 멤버가 아닌 일반 식별자 처리) 종료
     end;
 
     function ParsePrimary: TExprNode;
