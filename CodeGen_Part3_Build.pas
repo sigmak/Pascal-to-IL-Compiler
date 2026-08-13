@@ -1244,63 +1244,98 @@
     //   method/ctor의 DeclaringType이 반드시 열린 제네릭 타입 정의 자체여야 한다.
     //   Object 등 상위 클래스에서 상속된 멤버는 DeclaringType이 다르므로 건너뜀.
     // ---------------------------------------------------------------
+    // [Stage 122 재분할] Test110 재현 케이스에서 SafeGetProperty(typeof(string), "Length")
+    // 호출 자체 내부에서 NullReferenceException 발생 (MARK-IQCT-7까지 찍히고 MARK-IQCT-8은
+    // 안 찍힘). curType이 System.String이라 TypeBuilderInstantiation 분기도 안 타고
+    // t.GetProperty("Length")도 지극히 평범한 리플렉션 호출이라 로직 버그일 수 없다 —
+    // 바깥쪽 try/except 안에 while+try/except가 중첩된 구조(Stage 111/112와 동일 계열의
+    // 위험 패턴)를 의심하고, 세 조각(TypeBuilderInstantiation 특수 처리 / 기본 경로 /
+    // 폴백 계층 훑기)으로 완전히 분리한다.
     function SafeGetProperty(t: System.Type; name: string): PropertyInfo;
-    var curT91: System.Type; props91: array of PropertyInfo; p91: PropertyInfo;
+    var _sgpRuntimeTypeName: string;
     begin
-      if t.GetType().Name = 'TypeBuilderInstantiation' then
+      Writeln('[MARK-SGP-0] SafeGetProperty 진입, t=nil? '+(t=nil).ToString+' name="'+name+'"');
+      _sgpRuntimeTypeName := t.GetType().Name;
+      Writeln('[MARK-SGP-1] t.GetType().Name="'+_sgpRuntimeTypeName+'"');
+      if _sgpRuntimeTypeName = 'TypeBuilderInstantiation' then
       begin
-        // [Stage 99 버그 수정] 예전에는 여기서 곧바로 nil을 돌려줘서 List<TToken>.Count처럼
-        // 원소 타입이 아직 CreateType 안 된 로컬 클래스인 제네릭 컬렉션의 프로퍼티 접근이
-        // 전부 "메서드가 없습니다" 오류로 실패했다. SafeGetMethods/SafeGetConstructor(s)와
-        // 동일한 우회법(열린 제네릭 정의에서 멤버를 찾고 TypeBuilder.GetMethod로 그 접근자
-        // 만 닫힌 버전에 바인딩)을 get_/set_ 메서드에 적용해 TBoundGenericPropertyInfo로
-        // 감싸 돌려준다.
-        var openT99 := t.GetGenericTypeDefinition();
-        var openProp99: PropertyInfo := nil;
-        foreach var op99 in openT99.GetProperties(BindingFlags.Public or BindingFlags.NonPublic or
-                                                    BindingFlags.Instance or BindingFlags.Static) do
-          if (op99.Name = name) and (op99.DeclaringType = openT99) then
-          begin openProp99 := op99; break; end;
-        if openProp99 = nil then begin Result := nil; exit; end;
-
-        var boundGetter99: MethodInfo := nil;
-        var boundSetter99: MethodInfo := nil;
-        if openProp99.GetGetMethod(true) <> nil then
-          boundGetter99 := TypeBuilder.GetMethod(t, openProp99.GetGetMethod(true));
-        if openProp99.GetSetMethod(true) <> nil then
-          boundSetter99 := TypeBuilder.GetMethod(t, openProp99.GetSetMethod(true));
-
-        Result := new TBoundGenericPropertyInfo(openProp99, t, boundGetter99, boundSetter99);
-        exit;
-      end;
-      try
-        Result := t.GetProperty(name);
-      except
-        // [버그 수정] 이전에는 System.Reflection.AmbiguousMatchException만 잡았다. 그런데
-        // GroupCollection.Item처럼 이름은 같고 인자 타입만 다른(int/string) 인덱서가 두 개
-        // 이상 있을 때 t.GetProperty(name)이 실제로 AmbiguousMatchException을 던지는 게
-        // 맞지만, 만에 하나 여기서 그 특정 타입과 정확히 매치되지 않는 경우(어셈블리 로드
-        // 컨텍스트 차이 등) 예외가 이 on절을 통과하지 못하고 그대로 위로 전파되어, 이 함수를
-        // 부르는 GetExprClrType의 바깥쪽 포괄 except가 조용히 System.Object로 폴백해버린다
-        // (그 결과 m.Groups[2].Value처럼 실제로는 존재하는 멤버가 "System.Object에 멤버
-        // ...가 없습니다"로 잘못 보고된다). 어떤 예외든 동일한 DeclaredOnly 폴백을 타도록
-        // on절 없는 포괄 except로 넓힌다 — 아래 로직 자체는 기존 AmbiguousMatchException
-        // 대응과 동일하다(가장 파생된 타입에서 이름이 일치하는 첫 선언을 사용).
-        Result := nil;
-        curT91 := t;
-        while curT91 <> nil do
-        begin
-          try
-            props91 := curT91.GetProperties(BindingFlags.Public or BindingFlags.NonPublic or
-                                              BindingFlags.Instance or BindingFlags.Static or
-                                              BindingFlags.DeclaredOnly);
-            foreach p91 in props91 do
-              if p91.Name = name then begin Result := p91; break; end;
-          except
-          end;
-          if Result <> nil then break;
-          curT91 := curT91.BaseType;
+        Writeln('[MARK-SGP-TBI-0] TBI 분기 진입, SafeGetPropertyTBI 호출 직전');
+        Result := SafeGetPropertyTBI(t, name);
+        Writeln('[MARK-SGP-TBI-1] SafeGetPropertyTBI 반환 완료');
+      end
+      else
+      begin
+        Writeln('[MARK-SGP-2] else 분기 진입, t.GetProperty 호출 직전');
+        try
+          Result := t.GetProperty(name);
+          Writeln('[MARK-SGP-3] t.GetProperty 완료, Result=nil? '+(Result=nil).ToString);
+        except
+          Writeln('[MARK-SGP-EXC-0] except 진입, SafeGetPropertyFallback 호출 직전');
+          Result := SafeGetPropertyFallback(t, name);
+          Writeln('[MARK-SGP-EXC-1] SafeGetPropertyFallback 반환 완료');
         end;
+      end;
+      Writeln('[MARK-SGP-4] SafeGetProperty 반환 직전');
+    end;
+
+    // [Stage 122] TypeBuilderInstantiation(아직 CreateType 안 된 로컬 클래스를 담은
+    // 열린 제네릭 인스턴스화) 전용 경로 — 원래 SafeGetProperty 앞부분 그대로 이동.
+    function SafeGetPropertyTBI(t: System.Type; name: string): PropertyInfo;
+    begin
+      // [Stage 99 버그 수정] 예전에는 여기서 곧바로 nil을 돌려줘서 List<TToken>.Count처럼
+      // 원소 타입이 아직 CreateType 안 된 로컬 클래스인 제네릭 컬렉션의 프로퍼티 접근이
+      // 전부 "메서드가 없습니다" 오류로 실패했다. SafeGetMethods/SafeGetConstructor(s)와
+      // 동일한 우회법(열린 제네릭 정의에서 멤버를 찾고 TypeBuilder.GetMethod로 그 접근자
+      // 만 닫힌 버전에 바인딩)을 get_/set_ 메서드에 적용해 TBoundGenericPropertyInfo로
+      // 감싸 돌려준다.
+      var openT99 := t.GetGenericTypeDefinition();
+      var openProp99: PropertyInfo := nil;
+      foreach var op99 in openT99.GetProperties(BindingFlags.Public or BindingFlags.NonPublic or
+                                                  BindingFlags.Instance or BindingFlags.Static) do
+        if (op99.Name = name) and (op99.DeclaringType = openT99) then
+        begin openProp99 := op99; break; end;
+      if openProp99 = nil then begin Result := nil; exit; end;
+
+      var boundGetter99: MethodInfo := nil;
+      var boundSetter99: MethodInfo := nil;
+      if openProp99.GetGetMethod(true) <> nil then
+        boundGetter99 := TypeBuilder.GetMethod(t, openProp99.GetGetMethod(true));
+      if openProp99.GetSetMethod(true) <> nil then
+        boundSetter99 := TypeBuilder.GetMethod(t, openProp99.GetSetMethod(true));
+
+      Result := new TBoundGenericPropertyInfo(openProp99, t, boundGetter99, boundSetter99);
+    end;
+
+    // [Stage 122] 기본 t.GetProperty(name)이 예외를 던졌을 때(주로 AmbiguousMatchException)의
+    // 폴백 — 상속 계층을 위로 훑으며 DeclaredOnly로 이름이 일치하는 첫 선언을 찾는다.
+    // 원래 SafeGetProperty 뒷부분(중첩 try/except) 그대로 이동.
+    function SafeGetPropertyFallback(t: System.Type; name: string): PropertyInfo;
+    var curT91: System.Type; props91: array of PropertyInfo; p91: PropertyInfo; _found91: boolean;
+    begin
+      // [버그 수정] 이전에는 System.Reflection.AmbiguousMatchException만 잡았다. 그런데
+      // GroupCollection.Item처럼 이름은 같고 인자 타입만 다른(int/string) 인덱서가 두 개
+      // 이상 있을 때 t.GetProperty(name)이 실제로 AmbiguousMatchException을 던지는 게
+      // 맞지만, 만에 하나 여기서 그 특정 타입과 정확히 매치되지 않는 경우(어셈블리 로드
+      // 컨텍스트 차이 등) 예외가 이 on절을 통과하지 못하고 그대로 위로 전파되어, 이 함수를
+      // 부르는 GetExprClrType의 바깥쪽 포괄 except가 조용히 System.Object로 폴백해버린다
+      // (그 결과 m.Groups[2].Value처럼 실제로는 존재하는 멤버가 "System.Object에 멤버
+      // ...가 없습니다"로 잘못 보고된다). 어떤 예외든 동일한 DeclaredOnly 폴백을 타도록
+      // on절 없는 포괄 except로 넓힌다 — 아래 로직 자체는 기존 AmbiguousMatchException
+      // 대응과 동일하다(가장 파생된 타입에서 이름이 일치하는 첫 선언을 사용).
+      Result := nil;
+      curT91 := t;
+      _found91 := false;
+      while (curT91 <> nil) and (not _found91) do
+      begin
+        try
+          props91 := curT91.GetProperties(BindingFlags.Public or BindingFlags.NonPublic or
+                                            BindingFlags.Instance or BindingFlags.Static or
+                                            BindingFlags.DeclaredOnly);
+          foreach p91 in props91 do
+            if (p91.Name = name) and (not _found91) then begin Result := p91; _found91 := true; end;
+        except
+        end;
+        if not _found91 then curT91 := curT91.BaseType;
       end;
     end;
 
