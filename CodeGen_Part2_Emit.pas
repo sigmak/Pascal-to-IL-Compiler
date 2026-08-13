@@ -4026,6 +4026,13 @@
           fLocalScope.SetClrType(ts2.ExVarName, typeof(Exception));
         end;
 
+        // [버그 수정 - ildasm으로 확인됨] try가 if/else(또는 case, loop 등) 분기의 "첫 번째 문장"이면,
+        // 그 분기 진입을 위해 밖에서 뛰어드는 브랜치(brfalse/br 등)의 목적지가 .try 블록의 바로 그
+        // 첫 명령과 겹쳐버린다. CLR은 보호영역(try/catch/finally)에 "낙하(fall-through)"로만 진입할 수
+        // 있고 브랜치로 뛰어드는 것은 불법이라, JIT가 이 메서드를 로드하는 순간 BadImageFormatException을
+        // 던진다 (실제 재현: InferTypeMethodCall, self-host 빌드). Nop을 완충 지점으로 하나 끼워 넣으면
+        // 바깥의 브랜치는 이 Nop을 목적지로 삼고, .try는 그다음 명령을 낙하로 자연스럽게 얻는다.
+        aIL.Emit(OpCodes.Nop);
         aIL.BeginExceptionBlock;
         fCurExceptDepth:=fCurExceptDepth+1; // [Stage 60] break/continue가 이 블록을 벗어나면 Leave를 써야 함을 표시
 

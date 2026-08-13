@@ -511,17 +511,44 @@
     end;
 
     // 예외를 던지지 않는 버전 (외부 속성 폴백 판단용)
+    // [Stage 119 진단] Stage 118의 [MARK-TFB] 로그가 "iter=1"로 똑같은 인자를 두 번
+    // 출력한 뒤 두 번째 호출에서 access violation(0xC0000005)이 발생 — 입력에 따라
+    // 갈리는 로직 버그가 아니라 이 함수의 IL 자체가 손상된 것으로 보인다. 1164~1169줄
+    // 주석에 기록된 것과 같은 계열(중첩 if 안의 exit로 인한 분기 목적지 충돌) 의심 —
+    // exit를 완전히 제거하고 sentinel 변수 기반 단일 종료점 while 루프로 재작성한다.
     function TryFindFieldBuilder(startClass, fname: string; var fb: FieldBuilder): boolean;
-    var c: string;
+    var c: string; _classHasIt: boolean; _tfbIter: integer; _tfbFound: boolean; _tfbDone: boolean;
     begin
       c:=startClass;
-      while c<>'' do
+      _tfbIter:=0;
+      _tfbFound:=false;
+      _tfbDone:=false;
+      while not _tfbDone do
       begin
-        if DictDictHas(fFieldBuilders, c, fname) then
-        begin fb:=fFieldBuilders[c][fname]; Result:=true; exit; end;
-        c:=fClasses.GetParentName(c);
+        if c='' then
+          _tfbDone:=true
+        else
+        begin
+          _tfbIter:=_tfbIter+1;
+          Writeln('[MARK-TFB] iter='+_tfbIter.ToString+' c="'+c+'" fname="'+fname+'"');
+          if _tfbIter>1000 then
+            raise new Exception('[진단] TryFindFieldBuilder 무한루프 의심 — startClass='+startClass+', fname='+fname+', 마지막 c='+c);
+          _classHasIt:=false;
+          if fFieldBuilders.ContainsKey(c) then
+          begin
+            if fFieldBuilders[c].ContainsKey(fname) then _classHasIt:=true;
+          end;
+          if _classHasIt then
+          begin
+            fb:=fFieldBuilders[c][fname];
+            _tfbFound:=true;
+            _tfbDone:=true;
+          end
+          else
+            c:=fClasses.GetParentName(c);
+        end;
       end;
-      Result:=false;
+      Result:=_tfbFound;
     end;
 
     // [Stage 96 버그 수정] TypeBuilder로 만들고 있는(아직 CreateType 안 된) 제네릭 클래스가
@@ -587,53 +614,74 @@
     // 경우와, "MainMenu.Items.Add(x)"처럼 진짜 변수로 시작하는 체인을 구분하기 위한 용도 —
     // 이 판별 없이는 전자를 후자로 오인해 EmitQualifierChainLoad가 "System"을 변수로 찾다가
     // 실패한다.
+    // [Stage 120 재분할] TryFindFieldBuilder를 세 번 다시 써봐도(제네릭 제거, exit 제거)
+    // 증상이 전혀 안 바뀌어서 범인이 아니라고 결론짓고, 호출자인 이 함수(원래 7개의
+    // if...exit 연쇄, ~48줄)로 의심을 옮긴다. exit를 전부 없애고 각 판별 조건을 독립
+    // 함수로 분리해, InferTypeMethodCallA/InferTypeDispatch와 동일한 "handled 누적" 패턴으로 맞춘다.
     function IsChainStartSegment(first: string): boolean;
+    var _icss: boolean;
+    begin
+      _icss:=false;
+      if not _icss then _icss:=IsChainStartResult(first);
+      if not _icss then _icss:=IsChainStartField(first);
+      if not _icss then _icss:=IsChainStartClrVar(first);
+      if not _icss then _icss:=IsChainStartLocalClassVar(first);
+      if not _icss then _icss:=IsChainStartPrimitiveVar(first);
+      if not _icss then _icss:=IsChainStartExtAncestorProp(first);
+      if not _icss then _icss:=IsChainStartLocalNiladicMethod(first);
+      Result:=_icss;
+    end;
+
+    // [Stage 120] 1/7 — "Result" 자체에서 시작하는 체인.
+    function IsChainStartResult(first: string): boolean;
+    begin
+      Result:=(first='Result') and (fResultLocal<>nil);
+    end;
+
+    // [Stage 120] 2/7 — 지역 필드.
+    function IsChainStartField(first: string): boolean;
     var dummyFb: FieldBuilder;
     begin
-      // [자기컴파일] Result.FuncNames.AddRange(...); 처럼 함수의 Result 값에서 시작하는
-      // 체인도 인식한다 — Result는 fResultLocal이라는 별도 CLR 로컬이라 필드/변수 조회로는
-      // 못 찾아서 그동안 "알 수 없는 한정자"로 빠졌었다.
-      if (first='Result') and (fResultLocal<>nil) then begin Result:=true; exit; end;
-      if TryFindFieldBuilder(fCurClassName, first, dummyFb) then begin Result:=true; exit; end;
-      if (fLocalScope.Has(first) or fGlobalScope.Has(first))
-         and (fLocalScope.HasClrType(first) or fGlobalScope.HasClrType(first)) then
-      begin Result:=true; exit; end;
-      // [Stage 85 후속 수정] "c.Value.ToString" (c: Counter, Counter는 로컬에서 정의한 클래스)에서
-      // "c.Value" 부분이 점(.)을 포함한 ObjName으로 넘어오면 InferType의 체인 분기가 이 함수로
-      // 첫 세그먼트("c")가 체인 시작점인지 묻는다. 그런데 "c"는 외부 CLR 타입이 아니라 로컬에서
-      // 정의한 클래스(Counter)의 인스턴스라 HasClrType은 false를 반환한다 — GetVarClassName으로
-      // 로컬 클래스 인스턴스 변수인지도 확인해야 한다. 이게 없으면 "c"가 체인 시작점이 아니라고
-      // 오판되어, "c.Value"를 통째로 외부 네임스페이스/타입 경로로 오인해 ResolveExternalType이
-      // 호출되고 "외부 타입 'c.Value'을(를) 찾을 수 없습니다" 예외가 난다.
-      if (fLocalScope.Has(first) or fGlobalScope.Has(first)) and (GetVarClassName(first)<>'') then
-      begin Result:=true; exit; end;
-      // [버그 수정] incName[1]처럼 원시 타입(vtString 등) 지역/전역 변수를 그대로 인덱싱/체이닝하는
-      // 경우 — 원시 타입 변수는 ClrType도 ClassName도 스코프에 기록되지 않아(주석 참고, GetExprClrType의
-      // 동일한 문제와 같은 사유) 지금까지는 체인 시작점으로 인식되지 못해 "알 수 없는 한정자/인덱서
-      // 대상"으로 실패했다. GetVarType으로 실제 원시 타입을 확인해 통과시킨다.
-      if (fLocalScope.Has(first) or fGlobalScope.Has(first))
+      Result:=TryFindFieldBuilder(fCurClassName, first, dummyFb);
+    end;
+
+    // [Stage 120] 3/7 — 외부 CLR 타입을 가진 지역/전역 변수.
+    function IsChainStartClrVar(first: string): boolean;
+    begin
+      Result:=(fLocalScope.Has(first) or fGlobalScope.Has(first))
+         and (fLocalScope.HasClrType(first) or fGlobalScope.HasClrType(first));
+    end;
+
+    // [Stage 120] 4/7 — 로컬에서 정의한 클래스의 인스턴스 변수 (예: c: Counter).
+    function IsChainStartLocalClassVar(first: string): boolean;
+    begin
+      Result:=(fLocalScope.Has(first) or fGlobalScope.Has(first)) and (GetVarClassName(first)<>'');
+    end;
+
+    // [Stage 120] 5/7 — 원시 타입(vtString 등) 지역/전역 변수.
+    function IsChainStartPrimitiveVar(first: string): boolean;
+    begin
+      Result:=(fLocalScope.Has(first) or fGlobalScope.Has(first))
          and ((GetVarType(first)=vtString) or (GetVarType(first)=vtInteger)
               or (GetVarType(first)=vtInt64) or (GetVarType(first)=vtReal)
-              or (GetVarType(first)=vtBoolean) or (GetVarType(first)=vtChar)) then
-      begin Result:=true; exit; end;
-      if (FindExternalAncestorType(fCurClassName)<>nil)
-         and (SafeGetProperty(FindExternalAncestorType(fCurClassName), first)<>nil) then
-      begin Result:=true; exit; end;
-      // [버그 수정] "Cur.Line.ToString"처럼 체인의 첫 세그먼트가 필드/변수가 아니라
-      // 괄호 없이 호출하는 인자 없는 로컬 인스턴스 메서드(예: function Cur: TToken;)인
-      // 경우도 체인 시작점으로 인정한다. 이게 없으면 "Cur"가 어디에도 걸리지 않아
-      // "Cur.Line" 전체가 외부 정적 타입 경로로 오인된다.
-      // [버그 수정/자기컴파일] fInstanceMethods[..][first].GetParameters()는 아직 CreateType되지
-      // 않은(우리가 만드는 중인) 타입의 MethodBuilder에 대해서는 NotSupportedException
-      // ("형식이 만들어지지 않았습니다")을 던진다 — FindInstanceMethodParamTypes와 동일한 이유로,
-      // 정의 시점에 이미 계산해 둔 fMethodParamClrTypes를 대신 사용해 리플렉션 호출을 피한다.
-      if fInstanceMethods.ContainsKey(fCurClassName)
+              or (GetVarType(first)=vtBoolean) or (GetVarType(first)=vtChar));
+    end;
+
+    // [Stage 120] 6/7 — self가 상속한 외부 타입의 프로퍼티.
+    function IsChainStartExtAncestorProp(first: string): boolean;
+    begin
+      Result:=(FindExternalAncestorType(fCurClassName)<>nil)
+         and (SafeGetProperty(FindExternalAncestorType(fCurClassName), first)<>nil);
+    end;
+
+    // [Stage 120] 7/7 — 괄호 없이 호출하는 인자 없는 로컬 인스턴스 메서드.
+    function IsChainStartLocalNiladicMethod(first: string): boolean;
+    begin
+      Result:=fInstanceMethods.ContainsKey(fCurClassName)
          and fInstanceMethods[fCurClassName].ContainsKey(first)
          and fMethodParamClrTypes.ContainsKey(fCurClassName)
          and fMethodParamClrTypes[fCurClassName].ContainsKey(first)
-         and (fMethodParamClrTypes[fCurClassName][first].Length=0) then
-      begin Result:=true; exit; end;
-      Result:=false;
+         and (fMethodParamClrTypes[fCurClassName][first].Length=0);
     end;
 
     // [Stage 76] "MainMenu.Items.Add(x)" 같은 문장에서 파서는 마지막 세그먼트(Add)를 제외한
@@ -833,6 +881,9 @@
     // [Stage 76 확장] EmitQualifierChainLoad와 완전히 같은 판별 순서를 따르되, IL을 전혀 방출하지
     // 않고 최종 타입만 계산한다. InferType은 aIL을 받지 않으므로(방출 시점이 아니라 타입 추론
     // 시점이므로) IL을 섞어 넣으면 명령 스트림이 깨진다 — 그래서 별도 함수로 분리했다.
+    // [Stage 121 진단] Stage 120까지도 TryFindFieldBuilder/IsChainStartSegment 모두 무죄로
+    // 확인됨 — 다음 용의자인 이 함수에 지점별 태그 Writeln을 추가해 정확히 어디까지
+    // 도달하는지 확인한다.
     function InferQualifierChainType(segs: List<string>): System.Type;
     var i: integer; curType: System.Type; pi: PropertyInfo; fi: System.Reflection.FieldInfo;
         firstFb: FieldBuilder; first: string; extSelf: System.Type;
@@ -840,6 +891,7 @@
         mi101: MethodInfo; // [버그 수정] EmitQualifierChainLoad와 동일 — 괄호 없는 무인자 메서드 지원
     begin
       first:=segs[0];
+      Writeln('[MARK-IQCT-0] 진입, segs.Count='+segs.Count.ToString+' first="'+first+'"');
       if TryFindFieldBuilder(fCurClassName, first, firstFb) then curType:=firstFb.FieldType
       else if (fLocalScope.Has(first) or fGlobalScope.Has(first))
               and (fLocalScope.HasClrType(first) or fGlobalScope.HasClrType(first)) then
@@ -873,17 +925,25 @@
           curType:=fInstanceMethods[fCurClassName][first].ReturnType
         else raise new Exception('알 수 없는 한정자 "'+first+'" (연쇄 속성 접근의 시작점을 찾을 수 없습니다)');
       end;
+      Writeln('[MARK-IQCT-1] 첫 세그먼트 타입 결정 완료, curType="'+curType.ToString+'" ? 루프 시작, segs.Count-1='+(segs.Count-1).ToString);
 
       for i:=1 to segs.Count-1 do
       begin
+        Writeln('[MARK-IQCT-2] 루프 진입, i='+i.ToString+' segs[i]="'+segs[i]+'" curType="'+curType.ToString+'"');
         // [Stage 78 수정] curType이 아직 CreateType되지 않은 로컬 TypeBuilder이면
         // GetProperty/GetField가 NotSupportedException을 던진다.
         // fTypeBuilders를 역방향으로 조회해 클래스명을 찾고, fFieldBuilders에서 직접 타입을 가져온다.
         localClsName78:='';
+        Writeln('[MARK-IQCT-3] localClsName78 초기화 완료 ? curType is TypeBuilder 검사 직전');
         if curType is TypeBuilder then
+        begin
+          Writeln('[MARK-IQCT-4] curType is TypeBuilder = true ? foreach 진입');
           foreach tbKvp78 in fTypeBuilders do
             if tbKvp78.Value = TypeBuilder(curType) then
             begin localClsName78:=tbKvp78.Key; break; end;
+          Writeln('[MARK-IQCT-5] foreach 종료, localClsName78="'+localClsName78+'"');
+        end;
+        Writeln('[MARK-IQCT-6] TypeBuilder 분기 완료, localClsName78="'+localClsName78+'" ? 프로퍼티/필드 판별 직전');
 
         if (localClsName78<>'') and fInstanceMethods.ContainsKey(localClsName78)
            and fInstanceMethods[localClsName78].ContainsKey('get_'+segs[i]) then
@@ -898,9 +958,11 @@
           curType:=fFieldBuilders[localClsName78][segs[i]].FieldType
         else
         begin
+          Writeln('[MARK-IQCT-7] 외부 CLR 타입 경로 진입 ? SafeGetProperty 호출 직전');
           // 외부 CLR 타입 — 기존 GetProperty/GetField 경로 (Stage 93: SafeGetProperty로
           // AmbiguousMatchException 방지, EmitQualifierChainLoad와 동일한 이유)
           pi:=SafeGetProperty(curType, segs[i]);
+          Writeln('[MARK-IQCT-8] SafeGetProperty 완료, pi='+ (pi=nil).ToString);
           if pi<>nil then curType:=pi.PropertyType
           else
           begin
@@ -919,7 +981,9 @@
             end;
           end;
         end;
+        Writeln('[MARK-IQCT-9] i='+i.ToString+' 처리 완료, curType="'+curType.ToString+'"');
       end;
+      Writeln('[MARK-IQCT-10] 루프 전체 종료, Result 반환 직전');
       Result:=curType;
     end;
 
@@ -1009,8 +1073,14 @@
         raise new Exception('인터페이스에 없는 메서드 "'+ifname+'.'+mname+'"');
     end;
 
+    // [Stage 114 리팩터] InferType 자체는 재귀깊이 카운터(fEmitDepth)를 위한 얇은
+    // try/finally만 남기고, 실제 판별 로직(500줄 넘는 if-elseif 체인)은 try/finally가
+    // 전혀 없는 InferTypeDispatch로 완전히 분리했다. 재현 사례: BuildConstructorBody →
+    // EmitStatement → EmitStatementDataOps1 → InferType 경로에서, InferType 함수
+    // 진입 시점(JIT)에 곧바로 BadImageFormatException이 발생했다 — 이는 Stage 111
+    // (ParsePrimary)·Stage 112(EmitStatement)에서 겪은 것과 동일한 "거대한 try/finally
+    // 블록이 그 안의 복잡한 분기 로직과 함께 self-host 빌드 시 IL이 깨지는" 패턴이다.
     function InferType(e: TExprNode): TVarType;
-    var b: TBinOpNode;
     begin
       // [Stage 96] EmitExpr/EmitStatement와 같은 재귀 깊이 카운터(fEmitDepth)를 공유한다 —
       // InferType은 TBinOpNode에서 자기 자신을 여러 번 재귀 호출하므로(왼쪽/오른쪽 각각
@@ -1023,19 +1093,46 @@
         raise new Exception('[진단] InferType 재귀 깊이 초과(5000) — 폭주 의심 노드: '+e.GetType.Name);
       end;
       try
+        Result:=InferTypeDispatch(e);
+      finally
+        fEmitDepth:=fEmitDepth-1;
+      end;
+    end;
 
-      if e is TIntLiteralNode then Result:=vtInteger
-      else if e is TRealLiteralNode  then Result:=vtReal   // [Phase 1]
-      else if e is TCharLiteralNode  then Result:=vtChar   // [Phase 1]
-      else if e is TInt64LiteralNode then Result:=vtInt64  // [Phase 1]
-      else if e is TEnumValueExprNode then Result:=vtEnum  // [Stage 51]
-      else if e is TNilLiteralNode then Result:=vtObject // [Stage 29]
-      else if e is TStrLiteralNode then Result:=vtString
-      else if e is TIntToStrNode then Result:=vtString
-      else if e is TBoolToStrNode then Result:=vtString
-      else if e is TLengthExprNode then Result:=vtInteger
-      else if e is TResultRefNode then Result:=fResultType
-      else if e is TNewObjectExprNode then Result:=vtObject
+    // [Stage 114] InferType의 실제 판별 로직 — try/finally 없이 순수 if-elseif 체인만.
+    // [Stage 115 리팩터] InferTypeDispatch(약 520줄)를 통째로 하나의 함수로 두어도
+    // 여전히 self-host 빌드 시 BadImageFormatException이 재현되었다(가장 최근 재현:
+    // InferTypeDispatch 함수 진입 직후 JIT 검증 실패). Stage 112에서 EmitStatement를
+    // EmitStatementDataOps1/MethodCall/DataOps2로 쪼갠 것과 동일한 패턴 — 각 조각이
+    // "이 노드 종류를 내가 처리했으면 Result를 채우고 true, 아니면 false"를 돌려주는
+    // boolean 함수로 만들고, 얇은 디스패처가 순서대로 시도한다. TMethodCallExprNode
+    // 분기 하나만 약 230줄이라 별도 함수(InferTypeMethodCall)로 통째로 뺐다.
+    function InferTypeDispatch(e: TExprNode): TVarType;
+    var r: TVarType; handled: boolean;
+    begin
+      handled:=InferTypeLiteralsAndFields(e, r);
+      if not handled then handled:=InferTypeMethodCall(e, r);
+      if not handled then handled:=InferTypeIndexAndCalls(e, r);
+      if not handled then handled:=InferTypeRest(e, r);
+      if handled then Result:=r else Result:=vtInteger;
+    end;
+
+    // [Stage 115] 1/4 — 단순 리터럴 + TFieldReadExprNode.
+    function InferTypeLiteralsAndFields(e: TExprNode; var r: TVarType): boolean;
+    begin
+      Result:=true;
+      if e is TIntLiteralNode then r:=vtInteger
+      else if e is TRealLiteralNode  then r:=vtReal   // [Phase 1]
+      else if e is TCharLiteralNode  then r:=vtChar   // [Phase 1]
+      else if e is TInt64LiteralNode then r:=vtInt64  // [Phase 1]
+      else if e is TEnumValueExprNode then r:=vtEnum  // [Stage 51]
+      else if e is TNilLiteralNode then r:=vtObject // [Stage 29]
+      else if e is TStrLiteralNode then r:=vtString
+      else if e is TIntToStrNode then r:=vtString
+      else if e is TBoolToStrNode then r:=vtString
+      else if e is TLengthExprNode then r:=vtInteger
+      else if e is TResultRefNode then r:=fResultType
+      else if e is TNewObjectExprNode then r:=vtObject
       else if e is TFieldReadExprNode then
       begin
         // 지역 필드는 기존처럼 단순화(정수로 간주, 기존 동작 유지).
@@ -1049,12 +1146,12 @@
           // lt=vtInteger로 오판되어 Convert.ToString(int32)가 문자열 참조에 호출되고,
           // 그 결과 객체 참조값이 정수로 해석되어 엉뚱한 숫자가 출력되는 버그가 있었다.
           // FieldBuilder.FieldType을 실제로 확인해 string이면 vtString으로 판정한다.
-          if _fb.FieldType=typeof(string) then Result:=vtString
-          else if _fb.FieldType=typeof(boolean) then Result:=vtBoolean
-          else if _fb.FieldType=typeof(double)  then Result:=vtReal   // [Phase 1]
-          else if _fb.FieldType=typeof(char)    then Result:=vtChar   // [Phase 1]
-          else if _fb.FieldType=typeof(int64)   then Result:=vtInt64  // [Phase 1]
-          else Result:=vtInteger;
+          if _fb.FieldType=typeof(string) then r:=vtString
+          else if _fb.FieldType=typeof(boolean) then r:=vtBoolean
+          else if _fb.FieldType=typeof(double)  then r:=vtReal   // [Phase 1]
+          else if _fb.FieldType=typeof(char)    then r:=vtChar   // [Phase 1]
+          else if _fb.FieldType=typeof(int64)   then r:=vtInt64  // [Phase 1]
+          else r:=vtInteger;
         end
         else
         begin
@@ -1062,174 +1159,247 @@
           if _extType<>nil then
           begin
             var _pi:=SafeGetProperty(_extType, _fr.FieldName);
-            if (_pi<>nil) and (_pi.PropertyType=typeof(string)) then Result:=vtString
-            else if (_pi<>nil) and (_pi.PropertyType=typeof(boolean)) then Result:=vtBoolean
+            if (_pi<>nil) and (_pi.PropertyType=typeof(string)) then r:=vtString
+            else if (_pi<>nil) and (_pi.PropertyType=typeof(boolean)) then r:=vtBoolean
             else
             begin
               var _fi:=_extType.GetField(_fr.FieldName);
-              if (_fi<>nil) and (_fi.FieldType=typeof(string)) then Result:=vtString
-              else if (_fi<>nil) and (_fi.FieldType=typeof(boolean)) then Result:=vtBoolean
-              else if (_fi<>nil) and (_fi.FieldType=typeof(double)) then Result:=vtReal   // [Phase 1]
-              else if (_fi<>nil) and (_fi.FieldType=typeof(char))   then Result:=vtChar   // [Phase 1]
-              else if (_fi<>nil) and (_fi.FieldType=typeof(int64))  then Result:=vtInt64  // [Phase 1]
-              else Result:=vtInteger;
+              if (_fi<>nil) and (_fi.FieldType=typeof(string)) then r:=vtString
+              else if (_fi<>nil) and (_fi.FieldType=typeof(boolean)) then r:=vtBoolean
+              else if (_fi<>nil) and (_fi.FieldType=typeof(double)) then r:=vtReal   // [Phase 1]
+              else if (_fi<>nil) and (_fi.FieldType=typeof(char))   then r:=vtChar   // [Phase 1]
+              else if (_fi<>nil) and (_fi.FieldType=typeof(int64))  then r:=vtInt64  // [Phase 1]
+              else r:=vtInteger;
             end;
           end
-          else Result:=vtInteger;
+          else r:=vtInteger;
         end;
       end
-      else if e is TMethodCallExprNode then
+      else Result:=false;
+    end;
+
+    // [Stage 115] 2/4 — TMethodCallExprNode 전용 (단일 노드종류지만 약 230줄).
+    // [Stage 115 재분할] InferTypeMethodCall(230줄)이 self-host 빌드에서
+    // BadImageFormatException을 계속 일으켜, 이 함수를 다시 절반으로 쪼갠다.
+    // InferTypeMethodCall은 이제 얇은 디스패처만 남고, 실제 분기 로직은
+    // InferTypeMethodCallA(체인/self/지역CLR타입/필드형이름변수 4개 분기)와
+    // InferTypeMethodCallB(로컬필드조회/ToString특수케이스/외부정적멤버폴백
+    // 3개 분기)로 나뉜다.
+    function InferTypeMethodCall(e: TExprNode; var r: TVarType): boolean;
+    begin
+      Result:=true;
+      if e is TMethodCallExprNode then
       begin
-        var _mc4:=TMethodCallExprNode(e); var _qfb4: FieldBuilder;
-        // [Stage 76 확장] ObjName 자체가 점(.)으로 연결된 체인이면(예: "MainMenu.Items.Count")
-        // 아래의 단일 세그먼트 판별 분기들보다 먼저 처리한다 — 안 그러면 마지막 else의
-        // "외부 정적 타입"으로 오인되어 존재하지 않는 타입 조회로 실패한다(Stage 76 실전 버그).
-        if (_mc4.ObjName<>'') and (_mc4.ObjName.IndexOf('.')>=0) and (_mc4.ObjCastType='') then
+        if not InferTypeMethodCallA(e, r) then
+          InferTypeMethodCallB(e, r);
+      end
+      else Result:=false;
+    end;
+
+    // [Stage 116 재분할] InferTypeMethodCallA(107줄, if/elseif 4분기)가 self-host 빌드에서
+    // 다시 BadImageFormatException을 일으켰다(1245번줄 주석에 기록된 Stage 115 증상 재발).
+    // Test110 재현 케이스는 "src"(점 없는 단순 식별자, fLocalScope.HasClrType 분기)만
+    // 타는데도 함수 진입 자체가 죽었다 — Stage 111/112와 동일한 "실행되지 않는 분기까지
+    // 포함한 전체 함수 IL이 gen0 코드젠에서 깨진다" 패턴으로 보고, 4개 분기를 각각
+    // 별도 함수로 완전히 분리한다. 디스패처는 순수 if-elseif만 남긴다.
+    function InferTypeMethodCallA(e: TExprNode; var r: TVarType): boolean;
+    begin
+      Result:=true;
+      var _mc4:=TMethodCallExprNode(e);
+      // [Stage 76 확장] ObjName 자체가 점(.)으로 연결된 체인이면(예: "MainMenu.Items.Count")
+      // 아래의 단일 세그먼트 판별 분기들보다 먼저 처리한다 — 안 그러면 마지막 else의
+      // "외부 정적 타입"으로 오인되어 존재하지 않는 타입 조회로 실패한다(Stage 76 실전 버그).
+      if (_mc4.ObjName<>'') and (_mc4.ObjName.IndexOf('.')>=0) and (_mc4.ObjCastType='') then
+        InferTypeMethodCallAChain(_mc4, r)
+      else if _mc4.ObjName='' then // [Stage 30] Self.Method(...) / 암시적 self 호출
+        InferTypeMethodCallASelf(_mc4, r)
+      else if fLocalScope.HasClrType(_mc4.ObjName) or fGlobalScope.HasClrType(_mc4.ObjName) then
+        InferTypeMethodCallALocal(_mc4, r)
+      else if (_mc4.ObjCastType='') and (GetVarClassName(_mc4.ObjName)<>'') then
+        InferTypeMethodCallA2(_mc4, r)
+      else Result:=false;
+    end;
+
+    // [Stage 116] 분기 1/4 — ObjName이 점(.)으로 연결된 체인인 경우.
+    function InferTypeMethodCallAChain(_mc4: TMethodCallExprNode; var r: TVarType): boolean;
+    begin
+      Result:=true;
+      var _chainSegs4:=SplitByDot(_mc4.ObjName);
+      if IsChainStartSegment(_chainSegs4[0]) then
+      begin
+        // 첫 세그먼트가 실제 필드/변수/self 상속 프로퍼티 — 체인을 끝까지 타입만 추적한다.
+        var _chainType4:=InferQualifierChainType(_chainSegs4);
+        var _cpi4:=SafeGetProperty(_chainType4, _mc4.MethodName);
+        if (_cpi4<>nil) and (_cpi4.PropertyType=typeof(string)) then r:=vtString
+        else
         begin
-          var _chainSegs4:=SplitByDot(_mc4.ObjName);
-          if IsChainStartSegment(_chainSegs4[0]) then
-          begin
-            // 첫 세그먼트가 실제 필드/변수/self 상속 프로퍼티 — 체인을 끝까지 타입만 추적한다.
-            var _chainType4:=InferQualifierChainType(_chainSegs4);
-            var _cpi4:=SafeGetProperty(_chainType4, _mc4.MethodName);
-            if (_cpi4<>nil) and (_cpi4.PropertyType=typeof(string)) then Result:=vtString
-            else
-            begin
-              var _cmi4:=ResolveMethodByArity(_chainType4, _mc4.MethodName, _mc4.Args, false);
-              if (_cmi4<>nil) and (_cmi4.ReturnType=typeof(string)) then Result:=vtString
-              else Result:=vtInteger;
-            end;
-          end
+          var _cmi4:=ResolveMethodByArity(_chainType4, _mc4.MethodName, _mc4.Args, false);
+          if (_cmi4<>nil) and (_cmi4.ReturnType=typeof(string)) then r:=vtString
+          else r:=vtInteger;
+        end;
+      end
+      else
+      begin
+        // 첫 세그먼트가 진짜 외부 네임스페이스/타입 경로 — 기존 TStaticMemberExprNode와
+        // 동일한 방식으로 정적 필드/프로퍼티를 조회한다 (예: System.EventArgs.Empty).
+        // [버그 수정 - gen0 codegen 우회] var 선언에 초기화식이 없으면 아무 IL도 방출되지
+        // 않아, 이 else 분기로 들어오는 브랜치(if IsChainStartSegment... else)의 목적지가
+        // 바로 다음 줄 try 블록의 첫 명령과 겹쳐버린다(보호영역으로의 불법 진입 →
+        // BadImageFormatException, gen0의 EmitStatement/TTryStmtNode 코드젠 결함).
+        // gen0 자체를 고칠 수는 없으니, 여기서는 ":= nil" 초기화식을 명시해 실제 ldnull/stloc
+        // 명령을 하나 끼워 넣어 분기 목적지와 try 진입점이 겹치지 않게 우회한다.
+        var _staticT4: System.Type := nil;
+        try _staticT4:=ResolveExternalType(_mc4.ObjName); except _staticT4:=nil; end;
+        // [Stage 99 버그 수정] "System.Reflection.Assembly.GetExecutingAssembly"처럼
+        // ObjName 전체가 타입이 아니라 타입+무인자 정적 메서드 체인일 수 있다 — EmitExpr의
+        // 동일한 경로와 같은 방식으로 재시도한다(aIL=nil이므로 IL은 방출하지 않고 최종
+        // CLR 타입만 알아낸다).
+        if _staticT4=nil then
+        begin
+          var _isInst4: boolean;
+          try _staticT4:=ResolveOrEmitStaticChain(nil, _mc4.ObjName, _isInst4); except _staticT4:=nil; end;
+        end;
+        if _staticT4=nil then begin r:=vtInteger; exit; end;
+        var _spi4:=SafeGetProperty(_staticT4, _mc4.MethodName);
+        if (_spi4<>nil) and (_spi4.PropertyType=typeof(string)) then r:=vtString
+        else
+        begin
+          var _sfi4:=_staticT4.GetField(_mc4.MethodName);
+          if (_sfi4<>nil) and (_sfi4.FieldType=typeof(string)) then r:=vtString
           else
           begin
-            // 첫 세그먼트가 진짜 외부 네임스페이스/타입 경로 — 기존 TStaticMemberExprNode와
-            // 동일한 방식으로 정적 필드/프로퍼티를 조회한다 (예: System.EventArgs.Empty).
-            var _staticT4: System.Type;
-            try _staticT4:=ResolveExternalType(_mc4.ObjName); except _staticT4:=nil; end;
-            // [Stage 99 버그 수정] "System.Reflection.Assembly.GetExecutingAssembly"처럼
-            // ObjName 전체가 타입이 아니라 타입+무인자 정적 메서드 체인일 수 있다 — EmitExpr의
-            // 동일한 경로와 같은 방식으로 재시도한다(aIL=nil이므로 IL은 방출하지 않고 최종
-            // CLR 타입만 알아낸다).
-            if _staticT4=nil then
-            begin
-              var _isInst4: boolean;
-              try _staticT4:=ResolveOrEmitStaticChain(nil, _mc4.ObjName, _isInst4); except _staticT4:=nil; end;
-            end;
-            if _staticT4=nil then begin Result:=vtInteger; exit; end;
-            var _spi4:=SafeGetProperty(_staticT4, _mc4.MethodName);
-            if (_spi4<>nil) and (_spi4.PropertyType=typeof(string)) then Result:=vtString
-            else
-            begin
-              var _sfi4:=_staticT4.GetField(_mc4.MethodName);
-              if (_sfi4<>nil) and (_sfi4.FieldType=typeof(string)) then Result:=vtString
-              else
-              begin
-                // [버그 수정] 프로퍼티/필드가 아니라 "정적 메서드"인 경우(예:
-                // System.IO.Path.GetFileName(...))가 전혀 검사되지 않아 항상 vtInteger로
-                // 폴백했다. 그 결과 실제로는 string을 반환하는 외부 정적 메서드 호출이
-                // 정수로 오판되어, 문자열 연결식에서 string 참조값이 정수 변환 경로를 타
-                // 쓰레기(주소값에 가까운 숫자)로 찍히는 문제가 있었다.
-                var _smi4:=ResolveMethodByArity(_staticT4, _mc4.MethodName, _mc4.Args, true);
-                if (_smi4<>nil) and (_smi4.ReturnType=typeof(string)) then Result:=vtString
-                else Result:=vtInteger;
-              end;
-            end;
+            // [버그 수정] 프로퍼티/필드가 아니라 "정적 메서드"인 경우(예:
+            // System.IO.Path.GetFileName(...))가 전혀 검사되지 않아 항상 vtInteger로
+            // 폴백했다. 그 결과 실제로는 string을 반환하는 외부 정적 메서드 호출이
+            // 정수로 오판되어, 문자열 연결식에서 string 참조값이 정수 변환 경로를 타
+            // 쓰레기(주소값에 가까운 숫자)로 찍히는 문제가 있었다.
+            var _smi4:=ResolveMethodByArity(_staticT4, _mc4.MethodName, _mc4.Args, true);
+            if (_smi4<>nil) and (_smi4.ReturnType=typeof(string)) then r:=vtString
+            else r:=vtInteger;
+          end;
+        end;
+      end;
+    end;
+
+    // [Stage 116] 분기 2/4 — ObjName='' (Self.Method(...) / 암시적 self 호출).
+    function InferTypeMethodCallASelf(_mc4: TMethodCallExprNode; var r: TVarType): boolean;
+    begin
+      Result:=true;
+      if DictDictHas(fMethodReturnTypes, fCurClassName, _mc4.MethodName) then
+        r:=FindMethodReturnType(fCurClassName, _mc4.MethodName)
+      else
+      begin
+        var _extSelf:=FindExternalAncestorType(fCurClassName);
+        if _extSelf<>nil then
+        begin
+          var _pi4c:=SafeGetProperty(_extSelf, _mc4.MethodName);
+          if (_pi4c<>nil) and (_pi4c.PropertyType=typeof(string)) then r:=vtString
+          else
+          begin
+            var _mi4c:=ResolveMethodByArity(_extSelf, _mc4.MethodName, _mc4.Args, false);
+            if (_mi4c<>nil) and (_mi4c.ReturnType=typeof(string)) then r:=vtString
+            else r:=vtInteger;
           end;
         end
-        else if _mc4.ObjName='' then // [Stage 30] Self.Method(...) / 암시적 self 호출 — 지역 메서드 우선, 없으면 외부 조상 타입
+        else r:=vtInteger;
+      end;
+    end;
+
+    // [Stage 116] 분기 3/4 — ObjName이 지역/전역 스코프에 등록된 CLR 타입 변수인 경우.
+    // Test110 재현 케이스("fChars:=src.ToCharArray")는 이 분기만 탄다.
+    function InferTypeMethodCallALocal(_mc4: TMethodCallExprNode; var r: TVarType): boolean;
+    begin
+      Result:=true;
+      var _effType4: System.Type;
+      if fLocalScope.HasClrType(_mc4.ObjName) then _effType4:=fLocalScope.GetClrType(_mc4.ObjName)
+      else _effType4:=fGlobalScope.GetClrType(_mc4.ObjName);
+      if _mc4.ObjCastType<>'' then _effType4:=ResolveExternalType(_mc4.ObjCastType);
+      var _pi4b:=SafeGetProperty(_effType4, _mc4.MethodName);
+      if (_pi4b<>nil) and (_pi4b.PropertyType=typeof(string)) then r:=vtString
+      else
+      begin
+        // 프로퍼티가 아니면 메서드일 수 있으므로 실제 반환 타입을 확인한다.
+        // (예: sender.ToString() → GetProperty는 nil이지만 메서드 반환타입은 string)
+        var _mi4b:=ResolveMethodByArity(_effType4, _mc4.MethodName, _mc4.Args, false);
+        if (_mi4b<>nil) and (_mi4b.ReturnType=typeof(string)) then r:=vtString
+        else r:=vtInteger;
+      end;
+    end;
+
+    // [Stage 115 추가 분할] InferTypeMethodCallA의 네 번째 분기(필드형 이름 변수 —
+    // 로컬 클래스 인스턴스의 필드/프로퍼티/메서드 판별) 전용 함수. InferTypeMethodCall(230줄)을
+    // A/B로 나눴는데도 self-host 빌드에서 여전히 InferTypeMethodCallA 진입 자체가
+    // BadImageFormatException을 낸 것이 확인됨(IL 2354바이트/maxstack 138). "메서드 크기"
+    // 가설로 이 분기를 추가 분리했으나(1301바이트/maxstack 80으로 줄었음) 재발 확인됨 —
+    // 즉 크기 문제가 아니었다. IL을 스택 시뮬레이션으로 전수 검증한 결과 분기/스택
+    // 불일치는 없었고, 유일한 구조적 차이는 이 분리된 함수가 형제들(InferTypeMethodCall/A/B,
+    // 전부 function...: boolean)과 달리 유일하게 procedure(void 반환)였다는 것 — self-host
+    // 컴파일러가 "지역 중첩 procedure를 다른 지역 function이 호출"하는 조합을 실전 검증한 적이
+    // 없어 보여, 이미 검증된 "function...: boolean, 결과는 버림" 패턴(B 호출부와 동일)으로 맞춘다.
+    function InferTypeMethodCallA2(_mc4: TMethodCallExprNode; var r: TVarType): boolean;
+    begin
+      Result:=true;
+      // [버그 수정] EmitExpr에서 고친 것과 같은 문제 — obj.FieldName(괄호 없음, 인자 없음)은
+      // 메서드가 아니라 필드일 수 있다. 여기서 먼저 확인하지 않으면 FindMethodReturnType이
+      // "메서드 아님"으로 판단해 기본값 vtInteger를 돌려주고, 문자열 필드가 Writeln 등에서
+      // 정수로 오인되어 참조값이 숫자로 찍히는 버그가 생긴다.
+      var _cn4c:=GetVarClassName(_mc4.ObjName);
+      var _fb4c: FieldBuilder;
+      if (_mc4.Args.Count=0) and TryFindFieldBuilder(_cn4c, _mc4.MethodName, _fb4c) then
+      begin
+        if _fb4c.FieldType=typeof(string) then r:=vtString
+        else if _fb4c.FieldType=typeof(boolean) then r:=vtBoolean
+        else if _fb4c.FieldType=typeof(double)  then r:=vtReal   // [Phase 1]
+        else if _fb4c.FieldType=typeof(char)    then r:=vtChar   // [Phase 1]
+        else if _fb4c.FieldType=typeof(int64)   then r:=vtInt64  // [Phase 1]
+        else r:=vtInteger;
+      end
+      else if (_mc4.Args.Count=0) and DictDictHas(fInstanceMethods, _cn4c, 'get_'+_mc4.MethodName) then
+      begin
+        // [Stage 51] 로컬 클래스의 프로퍼티(get_X) — 실제 getter의 반환 CLR 타입으로 판정한다.
+        var _getMB4c:=fInstanceMethods[_cn4c]['get_'+_mc4.MethodName];
+        if _getMB4c.ReturnType=typeof(string) then r:=vtString
+        else if _getMB4c.ReturnType=typeof(boolean) then r:=vtBoolean
+        else if _getMB4c.ReturnType=typeof(double)  then r:=vtReal
+        else if _getMB4c.ReturnType=typeof(char)    then r:=vtChar
+        else if _getMB4c.ReturnType=typeof(int64)   then r:=vtInt64
+        else r:=vtInteger;
+      end
+      else if (_mc4.Args.Count=0) and (not DictDictHas(fMethodReturnTypes, _cn4c, _mc4.MethodName)) then
+      begin
+        // [Stage 46] 로컬 필드도 로컬 메서드도 아니면 외부 상속 타입(예: WPF Window)의
+        // 프로퍼티/필드일 수 있다 (예: w.Title). FindMethodReturnType은 로컬 메서드만 뒤져서
+        // 못 찾으면 무조건 vtInteger 기본값을 돌려주므로, 여기서 외부 조상 타입을 먼저 확인한다.
+        var _extAnc4c:=FindExternalAncestorType(_cn4c);
+        if _extAnc4c<>nil then
         begin
-          if DictDictHas(fMethodReturnTypes, fCurClassName, _mc4.MethodName) then
-            Result:=FindMethodReturnType(fCurClassName, _mc4.MethodName)
+          var _extPi4c:=SafeGetProperty(_extAnc4c, _mc4.MethodName);
+          if (_extPi4c<>nil) and (_extPi4c.PropertyType=typeof(string)) then r:=vtString
+          else if (_extPi4c<>nil) and (_extPi4c.PropertyType=typeof(boolean)) then r:=vtBoolean
           else
           begin
-            var _extSelf:=FindExternalAncestorType(fCurClassName);
-            if _extSelf<>nil then
-            begin
-              var _pi4c:=SafeGetProperty(_extSelf, _mc4.MethodName);
-              if (_pi4c<>nil) and (_pi4c.PropertyType=typeof(string)) then Result:=vtString
-              else
-              begin
-                var _mi4c:=ResolveMethodByArity(_extSelf, _mc4.MethodName, _mc4.Args, false);
-                if (_mi4c<>nil) and (_mi4c.ReturnType=typeof(string)) then Result:=vtString
-                else Result:=vtInteger;
-              end;
-            end
-            else Result:=vtInteger;
+            var _extFi4c:=_extAnc4c.GetField(_mc4.MethodName);
+            if (_extFi4c<>nil) and (_extFi4c.FieldType=typeof(string)) then r:=vtString
+            else if (_extFi4c<>nil) and (_extFi4c.FieldType=typeof(boolean)) then r:=vtBoolean
+            else if (_extFi4c<>nil) and (_extFi4c.FieldType=typeof(double))  then r:=vtReal  // [Phase 1]
+            else if (_extFi4c<>nil) and (_extFi4c.FieldType=typeof(char))    then r:=vtChar  // [Phase 1]
+            else if (_extFi4c<>nil) and (_extFi4c.FieldType=typeof(int64))   then r:=vtInt64 // [Phase 1]
+            else r:=vtInteger;
           end;
         end
-        else if fLocalScope.HasClrType(_mc4.ObjName) or fGlobalScope.HasClrType(_mc4.ObjName) then
-        begin
-          var _effType4: System.Type;
-          if fLocalScope.HasClrType(_mc4.ObjName) then _effType4:=fLocalScope.GetClrType(_mc4.ObjName)
-          else _effType4:=fGlobalScope.GetClrType(_mc4.ObjName);
-          if _mc4.ObjCastType<>'' then _effType4:=ResolveExternalType(_mc4.ObjCastType);
-          var _pi4b:=SafeGetProperty(_effType4, _mc4.MethodName);
-          if (_pi4b<>nil) and (_pi4b.PropertyType=typeof(string)) then Result:=vtString
-          else
-          begin
-            // 프로퍼티가 아니면 메서드일 수 있으므로 실제 반환 타입을 확인한다.
-            // (예: sender.ToString() → GetProperty는 nil이지만 메서드 반환타입은 string)
-            var _mi4b:=ResolveMethodByArity(_effType4, _mc4.MethodName, _mc4.Args, false);
-            if (_mi4b<>nil) and (_mi4b.ReturnType=typeof(string)) then Result:=vtString
-            else Result:=vtInteger;
-          end;
-        end
-        else if (_mc4.ObjCastType='') and (GetVarClassName(_mc4.ObjName)<>'') then
-        begin
-          // [버그 수정] EmitExpr에서 고친 것과 같은 문제 — obj.FieldName(괄호 없음, 인자 없음)은
-          // 메서드가 아니라 필드일 수 있다. 여기서 먼저 확인하지 않으면 FindMethodReturnType이
-          // "메서드 아님"으로 판단해 기본값 vtInteger를 돌려주고, 문자열 필드가 Writeln 등에서
-          // 정수로 오인되어 참조값이 숫자로 찍히는 버그가 생긴다.
-          var _cn4c:=GetVarClassName(_mc4.ObjName);
-          var _fb4c: FieldBuilder;
-          if (_mc4.Args.Count=0) and TryFindFieldBuilder(_cn4c, _mc4.MethodName, _fb4c) then
-          begin
-            if _fb4c.FieldType=typeof(string) then Result:=vtString
-            else if _fb4c.FieldType=typeof(boolean) then Result:=vtBoolean
-            else if _fb4c.FieldType=typeof(double)  then Result:=vtReal   // [Phase 1]
-            else if _fb4c.FieldType=typeof(char)    then Result:=vtChar   // [Phase 1]
-            else if _fb4c.FieldType=typeof(int64)   then Result:=vtInt64  // [Phase 1]
-            else Result:=vtInteger;
-          end
-          else if (_mc4.Args.Count=0) and DictDictHas(fInstanceMethods, _cn4c, 'get_'+_mc4.MethodName) then
-          begin
-            // [Stage 51] 로컬 클래스의 프로퍼티(get_X) — 실제 getter의 반환 CLR 타입으로 판정한다.
-            var _getMB4c:=fInstanceMethods[_cn4c]['get_'+_mc4.MethodName];
-            if _getMB4c.ReturnType=typeof(string) then Result:=vtString
-            else if _getMB4c.ReturnType=typeof(boolean) then Result:=vtBoolean
-            else if _getMB4c.ReturnType=typeof(double)  then Result:=vtReal
-            else if _getMB4c.ReturnType=typeof(char)    then Result:=vtChar
-            else if _getMB4c.ReturnType=typeof(int64)   then Result:=vtInt64
-            else Result:=vtInteger;
-          end
-          else if (_mc4.Args.Count=0) and (not DictDictHas(fMethodReturnTypes, _cn4c, _mc4.MethodName)) then
-          begin
-            // [Stage 46] 로컬 필드도 로컬 메서드도 아니면 외부 상속 타입(예: WPF Window)의
-            // 프로퍼티/필드일 수 있다 (예: w.Title). FindMethodReturnType은 로컬 메서드만 뒤져서
-            // 못 찾으면 무조건 vtInteger 기본값을 돌려주므로, 여기서 외부 조상 타입을 먼저 확인한다.
-            var _extAnc4c:=FindExternalAncestorType(_cn4c);
-            if _extAnc4c<>nil then
-            begin
-              var _extPi4c:=SafeGetProperty(_extAnc4c, _mc4.MethodName);
-              if (_extPi4c<>nil) and (_extPi4c.PropertyType=typeof(string)) then Result:=vtString
-              else if (_extPi4c<>nil) and (_extPi4c.PropertyType=typeof(boolean)) then Result:=vtBoolean
-              else
-              begin
-                var _extFi4c:=_extAnc4c.GetField(_mc4.MethodName);
-                if (_extFi4c<>nil) and (_extFi4c.FieldType=typeof(string)) then Result:=vtString
-                else if (_extFi4c<>nil) and (_extFi4c.FieldType=typeof(boolean)) then Result:=vtBoolean
-                else if (_extFi4c<>nil) and (_extFi4c.FieldType=typeof(double))  then Result:=vtReal  // [Phase 1]
-                else if (_extFi4c<>nil) and (_extFi4c.FieldType=typeof(char))    then Result:=vtChar  // [Phase 1]
-                else if (_extFi4c<>nil) and (_extFi4c.FieldType=typeof(int64))   then Result:=vtInt64 // [Phase 1]
-                else Result:=vtInteger;
-              end;
-            end
-            else Result:=vtInteger;
-          end
-          else
-            Result:=FindMethodReturnType(_cn4c, _mc4.MethodName);
-        end
-        else if TryFindFieldBuilder(fCurClassName, _mc4.ObjName, _qfb4) then
+        else r:=vtInteger;
+      end
+      else
+        r:=FindMethodReturnType(_cn4c, _mc4.MethodName);
+    end;
+
+    // [Stage 115 재분할] InferTypeMethodCall 뒤쪽 절반 — 로컬 필드 조회(foreach 포함)/
+    // ToString 특수케이스/외부 정적 멤버 폴백 3개 분기.
+    function InferTypeMethodCallB(e: TExprNode; var r: TVarType): boolean;
+    begin
+      Result:=true;
+      var _mc4:=TMethodCallExprNode(e); var _qfb4: FieldBuilder;
+        if TryFindFieldBuilder(fCurClassName, _mc4.ObjName, _qfb4) then
         begin
           var _effType4b:=_qfb4.FieldType;
           if _mc4.ObjCastType<>'' then _effType4b:=ResolveExternalType(_mc4.ObjCastType);
@@ -1249,29 +1419,29 @@
               _effType4b:=FindExternalAncestorType(_localCls101);
           end;
           var _pi4:=SafeGetProperty(_effType4b, _mc4.MethodName);
-          if (_pi4<>nil) and (_pi4.PropertyType=typeof(string)) then Result:=vtString
+          if (_pi4<>nil) and (_pi4.PropertyType=typeof(string)) then r:=vtString
           else
           begin
             var _mi4:=ResolveMethodByArity(_effType4b, _mc4.MethodName, _mc4.Args, false);
-            if (_mi4<>nil) and (_mi4.ReturnType=typeof(string)) then Result:=vtString
-            else Result:=vtInteger;
+            if (_mi4<>nil) and (_mi4.ReturnType=typeof(string)) then r:=vtString
+            else r:=vtInteger;
           end;
         end
         // [버그 수정] 지역/전역 원시 타입 변수(integer, real, boolean 등)의 .ToString() 호출.
         // 예: sum.ToString (sum: integer) — ObjName이 fLocalScope/fGlobalScope에 있고
         // MethodName이 'ToString'이면 결과는 항상 string이다.
-        // 이전에는 이 케이스가 아래의 else Result:=vtInteger로 폴백되어, 문자열 연결식
+        // 이전에는 이 케이스가 아래의 else r:=vtInteger로 폴백되어, 문자열 연결식
         // ('Add(3,4) = ' + sum.ToString)에서 rt=vtInteger로 오판되고, 실제로는 string이
         // 스택에 올라와 있는데도 Convert.ToString(int32)가 다시 호출되어 string 참조값을
         // 정수로 읽어 쓰레기값(메모리 주소)이 출력됐다.
         else if (fLocalScope.Has(_mc4.ObjName) or fGlobalScope.Has(_mc4.ObjName))
                 and (_mc4.Args.Count=0) and (_mc4.ObjCastType='')
                 and (_mc4.MethodName.ToLower='tostring') then
-          Result:=vtString
+          r:=vtString
         // [자기컴파일 버그 수정] "string.Join(...)"처럼 ObjName이 점(.) 없는 단일 세그먼트
         // 외부 정적 타입 이름(예: "string", "Math")을 가리키는 정적 메서드/프로퍼티 호출은
         // 위의 모든 분기(체인/self/지역CLR타입/클래스명변수/필드/ToString)에 하나도 걸리지
-        // 않고 곧장 else Result:=vtInteger로 폴백됐다. EmitExpr(실제 IL 방출)은
+        // 않고 곧장 else r:=vtInteger로 폴백됐다. EmitExpr(실제 IL 방출)은
         // ResolveOrEmitStaticChain 등을 통해 이런 이름을 정확히 System.String 등으로 풀어
         // 제대로 된 string 값을 스택에 올리지만, InferType은 그 값을 여전히 vtInteger로
         // 오판했다. 그 결과 "... + string.Join(#10, errs)" 같은 문자열 연결식에서 rt=vtInteger로
@@ -1287,37 +1457,42 @@
             var _bareIsInst4: boolean;
             try _bareStaticT4:=ResolveOrEmitStaticChain(nil, _mc4.ObjName, _bareIsInst4); except _bareStaticT4:=nil; end;
           end;
-          if _bareStaticT4=nil then Result:=vtInteger
+          if _bareStaticT4=nil then r:=vtInteger
           else
           begin
             var _barePi4:=SafeGetProperty(_bareStaticT4, _mc4.MethodName);
-            if (_barePi4<>nil) and (_barePi4.PropertyType=typeof(string)) then Result:=vtString
+            if (_barePi4<>nil) and (_barePi4.PropertyType=typeof(string)) then r:=vtString
             else
             begin
               var _bareFi4:=_bareStaticT4.GetField(_mc4.MethodName);
-              if (_bareFi4<>nil) and (_bareFi4.FieldType=typeof(string)) then Result:=vtString
+              if (_bareFi4<>nil) and (_bareFi4.FieldType=typeof(string)) then r:=vtString
               else
               begin
                 var _bareMi4:=ResolveMethodByArity(_bareStaticT4, _mc4.MethodName, _mc4.Args, true);
                 if (_bareMi4=nil) then
                   _bareMi4:=ResolveMethodByArity(_bareStaticT4, _mc4.MethodName, _mc4.Args, false);
-                if (_bareMi4<>nil) and (_bareMi4.ReturnType=typeof(string)) then Result:=vtString
-                else Result:=vtInteger;
+                if (_bareMi4<>nil) and (_bareMi4.ReturnType=typeof(string)) then r:=vtString
+                else r:=vtInteger;
               end;
             end;
           end;
         end;
-      end
+    end;
+
+    // [Stage 115] 3/4 — 배열/체인 인덱싱 + 변수참조 + 함수호출 + 정적 멤버.
+    function InferTypeIndexAndCalls(e: TExprNode; var r: TVarType): boolean;
+    begin
+      Result:=true;
       // [Stage 37 버그 수정] 이전에는 배열이 실제로 array of string이어도 무조건 vtInteger로
       // 추론해서, Writeln(strArr[i]) 같은 식이 Console.WriteLine(int) 오버로드로 잘못 디스패치됐다.
-      else if e is TArrayIndexExprNode then
+      if e is TArrayIndexExprNode then
       begin
-        if GetVarType(TArrayIndexExprNode(e).ArrName)=vtStrArray then Result:=vtString
+        if GetVarType(TArrayIndexExprNode(e).ArrName)=vtStrArray then r:=vtString
         // [Stage 90] array of object 원소 읽기는 vtObject로 추론
-        else if GetVarType(TArrayIndexExprNode(e).ArrName)=vtObjArray then Result:=vtObject
+        else if GetVarType(TArrayIndexExprNode(e).ArrName)=vtObjArray then r:=vtObject
         // [자기컴파일 버그 수정 2026.08] "order[order.Count-1]"처럼 ArrName이 네이티브 배열이
         // 아니라 List<string> 같은 외부 제네릭 컬렉션이면 GetVarType이 vtStrArray/vtObjArray
-        // 어느 쪽도 아닌 vtObject를 돌려줘서, 지금까지는 무조건 아래 "else Result:=vtInteger"로
+        // 어느 쪽도 아닌 vtObject를 돌려줘서, 지금까지는 무조건 아래 "else r:=vtInteger"로
         // 폴백했다. 그 결과 "'...' + order[i] + '...'" 같은 문자열 연결식에서 rt=vtInteger로
         // 오판되어, EmitExpr이 실제로는 올바른 string 참조를 스택에 올렸는데도 바로 뒤에서
         // Convert.ToString(Int32)가 그 참조를 정수로 재해석해버려 실행 시 쓰레기 숫자(예:
@@ -1330,13 +1505,13 @@
         else
         begin
           var _aiElemT101:=GetExprClrType(e);
-          if _aiElemT101=typeof(string) then Result:=vtString
-          else if _aiElemT101=typeof(integer) then Result:=vtInteger
-          else if _aiElemT101=typeof(int64) then Result:=vtInt64
-          else if _aiElemT101=typeof(double) then Result:=vtReal
-          else if _aiElemT101=typeof(boolean) then Result:=vtBoolean
-          else if _aiElemT101=typeof(char) then Result:=vtChar
-          else Result:=vtObject;
+          if _aiElemT101=typeof(string) then r:=vtString
+          else if _aiElemT101=typeof(integer) then r:=vtInteger
+          else if _aiElemT101=typeof(int64) then r:=vtInt64
+          else if _aiElemT101=typeof(double) then r:=vtReal
+          else if _aiElemT101=typeof(boolean) then r:=vtBoolean
+          else if _aiElemT101=typeof(char) then r:=vtChar
+          else r:=vtObject;
         end;
       end
       // [Stage 67] 2차원 배열 원소 읽기 타입 추론
@@ -1344,24 +1519,24 @@
       begin
         var _m2n:=TMatrix2DIndexExprNode(e);
         var _m2etn:=GetVarClassName(_m2n.ArrName); // 원소 타입 이름
-        if _m2etn='string' then Result:=vtString
-        else if (_m2etn='real') or (_m2etn='double') then Result:=vtReal
-        else if _m2etn='char' then Result:=vtChar
-        else if _m2etn='int64' then Result:=vtInt64
-        else Result:=vtInteger;
+        if _m2etn='string' then r:=vtString
+        else if (_m2etn='real') or (_m2etn='double') then r:=vtReal
+        else if _m2etn='char' then r:=vtChar
+        else if _m2etn='int64' then r:=vtInt64
+        else r:=vtInteger;
       end
-      else if e is TVarRefNode then Result:=GetVarType(TVarRefNode(e).VarName)
+      else if e is TVarRefNode then r:=GetVarType(TVarRefNode(e).VarName)
       else if e is TFuncCallExprNode then
       begin
         // [Stage 27] 이전에는 이 분기 자체가 없어 최상위 함수 호출식은 항상
         // vtInteger로 취급됐다 — 'x: ' + Greet(name) 같은 식에서 Greet()가
         // string을 반환해도 정수 변환 경로를 타 값이 깨졌다.
         var _fc4:=TFuncCallExprNode(e);
-        if fFuncReturnTypes.ContainsKey(_fc4.FuncName) then Result:=fFuncReturnTypes[_fc4.FuncName]
+        if fFuncReturnTypes.ContainsKey(_fc4.FuncName) then r:=fFuncReturnTypes[_fc4.FuncName]
         // [Stage 71] 단형화되지 않고 오픈 제네릭으로 남은 템플릿의 맹글링된 호출이면
         // fFuncReturnTypes에는 (구체 이름이 아니라) 템플릿 이름만 등록돼 있으므로 직접 계산한다.
         else if fOpenGenericCallMap.ContainsKey(_fc4.FuncName) then
-          Result:=ResolveOpenGenericFuncReturnType(fOpenGenericCallMap[_fc4.FuncName])
+          r:=ResolveOpenGenericFuncReturnType(fOpenGenericCallMap[_fc4.FuncName])
         // [셀프 컴파일 버그 수정] fFuncReturnTypes는 최상위 함수/프로시저 전용 표라서,
         // 클래스 안에 중첩 선언된 뒤 호이스트되어 fMethods에만 등록된 헬퍼 함수(예:
         // ResolveMethodByArity — InferType 자신이 한정자 없이 호출)는 여기서 못 찾고
@@ -1375,36 +1550,44 @@
         else if fMethods.ContainsKey(_fc4.FuncName) then
         begin
           var _fc4Ret:=fMethods[_fc4.FuncName].ReturnType;
-          if _fc4Ret=typeof(string) then Result:=vtString
-          else if (_fc4Ret<>typeof(System.Void)) and (not _fc4Ret.IsPrimitive) then Result:=vtObject
-          else Result:=vtInteger;
+          if _fc4Ret=typeof(string) then r:=vtString
+          else if (_fc4Ret<>typeof(System.Void)) and (not _fc4Ret.IsPrimitive) then r:=vtObject
+          else r:=vtInteger;
         end
-        else Result:=vtInteger;
+        else r:=vtInteger;
       end
-      else if e is TExceptionMsgExprNode then Result:=vtString // E.Message는 항상 string
-      else if e is TRuntimeTypeNameExprNode then Result:=vtString // [Stage 75] obj.GetType.FullName/.Name도 항상 string
+      else if e is TExceptionMsgExprNode then r:=vtString // E.Message는 항상 string
+      else if e is TRuntimeTypeNameExprNode then r:=vtString // [Stage 75] obj.GetType.FullName/.Name도 항상 string
       else if e is TStaticMemberExprNode then
       begin
         var _sm4:=TStaticMemberExprNode(e);
         var _smType4:=ResolveExternalType(_sm4.TypeName);
         var _smPi4:=SafeGetProperty(_smType4, _sm4.MemberName);
-        if (_smPi4<>nil) and (_smPi4.PropertyType=typeof(string)) then Result:=vtString
+        if (_smPi4<>nil) and (_smPi4.PropertyType=typeof(string)) then r:=vtString
         else
         begin
           var _smFi4:=_smType4.GetField(_sm4.MemberName);
-          if (_smFi4<>nil) and (_smFi4.FieldType=typeof(string)) then Result:=vtString
-          else Result:=vtInteger;
+          if (_smFi4<>nil) and (_smFi4.FieldType=typeof(string)) then r:=vtString
+          else r:=vtInteger;
         end;
       end
-      else if e is TCompareNode then // [Stage 41 수정 2026.07.11]
-        Result:=vtBoolean
+      else Result:=false;
+    end;
+
+    // [Stage 115] 4/4 — 나머지 전부(비교/집합/이항연산/캐스트/LINQ/내장함수 등) + 최종 폴백.
+    function InferTypeRest(e: TExprNode; var r: TVarType): boolean;
+    var b: TBinOpNode;
+    begin
+      Result:=true;
+      if e is TCompareNode then // [Stage 41 수정 2026.07.11]
+        r:=vtBoolean
       // [Stage 63] 집합 리터럴/멤버십 검사
-      else if e is TSetLiteralExprNode then Result:=vtSet
-      else if e is TInExprNode then Result:=vtBoolean
+      else if e is TSetLiteralExprNode then r:=vtSet
+      else if e is TInExprNode then r:=vtBoolean
       // [Stage 96] 일반 배열 리터럴 — 실제 CLR 배열 타입은 문맥(대입 대상/매개변수 타입)에 따라
       // 달라지므로 여기서는 "참조 타입"이라는 것만 표시해둔다(EmitArgForParamType/EmitExpr이
       // 실제 원소 타입까지 보고 Newarr/Stelem을 낸다).
-      else if e is TArrayLiteralExprNode then Result:=vtObject
+      else if e is TArrayLiteralExprNode then r:=vtObject
       else if e is TBinOpNode then
       begin
         b:=TBinOpNode(e);
@@ -1420,9 +1603,9 @@
         var _binRt:=InferType(b.Right);
         // [Stage 66] 두 피연산자 모두 vtObject면(연산자 오버로딩 대상) 결과도 vtObject —
         // 실제 오버로딩이 등록되어 있는지는 EmitExpr에서 검증하고, 여기서는 타입 모양만 전달한다.
-        if (_binLt=vtObject) and (_binRt=vtObject) then Result:=vtObject
+        if (_binLt=vtObject) and (_binRt=vtObject) then r:=vtObject
         // [Stage 63] 피연산자 중 하나라도 집합이면 결과도 집합 (합집합/차집합/교집합)
-        else if (_binLt=vtSet) or (_binRt=vtSet) then Result:=vtSet
+        else if (_binLt=vtSet) or (_binRt=vtSet) then r:=vtSet
         // [자기컴파일 버그 수정 — 실제 사례] boAnd/boOr(논리 and/or)의 결과 타입이 여기서
         // 하나도 매칭되지 않아 맨 아래 기본값 vtInteger로 잘못 추론되고 있었다. 피연산자가
         // 둘 다 boolean(비교식 등)인 흔한 경우, 그 결과는 명백히 vtBoolean이어야 하는데
@@ -1434,32 +1617,32 @@
         // (i+1<Length) and (chars[i+1]='/')")에서 여전히 IndexOutOfRangeException으로
         // 재현되었다. vtObject/vtSet(연산자 오버로딩) 판정보다는 뒤, 나머지 산술 타입
         // 판정보다는 앞에 두어 boAnd/boOr는 항상 vtBoolean으로 확정한다.
-        else if (b.Op=boAnd) or (b.Op=boOr) then Result:=vtBoolean
+        else if (b.Op=boAnd) or (b.Op=boOr) then r:=vtBoolean
         else if (_binLt=vtString) or (_binRt=vtString) then
-          Result:=vtString
+          r:=vtString
         // [버그 수정] 예전엔 이 분기가 없어서 real/int64가 섞인 이항연산(예: -3.7, 1.5+2)이
         // 전부 vtInteger로 잘못 추론됐다 — 실제 IL 생성(EmitExpr의 isReal 승격 로직, 이 파일
         // 위쪽)은 이미 올바르게 real로 처리하고 있었으니 InferType만 뒤처져 있던 것.
         // Writeln(-3.7)처럼 InferType 결과로 어떤 WriteLine 오버로드를 호출할지 고르는
         // 자리에서 int32 오버로드가 선택되어 스택의 double 값과 어긋나 런타임에 깨졌다.
-        else if (_binLt=vtReal) or (_binRt=vtReal) then Result:=vtReal
-        else if (_binLt=vtInt64) or (_binRt=vtInt64) then Result:=vtInt64
-        else Result:=vtInteger;
+        else if (_binLt=vtReal) or (_binRt=vtReal) then r:=vtReal
+        else if (_binLt=vtInt64) or (_binRt=vtInt64) then r:=vtInt64
+        else r:=vtInteger;
       end
-      else if e is TSelfExprNode then Result:=vtObject // [Stage 30]
+      else if e is TSelfExprNode then r:=vtObject // [Stage 30]
       else if e is TAsCastExprNode then // [Stage 30]
       begin
         var _ac:=TAsCastExprNode(e);
-        if fBuiltInterfaces.ContainsKey(_ac.TargetType) then Result:=vtInterface
-        else Result:=vtObject;
+        if fBuiltInterfaces.ContainsKey(_ac.TargetType) then r:=vtInterface
+        else r:=vtObject;
       end
-      else if e is TIsCheckExprNode then Result:=vtBoolean // [Stage 93c] <식> is <TypeName> → 항상 bool
+      else if e is TIsCheckExprNode then r:=vtBoolean // [Stage 93c] <식> is <TypeName> → 항상 bool
       else if e is TInheritedCallExprNode then // [Stage 30]
       begin
         var _ih:=TInheritedCallExprNode(e);
         var _pc:=fClasses.GetParentName(fCurClassName);
-        if _pc<>'' then Result:=FindMethodReturnType(_pc, _ih.MethodName)
-        else Result:=vtInteger;
+        if _pc<>'' then r:=FindMethodReturnType(_pc, _ih.MethodName)
+        else r:=vtInteger;
       end
       // [Stage 70] LINQ 스타일 확장 메서드. Where/Select 자체(중간 결과)는 1차 제약으로 값으로
       // 직접 저장/사용하지 않는 것이 원칙(더 체이닝하거나 for-in의 컬렉션 자리에만 씀)이라 vtObject로
@@ -1467,14 +1650,14 @@
       else if e is TSeqExtCallExprNode then
       begin
         var _se70:=TSeqExtCallExprNode(e);
-        if _se70.MethodName='Count' then Result:=vtInteger
-        else if _se70.MethodName='Sum' then Result:=GetSeqElemType(_se70.Source)
+        if _se70.MethodName='Count' then r:=vtInteger
+        else if _se70.MethodName='Sum' then r:=GetSeqElemType(_se70.Source)
         else if _se70.MethodName='ToArray' then
         begin
           var _elemT70:=GetSeqElemType(_se70.Source);
-          if _elemT70=vtString then Result:=vtStrArray else Result:=vtIntArray;
+          if _elemT70=vtString then r:=vtStrArray else r:=vtIntArray;
         end
-        else Result:=vtObject; // Where/Select 중간 결과
+        else r:=vtObject; // Where/Select 중간 결과
       end
       // [Stage 72] PABCSystem 표준 라이브러리 함수 호출의 결과 타입.
       else if e is TBuiltinCallExprNode then
@@ -1482,48 +1665,48 @@
         var _bc72:=TBuiltinCallExprNode(e);
         if (_bc72.Name='Abs') or (_bc72.Name='Sqr') then
         begin
-          if _bc72.Args.Count>0 then Result:=InferType(_bc72.Args[0]) else Result:=vtInteger;
+          if _bc72.Args.Count>0 then r:=InferType(_bc72.Args[0]) else r:=vtInteger;
         end
-        else if (_bc72.Name='Sqrt') or (_bc72.Name='StrToFloat') then Result:=vtReal
+        else if (_bc72.Name='Sqrt') or (_bc72.Name='StrToFloat') then r:=vtReal
         else if (_bc72.Name='Round') or (_bc72.Name='Trunc') or (_bc72.Name='StrToInt') or (_bc72.Name='Ord') then
-          Result:=vtInteger
+          r:=vtInteger
         else if _bc72.Name='Random' then
         begin
-          if _bc72.Args.Count=0 then Result:=vtReal else Result:=vtInteger;
+          if _bc72.Args.Count=0 then r:=vtReal else r:=vtInteger;
         end
         else if (_bc72.Name='UpperCase') or (_bc72.Name='LowerCase') or (_bc72.Name='Trim')
                 or (_bc72.Name='Copy') or (_bc72.Name='FloatToStr') or (_bc72.Name='ReadLn')
                 or (_bc72.Name='Format') or (_bc72.Name='GetCurrentDir') or (_bc72.Name='ParamStr') then // [Stage 90/93/96]
-          Result:=vtString
-        else if _bc72.Name='Pos' then Result:=vtInteger
-        else if _bc72.Name='Chr' then Result:=vtChar
-        else if _bc72.Name='ParamCount' then Result:=vtInteger // [Stage 96]
-        else Result:=vtInteger; // 방어적 폴백(정상 경로면 도달하지 않음)
+          r:=vtString
+        else if _bc72.Name='Pos' then r:=vtInteger
+        else if _bc72.Name='Chr' then r:=vtChar
+        else if _bc72.Name='ParamCount' then r:=vtInteger // [Stage 96]
+        else r:=vtInteger; // 방어적 폴백(정상 경로면 도달하지 않음)
       end
       // [Stage 91] typeof(...)의 결과(System.Type)는 별도 vtType이 없으므로 vtObject로 취급.
-      else if e is TTypeOfExprNode then Result:=vtObject
+      else if e is TTypeOfExprNode then r:=vtObject
       // [Stage 90] TargetType(expr) 캐스트 결과 — 캐스트 대상 타입 자체가 곧 결과 타입.
       // vtObject로 취급하고 클래스 이름은 GetExprClrType/ObjCastType 경로에서 다시 조회되므로
       // 여기서는 "객체"라는 사실만 전달하면 충분하다.
-      else if e is TExternalCastExprNode then Result:=vtObject
+      else if e is TExternalCastExprNode then r:=vtObject
       // [Stage 90] a.GetName().Version.ToString() 같은 체인의 결과 타입 — 실제 CLR 반환
       // 타입을 리플렉션으로 추론해 가장 가까운 Pascal 타입으로 매핑한다(예: string→vtString).
       else if e is TChainedMemberExprNode then
       begin
         var _chT90:=GetExprClrType(e);
-        if _chT90=typeof(string) then Result:=vtString
-        else if _chT90=typeof(integer) then Result:=vtInteger
-        else if _chT90=typeof(int64) then Result:=vtInt64
-        else if _chT90=typeof(double) then Result:=vtReal
-        else if _chT90=typeof(boolean) then Result:=vtBoolean
-        else if _chT90=typeof(char) then Result:=vtChar
-        else Result:=vtObject;
+        if _chT90=typeof(string) then r:=vtString
+        else if _chT90=typeof(integer) then r:=vtInteger
+        else if _chT90=typeof(int64) then r:=vtInt64
+        else if _chT90=typeof(double) then r:=vtReal
+        else if _chT90=typeof(boolean) then r:=vtBoolean
+        else if _chT90=typeof(char) then r:=vtChar
+        else r:=vtObject;
       end
       // [자기컴파일 버그 수정] "var _getMB4c:=fInstanceMethods[cn]['get_'+name];"처럼 이중
       // 인덱싱(Dictionary<string,Dictionary<string,MethodBuilder>> 등 — 바깥 인덱싱의
       // 결과를 다시 인덱싱)으로 얻은 값을 담는 지역 변수의 초기화식은 TChainedIndexExprNode로
       // 파싱된다. 지금까지 InferType에 이 노드 종류 자체가 없어 무조건 맨 아래
-      // "else Result:=vtInteger"로 폴백했다 — 그 결과 TInlineVarStmtNode가 int32 슬롯으로
+      // "else r:=vtInteger"로 폴백했다 — 그 결과 TInlineVarStmtNode가 int32 슬롯으로
       // 선언해버려, 이후 "_getMB4c.ReturnType" 같은 멤버 접근이 cn=''인 원시타입 취급으로
       // "알 수 없는 메서드 \".ReturnType\""로 실패했다(자기컴파일 InferType 자신의 본문에서
       // 실제로 재현됨). TChainedMemberExprNode와 동일하게 GetExprClrType(이미 이 노드 종류를
@@ -1531,18 +1714,15 @@
       else if e is TChainedIndexExprNode then
       begin
         var _cixIT100:=GetExprClrType(e);
-        if _cixIT100=typeof(string) then Result:=vtString
-        else if _cixIT100=typeof(integer) then Result:=vtInteger
-        else if _cixIT100=typeof(int64) then Result:=vtInt64
-        else if _cixIT100=typeof(double) then Result:=vtReal
-        else if _cixIT100=typeof(boolean) then Result:=vtBoolean
-        else if _cixIT100=typeof(char) then Result:=vtChar
-        else Result:=vtObject;
+        if _cixIT100=typeof(string) then r:=vtString
+        else if _cixIT100=typeof(integer) then r:=vtInteger
+        else if _cixIT100=typeof(int64) then r:=vtInt64
+        else if _cixIT100=typeof(double) then r:=vtReal
+        else if _cixIT100=typeof(boolean) then r:=vtBoolean
+        else if _cixIT100=typeof(char) then r:=vtChar
+        else r:=vtObject;
       end
-      else Result:=vtInteger;
-      finally
-        fEmitDepth:=fEmitDepth-1;
-      end;
+      else r:=vtInteger;
     end;
 
     // [Stage 70] "시퀀스처럼 취급 가능한 식" e의 원소 Pascal 타입을 알아낸다.

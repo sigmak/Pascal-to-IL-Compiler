@@ -2796,17 +2796,19 @@
     end;
 
     // 4) 프로퍼티(PropertyBuilder + get/set 메서드 쌍) 방출
-    procedure BuildClassShell_Properties(tb: TypeBuilder; cd: TClassDeclNode);
+    // [Stage 113 리팩터] BuildClassShell_Properties의 foreach 루프 본문(getter/setter
+    // 처리, DictDictHas 분기 + raise Exception 중첩)을 BuildOneProperty로 분리했다.
+    // 재현 사례: cd.Properties.Count=0(프로퍼티가 하나도 없는 클래스, 즉 루프 본문이
+    // 한 번도 실행되지 않는 경우)에서도 BuildClassShell_Properties 함수 진입 직후
+    // (첫 Writeln조차 찍히기 전에) BadImageFormatException이 발생했다 — 이는 런타임
+    // 분기 문제가 아니라 이 함수의 IL 자체가 self-host 빌드 시점에 이미 깨져서 JIT
+    // 검증에 실패하는 것으로, Stage 111(ParsePrimary)/Stage 112(EmitStatement)와
+    // 동일한 "크고 복잡한 함수(특히 try/finally나 중첩 예외처리를 포함)의 self-compile
+    // IL 손상" 패턴이다. foreach 본문을 프로시저 호출 한 줄로 줄여서 회피한다.
+    procedure BuildOneProperty(tb: TypeBuilder; cd: TClassDeclNode; ps: TPropertySignature);
     begin
-      Writeln('[MARK-BCS-6] 메서드 시그니처 루프 종료, 프로퍼티 루프 시작, cd.Properties.Count='+cd.Properties.Count.ToString);
-      // [Phase 1, Stage 85 확장] 프로퍼티 — CLR PropertyBuilder + get/set 메서드 쌍으로 방출.
-      // 메서드 시그니처 정의가 끝난 뒤에 처리하므로, read/write가 필드가 아니라
-      // 메서드 이름을 가리키는 경우(예: property Enabled: boolean read FEnabled
-      // write SetEnabled;)에도 그 메서드의 MethodBuilder를 이미 찾을 수 있다.
-      foreach var ps in cd.Properties do
-      begin
-        Writeln('[MARK-BCS-6a] 프로퍼티 "'+ps.Name+'" 처리 시작');
-        var propClrType: System.Type;
+      Writeln('[MARK-BCS-6a] 프로퍼티 "'+ps.Name+'" 처리 시작');
+      var propClrType: System.Type;
         if (ps.PropType=vtObject) and ps.IsExternalType then
           propClrType:=ResolveExternalType(ps.PropClassName)
         else
@@ -2888,7 +2890,19 @@
             fMethodParamClrTypes[cd.Name]:=new Dictionary<string, array of System.Type>;
           fMethodParamClrTypes[cd.Name]['set_'+ps.Name]:=setterParamTypes;
         end;
-      end;
+    end;
+
+    procedure BuildClassShell_Properties(tb: TypeBuilder; cd: TClassDeclNode);
+    begin
+      Writeln('[MARK-BCS-6] 메서드 시그니처 루프 종료, 프로퍼티 루프 시작, cd.Properties.Count='+cd.Properties.Count.ToString);
+      // [Phase 1, Stage 85 확장] 프로퍼티 — CLR PropertyBuilder + get/set 메서드 쌍으로 방출.
+      // 메서드 시그니처 정의가 끝난 뒤에 처리하므로, read/write가 필드가 아니라
+      // 메서드 이름을 가리키는 경우(예: property Enabled: boolean read FEnabled
+      // write SetEnabled;)에도 그 메서드의 MethodBuilder를 이미 찾을 수 있다.
+      // [Stage 113] 루프 본문은 BuildOneProperty로 분리 — foreach의 암묵적
+      // try/finally 안에 복잡한 로직이 남지 않도록 한다.
+      foreach var ps in cd.Properties do
+        BuildOneProperty(tb, cd, ps);
     end;
 
     // 5) 생성자(오버로드 전부) 정의 + 사용자 생성자가 없으면 기본(부모 체이닝) 본문까지 방출
@@ -3014,6 +3028,7 @@
       svCurClass: string;
       svExitLabel78: &Label; // [Stage 78]
     begin
+      //Writeln('procedure BuildConstructorBody --01-- '); //<- 여기 삽입
       if not fCtorBuilders.ContainsKey(impl.ClassName) then
         raise new Exception('생성자를 찾을 수 없음: '+impl.ClassName+'.Create');
 
@@ -3031,7 +3046,7 @@
       svResult:=fResultLocal; svResultType:=fResultType;
       svCurClass:=fCurClassName;
       svExitLabel78:=fMethodExitLabel; // [Stage 78]
-
+      
       fLocalScope:=new TScope('local(ctor)', fGlobalScope);
       fResultLocal:=nil; // 생성자는 반환값이 없음
       fCurClassName:=impl.ClassName;
@@ -3114,6 +3129,7 @@
       // 파생 클래스 생성자가 base(...)를 안 쓰면 컴파일러가 자동으로 부모의 매개변수
       // 없는 생성자를 호출해주는 것과 동일한 처리를 여기서 해준다.
       var hasExplicitInherited: boolean := false;
+      Writeln('procedure BuildConstructorBody --18-- '); //<- 여기 삽입
       // [임시 진단] "inherited Create;"(괄호 없는 무인자 호출)가 명시적으로 있는데도
       // hasExplicitInherited가 false로 나오는 사례(자기컴파일 중 TBoundGenericPropertyInfo에서
       // 실제 재현)의 원인을 확정하기 위해, 문제되는 클래스의 생성자 본문 첫 문장 타입을
@@ -3182,15 +3198,24 @@
       // (본문 안의 "inherited Create(...)"가 이보다 먼저 실행돼야 하는 드문 경우는
       // 위 EmitClassFieldDefaults 주석에 적어둔 1차 제약으로 남겨둔다.)
       EmitClassFieldDefaults(il, impl.ClassName);
+      Writeln('procedure BuildConstructorBody --22-- '); //<- 여기 삽입 여기까지는 표시됨.
 
-      foreach st in impl.Body.Statements do EmitStatement(il, st);
+      foreach st in impl.Body.Statements do EmitStatement(il, st); //<-  여기서 죽는듯
+      Writeln('procedure BuildConstructorBody --23-- '); //<- 여기 삽입
       il.MarkLabel(fMethodExitLabel); // [Stage 78] exit 문의 착지점
+      Writeln('procedure BuildConstructorBody --24-- '); //<- 여기 삽입
       il.Emit(OpCodes.Ret);
+      Writeln('procedure BuildConstructorBody --25-- '); //<- 여기 삽입
+
 
       fLocalScope:=savedLocalScope;
+      Writeln('procedure BuildConstructorBody --26-- '); //<- 여기 삽입
       fResultLocal:=svResult; fResultType:=svResultType;
+      Writeln('procedure BuildConstructorBody --27-- '); //<- 여기 삽입
       fCurClassName:=svCurClass;
+      Writeln('procedure BuildConstructorBody --28-- '); //<- 여기 삽입
       fMethodExitLabel:=svExitLabel78; // [Stage 78]
+      Writeln('procedure BuildConstructorBody --29-- '); //<- 여기 삽입
     end;
 
     // 클래스 메서드 본문 IL 생성
@@ -4520,7 +4545,9 @@
       LogGenStep('4-1단계 시작 — 생성자 본문 '+fProg.ConstructorImpls.Count.ToString+'개');
       foreach ctorImpl in fProg.ConstructorImpls do
       try
+        Writeln('4-1  BuildConstructorBody(ctorImpl); 전');
         BuildConstructorBody(ctorImpl);
+        Writeln('4-1  BuildConstructorBody(ctorImpl); 후');
       except
         on E: Exception do
         begin
