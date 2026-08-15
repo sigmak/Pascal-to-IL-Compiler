@@ -1253,9 +1253,21 @@
     // 폴백 계층 훑기)으로 완전히 분리한다.
     function SafeGetProperty(t: System.Type; name: string): PropertyInfo;
     var _sgpRuntimeTypeName: string;
+    var _sgpTypeObj: System.Type;
+    var _sgpB0, _sgpB1, _sgpB2: boolean;
     begin
-      Writeln('[MARK-SGP-0] SafeGetProperty 진입, t=nil? '+(t=nil).ToString+' name="'+name+'"');
-      _sgpRuntimeTypeName := t.GetType().Name;
+      // [Stage 138 버그 수정 - 진짜 근본 원인 발견] "(지역변수=nil).ToString"을 문자열
+      // 접합(+) 안에서 곧바로 체이닝하면 gen0의 코드생성기가 잘못된 IL을 방출한다
+      // (Test_stage135/136/137로 확증됨: 중간 boolean 변수에 먼저 담으면 안전하고,
+      // 인라인으로 체이닝하면 100% 재현되는 크래시). 매개변수(t)에 대해서는 문제없지만,
+      // Result 등 지역변수에 대해서는 반드시 중간 변수를 거친다.
+      _sgpB0 := (t = nil);
+      Writeln('[MARK-SGP-0] SafeGetProperty 진입, t=nil? '+_sgpB0.ToString+' name="'+name+'"');
+      // [Stage 122 후속 수정] t.GetType().Name 한 줄 체이닝(메서드 호출 결과에 곧바로
+      // 프로퍼티 접근)이 IL 손상 트리거일 가능성을 배제하기 위해 중간 변수로 분리.
+      _sgpTypeObj := t.GetType();
+      Writeln('[MARK-SGP-0b] t.GetType() 완료');
+      _sgpRuntimeTypeName := _sgpTypeObj.Name;
       Writeln('[MARK-SGP-1] t.GetType().Name="'+_sgpRuntimeTypeName+'"');
       if _sgpRuntimeTypeName = 'TypeBuilderInstantiation' then
       begin
@@ -1263,12 +1275,27 @@
         Result := SafeGetPropertyTBI(t, name);
         Writeln('[MARK-SGP-TBI-1] SafeGetPropertyTBI 반환 완료');
       end
+      // [Stage 125 버그 수정] 진짜 원인 발견: t가 (제네릭이 아닌) 순수 로컬 클래스의
+      // TypeBuilder 자체일 때, 아직 CreateType()되지 않았으면 t.GetProperty(name)이
+      // System.NotSupportedException("호출된 멤버는 동적 모듈에서 지원되지 않습니다")을
+      // 던진다. 지금까지는 이 예외가 아래 try/except에 조용히 먹히고 SafeGetPropertyFallback
+      // 으로 넘어갔는데, 그 폴백도 TypeBuilder.GetProperties()에서 똑같이 막혀 결국 nil을
+      // 반환했을 가능성이 크다 — 이게 몇 주간 쫓아온 미스터리의 실제 근원으로 보인다.
+      // 리플렉션 대신 fInstanceMethods에서 직접 get_/set_ 메서드를 찾아 우회한다.
+      else if (t is TypeBuilder) then
+      begin
+        Writeln('[MARK-SGP-LOCAL-0] 원시 TypeBuilder 분기 — SafeGetPropertyLocal 호출 직전');
+        Result := SafeGetPropertyLocal(t, name);
+        _sgpB1 := (Result = nil);
+        Writeln('[MARK-SGP-LOCAL-1] SafeGetPropertyLocal 반환 완료, Result=nil? '+_sgpB1.ToString);
+      end
       else
       begin
         Writeln('[MARK-SGP-2] else 분기 진입, t.GetProperty 호출 직전');
         try
           Result := t.GetProperty(name);
-          Writeln('[MARK-SGP-3] t.GetProperty 완료, Result=nil? '+(Result=nil).ToString);
+          _sgpB2 := (Result = nil);
+          Writeln('[MARK-SGP-3] t.GetProperty 완료, Result=nil? '+_sgpB2.ToString);
         except
           Writeln('[MARK-SGP-EXC-0] except 진입, SafeGetPropertyFallback 호출 직전');
           Result := SafeGetPropertyFallback(t, name);
@@ -1277,6 +1304,38 @@
       end;
       Writeln('[MARK-SGP-4] SafeGetProperty 반환 직전');
     end;
+
+    // [Stage 125] t가 아직 CreateType()되지 않은 순수 로컬 클래스 TypeBuilder일 때,
+    // fTypeBuilders 역방향 조회(InferQualifierChainFindLocalClassName 재사용)로 클래스명을
+    // 찾고, fInstanceMethods에서 get_.../set_... 메서드를 직접 찾아 TBoundGenericPropertyInfo
+    // (이름 직접 지정 생성자)로 감싼다. 리플렉션(t.GetProperty)을 전혀 쓰지 않으므로
+    // NotSupportedException이 날 수 없다.
+    function SafeGetPropertyLocal(t: System.Type; name: string): PropertyInfo;
+    var localCls125: string; getter125, setter125: MethodInfo;
+    var _sgplB0, _sgplB1: boolean;
+    begin
+      Writeln('[MARK-SGPL-0] 진입, name="'+name+'"');
+      Result := nil;
+      localCls125 := InferQualifierChainFindLocalClassName(t);
+      Writeln('[MARK-SGPL-1] localCls125="'+localCls125+'"');
+      if localCls125 = '' then exit;
+
+      getter125 := nil;
+      setter125 := nil;
+      if fInstanceMethods.ContainsKey(localCls125) and fInstanceMethods[localCls125].ContainsKey('get_'+name) then
+        getter125 := fInstanceMethods[localCls125]['get_'+name];
+      if fInstanceMethods.ContainsKey(localCls125) and fInstanceMethods[localCls125].ContainsKey('set_'+name) then
+        setter125 := fInstanceMethods[localCls125]['set_'+name];
+      // [Stage 138 버그 수정] 인라인 (지역변수=nil).ToString 체이닝 제거 — 중간 변수로 분리.
+      _sgplB0 := (getter125 = nil);
+      _sgplB1 := (setter125 = nil);
+      Writeln('[MARK-SGPL-2] getter=nil? '+_sgplB0.ToString+' setter=nil? '+_sgplB1.ToString);
+
+      if (getter125 = nil) and (setter125 = nil) then exit;
+      Result := new TBoundGenericPropertyInfo(nil, name, t, getter125, setter125);
+      Writeln('[MARK-SGPL-3] 반환 직전');
+    end;
+
 
     // [Stage 122] TypeBuilderInstantiation(아직 CreateType 안 된 로컬 클래스를 담은
     // 열린 제네릭 인스턴스화) 전용 경로 — 원래 SafeGetProperty 앞부분 그대로 이동.
@@ -1303,7 +1362,7 @@
       if openProp99.GetSetMethod(true) <> nil then
         boundSetter99 := TypeBuilder.GetMethod(t, openProp99.GetSetMethod(true));
 
-      Result := new TBoundGenericPropertyInfo(openProp99, t, boundGetter99, boundSetter99);
+      Result := new TBoundGenericPropertyInfo(openProp99, '', t, boundGetter99, boundSetter99);
     end;
 
     // [Stage 122] 기본 t.GetProperty(name)이 예외를 던졌을 때(주로 AmbiguousMatchException)의
@@ -1476,7 +1535,7 @@
               g101 := TypeBuilder.GetMethod(t, openProps101[i101].GetGetMethod(true));
             if openProps101[i101].GetSetMethod(true) <> nil then
               s101 := TypeBuilder.GetMethod(t, openProps101[i101].GetSetMethod(true));
-            bound101.Add(new TBoundGenericPropertyInfo(openProps101[i101], t, g101, s101));
+            bound101.Add(new TBoundGenericPropertyInfo(openProps101[i101], '', t, g101, s101));
           end;
         Result := bound101.ToArray();
       end

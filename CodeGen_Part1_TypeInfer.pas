@@ -884,11 +884,98 @@
     // [Stage 121 진단] Stage 120까지도 TryFindFieldBuilder/IsChainStartSegment 모두 무죄로
     // 확인됨 — 다음 용의자인 이 함수에 지점별 태그 Writeln을 추가해 정확히 어디까지
     // 도달하는지 확인한다.
+    // [Stage 123 분할] InferQualifierChainType의 루프 안에 있던 foreach(fTypeBuilders 역방향
+    // 조회)를 별도 함수로 뽑아냈다. PascalABC.NET의 foreach는 암묵적으로 try/finally로
+    // 감싸지는데, 이게 큰 함수 안에 들어있으면 JIT 시점에 IL이 깨지는 게 기존에 반복적으로
+    // 확인된 패턴이다(Stage 111/112/113과 동일 계열). 이 함수 하나에만 그 foreach를 담아
+    // 손상 가능성을 최소화한다.
+    function InferQualifierChainFindLocalClassName(curType: System.Type): string;
+    var tbKvp78: System.Collections.Generic.KeyValuePair<string, TypeBuilder>;
+    begin
+      Writeln('[MARK-IQCFL-0] 진입');
+      Result:='';
+      if curType is TypeBuilder then
+      begin
+        Writeln('[MARK-IQCFL-1] curType is TypeBuilder = true — foreach 진입');
+        foreach tbKvp78 in fTypeBuilders do
+          if tbKvp78.Value = TypeBuilder(curType) then
+          begin Result:=tbKvp78.Key; break; end;
+        Writeln('[MARK-IQCFL-2] foreach 종료, Result="'+Result+'"');
+      end;
+      Writeln('[MARK-IQCFL-3] 반환 직전');
+    end;
+
+    // [Stage 123 분할] InferQualifierChainType의 루프 안, "외부 CLR 타입" 경로(SafeGetProperty
+    // 호출 + GetField/GetMethod 폴백)를 별도 함수로 뽑아냈다. 원래 위치에서는 바로 위에서
+    // 실행된 foreach(위 함수로 분리됨)의 흔적이 같은 함수 안에 남아있어 SafeGetProperty 호출이
+    // 애꿎게 크래시 지점으로 잘못 지목됐을 가능성이 있다 — 완전히 별도 함수로 분리해 검증한다.
+    function InferQualifierChainStepExternalMember(curType: System.Type; segName: string): System.Type;
+    var pi: PropertyInfo; fi: System.Reflection.FieldInfo; mi101: MethodInfo;
+        _P1EmptyTypesLocal2: array of System.Type;
+        _iqcseB0, _iqcseB1, _iqcseB2: boolean;
+    begin
+      Writeln('[MARK-IQCSE-0] 진입, curType="'+curType.ToString+'" segName="'+segName+'"');
+      pi:=SafeGetProperty(curType, segName);
+      // [Stage 138 버그 수정 - 진짜 근본 원인] "(지역변수=nil).ToString"을 문자열 접합(+)
+      // 안에서 곧바로 체이닝하면 gen0의 코드생성기가 잘못된 IL을 방출한다(Test_stage135/136/137
+      // 로 확증). 중간 boolean 변수를 거치도록 전부 고친다.
+      _iqcseB0 := (pi = nil);
+      Writeln('[MARK-IQCSE-1] SafeGetProperty 완료, pi=nil? '+_iqcseB0.ToString);
+      if pi<>nil then Result:=pi.PropertyType
+      else
+      begin
+        fi:=curType.GetField(segName);
+        _iqcseB1 := (fi = nil);
+        Writeln('[MARK-IQCSE-2] GetField 완료, fi=nil? '+_iqcseB1.ToString);
+        if fi<>nil then Result:=fi.FieldType
+        else
+        begin
+          // [버그 수정] EmitQualifierChainLoad와 동일 — 프로퍼티/필드가 아니면 괄호 없는
+          // 무인자 메서드일 수 있다 (예: dirSb.ToString.Trim).
+          _P1EmptyTypesLocal2:=System.Type.EmptyTypes;
+          mi101:=curType.GetMethod(segName, _P1EmptyTypesLocal2);
+          _iqcseB2 := (mi101 = nil);
+          Writeln('[MARK-IQCSE-3] GetMethod 완료, mi101=nil? '+_iqcseB2.ToString);
+          if mi101=nil then
+            raise new Exception('타입 "'+curType.FullName+'"에 속성/필드/무인자 메서드 "'+segName+'"가 없습니다 (연쇄 접근 중)');
+          Result:=mi101.ReturnType;
+        end;
+      end;
+      Writeln('[MARK-IQCSE-4] 반환 직전');
+    end;
+
+    // [Stage 123 분할] 위 두 헬퍼(InferQualifierChainFindLocalClassName /
+    // InferQualifierChainStepExternalMember)를 뽑아내고, 로컬 클래스 프로퍼티/필드 판별
+    // 같은 단순 분기만 남긴 얇은 스텝 함수. 원래 for 루프 몸통 전체가 여기 있었다.
+    function InferQualifierChainStep(segs: List<string>; i: integer; curType: System.Type): System.Type;
+    var localClsName78: string;
+    begin
+      Writeln('[MARK-IQCS-0] 진입, i='+i.ToString+' segs[i]="'+segs[i]+'" curType="'+curType.ToString+'"');
+      localClsName78:=InferQualifierChainFindLocalClassName(curType);
+      Writeln('[MARK-IQCS-1] localClsName78="'+localClsName78+'"');
+
+      if (localClsName78<>'') and fInstanceMethods.ContainsKey(localClsName78)
+         and fInstanceMethods[localClsName78].ContainsKey('get_'+segs[i]) then
+        // [Stage 85] 로컬 클래스의 프로퍼티 getter
+        Result:=fInstanceMethods[localClsName78]['get_'+segs[i]].ReturnType
+      // [Stage 89] 괄호 없이 부른 인자 없는 메서드 — EmitQualifierChainLoad와 동일한 사유
+      else if (localClsName78<>'') and fInstanceMethods.ContainsKey(localClsName78)
+         and fInstanceMethods[localClsName78].ContainsKey(segs[i]) then
+        Result:=fInstanceMethods[localClsName78][segs[i]].ReturnType
+      else if (localClsName78<>'') and fFieldBuilders.ContainsKey(localClsName78)
+         and fFieldBuilders[localClsName78].ContainsKey(segs[i]) then
+        Result:=fFieldBuilders[localClsName78][segs[i]].FieldType
+      else
+      begin
+        Writeln('[MARK-IQCS-2] 외부 CLR 타입 경로 — InferQualifierChainStepExternalMember 호출 직전');
+        Result:=InferQualifierChainStepExternalMember(curType, segs[i]);
+      end;
+      Writeln('[MARK-IQCS-3] 반환 직전, Result="'+Result.ToString+'"');
+    end;
+
     function InferQualifierChainType(segs: List<string>): System.Type;
-    var i: integer; curType: System.Type; pi: PropertyInfo; fi: System.Reflection.FieldInfo;
+    var i: integer; curType: System.Type;
         firstFb: FieldBuilder; first: string; extSelf: System.Type;
-        localClsName78: string; tbKvp78: System.Collections.Generic.KeyValuePair<string, TypeBuilder>;
-        mi101: MethodInfo; // [버그 수정] EmitQualifierChainLoad와 동일 — 괄호 없는 무인자 메서드 지원
     begin
       first:=segs[0];
       Writeln('[MARK-IQCT-0] 진입, segs.Count='+segs.Count.ToString+' first="'+first+'"');
@@ -925,62 +1012,12 @@
           curType:=fInstanceMethods[fCurClassName][first].ReturnType
         else raise new Exception('알 수 없는 한정자 "'+first+'" (연쇄 속성 접근의 시작점을 찾을 수 없습니다)');
       end;
-      Writeln('[MARK-IQCT-1] 첫 세그먼트 타입 결정 완료, curType="'+curType.ToString+'" ? 루프 시작, segs.Count-1='+(segs.Count-1).ToString);
+      Writeln('[MARK-IQCT-1] 첫 세그먼트 타입 결정 완료, curType="'+curType.ToString+'" — 루프 시작, segs.Count-1='+(segs.Count-1).ToString);
 
       for i:=1 to segs.Count-1 do
       begin
-        Writeln('[MARK-IQCT-2] 루프 진입, i='+i.ToString+' segs[i]="'+segs[i]+'" curType="'+curType.ToString+'"');
-        // [Stage 78 수정] curType이 아직 CreateType되지 않은 로컬 TypeBuilder이면
-        // GetProperty/GetField가 NotSupportedException을 던진다.
-        // fTypeBuilders를 역방향으로 조회해 클래스명을 찾고, fFieldBuilders에서 직접 타입을 가져온다.
-        localClsName78:='';
-        Writeln('[MARK-IQCT-3] localClsName78 초기화 완료 ? curType is TypeBuilder 검사 직전');
-        if curType is TypeBuilder then
-        begin
-          Writeln('[MARK-IQCT-4] curType is TypeBuilder = true ? foreach 진입');
-          foreach tbKvp78 in fTypeBuilders do
-            if tbKvp78.Value = TypeBuilder(curType) then
-            begin localClsName78:=tbKvp78.Key; break; end;
-          Writeln('[MARK-IQCT-5] foreach 종료, localClsName78="'+localClsName78+'"');
-        end;
-        Writeln('[MARK-IQCT-6] TypeBuilder 분기 완료, localClsName78="'+localClsName78+'" ? 프로퍼티/필드 판별 직전');
-
-        if (localClsName78<>'') and fInstanceMethods.ContainsKey(localClsName78)
-           and fInstanceMethods[localClsName78].ContainsKey('get_'+segs[i]) then
-          // [Stage 85] 로컬 클래스의 프로퍼티 getter
-          curType:=fInstanceMethods[localClsName78]['get_'+segs[i]].ReturnType
-        // [Stage 89] 괄호 없이 부른 인자 없는 메서드 — EmitQualifierChainLoad와 동일한 사유
-        else if (localClsName78<>'') and fInstanceMethods.ContainsKey(localClsName78)
-           and fInstanceMethods[localClsName78].ContainsKey(segs[i]) then
-          curType:=fInstanceMethods[localClsName78][segs[i]].ReturnType
-        else if (localClsName78<>'') and fFieldBuilders.ContainsKey(localClsName78)
-           and fFieldBuilders[localClsName78].ContainsKey(segs[i]) then
-          curType:=fFieldBuilders[localClsName78][segs[i]].FieldType
-        else
-        begin
-          Writeln('[MARK-IQCT-7] 외부 CLR 타입 경로 진입 ? SafeGetProperty 호출 직전');
-          // 외부 CLR 타입 — 기존 GetProperty/GetField 경로 (Stage 93: SafeGetProperty로
-          // AmbiguousMatchException 방지, EmitQualifierChainLoad와 동일한 이유)
-          pi:=SafeGetProperty(curType, segs[i]);
-          Writeln('[MARK-IQCT-8] SafeGetProperty 완료, pi='+ (pi=nil).ToString);
-          if pi<>nil then curType:=pi.PropertyType
-          else
-          begin
-            fi:=curType.GetField(segs[i]);
-            if fi<>nil then curType:=fi.FieldType
-            else
-            begin
-              // [버그 수정] EmitQualifierChainLoad와 동일 — 프로퍼티/필드가 아니면 괄호 없는
-              // 무인자 메서드일 수 있다 (예: dirSb.ToString.Trim).
-              var _P1EmptyTypesLocal2: array of System.Type;
-              _P1EmptyTypesLocal2:=System.Type.EmptyTypes;
-              mi101:=curType.GetMethod(segs[i], _P1EmptyTypesLocal2);
-              if mi101=nil then
-                raise new Exception('타입 "'+curType.FullName+'"에 속성/필드/무인자 메서드 "'+segs[i]+'"가 없습니다 (연쇄 접근 중 — 경로: '+string.Join('.', segs)+')');
-              curType:=mi101.ReturnType;
-            end;
-          end;
-        end;
+        Writeln('[MARK-IQCT-2] 루프 진입, i='+i.ToString+' — InferQualifierChainStep 호출 직전');
+        curType:=InferQualifierChainStep(segs, i, curType);
         Writeln('[MARK-IQCT-9] i='+i.ToString+' 처리 완료, curType="'+curType.ToString+'"');
       end;
       Writeln('[MARK-IQCT-10] 루프 전체 종료, Result 반환 직전');

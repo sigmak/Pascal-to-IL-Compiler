@@ -54,17 +54,32 @@ type
     function GetCanWrite0: boolean;
     begin Result := fSetter <> nil; end;
   public
-    constructor Create(openProp: PropertyInfo; declType: System.Type; getter, setter: MethodInfo);
+    // [Stage 126 수정] 예전에는 이 생성자와 별도로 propName을 직접 받는 오버로드가
+    // 하나 더 있었다(둘 다 인자 4개). 그런데 이 자기호스팅 컴파일러의 생성자 빌드 로직이
+    // "인자 개수가 같은 두 개의 Create 오버로드"를 구분하지 못해 하나는 IL 본문 없이
+    // 남겨져 CreateType 시 "'.ctor' 메서드에 메서드 본문이 없습니다" 오류가 났다(실제
+    // 자기컴파일 사례). 오버로드를 아예 없애고 인자 5개짜리 단일 생성자로 통합한다 —
+    // openProp이 있으면(제네릭 로컬 클래스 경로) 거기서 Name/Attributes를 가져오고,
+    // 없으면(nil, 순수 로컬 클래스 경로) propName/기본 Attributes를 쓴다.
+    constructor Create(openProp: PropertyInfo; propName: string; declType: System.Type; getter, setter: MethodInfo);
     begin
       // [버그 수정] PropertyInfo의 무인자 생성자는 protected라 자동 체이닝이 안 됨 — 명시 호출 필요.
       // [추가 수정] 괄호 없는 "inherited Create;" 형태를 BuildConstructorBody의 hasExplicitInherited
       // 감지 로직이 놓치는 문제가 재현되어(자기컴파일 실제 사례), 괄호를 붙인 형태로 바꿔 우회한다.
       inherited Create();
-      fName := openProp.Name;
+      if openProp <> nil then
+      begin
+        fName := openProp.Name;
+        fAttrs := openProp.Attributes;
+      end
+      else
+      begin
+        fName := propName;
+        fAttrs := PropertyAttributes.None;
+      end;
       fDeclType := declType;
       fGetter := getter;
       fSetter := setter;
-      fAttrs := openProp.Attributes;
       if getter <> nil then
       begin
         fPropType := getter.ReturnType;
