@@ -1153,12 +1153,23 @@ begin
 
 end; // RunCompilerBodyInner
 
+procedure StackProbe(n: integer; maxDepth: integer);
+begin
+  if (n mod 20000) = 0 then
+    Writeln('[MARK-STACKPROBE] depth=' + n.ToString);
+  if n < maxDepth then
+    StackProbe(n + 1, maxDepth);
+end;
+
 // [버그 수정] RunCompilerBodyInner를 감싸는 얇은 래퍼. 개별 단계(Lexer/Parser/CodeGen 등)의
 // try/except가 못 잡는 예상 밖 예외(예: 이번에 실제로 겪은 ArgumentNullException)까지 여기서
 // 한 번 더 잡아서, 최소한 예외 타입/메시지/StackTrace는 항상 화면에 남기고 "아무 키나 누르면
 // 종료합니다" 프롬프트까지 정상적으로 도달하게 한다. 스레드 진입점은 이제 이 절차를 가리킨다.
 procedure RunCompilerBody;
 begin
+  //Writeln('[MARK-STACKPROBE-START]');
+  //StackProbe(0, 500000);
+  //Writeln('[MARK-STACKPROBE-END] 500000 깊이 재귀 생존');
   try
     RunCompilerBodyInner;
   except
@@ -1188,8 +1199,21 @@ const CompilerThreadStackSize = 256 * 1024 * 1024; // 256MB//64MB
 
 var
   compileThread: System.Threading.Thread;
+  _autoFlushOut: System.IO.StreamWriter;
 
 begin
+  // [진단] Console 출력이 파일로 리다이렉트될 때 기본 StreamWriter가 내부 버퍼를 쓰는데,
+  // AccessViolationException 같은 native/corrupted-state 크래시는 .NET이 정상적으로
+  // 가로챌 수 없어 프로세스가 즉시 통째로 죽는다 — 이때 아직 flush 안 된 버퍼 속 Writeln
+  // 출력들은 그대로 유실된다. 즉 지금까지 로그의 "마지막 줄"이 실제로는 진짜 마지막 실행
+  // 지점이 아니라 마지막으로 flush된 지점일 뿐일 수 있다. AutoFlush:=true로 매 Writeln마다
+  // 즉시 디스크에 쓰도록 강제해, 다음 크래시부터는 로그의 마지막 줄을 완전히 신뢰할 수
+  // 있게 한다. 반드시 컴파일 스레드를 시작하기 전에(Writeln이 한 번이라도 불리기 전에)
+  // 설정해야 한다 — Console.SetOut은 프로세스 전역 설정이라 스레드에도 그대로 적용된다.
+  _autoFlushOut:=new System.IO.StreamWriter(Console.OpenStandardOutput());
+  _autoFlushOut.AutoFlush:=true;
+  Console.SetOut(_autoFlushOut);
+
   compileThread := new System.Threading.Thread(RunCompilerBody, CompilerThreadStackSize);
   compileThread.Start;
   compileThread.Join;

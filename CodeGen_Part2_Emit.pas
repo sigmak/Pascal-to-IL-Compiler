@@ -1371,7 +1371,12 @@
           else if b.Op=boSub then begin aIL.Emit(OpCodes.Not); aIL.Emit(OpCodes.And); end
           else raise new Exception('집합에는 +(합집합), -(차집합), *(교집합)만 지원합니다 (Stage 63)');
         end
-        else if (b.Op=boAdd) and ((lt=vtString) or (rt=vtString)) then
+        // [Stage 116 버그 수정] char+char(둘 다 vtChar, 둘 다 아직 vtString이 아닌 경우)도
+        // 문자열 연결 경로로 보낸다 — 예전엔 이 조건이 없어 char+char가 곧장 아래 else의
+        // 순수 정수 덧셈(OpCodes.Add)으로 떨어져, 문자 코드가 숫자로 더해진 값이 string
+        // 자리(예: TToken 생성자 인자)에 그대로 들어가는 자기컴파일 전용 버그를 냈다
+        // (Lexer.pas의 `#39+_qlast+#39`에서 재현, 39+32+39=110).
+        else if (b.Op=boAdd) and ((lt=vtString) or (rt=vtString) or ((lt=vtChar) and (rt=vtChar))) then
         begin
           // 문자열 연결: 피연산자를 string으로 변환 후 Concat
           EmitExpr(aIL, b.Left);

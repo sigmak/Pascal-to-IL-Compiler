@@ -1657,6 +1657,17 @@
         else if (b.Op=boAnd) or (b.Op=boOr) then r:=vtBoolean
         else if (_binLt=vtString) or (_binRt=vtString) then
           r:=vtString
+        // [Stage 116 버그 수정] char+char(둘 다 vtChar)는 Pascal 의미상 문자열 연결이어야
+        // 하는데, 위 vtString 분기는 "이미 vtString인 피연산자가 있을 때"만 걸려 char+char는
+        // 걸러지지 않고 맨 아래 vtInteger 기본값으로 잘못 추론되고 있었다. 그 결과 EmitExpr도
+        // (같은 InferType을 그대로 재사용하므로) 문자열 연결이 아니라 문자 코드의 정수 덧셈으로
+        // 방출됐다 — 자기컴파일 중 Lexer.pas의 `#39+_qlast+#39`(따옴표문자 조립)에서 실제로
+        // 재현: 결과가 39+공백(32)+39=110라는 정수로 계산되어 string 자리에 잘못 들어갔다.
+        // boAdd이고 두 피연산자 모두 vtChar면 결과도 vtString으로 확정한다(3항 이상 체이닝,
+        // 예: #39+c+#39도 안쪽 char+char가 먼저 vtString이 되어 바깥쪽은 기존 vtString 분기로
+        // 자연히 처리됨).
+        else if (b.Op=boAdd) and (_binLt=vtChar) and (_binRt=vtChar) then
+          r:=vtString
         // [버그 수정] 예전엔 이 분기가 없어서 real/int64가 섞인 이항연산(예: -3.7, 1.5+2)이
         // 전부 vtInteger로 잘못 추론됐다 — 실제 IL 생성(EmitExpr의 isReal 승격 로직, 이 파일
         // 위쪽)은 이미 올바르게 real로 처리하고 있었으니 InferType만 뒤처져 있던 것.

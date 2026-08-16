@@ -254,9 +254,19 @@ type
     // 자신의 닫는 end이므로 거기서 스캔을 멈춘다. fPos는 스캔 전후로 그대로 복원한다.
     procedure PreRegisterClassMethodNames(cn: string);
     var savedPos, depth: integer;
+        _preMethDict: Dictionary<string, boolean>;
     begin
       savedPos:=fPos;
       depth:=0;
+      // [Stage 118 버그 수정] 아래 fClassMethods[cn].ContainsKey(_preName)이 바로 그
+      // "인덱서 결과에 바로 이어서 메서드를 호출하는 체인(X[Y].Method(Z))" 패턴이었다 —
+      // ParsePrimaryIdentB/C(1466번째 줄 근방, 1586번째 줄 근방)에서 이미 진단/패치했던 것과
+      // 완전히 동일한 안티패턴인데 이 함수만 빠져 있었다. 이 함수가 정확히 "Lexer.pas의 CC"
+      // 이름을 등록하는 지점이라(244번째 줄 주석 참고), 여기서 만들어진 손상된 IL이 같은
+      // 클래스 안에서 물리적으로 가까운 다른 메서드(ParsePrimaryIdentC 등)의 JIT를 깨뜨려
+      // 크래시가 엉뚱한 곳에서 관찰되는 것으로 추정된다. 인덱서 결과를 미리 한 번만
+      // 지역변수에 담아 체인을 끊는다.
+      _preMethDict:=fClassMethods[cn];
       while fPos<fTokens.Count do
       begin
         if (Cur.Kind=tkBegin) or (Cur.Kind=tkCase) or (Cur.Kind=tkTry) or (Cur.Kind=tkRecord) then
@@ -272,8 +282,8 @@ type
           if (fPos+1<fTokens.Count) and (fTokens[fPos+1].Kind=tkIdent) then
           begin
             var _preName:=fTokens[fPos+1].Text;
-            if not fClassMethods[cn].ContainsKey(_preName) then
-              fClassMethods[cn][_preName]:=_preIsFunc;
+            if not _preMethDict.ContainsKey(_preName) then
+              _preMethDict[_preName]:=_preIsFunc;
           end;
         end;
         fPos:=fPos+1;
@@ -1165,68 +1175,14 @@ type
           end
           else if (Cur.Kind=tkLParen) and (segs2.Count>1) then
           begin
-            // TypeName(expr).member 캐스트 읽기 패턴인지 확인해본다.
-            // segs2 전체가 사실 타입 이름이고, 괄호 안 인자(정확히 1개)가 캐스트 대상.
-            var savedPos5:=fPos;
-            fPos:=fPos+1; // '(' 소비
-            var castArgs2:=new List<TExprNode>;
-            if Cur.Kind<>tkRParen then
-            begin
-              castArgs2.Add(ParseExpr);
-              while Cur.Kind=tkComma do begin fPos:=fPos+1; castArgs2.Add(ParseExpr); end;
-            end;
-            Expect(tkRParen);
-            Writeln('[MARK-PPI-A] IsResolvableExternalTypeName 호출 직전, name="'+string.Join('.', segs2)+'"');
-            if IsResolvableExternalTypeName(string.Join('.', segs2))
-               and (castArgs2.Count=1) and (Cur.Kind=tkDot) then
-            begin
-              var castType2:=string.Join('.', segs2);
-              var innerName2:='';
-              var isSimpleCastTarget90:=true;
-              if castArgs2[0] is TVarRefNode then innerName2:=TVarRefNode(castArgs2[0]).VarName
-              else if castArgs2[0] is TFieldReadExprNode then innerName2:=TFieldReadExprNode(castArgs2[0]).FieldName
-              else isSimpleCastTarget90:=false;
-
-              if not isSimpleCastTarget90 then
-              begin
-                // [Stage 90] 단순 변수/필드가 아닌 임의의 식(예: attributes[0]) — 캐스트 노드로 감싸고
-                // 뒤의 ".member"/".method(...)"는 ParsePrimary 끝의 범용 체이닝 루프에 맡긴다
-                // (거기서 TChainedMemberExprNode로 감싸며, 여러 단계 체이닝도 자동으로 처리됨).
-                Result:=new TExternalCastExprNode(castType2, castArgs2[0]);
-              end
-              else
-              begin
-                fPos:=fPos+1; // '.' 소비
-                var member3:=ExpectMemberName; // [Stage 41] 키워드 속성명(Length 등) 허용
-                var mc3:=new TMethodCallExprNode(innerName2, member3);
-                mc3.ObjCastType:=castType2;
-                if Cur.Kind=tkLParen then
-                begin
-                  fPos:=fPos+1;
-                  if Cur.Kind<>tkRParen then
-                  begin
-                    mc3.Args.Add(ParseExpr);
-                    while Cur.Kind=tkComma do begin fPos:=fPos+1; mc3.Args.Add(ParseExpr); end;
-                  end;
-                  Expect(tkRParen);
-                end;
-                Result:=mc3;
-              end;
-            end
-            else
-            begin
-              // [버그 수정] segs2(예: "dirText.Substring")가 실제로 리플렉션 가능한 외부 타입이
-              // 아니면 캐스트일 수 없다 — 그냥 obj.Method(args) 형태의 일반 메서드 호출이다
-              // (예: dirText.Substring(1).Trim — dirText는 지역변수, Substring은 그 위의
-              // 인스턴스 메서드). 뒤에 이어지는 ".Trim"은 ParsePrimary 끝의 범용 체이닝 루프가
-              // 이 mc4 결과 위에 TChainedMemberExprNode로 자동으로 얹어준다.
-              // (예: System.Windows.Forms.MessageBox.Show(...) 를 식으로 사용).
-              var staticQualifier:=string.Join('.', segs2.GetRange(0, segs2.Count-1));
-              var staticMname:=segs2[segs2.Count-1];
-              var mc4:=new TMethodCallExprNode(staticQualifier, staticMname);
-              foreach var a6 in castArgs2 do mc4.Args.Add(a6);
-              Result:=mc4;
-            end;
+            // [Stage 114 리팩터] ParsePrimaryIdentDotted가 ~185줄까지 커져 있어(TParser 안에서
+            // 가장 크고 복잡한 함수 중 하나), self-compile 시 이 함수의 손상된 IL이 클래스 안에서
+            // 바로 뒤에 배치되는 메서드(ParsePrimaryIdentB)의 IL 영역까지 침범하는 것으로 추정된다
+            // (ParsePrimaryIdentB 자체의 내용을 두 차례 바꿔도 동일한 BadImageFormatException이
+            // 재발한 것이 그 근거 — 즉 원인이 피해 메서드가 아니라 이 함수 쪽일 가능성이 높다).
+            // 가장 큰 단일 블록("TypeName(expr).member" 캐스트 읽기 패턴 판별, 원래 이 자리에
+            // ~65줄 인라인)을 로직 변경 없이 별도 함수로 옮긴다.
+            Result:=ParsePrimaryIdentDottedCast(t, segs2);
           end
           // [Stage 75] obj.GetType.FullName / obj.GetType.Name — 3단계 체인이지만 첫 세그먼트는
           // 변수(예: except 블록의 ex)이지 외부 타입 이름이 아니다. 아래 일반 정적-경로 분기보다
@@ -1302,6 +1258,77 @@ type
               end;
             end;
           end;
+        end;
+    end;
+
+    // [Stage 114] ParsePrimaryIdentDotted에서 분리됨 — "TypeName(expr).member" 형태가
+    // 캐스트 읽기인지, 아니면 그냥 obj.Method(args) 호출인지 판별하는 로직. 로직은
+    // 원본과 완전히 동일하다(savedPos5는 원본에서도 실제로 쓰이지 않던 값이라 그대로 유지).
+    function ParsePrimaryIdentDottedCast(t: TToken; segs2: List<string>): TExprNode;
+    var savedPos5: integer;
+        castArgs2: List<TExprNode>;
+    begin
+        // TypeName(expr).member 캐스트 읽기 패턴인지 확인해본다.
+        // segs2 전체가 사실 타입 이름이고, 괄호 안 인자(정확히 1개)가 캐스트 대상.
+        savedPos5:=fPos;
+        fPos:=fPos+1; // '(' 소비
+        castArgs2:=new List<TExprNode>;
+        if Cur.Kind<>tkRParen then
+        begin
+          castArgs2.Add(ParseExpr);
+          while Cur.Kind=tkComma do begin fPos:=fPos+1; castArgs2.Add(ParseExpr); end;
+        end;
+        Expect(tkRParen);
+        Writeln('[MARK-PPI-A] IsResolvableExternalTypeName 호출 직전, name="'+string.Join('.', segs2)+'"');
+        if IsResolvableExternalTypeName(string.Join('.', segs2))
+           and (castArgs2.Count=1) and (Cur.Kind=tkDot) then
+        begin
+          var castType2:=string.Join('.', segs2);
+          var innerName2:='';
+          var isSimpleCastTarget90:=true;
+          if castArgs2[0] is TVarRefNode then innerName2:=TVarRefNode(castArgs2[0]).VarName
+          else if castArgs2[0] is TFieldReadExprNode then innerName2:=TFieldReadExprNode(castArgs2[0]).FieldName
+          else isSimpleCastTarget90:=false;
+
+          if not isSimpleCastTarget90 then
+          begin
+            // [Stage 90] 단순 변수/필드가 아닌 임의의 식(예: attributes[0]) — 캐스트 노드로 감싸고
+            // 뒤의 ".member"/".method(...)"는 ParsePrimary 끝의 범용 체이닝 루프에 맡긴다
+            // (거기서 TChainedMemberExprNode로 감싸며, 여러 단계 체이닝도 자동으로 처리됨).
+            Result:=new TExternalCastExprNode(castType2, castArgs2[0]);
+          end
+          else
+          begin
+            fPos:=fPos+1; // '.' 소비
+            var member3:=ExpectMemberName; // [Stage 41] 키워드 속성명(Length 등) 허용
+            var mc3:=new TMethodCallExprNode(innerName2, member3);
+            mc3.ObjCastType:=castType2;
+            if Cur.Kind=tkLParen then
+            begin
+              fPos:=fPos+1;
+              if Cur.Kind<>tkRParen then
+              begin
+                mc3.Args.Add(ParseExpr);
+                while Cur.Kind=tkComma do begin fPos:=fPos+1; mc3.Args.Add(ParseExpr); end;
+              end;
+              Expect(tkRParen);
+            end;
+            Result:=mc3;
+          end;
+        end
+        else
+        begin
+          // [버그 수정] segs2(예: "dirText.Substring")가 실제로 리플렉션 가능한 외부 타입이
+          // 아니면 캐스트일 수 없다 — 그냥 obj.Method(args) 형태의 일반 메서드 호출이다
+          // (예: dirText.Substring(1).Trim — dirText는 지역변수, Substring은 그 위의
+          // 인스턴스 메서드). 뒤에 이어지는 ".Trim"은 ParsePrimary 끝의 범용 체이닝 루프가
+          // 이 mc4 결과 위에 TChainedMemberExprNode로 자동으로 얹어준다.
+          // (예: System.Windows.Forms.MessageBox.Show(...) 를 식으로 사용).
+          var staticQualifier:=string.Join('.', segs2.GetRange(0, segs2.Count-1));
+          var staticMname:=segs2[segs2.Count-1];
+          var mc4:=new TMethodCallExprNode(staticQualifier, staticMname);
+          foreach var a6 in castArgs2 do mc4.Args.Add(a6);
+          Result:=mc4;
         end;
     end;
 
@@ -1423,10 +1450,48 @@ type
     end;
 
     function ParsePrimaryIdentB(t: TToken): TExprNode;
-    var cn: TFuncCallExprNode; mc: TMethodCallExprNode;
-        extCastFull93: string;
+    var extCastFull93: string;
+        _ok94: boolean;
+        _hasCurMethod127: boolean;
+        _methDict127: Dictionary<string, boolean>;
     begin
         Writeln('[MARK-PPIB] ParsePrimaryIdentB 진입, t.Text="'+t.Text+'"');
+
+        // [Stage 115 버그 수정] 아래 "로컬 클래스 캐스트" 분기의 원래 조건은
+        // "... and not ((fCurClass<>'') and DictDictHas(fClassMethods, fCurClass, t.Text))"
+        // 형태로, 제네릭 헬퍼 DictDictHas<TV>를 self에서 암시적으로 호출했다. 이 헬퍼는
+        // CodeGen_Part2_Emit.pas의 SafeArrayElemType 주석에 이미 기록돼 있듯 자기컴파일 시
+        // "TParser.DictDictHas<TV>의 매개변수 d — Parser.pas의 d[k1]이 배열 인덱싱 경로를
+        // 타면서" 문제를 일으킨 전력이 있는 함수다 — 즉 gen0가 제네릭 메서드 self-호출의
+        // call-site를 self-compile 상황에서 아직 완전히 신뢰할 수 없다. 여기서는 TV가 항상
+        // boolean으로 고정된 호출이라 제네릭을 거칠 필요가 전혀 없으므로, ContainsKey를
+        // 직접 두 번 호출하는 방식으로 인라인해 제네릭 self-호출 자체를 피한다.
+        // [Stage 117 버그 수정] fClassMethods[fCurClass].ContainsKey(t.Text)처럼 인덱서
+        // 결과에 바로 이어서 메서드를 호출하는 체인(X[Y].Method(Z))이, self-compile된 gen1에서
+        // 키가 실제로 존재하는 실행 경로를 탈 때 native AccessViolation(exit code 80131506)으로
+        // 죽는 것으로 실제 재현됐다(ParsePrimaryIdentC의 동일 패턴에서 "CC" 처리 중 크래시).
+        // 인덱서 결과를 중간 지역변수(_methDict127)에 먼저 담아 체인을 끊는다 — Dictionary
+        // 인덱서 읽기와 지역변수에 대한 일반 메서드 호출은 각각 프로젝트 전체에서 이미 안전하게
+        // 잘 동작하는 패턴이라, 둘을 합친 체인 표현만 피하면 된다.
+        _hasCurMethod127:=false;
+        if (fCurClass<>'') and fClassMethods.ContainsKey(fCurClass) then
+        begin
+          _methDict127:=fClassMethods[fCurClass];
+          _hasCurMethod127:=_methDict127.ContainsKey(t.Text);
+        end;
+
+
+        // [_ok94 패턴] PascalABC.NET의 and는 short-circuit이 아니라서, 아래 "외부 타입 캐스트"
+        // 분기의 조건이 원래 (... and ... and TryResolveExternalTypeByUses(t.Text, extCastFull93))
+        // 형태로 되어 있으면 앞의 다른 조건이 거짓이어도 항상 실행된다. 게다가
+        // TryResolveExternalTypeByUses는 var(byref) 매개변수를 받는데, 이런 byref 호출이
+        // boolean and 체인 한가운데 직접 들어가면 self-compile 시 gen0가 손상된 IL(주소 로드
+        // 위치/스택 정리가 어긋남)을 만드는 것으로 추정된다 — 이 프로젝트 전체에서 byref 호출이
+        // and 식 안에 직접 놓인 유일한 자리였다. 기존 5개 파일에 적용했던 것과 같은 방식으로
+        // 호출을 별도 문장으로 분리해 and 식에서는 순수 boolean 변수만 참조하게 한다.
+        // TryResolveExternalTypeByUses 자체는 파서 상태(fPos 등)를 건드리지 않는 순수 조회
+        // 함수라 항상 먼저 호출해도 동작에는 영향이 없다.
+        _ok94:=TryResolveExternalTypeByUses(t.Text, extCastFull93);
 
         // [Stage 72] PABCSystem 표준 라이브러리 함수(Abs/Sqrt/UpperCase/Copy/StrToInt/... 등).
         // fFuncNames(사용자 정의 함수)에 없을 때만 반응하므로, 혹시 사용자가 같은 이름으로
@@ -1463,7 +1528,7 @@ type
         // 실제로 그 이름의 타입이 존재하는지 찾아본다(ParseTypeName의 Stage 87과 동일한 방식).
         // 사용자 함수/로컬 클래스 이름과 겹치면 그쪽을 우선한다.
         else if (Cur.Kind=tkLParen) and (not fFuncNames.Contains(t.Text)) and (not fClassNames.Contains(t.Text))
-                and TryResolveExternalTypeByUses(t.Text, extCastFull93) then
+                and _ok94 then
         begin
           fPos:=fPos+1; // '(' 소비
           var castArgExt94:=ParseExpr;
@@ -1483,7 +1548,7 @@ type
         // 그쪽을 우선한다. Castclass로 구현되는 TAsCastExprNode(IsExternalType=false)를
         // 그대로 재사용하면 fTypeBuilders 조회 로직(TAsCastExprNode 처리부)을 그대로 탄다.
         else if (Cur.Kind=tkLParen) and fClassNames.Contains(t.Text)
-                and not ((fCurClass<>'') and DictDictHas(fClassMethods, fCurClass, t.Text)) then
+                and not _hasCurMethod127 then
         begin
           fPos:=fPos+1; // '(' 소비
           var castArgLocalCls:=ParseExpr;
@@ -1493,13 +1558,66 @@ type
           Result:=localClsCast;
         end
 
+        // [Stage 113 리팩터] 여기까지도 여전히 걸리지 않으면(니라딕 표준함수/암시적 self
+        // 호출/필드-변수 폴백) ParsePrimaryIdentC로 위임한다. ParsePrimaryIdentB가 다시
+        // ~125줄까지 커지면서 Stage 111/112와 동일한 self-compile 전용
+        // BadImageFormatException(메서드 크기/분기복잡도 한계로 gen0가 손상된 IL을 만드는
+        // 것으로 추정)이 재발했기 때문에, 앞의 4개 분기(모두 '(' 뒤 캐스트/빌트인 호출류)와
+        // 뒤의 4개 분기(괄호 없는 니라딕/자기 메서드/필드 폴백류)를 물리적으로 분리했다.
+        // 로직은 원본과 완전히 동일하다.
+        else
+        begin
+          Result:=ParsePrimaryIdentC(t);
+        end;
+    end;
+
+    function ParsePrimaryIdentC(t: TToken): TExprNode;
+    var mc: TMethodCallExprNode;
+        _isCurMethod128: boolean;
+        _methDict128: Dictionary<string, boolean>;
+        _picIsNil: boolean;
+    begin
+        Writeln('[MARK-PPIC] ParsePrimaryIdentC 진입, t.Text="'+t.Text+'"');
+        Writeln('[MARK-PPIC-0] 지역변수 선언부 통과');
+
+        // [Stage 116 버그 수정] 아래 "괄호 없는 니라딕 self 메서드" 분기의 원래 조건은
+        // "... and fClassMethods.ContainsKey(fCurClass) and fClassMethods[fCurClass].ContainsKey(t.Text)"
+        // 형태로, DictDictHas를 우회한 ParsePrimaryIdentB의 _hasCurMethod127과 똑같은 이중
+        // Dictionary 인덱서를 and 체인 안에 그대로 두고 있었다. PascalABC.NET은 and를
+        // non-short-circuit으로 평가하므로 fClassMethods.ContainsKey(fCurClass)가 거짓이어도
+        // fClassMethods[fCurClass]가 항상 실행되는데, self-compile된 gen1에서는 이게 존재하지
+        // 않는 키에 대한 정상적인 KeyNotFoundException이 아니라 native AccessViolation(exit
+        // code 80131506, clr.dll 0xc0000005 — 자기컴파일 실제 재현: "CC" 처리 중 크래시)으로
+        // 이어졌다. 미리 존재 여부를 nested if로 확인한 뒤에만 인덱서에 접근하도록 바꿨었다.
+        // [Stage 117 버그 수정] 그런데도 여전히 같은 지점("CC", 키가 실제로 존재하는 실행
+        // 경로)에서 크래시가 재현됐다 — 즉 원인은 "키가 없을 때의 non-short-circuit 평가"가
+        // 아니라, fClassMethods[fCurClass].ContainsKey(t.Text)처럼 인덱서 결과에 바로 이어서
+        // 메서드를 호출하는 체인(X[Y].Method(Z)) 자체를 gen0가 self-compile 상황에서 잘못
+        // 컴파일하는 것이었다. 인덱서 결과를 중간 지역변수(_methDict128)에 먼저 담아 체인을
+        // 끊는다.
+        _isCurMethod128:=false;
+        Writeln('[MARK-PPIC-1] _isCurMethod128 초기화 완료');
+        if (fCurClass<>'') and not fCurParams.Contains(t.Text) and fClassMethods.ContainsKey(fCurClass) then
+        begin
+          Writeln('[MARK-PPIC-2] if 진입, fCurClass="'+fCurClass+'"');
+          _methDict128:=fClassMethods[fCurClass];
+          _picIsNil:=(_methDict128=nil);
+          Writeln('[MARK-PPIC-3] _methDict128 할당 완료, nil? '+_picIsNil.ToString);
+          _isCurMethod128:=_methDict128.ContainsKey(t.Text);
+          Writeln('[MARK-PPIC-4] _isCurMethod128 = '+_isCurMethod128.ToString);
+        end;
+        Writeln('[MARK-PPIC-5] 첫 if 블록 통과');
+
         // [Stage 93] 괄호 없이 부른 인자 0개 표준 라이브러리 함수 — 예: GetCurrentDir;
         // (Pascal 관례상 무인자 함수는 괄호 생략 가능). IsNiladicBuiltinFuncName 화이트리스트에
         // 있고 사용자가 같은 이름의 함수/필드를 직접 정의하지 않았을 때만 반응한다.
-        else if (NormalizeBuiltinFuncName(t.Text)<>'') and IsNiladicBuiltinFuncName(t.Text)
+        Writeln('[MARK-PPIC-6] 니라딕 빌트인 분기 조건 평가 직전');
+        if (NormalizeBuiltinFuncName(t.Text)<>'') and IsNiladicBuiltinFuncName(t.Text)
                 and (Cur.Kind<>tkLParen) and (not fFuncNames.Contains(t.Text)) then
         begin
+          Writeln('[MARK-PPIC-7] 니라딕 빌트인 분기 진입');
           Result:=new TBuiltinCallExprNode(NormalizeBuiltinFuncName(t.Text));
+          Writeln('[MARK-PPIC-8] 니라딕 빌트인 분기 Result 할당 완료');
         end
 
         // [자기컴파일] 암시적 self 메서드 호출 (식 위치): 예) argName:=ResolveGenericInstantiation(argName);
@@ -1510,13 +1628,17 @@ type
         // 루프가 이어지는 .Text/.Kind 등을 자동으로 처리해준다.
         else if (fCurClass<>'') and (Cur.Kind=tkLParen) then
         begin
+          Writeln('[MARK-PPIC-9] 괄호 있는 self 메서드 호출 분기 진입');
           mc:=new TMethodCallExprNode('', t.Text); fPos:=fPos+1;
+          Writeln('[MARK-PPIC-10] mc 생성 및 "(" 소비 완료');
           if Cur.Kind<>tkRParen then
           begin
             mc.Args.Add(ParseExpr);
             while Cur.Kind=tkComma do begin fPos:=fPos+1; mc.Args.Add(ParseExpr); end;
           end;
+          Writeln('[MARK-PPIC-11] 인자 파싱 루프 통과, Expect(tkRParen) 직전');
           Expect(tkRParen); Result:=mc;
+          Writeln('[MARK-PPIC-12] Expect(tkRParen) 및 Result 할당 완료');
         end
 
         // [버그 수정] 괄호 없이 호출된 자기 클래스의 무인자(니라딕) 메서드 —
@@ -1528,25 +1650,36 @@ type
         // 없음: TLexer.CC" 예외로 이어졌다. 매개변수 이름이 아니면서 현재
         // 클래스의 메서드 이름과 일치할 때만 이 분기가 반응하므로 진짜 필드
         // 읽기 동작에는 영향이 없다.
-        else if (fCurClass<>'') and not fCurParams.Contains(t.Text)
-                and fClassMethods.ContainsKey(fCurClass)
-                and fClassMethods[fCurClass].ContainsKey(t.Text) then
+        else if _isCurMethod128 then
         begin
+          Writeln('[MARK-PPIC-13] 괄호 없는 니라딕 self 메서드 분기 진입, t.Text="'+t.Text+'"');
           Result:=new TMethodCallExprNode('', t.Text);
+          Writeln('[MARK-PPIC-14] 괄호 없는 니라딕 self 메서드 Result 할당 완료');
         end
 
         else
         begin
+          Writeln('[MARK-PPIC-15] else(필드/변수 폴백) 분기 진입, t.Text="'+t.Text+'"');
           // 메서드 본문 안에서의 식별자 읽기: 매개변수 이름이면 지역 변수 참조,
           // 그렇지 않으면 필드/속성 읽기로 취급한다.
           // (var 섹션보다 메서드가 먼저 파싱되어 전역변수 이름을 알 수 없고,
           //  이 경로로 전역변수를 읽는 기존 코드도 없었음. 지역 필드든 외부
           //  상속 타입의 속성이든 CodeGen 단계에서 최종 판별한다.)
           if (fCurClass<>'') and not fCurParams.Contains(t.Text) then
-            Result:=new TFieldReadExprNode(t.Text)
+          begin
+            Writeln('[MARK-PPIC-16] TFieldReadExprNode 생성 직전');
+            Result:=new TFieldReadExprNode(t.Text);
+            Writeln('[MARK-PPIC-17] TFieldReadExprNode 생성 완료');
+          end
           else
+          begin
+            Writeln('[MARK-PPIC-18] TVarRefNode 생성 직전');
             Result:=new TVarRefNode(t.Text);
+            Writeln('[MARK-PPIC-19] TVarRefNode 생성 완료');
+          end;
         end;
+        _picIsNil:=(Result=nil);
+        Writeln('[MARK-PPIC-20] ParsePrimaryIdentC 반환 직전, Result=nil? '+_picIsNil.ToString);
     end;
 
     function ParsePrimary: TExprNode;
@@ -1555,6 +1688,7 @@ type
         extCastFull93: string;
     begin
       t:=Cur;
+      Writeln('[MARK-PP] ParsePrimary 진입, t.Text="'+t.Text+'", line='+t.Line.ToString+', col='+t.Column.ToString);
 
       // [버그 수정] 단항 마이너스(-x). 예전에는 이 분기 자체가 없어서 i := -7; 처럼 식
       // 맨 앞에 오는 '-'는 무조건 "식이 와야 하는데 -" 파싱 에러였다(이항 뺄셈은
@@ -1952,6 +2086,21 @@ type
       else
         raise new Exception('줄 '+t.Line.ToString+', 열 '+t.Column.ToString+': 식이 와야 하는데 "'+t.Text+'"');
 
+      // [Stage 118 리팩터] ParsePrimary가 472줄까지 커져 있어(콜사이트인 ParseAsCast가
+      // ParsePrimary로 진입하는 시점 자체에서 self-compile 전용 크래시가 재현됐다 —
+      // ParsePrimaryIdentDotted(~180줄)/ParsePrimaryIdentB(~125줄)에서 이미 두 번 겪은
+      // "함수가 커지면 gen0가 손상된 IL을 만든다" 패턴과 동일). 뒤쪽의 '.'/'[' 체이닝 루프
+      // (LINQ 확장 메서드 + 일반 멤버/인덱싱 체인, 약 60줄)는 Result 하나만 받아 계속
+      // 갱신하는 완전히 독립적인 후처리 블록이라 분리하기 좋다. 로직은 원본과 완전히 동일.
+      Result:=ParsePrimaryPostfix(Result);
+      Writeln('[MARK-PP-EXIT] ParsePrimary 반환 직전');
+    end;
+
+    function ParsePrimaryPostfix(baseResult: TExprNode): TExprNode;
+    begin
+      Writeln('[MARK-PPP] ParsePrimaryPostfix 진입');
+      Result:=baseResult;
+
       // [Stage 70] LINQ 스타일 확장 메서드 체이닝: Source.Where(...)/.Select(...)/.Sum()/.Count()/.ToArray().
       // 화이트리스트 이름(IsSeqExtMethodName) + 바로 뒤 '(' 조합일 때만 반응하므로, 위에서 이미
       // 처리된 일반 obj.Method(...) 호출 파싱(TMethodCallExprNode)과는 겹치지 않는다. 여러 번
@@ -2015,6 +2164,7 @@ type
             Result:=new TChainedMemberExprNode(Result, chMember, false);
         end;
       end;
+      Writeln('[MARK-PPP-EXIT] ParsePrimaryPostfix 반환 직전');
     end;
 
     // [Stage 30] <식> as <TypeName> — Delphi에서 as는 *,/,mod와 같은 우선순위이므로
@@ -2022,6 +2172,7 @@ type
     function ParseAsCast: TExprNode;
     var e: TExprNode; tn: string; isExt: boolean; asN: TAsCastExprNode; isN: TIsCheckExprNode; wasIs: boolean;
     begin
+      Writeln('[MARK-PAC] ParseAsCast 진입');
       e:=ParsePrimary;
       // [자기컴파일] 'is'는 AST(TIsCheckExprNode)/CodeGen(Isinst+null비교)은 이미 준비돼 있었지만
       // Parser에 인식 자체가 빠져 있었다. 'as'와 완전히 같은 자리(우선순위)에서 함께 처리한다.
@@ -2044,11 +2195,13 @@ type
         end;
       end;
       Result:=e;
+      Writeln('[MARK-PAC-EXIT] ParseAsCast 반환 직전');
     end;
 
     function ParseMulDivMod: TExprNode;
     var left: TExprNode; op: TBinOpKind;
     begin
+      Writeln('[MARK-PMD] ParseMulDivMod 진입');
       left:=ParseAsCast;
       while (Cur.Kind=tkStar) or (Cur.Kind=tkSlash) or (Cur.Kind=tkMod) or (Cur.Kind=tkAnd)
             or (Cur.Kind=tkShl) or (Cur.Kind=tkShr) do
@@ -2062,11 +2215,13 @@ type
         fPos:=fPos+1; left:=new TBinOpNode(op, left, ParseAsCast);
       end;
       Result:=left;
+      Writeln('[MARK-PMD-EXIT] ParseMulDivMod 반환 직전');
     end;
 
     function ParseAddSub: TExprNode;
     var left: TExprNode; op: TBinOpKind;
     begin
+      Writeln('[MARK-PAS] ParseAddSub 진입');
       left:=ParseMulDivMod;
       while (Cur.Kind=tkPlus) or (Cur.Kind=tkMinus) or (Cur.Kind=tkOr) do
       begin
@@ -2076,11 +2231,13 @@ type
         fPos:=fPos+1; left:=new TBinOpNode(op, left, ParseMulDivMod);
       end;
       Result:=left;
+      Writeln('[MARK-PAS-EXIT] ParseAddSub 반환 직전');
     end;
 
     function ParseExpr: TExprNode;
     var left: TExprNode; ck: TCompareKind; has: boolean;
     begin
+      Writeln('[MARK-PE] ParseExpr 진입');
       left:=ParseAddSub; has:=true;
       if      Cur.Kind=tkEq  then ck:=cmpEq
       else if Cur.Kind=tkNeq then ck:=cmpNeq
@@ -2096,6 +2253,7 @@ type
         Result:=new TInExprNode(left, ParseAddSub);
       end
       else Result:=left;
+      Writeln('[MARK-PE-EXIT] ParseExpr 반환 직전');
     end;
 
     // ---- [Stage 51] 문장 목록 파싱 (panic-mode 오류 복구 포함) ----
@@ -2214,6 +2372,7 @@ type
       tS, eS, bS: TStmtNode; pcn: TProcCallStmtNode;
       mcs: TMethodCallStmtNode;
     begin
+      Writeln('[MARK-PS] ParseStatement 진입, Cur.Kind='+Cur.Kind.ToString+', Cur.Text="'+Cur.Text+'", line='+Cur.Line.ToString);
       if Cur.Kind=tkWriteln then
       begin
         fPos:=fPos+1;
