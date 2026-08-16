@@ -1162,6 +1162,14 @@
       else if e is TRealLiteralNode  then r:=vtReal   // [Phase 1]
       else if e is TCharLiteralNode  then r:=vtChar   // [Phase 1]
       else if e is TInt64LiteralNode then r:=vtInt64  // [Phase 1]
+      // [자기컴파일 버그 수정] TBoolLiteralNode(true/false 리터럴) 분기가 빠져 있어서
+      // "var x:=false;" 같은 인라인 var 선언이 InferTypeDispatch의 최종 폴백(vtInteger)으로
+      // 떨어졌다. 그 결과 나중에 x.ToString을 호출하면 boolean용 Convert.ToString(Boolean)
+      // 대신 정수용 Convert.ToString(Integer)가 호출되어 "False" 대신 "0"이 출력됨
+      // (실제 재현: BuildClassShell의 classHasAbstractMethod). GetExprClrType/EmitExpr의
+      // 리터럴 직접 방출부에는 이미 TBoolLiteralNode가 정확히 처리돼 있었는데, 이 인라인-var
+      // 타입 추론 함수에만 빠져 있었다.
+      else if e is TBoolLiteralNode then r:=vtBoolean
       else if e is TEnumValueExprNode then r:=vtEnum  // [Stage 51]
       else if e is TNilLiteralNode then r:=vtObject // [Stage 29]
       else if e is TStrLiteralNode then r:=vtString
