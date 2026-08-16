@@ -2747,7 +2747,11 @@
       var classTypeAttrs:=TypeAttributes.Public or TypeAttributes.Class;
       if classHasAbstractMethod then classTypeAttrs:=classTypeAttrs or TypeAttributes.Abstract;
 
-      Writeln('[MARK-BCS-1] parentType 결정 완료="'+parentType.FullName+'", classHasAbstractMethod='+classHasAbstractMethod.ToString+' — DefineType 호출 직전');
+      // [자기컴파일 버그 수정 - Stage 138과 동일 클래스] "classHasAbstractMethod.ToString"을
+      // 문자열 접합(+) 안에서 곧바로 체이닝하면 gen0가 자기 자신을 컴파일할 때 Boolean.ToString
+      // 대신 정수 표현("0")을 방출한다(gen1 실제 재현: "False" 대신 "0"). 중간 로컬 변수로 분리.
+      var _bcsAbsStr:=classHasAbstractMethod.ToString;
+      Writeln('[MARK-BCS-1] parentType 결정 완료="'+parentType.FullName+'", classHasAbstractMethod='+_bcsAbsStr+' — DefineType 호출 직전');
       tb:=modBuilder.DefineType(cd.Name, classTypeAttrs, parentType);
       Writeln('[MARK-BCS-2] modBuilder.DefineType 완료');
       fTypeBuilders[cd.Name]:=tb;

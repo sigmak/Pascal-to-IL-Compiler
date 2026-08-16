@@ -2372,7 +2372,15 @@ type
       tS, eS, bS: TStmtNode; pcn: TProcCallStmtNode;
       mcs: TMethodCallStmtNode;
     begin
-      Writeln('[MARK-PS] ParseStatement 진입, Cur.Kind='+Cur.Kind.ToString+', Cur.Text="'+Cur.Text+'", line='+Cur.Line.ToString);
+      // [자기컴파일 버그 수정 - Stage 138과 동일 클래스] "Cur.Kind.ToString"/"Cur.Text"/
+      // "Cur.Line.ToString"처럼 체인 표현식을 문자열 접합(+) 안에서 곧바로 쓰면 gen0가
+      // 자기 자신을 컴파일할 때 잘못된 IL을 방출한다(Cur.Text가 문자열이 아니라 정수/해시값
+      // 같은 쓰레기로 찍히는 실제 재현 사례). 중간 로컬 변수를 거치도록 분리한다.
+      var _psTok:=Cur;
+      var _psKindStr:=_psTok.Kind.ToString;
+      var _psText:=_psTok.Text;
+      var _psLineStr:=_psTok.Line.ToString;
+      Writeln('[MARK-PS] ParseStatement 진입, Cur.Kind='+_psKindStr+', Cur.Text="'+_psText+'", line='+_psLineStr);
       if Cur.Kind=tkWriteln then
       begin
         fPos:=fPos+1;

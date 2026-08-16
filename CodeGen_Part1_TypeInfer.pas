@@ -1267,11 +1267,21 @@
         // 첫 세그먼트가 실제 필드/변수/self 상속 프로퍼티 — 체인을 끝까지 타입만 추적한다.
         var _chainType4:=InferQualifierChainType(_chainSegs4);
         var _cpi4:=SafeGetProperty(_chainType4, _mc4.MethodName);
-        if (_cpi4<>nil) and (_cpi4.PropertyType=typeof(string)) then r:=vtString
+        // [자기컴파일 버그 수정 - Stage 110] "(_cpi4<>nil) and (_cpi4.PropertyType=...)"는
+        // gen0가 자기 자신을 컴파일할 때 방출하는 and의 IL이 short-circuit이 아니어서,
+        // _cpi4=nil이어도 뒤쪽 _cpi4.PropertyType을 그대로 평가해 NullReferenceException이
+        // 난다(src.Length.ToString()에서 실제 재현 — ToString은 프로퍼티가 아니라
+        // SafeGetProperty가 nil을 반환함). 기존 5개 파일에서 쓴 것과 동일한 _okNNN 패턴으로
+        // nil 체크와 멤버 접근을 완전히 분리된 if로 나눈다.
+        var _cpi4Ok:=(_cpi4<>nil);
+        if _cpi4Ok then _cpi4Ok:=(_cpi4.PropertyType=typeof(string));
+        if _cpi4Ok then r:=vtString
         else
         begin
           var _cmi4:=ResolveMethodByArity(_chainType4, _mc4.MethodName, _mc4.Args, false);
-          if (_cmi4<>nil) and (_cmi4.ReturnType=typeof(string)) then r:=vtString
+          var _cmi4Ok:=(_cmi4<>nil);
+          if _cmi4Ok then _cmi4Ok:=(_cmi4.ReturnType=typeof(string));
+          if _cmi4Ok then r:=vtString
           else r:=vtInteger;
         end;
       end
@@ -1352,13 +1362,21 @@
       else _effType4:=fGlobalScope.GetClrType(_mc4.ObjName);
       if _mc4.ObjCastType<>'' then _effType4:=ResolveExternalType(_mc4.ObjCastType);
       var _pi4b:=SafeGetProperty(_effType4, _mc4.MethodName);
-      if (_pi4b<>nil) and (_pi4b.PropertyType=typeof(string)) then r:=vtString
+      // [자기컴파일 버그 수정 - Stage 110] and 비단축평가로 인한 NullReferenceException
+      // 방지 — src.ToCharArray()처럼 MethodName이 프로퍼티가 아니라 메서드인 경우
+      // _pi4b가 nil이 되는데, 예전 "(_pi4b<>nil) and (_pi4b.PropertyType=...)" 형태는
+      // gen0 self-host 빌드에서 nil 역참조로 죽는다. _okNNN 패턴으로 분리.
+      var _pi4bOk:=(_pi4b<>nil);
+      if _pi4bOk then _pi4bOk:=(_pi4b.PropertyType=typeof(string));
+      if _pi4bOk then r:=vtString
       else
       begin
         // 프로퍼티가 아니면 메서드일 수 있으므로 실제 반환 타입을 확인한다.
         // (예: sender.ToString() → GetProperty는 nil이지만 메서드 반환타입은 string)
         var _mi4b:=ResolveMethodByArity(_effType4, _mc4.MethodName, _mc4.Args, false);
-        if (_mi4b<>nil) and (_mi4b.ReturnType=typeof(string)) then r:=vtString
+        var _mi4bOk:=(_mi4b<>nil);
+        if _mi4bOk then _mi4bOk:=(_mi4b.ReturnType=typeof(string));
+        if _mi4bOk then r:=vtString
         else r:=vtInteger;
       end;
     end;
