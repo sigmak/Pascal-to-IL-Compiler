@@ -91,17 +91,23 @@
     // 원인이 될 수 있다는 뜻으로 판단. EmitExprDispatch 안에서 압도적으로 큰 단일 분기인
     // TMethodCallExprNode 처리부(~700줄)를, EmitStatement에서 EmitStatementMethodCall을 뽑아냈던
     // 것과 똑같은 방식으로 별도 함수로 분리한다. 내용은 원본과 100% 동일 — 위치만 옮겼다.
-    procedure EmitExprMethodCallBranch(aIL: ILGenerator; e: TExprNode);
-    var mc: TMethodCallExprNode; imb: MethodBuilder; fb: FieldBuilder; cn: string;
-        vtVar: TVarType; imbSelf100: MethodBuilder;
+    // ============================================================
+    // [Stage 144 분할 - 자기컴파일 IL 손상 추가 수정] Stage 143에서 EmitExprDispatch의
+    // TMethodCallExprNode 처리부(~700줄)를 EmitExprMethodCallBranch로 뽑아냈지만, Stage 110
+    // self 로그가 여전히 정확히 이 함수의 프레임(BadImageFormatException, 스택 맨 위가
+    // EmitExprMethodCallBranch)에서 죽었다 - 이 프로젝트에서 반복 확인된 "큰 함수 자체가
+    // gen1 JIT 시점에 IL을 깨뜨린다" 패턴(EmitStatement/EmitExprDispatch와 동일)이 여기서도
+    // 재현된 것. EmitExprMethodCallBranch 몸통의 최상위 if/else if 7갈래(원본과 100% 동일한
+    // 조건/순서)를 각각 별도의 작은 함수로 뽑아내고, EmitExprMethodCallBranch 자신은 그
+    // 조건을 그대로 재평가해 알맞은 함수를 호출하는 얇은 디스패처만 남긴다.
+    // (참고: EmitStatementDataOps1/EmitStatementMethodCall/EmitStatementDataOps2는 각각
+    // 500줄 안팎인데도 gen1에서 정상 동작하는 것으로 확인되어, 아래 각 조각은 그보다도
+    // 훨씬 작게 유지했다.)
+    // ============================================================
+
+    // 갈래 1: mc.ObjName이 점(.)으로 연결된 체인 (예: "MainMenu.Items.Count.ToString").
+    procedure EmitMCB_QualifiedChain(aIL: ILGenerator; mc: TMethodCallExprNode);
     begin
-        // c.GetValue → Ldloc c + Call TCounter::GetValue
-        mc:=TMethodCallExprNode(e);
-        // [Stage 76 확장] ObjName 자체가 점(.)으로 연결된 체인이면(예: "MainMenu.Items.Count")
-        // 아래의 단일 세그먼트 판별 분기들보다 먼저 처리한다 — EmitStatement의 TMethodCallStmtNode
-        // 처리(Stage 76)와 동일한 원리를 식(expression) 자리에도 적용한 것.
-        if (mc.ObjName<>'') and (mc.ObjName.IndexOf('.')>=0) and (mc.ObjCastType='') then
-        begin
           var _chainSegsE:=SplitByDot(mc.ObjName);
           if IsChainStartSegment(_chainSegsE[0]) then
           begin
@@ -276,9 +282,11 @@
               end;
             end;
           end;
-        end
-        else if mc.ObjName='' then
-        begin
+    end;
+
+    // 갈래 2: mc.ObjName=='' - 암시적 self 호출 (예: 식 위치의 "IsKeywordAllowedAsMemberName(t.Kind)").
+    procedure EmitMCB_ImplicitSelfCall(aIL: ILGenerator; mc: TMethodCallExprNode);
+    begin
           // [버그 수정] 식(expression) 위치에서 쓰이는 암시적 self 호출(예: "A or B or
           // IsKeywordAllowedAsMemberName(t.Kind)")이 여태 처리되지 않았다 — 문장(statement)
           // 위치의 동일 패턴(TMethodCallStmtNode, ObjName='' 분기)은 이미 있었지만 식 위치의
@@ -306,10 +314,11 @@
               EmitArgForParamType(aIL, mc.Args[_emiEC93Ai], _emiEC93Params[_emiEC93Ai].ParameterType);
             aIL.Emit(OpCodes.Callvirt, _emiEC93);
           end;
-        end
-        else if (fLocalScope.Has(mc.ObjName) or fGlobalScope.Has(mc.ObjName))
-           and (fLocalScope.HasClrType(mc.ObjName) or fGlobalScope.HasClrType(mc.ObjName)) then
-        begin
+    end;
+
+    // 갈래 3: mc.ObjName이 CLR 타입이 붙은 지역/전역 변수(sender/e 같은 외부 타입 매개변수 등).
+    procedure EmitMCB_ClrTypedVar(aIL: ILGenerator; mc: TMethodCallExprNode);
+    begin
           // sender/e 같은, 외부(또는 객체) 타입 매개변수/지역변수를 통한 접근.
           // 우리가 만든 클래스가 아니라 Reflection으로 속성/메서드를 찾는다.
           var _qType2: System.Type;
@@ -372,10 +381,12 @@
             else aIL.Emit(OpCodes.Callvirt, _emi6);
           end;
           end;
-        end
-        else if fLocalScope.Has(mc.ObjName) or fGlobalScope.Has(mc.ObjName)
-                or fGlobalConstFields.ContainsKey(mc.ObjName) then  // [Stage 96] 전역 const도 허용
-        begin
+    end;
+
+    // 갈래 4: mc.ObjName이 (CLR 타입 아닌) 지역/전역 변수 또는 전역 const.
+    procedure EmitMCB_LocalVarOrConst(aIL: ILGenerator; mc: TMethodCallExprNode);
+    var cn: string; vtVar: TVarType; imb: MethodBuilder; fb: FieldBuilder;
+    begin
           cn:=GetVarClassName(mc.ObjName);
           vtVar:=GetVarType(mc.ObjName);
           // [Stage 62] cn이 레코드(값 타입)면 Ldfld가 값이 아니라 주소를 요구하므로 Ldloca를 쓴다.
@@ -566,9 +577,12 @@
               end;
             end;
           end;
-        end
-        else if TryFindFieldBuilder(fCurClassName, mc.ObjName, fb) then
-        begin
+    end;
+
+    // 갈래 5: mc.ObjName이 현재 클래스의 필드(fb는 호출부에서 TryFindFieldBuilder로 이미 찾아
+    // 넘겨준다 - 조건 판정과 실제 사용이 원본에서도 같은 fb였던 것과 동일).
+    procedure EmitMCB_FieldAccess(aIL: ILGenerator; mc: TMethodCallExprNode; fb: FieldBuilder);
+    begin
           // Button1.Text (필드를 통한 속성 읽기) 또는 Button1.SomeMethod() (필드를 통한 메서드 호출)
           aIL.Emit(OpCodes.Ldarg_0);
           aIL.Emit(OpCodes.Ldfld, fb);        // ← fLine 필드의 "원시 int32 값"을 스택에 직접 로드
@@ -656,10 +670,11 @@
               end;
             end;
           end;
-        end
-        else if (FindExternalAncestorType(fCurClassName)<>nil)
-                and (SafeGetProperty(FindExternalAncestorType(fCurClassName), mc.ObjName)<>nil) then
-        begin
+    end;
+
+    // 갈래 6: mc.ObjName이 self가 상속한 외부 타입의 프로퍼티(예: "Controls.Count").
+    procedure EmitMCB_ExternalAncestorProp(aIL: ILGenerator; mc: TMethodCallExprNode);
+    begin
           // [버그 수정] Controls.Count 처럼, 한정자(qualifier) 자체가 로컬변수/필드가 아니라
           // self가 상속받은 외부 타입(Form 등)의 프로퍼티이고, 그 결과를 값으로 쓰는 경우
           // (statement 위치의 Controls.Add(...)는 이미 별도 분기에서 처리되고 있었으나,
@@ -711,19 +726,12 @@
               aIL.Emit(OpCodes.Callvirt, _emi7);
             end;
           end;
-        end
-        // [버그 수정] Cur.Kind 처럼 ObjName 자체가 필드/지역변수가 아니라 self의 무인자
-        // (괄호 없이 부르는 관례) 인스턴스 메서드 호출(예: function Cur: TToken)이고,
-        // 그 반환값에 다시 멤버 접근(.Kind 등)을 하는 경우. 이전에는 필드/지역변수/외부
-        // 조상 프로퍼티 어디에도 안 걸려 곧장 "알 수 없는 변수"로 던져졌다.
-        // TryFindInstanceMethod가 돌려주는 MethodBuilder는 아직 CreateType 전이라
-        // GetParameters()가 NotSupportedException을 던지므로, "무인자인가"는 반드시
-        // FindInstanceMethodParamTypes(길이 0 또는 nil)로 판단해야 한다.
-        else if (fCurClassName<>'') and (mc.ObjCastType='')
-                and TryFindInstanceMethod(fCurClassName, mc.ObjName, imbSelf100)
-                and ((FindInstanceMethodParamTypes(fCurClassName, mc.ObjName)=nil)
-                     or (FindInstanceMethodParamTypes(fCurClassName, mc.ObjName).Length=0)) then
-        begin
+    end;
+
+    // 갈래 7: mc.ObjName이 self의 무인자 인스턴스 메서드(예: "Cur.Kind"의 Cur).
+    // imbSelf100은 호출부에서 TryFindInstanceMethod로 이미 찾아 넘겨준다.
+    procedure EmitMCB_SelfNoArgMethod(aIL: ILGenerator; mc: TMethodCallExprNode; imbSelf100: MethodBuilder);
+    begin
           aIL.Emit(OpCodes.Ldarg_0);
           aIL.Emit(OpCodes.Callvirt, imbSelf100);
           var _retT100:=imbSelf100.ReturnType;
@@ -749,9 +757,11 @@
               aIL.Emit(OpCodes.Callvirt, _emiSelf100);
             end;
           end;
-        end
-        else
-        begin
+    end;
+
+    // 갈래 8(폴백): 위 어디에도 안 걸리면 점 없는 단일 이름의 외부 정적 타입(주로 enum)을 시도.
+    procedure EmitMCB_Fallback(aIL: ILGenerator; mc: TMethodCallExprNode);
+    begin
           // [버그 수정] ObjName이 필드/지역변수/외부 조상 프로퍼티/self 무인자 메서드
           // 어디에도 없으면, 마지막으로 점 없는 단일 이름의 외부 정적 타입(주로 enum, 예:
           // ColumnHeaderStyle)일 가능성을 시도한다. 기존에는 이 케이스를 아예 시도하지
@@ -790,8 +800,39 @@
           end
           else
             raise new Exception('알 수 없는 변수 "'+mc.ObjName+'"');
-        end;
-      end;
+    end;
+
+    // [Stage 143] EmitExprDispatch 안에서 압도적으로 큰 단일 분기인 TMethodCallExprNode
+    // 처리부(~700줄)를 별도 함수로 분리. 내용은 원본과 100% 동일 - 위치만 옮겼다.
+    // [Stage 144] 위 7갈래를 각각 별도 함수로 추가 분할 - 이 함수는 조건을 그대로 재평가해
+    // 알맞은 함수를 호출하는 얇은 디스패처만 남긴다.
+    procedure EmitExprMethodCallBranch(aIL: ILGenerator; e: TExprNode);
+    var mc: TMethodCallExprNode; fb144: FieldBuilder; imbSelf144: MethodBuilder;
+    begin
+        mc:=TMethodCallExprNode(e);
+        if (mc.ObjName<>'') and (mc.ObjName.IndexOf('.')>=0) and (mc.ObjCastType='') then
+          EmitMCB_QualifiedChain(aIL, mc)
+        else if mc.ObjName='' then
+          EmitMCB_ImplicitSelfCall(aIL, mc)
+        else if (fLocalScope.Has(mc.ObjName) or fGlobalScope.Has(mc.ObjName))
+           and (fLocalScope.HasClrType(mc.ObjName) or fGlobalScope.HasClrType(mc.ObjName)) then
+          EmitMCB_ClrTypedVar(aIL, mc)
+        else if fLocalScope.Has(mc.ObjName) or fGlobalScope.Has(mc.ObjName)
+                or fGlobalConstFields.ContainsKey(mc.ObjName) then
+          EmitMCB_LocalVarOrConst(aIL, mc)
+        else if TryFindFieldBuilder(fCurClassName, mc.ObjName, fb144) then
+          EmitMCB_FieldAccess(aIL, mc, fb144)
+        else if (FindExternalAncestorType(fCurClassName)<>nil)
+                and (SafeGetProperty(FindExternalAncestorType(fCurClassName), mc.ObjName)<>nil) then
+          EmitMCB_ExternalAncestorProp(aIL, mc)
+        else if (fCurClassName<>'') and (mc.ObjCastType='')
+                and TryFindInstanceMethod(fCurClassName, mc.ObjName, imbSelf144)
+                and ((FindInstanceMethodParamTypes(fCurClassName, mc.ObjName)=nil)
+                     or (FindInstanceMethodParamTypes(fCurClassName, mc.ObjName).Length=0)) then
+          EmitMCB_SelfNoArgMethod(aIL, mc, imbSelf144)
+        else
+          EmitMCB_Fallback(aIL, mc);
+    end;
 
     procedure EmitExprDispatch(aIL: ILGenerator; e: TExprNode);
     var
@@ -2756,32 +2797,20 @@
     // ParsePrimary와 동일한 증상/원인)을 완화하기 위해, 재귀호출(EmitStatement 자기 자신을
     // 다시 부르는 제어흐름 분기)이 없는 분기들을 별도 함수로 분리했다. 로직은 원본과
     // 완전히 동일하다 — 처리했으면 True, 이 함수가 담당하지 않는 문장이면 False를 돌려준다.
-    function EmitStatementMethodCall(aIL: ILGenerator; s: TStmtNode): boolean;
-    var
-      we: TWritelnExprStmtNode; ws: TWritelnStringStmtNode;
-      asg: TAssignStmtNode; ra: TResultAssignStmtNode;
-      comp: TCompoundStmtNode; ifs: TIfStmtNode; whs: TWhileStmtNode;
-      pc: TProcCallStmtNode; sl: TSetLengthStmtNode; aa: TArrayAssignStmtNode;
-      mcs: TMethodCallStmtNode; fas: TFieldAssignStmtNode;
-      loc: LocalBuilder; mb: MethodBuilder; imb: MethodBuilder;
-      ae: TExprNode; wlS, wlI, rm: MethodInfo;
-      et, at2: TVarType; fb: FieldBuilder; cn: string; vtVar: TVarType;
-      eL, endL, ckL, bdL: &Label;
-      extType: System.Type; propInfo: PropertyInfo; extFld: System.Reflection.FieldInfo;
-      setter, emi: MethodInfo; qfb: FieldBuilder; qTargetType: System.Type;
-      evs: TEventSubscribeStmtNode; evInfo: EventInfo; delCtor: ConstructorInfo;
+    // ============================================================
+    // [Stage 145 분할 - 자기컴파일 IL 손상 추가 수정] Stage 110 self 로그에서
+    // EmitExprMethodCallBranch 분할(Stage 144) 이후 그 지점은 통과했지만, 바로 위
+    // 호출부인 EmitStatementMethodCall(474줄, 그 안에 인라인 try/except 2곳까지 포함)에서
+    // 정확히 같은 증상(BadImageFormatException, 스택 맨 위가 이 함수 자신)으로 다시 죽었다.
+    // TMethodCallStmtNode 처리부 안의 최상위 if/else if 7갈래(원본과 100% 동일한 조건/순서)를
+    // EmitMCB_*와 동일한 방식으로 각각 별도 함수로 뽑아내고, 인라인 try/except 2곳은
+    // EmitExprMethodCallBranch 쪽에서 이미 쓰고 있는 SafeResolveExternalType/
+    // SafeResolveOrEmitStaticChain을 그대로 재사용해 제거한다.
+    // ============================================================
+
+    // 갈래 1: mcs.ObjName이 점(.)으로 연결된 체인.
+    procedure EmitSMC_QualifiedChain(aIL: ILGenerator; mcs: TMethodCallStmtNode);
     begin
-      Result:=true;
-      if s is TMethodCallStmtNode then
-      begin
-        mcs:=TMethodCallStmtNode(s);
-        // [Stage 76] "MainMenu.Items.Add(x)" 처럼 한정자 자체가 점(.)으로 연결된 체인이면
-        // (지역변수/필드.프로퍼티.프로퍼티...) 아래의 단일 세그먼트 판별 분기들보다 먼저
-        // 처리한다 — 안 그러면 마지막 else의 "외부 정적 타입"으로 오인되어
-        // ResolveExternalType("MainMenu.Items") 같은 존재하지 않는 타입 조회로 실패한다.
-        if (mcs.ObjName<>'') and (mcs.ObjName.IndexOf('.')>=0) and (mcs.ObjCastType='')
-           and IsChainStartSegment(SplitByDot(mcs.ObjName)[0]) then
-        begin
           var chainSegs:=SplitByDot(mcs.ObjName);
           var chainType: System.Type;
           EmitQualifierChainLoad(aIL, chainSegs, chainType);
@@ -2832,9 +2861,12 @@
               if _emiC.ReturnType<>typeof(System.Void) then aIL.Emit(OpCodes.Pop);
             end;
           end;
-        end
-        else if mcs.ObjName='' then
-        begin
+    end;
+
+    // 갈래 2: mcs.ObjName=='' - 암시적 self 호출.
+    procedure EmitSMC_ImplicitSelfCall(aIL: ILGenerator; mcs: TMethodCallStmtNode);
+    var imb: MethodBuilder; extType: System.Type; emi: MethodInfo;
+    begin
           // [버그수정] Halt / Halt(exitCode) — 파스칼 내장 프로시저. Writeln/Readln/Exit와
           // 달리 전용 AST 노드가 없어서 지금까지는 일반 메서드 호출로 파싱되어 여기
           // "암시적 self 호출" 분기로 흘러들었고, Form1(및 조상 타입 Form)에 "Halt"라는
@@ -2873,16 +2905,12 @@
             if emi.ReturnType<>typeof(System.Void) then aIL.Emit(OpCodes.Pop);
           end;
           end;
-        end
-        // [버그 수정] "Result.Add(x);"처럼 함수 자신의 반환값(Result) 위에서 메서드를 호출하는
-        // 문장(식이 아니라 문장 위치) — EmitExpr/EmitQualifierChainLoad 쪽은 'Result' 세그먼트를
-        // fResultLocal로 이미 특별 취급하지만, TMethodCallStmtNode 쪽엔 이 분기가 없었다. 그래서
-        // Result는 fLocalScope/fGlobalScope 어디에도 없으니 모든 분기를 다 지나쳐 맨 아래
-        // "외부 정적 타입" 폴백까지 흘러가 ResolveExternalType('Result')가 "외부 타입 Result를
-        // 찾을 수 없습니다"로 실패했다. fLocalScope/fGlobalScope 분기(바로 아래)와 동일한 패턴을
-        // fResultLocal에 대해 그대로 적용한다.
-        else if (mcs.ObjName='Result') and (fResultLocal<>nil) then
-        begin
+    end;
+
+    // 갈래 3: "Result.Add(x);"처럼 함수 자신의 반환값(Result) 위에서 메서드 호출.
+    procedure EmitSMC_ResultCall(aIL: ILGenerator; mcs: TMethodCallStmtNode);
+    var qTargetType: System.Type;
+    begin
           qTargetType:=fResultLocal.LocalType;
           aIL.Emit(OpCodes.Ldloc, fResultLocal);
           if mcs.ObjCastType<>'' then
@@ -2907,10 +2935,12 @@
             aIL.Emit(OpCodes.Callvirt, emiR);
             if emiR.ReturnType<>typeof(System.Void) then aIL.Emit(OpCodes.Pop);
           end;
-        end
-        else if (fLocalScope.Has(mcs.ObjName) or fGlobalScope.Has(mcs.ObjName))
-                and (fLocalScope.HasClrType(mcs.ObjName) or fGlobalScope.HasClrType(mcs.ObjName)) then
-        begin
+    end;
+
+    // 갈래 4: mcs.ObjName이 CLR 타입이 붙은 지역/전역 변수(sender 등).
+    procedure EmitSMC_ClrTypedVar(aIL: ILGenerator; mcs: TMethodCallStmtNode);
+    var emi: MethodInfo; qTargetType: System.Type;
+    begin
           // sender.Focus(); 같은, 외부(객체) 타입 매개변수/지역변수를 통한 호출.
           if fLocalScope.HasClrType(mcs.ObjName) then qTargetType:=fLocalScope.GetClrType(mcs.ObjName)
           else qTargetType:=fGlobalScope.GetClrType(mcs.ObjName);
@@ -2952,10 +2982,12 @@
             else aIL.Emit(OpCodes.Callvirt, emi);
             if emi.ReturnType<>typeof(System.Void) then aIL.Emit(OpCodes.Pop);
           end;
-        end
-        else if fLocalScope.Has(mcs.ObjName) or fGlobalScope.Has(mcs.ObjName)
-                or fGlobalConstFields.ContainsKey(mcs.ObjName) then  // [Stage 96] 전역 const도 허용
-        begin
+    end;
+
+    // 갈래 5: mcs.ObjName이 (CLR 타입 아닌) 지역/전역 변수 또는 전역 const.
+    procedure EmitSMC_LocalVarOrConst(aIL: ILGenerator; mcs: TMethodCallStmtNode);
+    var imb: MethodBuilder; cn: string; vtVar: TVarType;
+    begin
           // c.Init(10) → Ldloc c + args + Call
           cn:=GetVarClassName(mcs.ObjName);
           vtVar:=GetVarType(mcs.ObjName);
@@ -3053,9 +3085,12 @@
               if cnEmi.ReturnType<>typeof(System.Void) then aIL.Emit(OpCodes.Pop);
             end;
           end;
-        end
-        else if TryFindFieldBuilder(fCurClassName, mcs.ObjName, qfb) then
-        begin
+    end;
+
+    // 갈래 6: mcs.ObjName이 현재 클래스의 필드.
+    procedure EmitSMC_FieldBuilder(aIL: ILGenerator; mcs: TMethodCallStmtNode; qfb: FieldBuilder);
+    var emi: MethodInfo; qTargetType: System.Type;
+    begin
           // Button1.Focus(); 처럼 필드를 통한 메서드 호출. 인자 0개면 프로퍼티
           // 게터일 가능성도 먼저 확인한다 (문장 위치에서 값은 버림).
           aIL.Emit(OpCodes.Ldarg_0);
@@ -3143,10 +3178,12 @@
               if emi.ReturnType<>typeof(System.Void) then aIL.Emit(OpCodes.Pop);
             end;
           end;
-        end
-        else if (FindExternalAncestorType(fCurClassName)<>nil)
-                and (SafeGetProperty(FindExternalAncestorType(fCurClassName), mcs.ObjName)<>nil) then
-        begin
+    end;
+
+    // 갈래 7: mcs.ObjName이 self가 상속한 외부 타입의 프로퍼티(예: "Controls.Add(...)").
+    procedure EmitSMC_ExternalAncestorProp(aIL: ILGenerator; mcs: TMethodCallStmtNode);
+    var extType: System.Type; propInfo: PropertyInfo; emi: MethodInfo; qTargetType: System.Type;
+    begin
           // [Stage 68 재확인] Controls.Add(Button1); 처럼, 한정자(qualifier) 자체가
           // 로컬변수/필드가 아니라 self가 상속받은 외부 타입(Form 등)의 프로퍼티인 경우.
           // self를 로드하고 그 프로퍼티의 게터를 호출해 얻은 값(예: Form.Controls의
@@ -3173,9 +3210,14 @@
             aIL.Emit(OpCodes.Callvirt, emi);
             if emi.ReturnType<>typeof(System.Void) then aIL.Emit(OpCodes.Pop);
           end;
-        end
-        else
-        begin
+    end;
+
+    // 갈래 8(폴백): 외부 타입의 정적(static) 멤버 호출. 원래 인라인 try/except 2곳이 있었으나
+    // SafeResolveExternalType/SafeResolveOrEmitStaticChain(EmitExprMethodCallBranch에서
+    // 이미 쓰는 헬퍼)을 재사용해 try/except 없이 동일한 동작을 낸다.
+    procedure EmitSMC_StaticFallback(aIL: ILGenerator; mcs: TMethodCallStmtNode);
+    var extType: System.Type; emi: MethodInfo;
+    begin
           // 로컬/전역 변수가 아니면 System.Windows.Forms.Application.Run(f) 처럼
           // 외부 타입의 정적(static) 멤버 호출로 간주한다. 정적 호출은 인스턴스를
           // 먼저 로드하지 않고 인자만 쌓은 뒤 Call(비가상)로 호출한다.
@@ -3187,11 +3229,13 @@
           // 동일한 로직을 문장 위치에도 적용한다 — 성공하면 이미 체인 앞부분의 IL(Out 프로퍼티
           // getter 호출 등)이 방출되어 스택에 인스턴스가 로드된 상태이므로, 이후 mcs.MethodName은
           // 정적이 아니라 인스턴스 멤버로 호출해야 한다.
-          var _stmtStaticT: System.Type := nil;
-          try _stmtStaticT:=ResolveExternalType(mcs.ObjName); except end;
+          // [Stage 145 버그 수정] 인라인 try/except 2곳을 EmitExprMethodCallBranch 쪽에서
+          // 이미 쓰고 있는 SafeResolveExternalType/SafeResolveOrEmitStaticChain으로 교체 —
+          // 이 프로젝트에서 반복 확인된 "큰 함수 + try/except 동거" 패턴을 예방한다.
+          var _stmtStaticT: System.Type := SafeResolveExternalType(mcs.ObjName);
           var _stmtIsInst: boolean := false;
           if _stmtStaticT=nil then
-            try _stmtStaticT:=ResolveOrEmitStaticChain(aIL, mcs.ObjName, _stmtIsInst); except _stmtStaticT:=nil; end;
+            _stmtStaticT:=SafeResolveOrEmitStaticChain(aIL, mcs.ObjName, _stmtIsInst);
 
           if _stmtStaticT=nil then
             raise new Exception('외부 타입 "'+mcs.ObjName+'"을(를) 찾을 수 없습니다. 기본 프레임워크(WinForms/WPF/System.*)가 아니라면 {$reference 어셈블리명.dll} 지시문으로 해당 타입이 들어있는 어셈블리를 먼저 등록했는지 확인하세요.');
@@ -3220,16 +3264,43 @@
             else aIL.Emit(OpCodes.Call, emi);
             if emi.ReturnType<>typeof(System.Void) then aIL.Emit(OpCodes.Pop);
           end;
-        end;
+    end;
+
+    // [Stage 112] EmitStatement에서 재귀호출 없는 분기를 뽑아낸 함수 중 하나 — TMethodCallStmtNode
+    // 처리부만 담당. 로직은 원본과 완전히 동일 — 처리했으면 True, 아니면 False.
+    // [Stage 145] 내부의 7갈래 if/else if를 각각 별도 함수로 분리 — 이 함수는 조건을 그대로
+    // 재평가해 알맞은 함수를 호출하는 얇은 디스패처만 남긴다.
+    function EmitStatementMethodCall(aIL: ILGenerator; s: TStmtNode): boolean;
+    var mcs: TMethodCallStmtNode; qfb145: FieldBuilder; imb145: MethodBuilder;
+    begin
+      Result:=true;
+      if s is TMethodCallStmtNode then
+      begin
+        mcs:=TMethodCallStmtNode(s);
+        if (mcs.ObjName<>'') and (mcs.ObjName.IndexOf('.')>=0) and (mcs.ObjCastType='')
+           and IsChainStartSegment(SplitByDot(mcs.ObjName)[0]) then
+          EmitSMC_QualifiedChain(aIL, mcs)
+        else if mcs.ObjName='' then
+          EmitSMC_ImplicitSelfCall(aIL, mcs)
+        else if (mcs.ObjName='Result') and (fResultLocal<>nil) then
+          EmitSMC_ResultCall(aIL, mcs)
+        else if (fLocalScope.Has(mcs.ObjName) or fGlobalScope.Has(mcs.ObjName))
+                and (fLocalScope.HasClrType(mcs.ObjName) or fGlobalScope.HasClrType(mcs.ObjName)) then
+          EmitSMC_ClrTypedVar(aIL, mcs)
+        else if fLocalScope.Has(mcs.ObjName) or fGlobalScope.Has(mcs.ObjName)
+                or fGlobalConstFields.ContainsKey(mcs.ObjName) then
+          EmitSMC_LocalVarOrConst(aIL, mcs)
+        else if TryFindFieldBuilder(fCurClassName, mcs.ObjName, qfb145) then
+          EmitSMC_FieldBuilder(aIL, mcs, qfb145)
+        else if (FindExternalAncestorType(fCurClassName)<>nil)
+                and (SafeGetProperty(FindExternalAncestorType(fCurClassName), mcs.ObjName)<>nil) then
+          EmitSMC_ExternalAncestorProp(aIL, mcs)
+        else
+          EmitSMC_StaticFallback(aIL, mcs);
       end
       else Result:=false;
     end;
 
-    // [Stage 112 리팩터] EmitStatement가 self-compile 시 System.BadImageFormatException으로
-    // 로드조차 안 되는 문제(단일 try/finally 안에 33개의 s-is 분기, 1800줄 이상이 들어있어
-    // self-compile 코드생성기가 메서드 전체를 손상된 IL로 만드는 것으로 추정 — Stage 111의
-    // ParsePrimary와 동일한 증상/원인)을 완화하기 위해, 재귀호출(EmitStatement 자기 자신을
-    // 다시 부르는 제어흐름 분기)이 없는 분기들을 별도 함수로 분리했다. 로직은 원본과
     // 완전히 동일하다 — 처리했으면 True, 이 함수가 담당하지 않는 문장이면 False를 돌려준다.
     function EmitStatementDataOps2(aIL: ILGenerator; s: TStmtNode): boolean;
     var
