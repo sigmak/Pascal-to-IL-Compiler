@@ -2600,10 +2600,27 @@
           // 떨어져, 이후 "_fr.FieldName" 같은 멤버 접근이 "System.Object에 멤버가 없습니다"로
           // 실패했다. GetExprClrType은 이미 TAsCastExprNode를 로컬(fBuiltInterfaces/fBuiltTypes/
           // fTypeBuilders)/외부(ResolveExternalType) 양쪽 다 정확히 추론하므로 재사용한다.
+          //
+          // [Stage 116 버그 수정] 위 GetExprClrType이 돌려준 CLR 타입만 보고 무조건
+          // ivIsExternal:=true로 등록해 fLocalScope.SetClrType만 호출하던 것이 문제였다 —
+          // 로컬 클래스로의 캐스트(예: TMethodCallExprNode(argExpr))인 경우에도 "외부 타입"
+          // 취급되어 SetClassName이 등록되지 않았고, 그 결과 이 변수의 필드 읽기(.ObjName 등)가
+          // GetVarClassName→TryFindFieldBuilder 경로를 타지 못하고 리플렉션 전용 경로로
+          // 빠졌다 — 대상이 아직 CreateType되지 않은 TypeBuilder라 리플렉션이 정상 동작하지
+          // 않아 손상된 값을 읽었다(자기컴파일 중 EmitArgForParamType 자신의
+          // "var _diagMc110:=TMethodCallExprNode(argExpr);" 이후 "_diagMc110.ObjName"/
+          // ".MethodName"이 문자열 "src"/"ToCharArray" 대신 숫자 쓰레기값으로 나오는 것으로
+          // 실제 재현됨: 호스트 컴파일러 로그엔 정상 문자열이 찍히지만, 그 self-compiled
+          // 바이너리로 재컴파일하면 같은 자리에서 숫자가 찍힘). TNewObjectExprNode 분기와
+          // 동일하게 IsExternalType으로 분기해, 로컬 클래스는 ivClassName+SetClassName
+          // 경로를 타도록 고친다.
+          var ivAsc116:=TAsCastExprNode(ivs.ValueExpr);
           var ivAsCastT:=GetExprClrType(ivs.ValueExpr);
           if (ivAsCastT<>nil) and (ivAsCastT<>typeof(System.Object)) then
           begin
-            ivClrType:=ivAsCastT; ivIsExternal:=true; ivVt:=vtObject;
+            ivClrType:=ivAsCastT; ivVt:=vtObject;
+            if ivAsc116.IsExternalType then ivIsExternal:=true
+            else begin ivIsExternal:=false; ivClassName:=ivAsc116.TargetType; end;
           end
           else ivClrType:=VTC(ivVt, '');
         end
