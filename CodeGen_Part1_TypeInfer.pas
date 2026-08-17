@@ -372,7 +372,7 @@
     // 않는 경우가 대부분이라(함수 반환 타입에 ClassName이 없음, Stage 66 범위 밖) 지원하지 않는다.
     function TryGetObjClassName(ex: TExprNode; var outCn: string): boolean;
     var _fr66: TFieldReadExprNode; _mc66: TMethodCallExprNode; _vr66: TVarRefNode; _bo66: TBinOpNode;
-        _ownerCn66, _lcn66, _rcn66, _sym66: string;
+        _ownerCn66, _lcn66, _rcn66, _sym66: string; _ddh66: boolean;
     begin
       outCn:='';
       if ex is TVarRefNode then
@@ -392,9 +392,14 @@
       begin
         _mc66:=TMethodCallExprNode(ex);
         _ownerCn66:=GetVarClassName(_mc66.ObjName);
-        if (_ownerCn66<>'') and DictDictHas(fFieldObjClassName, _ownerCn66, _mc66.MethodName) then
-        begin outCn:=fFieldObjClassName[_ownerCn66][_mc66.MethodName]; Result:=true; end
-        else Result:=false;
+        // [자기컴파일 버그 수정] DictDictHas<TV> 제네릭 호출을 and 체인에서 분리(SafeGetField와 동일 사유).
+        Result:=false;
+        if _ownerCn66<>'' then
+        begin
+          _ddh66:=DictDictHas(fFieldObjClassName, _ownerCn66, _mc66.MethodName);
+          if _ddh66 then
+          begin outCn:=fFieldObjClassName[_ownerCn66][_mc66.MethodName]; Result:=true; end;
+        end;
       end
       else if ex is TBinOpNode then
       begin
@@ -460,19 +465,58 @@
     // TypeBuilder)일 때 이 예외로 죽는 실제 사례가 있었다(TScope.SetClassName 등).
     // t가 우리가 아는 로컬 클래스면 리플렉션 없이 fFieldBuilders에서 바로 찾고, 아니면
     // 기존처럼 리플렉션을 시도하되 예외는 조용히 nil로 흡수한다.
+    // [Stage 121 진단] 위 "and DictDictHas(...)" 분리 수정 후에도 SafeGetField 프레임에서
+    // 정확히 동일한 BadImageFormatException(TX.fChars)이 재현됨 — 즉 boolean and 체인이
+    // 근본 원인의 전부가 아니었다. 이 함수엔 "중첩 if 안의 exit"가 남아 있는데
+    // (if _sgfCls<>'' then begin ... if _sgfHas then begin ... exit; end end), 이는
+    // TryFindFieldBuilder에서 이미 한 번 자기컴파일 IL 손상의 범인으로 지목되어
+    // "exit 완전 제거 + sentinel 변수 기반 단일 종료점" 패턴으로 재작성됐던 것과 동일한
+    // 모양이다(위 주석 참조: "중첩 if 안의 exit로 인한 분기 목적지 충돌 의심"). 여기도
+    // 같은 방식으로 exit를 전부 없애고 sentinel(_sgfDone)로 단일 종료점을 만든다.
+    // [Stage 122 진단] 기존 두 차례 수정(and 체인 분리 → exit 제거)에도 완전히 동일한
+    // BadImageFormatException이 SafeGetField 프레임에서 재현됨. try/except로 감싼
+    // t.GetField 호출이 실행만 됐다면 어떤 예외든 조용히 흡수되어야 하므로, 이 메서드
+    // 자체가 JIT되는 시점(첫 호출)에 CLR이 IL을 거부하는 것으로 보인다 — 즉 메서드
+    // 본문의 "로직" 문제가 아니라 gen0가 이 메서드를 통째로 잘못된 바이트코드로
+    // 컴파일했을 가능성. 기존 178건 수정과 동일하게 DictDictHas<TV> 제네릭 자기호출
+    // 자체를 없애고 ContainsKey를 직접 인라인한다(이전 수정은 and 체인에서 분리만
+    // 했을 뿐 제네릭 호출 자체는 남아 있었다). 추가로 진입/중간/반환 직전에 마커를
+    // 찍어, 이 메서드가 실제로 JIT/실행되는지(=재빌드가 반영됐는지) 다음 로그로 확인한다.
     function SafeGetField(t: System.Type; fname: string): FieldInfo;
-    var _sgfCls: string;
+    var _sgfCls: string; _sgfHasCls: boolean; _sgfHasFld: boolean; _sgfDone: boolean;
     begin
+      Writeln('[MARK-SGF-v122] SafeGetField 진입, fname="'+fname+'"');
       Result:=nil;
-      if t=nil then exit;
-      _sgfCls:=FindLocalClassNameForTypeBuilder(t);
-      if (_sgfCls<>'') and DictDictHas(fFieldBuilders, _sgfCls, fname) then
-      begin Result:=fFieldBuilders[_sgfCls][fname]; exit; end;
-      try
-        Result:=t.GetField(fname, BindingFlags.Public or BindingFlags.Instance);
-      except
-        Result:=nil;
+      _sgfDone:=false;
+      if t=nil then
+        _sgfDone:=true;
+      if not _sgfDone then
+      begin
+        _sgfCls:=FindLocalClassNameForTypeBuilder(t);
+        if _sgfCls<>'' then
+        begin
+          _sgfHasCls:=fFieldBuilders.ContainsKey(_sgfCls);
+          if _sgfHasCls then
+          begin
+            _sgfHasFld:=fFieldBuilders[_sgfCls].ContainsKey(fname);
+            if _sgfHasFld then
+            begin
+              Result:=fFieldBuilders[_sgfCls][fname];
+              _sgfDone:=true;
+            end;
+          end;
+        end;
       end;
+      Writeln('[MARK-SGF-v122b] 로컬 클래스 분기 통과, _sgfDone='+_sgfDone.ToString);
+      if not _sgfDone then
+      begin
+        try
+          Result:=t.GetField(fname, BindingFlags.Public or BindingFlags.Instance);
+        except
+          Result:=nil;
+        end;
+      end;
+      Writeln('[MARK-SGF-v122c] SafeGetField 반환 직전');
     end;
 
     // 위 FindLocalClassNameForTypeBuilder로 찾은 로컬 클래스에 대해, mc.MethodName을
@@ -480,9 +524,13 @@
     // EmitExpr 여러 지점에서 "외부 타입인 줄 알았는데 사실 로컬 클래스였다"를 처리할 때
     // 재사용한다.
     procedure EmitLocalClassMemberAccess(aIL: ILGenerator; localCls: string; mc: TMethodCallExprNode);
-    var _imb100: MethodBuilder;
+    var _imb100: MethodBuilder; _emlmaHasField: boolean;
     begin
-      if (mc.Args.Count=0) and DictDictHas(fFieldBuilders, localCls, mc.MethodName) then
+      // [자기컴파일 버그 수정] DictDictHas<TV> 제네릭 호출을 and 체인에서 분리(SafeGetField와 동일 사유).
+      _emlmaHasField:=false;
+      if mc.Args.Count=0 then
+        _emlmaHasField:=DictDictHas(fFieldBuilders, localCls, mc.MethodName);
+      if _emlmaHasField then
         aIL.Emit(OpCodes.Ldfld, fFieldBuilders[localCls][mc.MethodName])
       else if TryFindInstanceMethod(localCls, mc.MethodName, _imb100) then
       begin
@@ -1482,6 +1530,16 @@
       // 정수로 오인되어 참조값이 숫자로 찍히는 버그가 생긴다.
       var _cn4c:=GetVarClassName(_mc4.ObjName);
       var _fb4c: FieldBuilder;
+      // [자기컴파일 버그 수정] DictDictHas<TV> 제네릭 호출을 and 체인에서 분리(SafeGetField와 동일 사유) —
+      // 결과를 지역 boolean에 먼저 담아, gen0가 gen1을 빌드할 때 잘못된 IL을
+      // 방출하는 "boolean and 체인 안의 제네릭 자기호출" 패턴을 피한다.
+      var _itmca2HasGetter: boolean:=false;
+      var _itmca2HasRetType: boolean:=false;
+      if _mc4.Args.Count=0 then
+      begin
+        _itmca2HasGetter:=DictDictHas(fInstanceMethods, _cn4c, 'get_'+_mc4.MethodName);
+        _itmca2HasRetType:=DictDictHas(fMethodReturnTypes, _cn4c, _mc4.MethodName);
+      end;
       if (_mc4.Args.Count=0) and TryFindFieldBuilder(_cn4c, _mc4.MethodName, _fb4c) then
       begin
         if _fb4c.FieldType=typeof(string) then r:=vtString
@@ -1491,7 +1549,7 @@
         else if _fb4c.FieldType=typeof(int64)   then r:=vtInt64  // [Phase 1]
         else r:=vtInteger;
       end
-      else if (_mc4.Args.Count=0) and DictDictHas(fInstanceMethods, _cn4c, 'get_'+_mc4.MethodName) then
+      else if (_mc4.Args.Count=0) and _itmca2HasGetter then
       begin
         // [Stage 51] 로컬 클래스의 프로퍼티(get_X) — 실제 getter의 반환 CLR 타입으로 판정한다.
         var _getMB4c:=fInstanceMethods[_cn4c]['get_'+_mc4.MethodName];
@@ -1502,7 +1560,7 @@
         else if _getMB4c.ReturnType=typeof(int64)   then r:=vtInt64
         else r:=vtInteger;
       end
-      else if (_mc4.Args.Count=0) and (not DictDictHas(fMethodReturnTypes, _cn4c, _mc4.MethodName)) then
+      else if (_mc4.Args.Count=0) and (not _itmca2HasRetType) then
       begin
         // [Stage 46] 로컬 필드도 로컬 메서드도 아니면 외부 상속 타입(예: WPF Window)의
         // 프로퍼티/필드일 수 있다 (예: w.Title). FindMethodReturnType은 로컬 메서드만 뒤져서

@@ -381,7 +381,11 @@ begin
       begin
         if not fTemplateImpls.ContainsKey(impl.ClassName) then
           fTemplateImpls[impl.ClassName]:=new List<TMethodImplNode>;
-        fTemplateImpls[impl.ClassName].Add(impl);
+        // [자기컴파일 버그 수정] fTemplateImpls[impl.ClassName].Add(impl)처럼 딕셔너리 인덱서
+        // 결과에 바로 이어서 메서드를 호출하는 체인(X[Y].Method(Z))은 gen0가 self-compile
+        // 상황에서 잘못 컴파일하는 것으로 확인된 패턴이다 — 지역변수로 체인을 끊는다.
+        var _tiList:=fTemplateImpls[impl.ClassName];
+        _tiList.Add(impl);
       end;
 
     // 1-2) 요청된 인스턴스화마다 구체 클래스 + 메서드구현을 합성

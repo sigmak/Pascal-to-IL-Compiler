@@ -3801,7 +3801,12 @@ type
               cd.Properties.Add(ps);
               // 프로퍼티는 클래스 필드 목록에 이름을 추가한다.
               // 이를 통해 메서드 본문에서 Self.PropName 접근이 필드처럼 인식된다.
-              fClassFields[cn].Add(propName);
+              // [자기컴파일 버그 수정] fClassFields[cn].Add(propName)처럼 딕셔너리 인덱서 결과에
+              // 바로 이어서 메서드를 호출하는 체인(X[Y].Method(Z))은 gen0가 self-compile 상황에서
+              // 잘못 컴파일하는 것으로 확인된 패턴이다(주변 주석 참조). 인덱싱 결과를 먼저
+              // 지역변수에 담아 체인을 끊는다.
+              var _pcfList:=fClassFields[cn];
+              _pcfList.Add(propName);
             end
 
             // 메서드 시그니처: procedure/function
@@ -4139,7 +4144,14 @@ type
                 fld.ClassName:=fldCn; fld.IsExternalType:=fldIsExt;
                 fld.DefaultValueExpr:=fldDefaultExpr; // [Stage 83]
                 cd.Fields.Add(fld);
-                fClassFields[cn].Add(fn);
+                // [자기컴파일 버그 수정] fClassFields[cn].Add(fn)처럼 딕셔너리 인덱서 결과에
+                // 바로 이어서 메서드를 호출하는 체인(X[Y].Method(Z))은 gen0가 self-compile
+                // 상황에서 잘못 컴파일하는 것으로 확인된 패턴이다 — 지역변수로 체인을 끊는다.
+                // (참고: 바로 아래 주석에서 다루는 "fChars: array of char" 필드 등록이
+                // 실제로 이 라인을 거치므로, 지금 재발 중인 TX.fChars 자기컴파일 크래시와
+                // 직접 관련될 가능성이 있는 지점이다.)
+                var _pcf2List:=fClassFields[cn];
+                _pcf2List.Add(fn);
                 // [버그 수정] array of T 클래스 필드(예: Lexer.pas의 "fChars: array of char")도
                 // 로컬 변수/매개변수와 동일하게 fArrayNames에 등록해야 한다. 이게 없으면
                 // 메서드 본문 안에서 "fChars[fPos]" 같은 인덱싱 식이 "fArrayNames.Contains"
