@@ -2206,8 +2206,61 @@
     // 리플렉션으로 찾으려면 그 왼쪽(Inner) 식의 CLR 타입을 먼저 알아야 하기 때문에 필요하다.
     // 판별 불가능하면 typeof(System.Object)로 안전하게 폴백한다(호출부가 멤버를 못 찾으면
     // 어차피 명확한 예외를 던지도록 되어 있으므로, 여기서 잘못 단정하는 것보다 안전하다).
+    // [Stage 118] GetExprClrType의 TChainedMemberExprNode 분기를 그대로 옮긴 함수.
+    // 원본은 여러 지점에서 "Result:=값; exit;"로 함수 전체를 즉시 빠져나갔는데, 그 값들은
+    // 전부 이 분기 안에서 최종적으로 남는 값과 같으므로(원본 GetExprClrType의 Result 초기값
+    // typeof(System.Object)를 그대로 이어받아 시작), 여기서는 exit 없이 그대로 "if/else if"
+    // 순서만 유지한 채 값을 대입하는 방식으로 바꿨다 — 마지막에 아무것도 못 찾으면 자연히
+    // 이 함수 시작값(System.Object)이 그대로 남아 원본과 동일한 결과가 된다.
+    function GetExprClrTypeChainedMember(e: TExprNode): System.Type;
+    begin
+      Result:=typeof(System.Object);
+      var _ch90:=TChainedMemberExprNode(e);
+      var _innerT90:=GetExprClrType(_ch90.Inner);
+      if _innerT90=nil then exit; // Result는 이미 System.Object로 초기화되어 있음(원본과 동일)
+      // [Stage 101] _innerT90이 아직 CreateType되지 않은 로컬 클래스의 TypeBuilder이면
+      // 아래 SafeGetProperty/GetField가 예외를 던진다(호출부 GetExprClrType 전체가
+      // try/except로 감싸여 있어 크래시는 안 나지만, 그대로면 System.Object로 조용히
+      // 폴백해 타입 추론이 틀려버린다) — EmitExpr의 TChainedMemberExprNode와 동일하게
+      // 로컬 딕셔너리로 먼저 조회한다.
+      var _chLocalCls101:=FindLocalClassNameForTypeBuilder(_innerT90);
+      var _done118:=false;
+      if (_chLocalCls101<>'') and fInstanceMethods.ContainsKey(_chLocalCls101) then
+      begin
+        if (not _ch90.IsCall) and fInstanceMethods[_chLocalCls101].ContainsKey('get_'+_ch90.MemberName) then
+        begin Result:=fInstanceMethods[_chLocalCls101]['get_'+_ch90.MemberName].ReturnType; _done118:=true; end;
+        if (not _done118) and DictDictHas(fFieldBuilders, _chLocalCls101, _ch90.MemberName) then
+        begin Result:=fFieldBuilders[_chLocalCls101][_ch90.MemberName].FieldType; _done118:=true; end;
+        if (not _done118) and fInstanceMethods[_chLocalCls101].ContainsKey(_ch90.MemberName) then
+        begin Result:=fInstanceMethods[_chLocalCls101][_ch90.MemberName].ReturnType; _done118:=true; end;
+      end;
+      if _done118 then exit;
+      var _pi90:=SafeGetProperty(_innerT90, _ch90.MemberName);
+      if (not _ch90.IsCall) and (_pi90<>nil) and (_pi90.GetGetMethod<>nil) then
+      begin Result:=_pi90.PropertyType; exit; end;
+      if not _ch90.IsCall then
+      begin
+        // [자기컴파일 버그 수정] EmitExpr의 동일 지점(위 993행대 주석 참고)과 같은 이유로
+        // raw _innerT90.GetField(...)는 아직 CreateType 안 된 로컬 TypeBuilder에서
+        // NotSupportedException을 던진다. 이 함수 전체가 try/except로 감싸여 있어 죽지는
+        // 않지만, 예외가 나는 즉시 Result가 기본값(System.Object)에 머물러 타입 추론이
+        // 틀려버린다(실제 사례: "X.GetType.Name"에서 "X.GetType"의 타입이 System.Type이
+        // 아니라 System.Object로 잘못 추론되어, 그 다음 ".Name" 단계가 "System.Object에
+        // 멤버 Name이 없습니다"로 실패). 부모 체인까지 훑는 TryFindFieldBuilder로 먼저
+        // 찾고, 그래도 없으면 예외를 삼키는 SafeGetField로 대체한다.
+        var _fbCh101: FieldBuilder;
+        var _fiCh101: FieldInfo;
+        if (_chLocalCls101<>'') and TryFindFieldBuilder(_chLocalCls101, _ch90.MemberName, _fbCh101) then
+          _fiCh101:=_fbCh101
+        else
+          _fiCh101:=SafeGetField(_innerT90, _ch90.MemberName);
+        if _fiCh101<>nil then begin Result:=_fiCh101.FieldType; exit; end;
+      end;
+      var _mi90:=ResolveMethodByArity(_innerT90, _ch90.MemberName, _ch90.Args, false);
+      if _mi90<>nil then Result:=_mi90.ReturnType;
+    end;
+
     function GetExprClrType(e: TExprNode): System.Type;
-    var _fb90: FieldBuilder;
     begin
       Result:=typeof(System.Object);
       try
@@ -2246,46 +2299,15 @@
         end
         else if e is TChainedMemberExprNode then
         begin
-          var _ch90:=TChainedMemberExprNode(e);
-          var _innerT90:=GetExprClrType(_ch90.Inner);
-          if _innerT90=nil then exit;
-          // [Stage 101] _innerT90이 아직 CreateType되지 않은 로컬 클래스의 TypeBuilder이면
-          // 아래 SafeGetProperty/GetField가 예외를 던진다(이 함수 전체가 try/except로 감싸여
-          // 있어 크래시는 안 나지만, 그대로면 System.Object로 조용히 폴백해 타입 추론이
-          // 틀려버린다) — EmitExpr의 TChainedMemberExprNode와 동일하게 로컬 딕셔너리로 먼저 조회한다.
-          var _chLocalCls101:=FindLocalClassNameForTypeBuilder(_innerT90);
-          if (_chLocalCls101<>'') and fInstanceMethods.ContainsKey(_chLocalCls101) then
-          begin
-            if (not _ch90.IsCall) and fInstanceMethods[_chLocalCls101].ContainsKey('get_'+_ch90.MemberName) then
-            begin Result:=fInstanceMethods[_chLocalCls101]['get_'+_ch90.MemberName].ReturnType; exit; end;
-            if DictDictHas(fFieldBuilders, _chLocalCls101, _ch90.MemberName) then
-            begin Result:=fFieldBuilders[_chLocalCls101][_ch90.MemberName].FieldType; exit; end;
-            if fInstanceMethods[_chLocalCls101].ContainsKey(_ch90.MemberName) then
-            begin Result:=fInstanceMethods[_chLocalCls101][_ch90.MemberName].ReturnType; exit; end;
-          end;
-          var _pi90:=SafeGetProperty(_innerT90, _ch90.MemberName);
-          if (not _ch90.IsCall) and (_pi90<>nil) and (_pi90.GetGetMethod<>nil) then
-          begin Result:=_pi90.PropertyType; exit; end;
-          if not _ch90.IsCall then
-          begin
-            // [자기컴파일 버그 수정] EmitExpr의 동일 지점(위 993행대 주석 참고)과 같은 이유로
-            // raw _innerT90.GetField(...)는 아직 CreateType 안 된 로컬 TypeBuilder에서
-            // NotSupportedException을 던진다. 이 함수 전체가 try/except로 감싸여 있어 죽지는
-            // 않지만, 예외가 나는 즉시 Result가 기본값(System.Object)에 머물러 타입 추론이
-            // 틀려버린다(실제 사례: "X.GetType.Name"에서 "X.GetType"의 타입이 System.Type이
-            // 아니라 System.Object로 잘못 추론되어, 그 다음 ".Name" 단계가 "System.Object에
-            // 멤버 Name이 없습니다"로 실패). 부모 체인까지 훑는 TryFindFieldBuilder로 먼저
-            // 찾고, 그래도 없으면 예외를 삼키는 SafeGetField로 대체한다.
-            var _fbCh101: FieldBuilder;
-            var _fiCh101: FieldInfo;
-            if (_chLocalCls101<>'') and TryFindFieldBuilder(_chLocalCls101, _ch90.MemberName, _fbCh101) then
-              _fiCh101:=_fbCh101
-            else
-              _fiCh101:=SafeGetField(_innerT90, _ch90.MemberName);
-            if _fiCh101<>nil then begin Result:=_fiCh101.FieldType; exit; end;
-          end;
-          var _mi90:=ResolveMethodByArity(_innerT90, _ch90.MemberName, _ch90.Args, false);
-          if _mi90<>nil then Result:=_mi90.ReturnType;
+          // [Stage 118] 이 분기(가장 크고 복잡한 단일 분기, ~40줄)를 GetExprClrTypeChainedMember로
+          // 옮겼다 — Stage 117에서 GetExprClrType을 한 번 분리했음에도 동일한
+          // BadImageFormatException이 재현되어(사용자 재확인), 한 번의 분리로는 부족했던
+          // Stage 111→112 사례(ParsePrimary→ParsePrimaryIdent도 1차 분리 후 재발, 그
+          // 안의 최대 단일 블록을 다시 분리하고서야 해결됨)와 동일한 패턴으로 보고, 이 함수의
+          // 최대 단일 분기부터 추가로 들어냈다. GetExprClrTypeChainedMember는 원본의 여러
+          // "exit" 지점과 동일한 값(못 찾으면 System.Object 기본값)을 그대로 반환하도록
+          // 만들어, 여기서는 단순 대입만 하면 원본과 동일한 동작이 된다.
+          Result:=GetExprClrTypeChainedMember(e);
         end
         else if e is TMethodCallExprNode then
         begin
@@ -2321,162 +2343,188 @@
             end;
           end;
         end
-        // [진단/버그 수정] Qualifier[Index] (obj[i], obj[i][j], obj[i].Field 등) — 지금까지
-        // GetExprClrType에 이 분기가 아예 없어서, obj[i] 뒤에 .Member가 체이닝되는 식(예:
-        // "map[key].Value")은 무조건 System.Object로 폴백해 "타입 System.Object에 멤버
-        // Value가 없습니다"로 실패했다(DescribeExprChain으로 처음 확인된 실제 사례).
-        // EmitExpr의 TExternalIndexExprNode 처리부와 동일한 순서로(Qualifier 체인 →
-        // 인덱싱 → IndexExpr2/ExtraIndices → MemberName) 타입만 추론한다.
-        else if e is TExternalIndexExprNode then
+        // [Stage 118] TExternalIndexExprNode 분기(아래 else에서 호출하는 GetExprClrTypeTail로
+        // 함께 이동) — 남은 분기 수를 더 줄이기 위해 이 자리엔 별도 코드를 남기지 않는다.
+        else
         begin
-          var _eiG90:=TExternalIndexExprNode(e);
-          var _eiSegs90:=SplitByDot(_eiG90.Qualifier);
-          if IsChainStartSegment(_eiSegs90[0]) then
-          begin
-            var _eiBaseT90:=InferQualifierChainType(_eiSegs90);
-            var _eiResT90:=InferIndexerResultType(_eiBaseT90, _eiG90.IndexExpr);
-            if _eiG90.IndexExpr2<>nil then _eiResT90:=InferIndexerResultType(_eiResT90, _eiG90.IndexExpr2);
-            if _eiG90.ExtraIndices<>nil then
-              foreach var _eiExtra90 in _eiG90.ExtraIndices do
-                _eiResT90:=InferIndexerResultType(_eiResT90, _eiExtra90);
-            if _eiResT90<>nil then
-            begin
-              if _eiG90.MemberName='' then Result:=_eiResT90
-              else
-              begin
-                var _eiPi90:=SafeGetProperty(_eiResT90, _eiG90.MemberName);
-                if _eiPi90<>nil then Result:=_eiPi90.PropertyType
-                else
-                begin
-                  var _eiFi90:=_eiResT90.GetField(_eiG90.MemberName);
-                  if _eiFi90<>nil then Result:=_eiFi90.FieldType;
-                end;
-              end;
-            end;
-          end;
-        end
-        // [버그 수정] Target[Index] 인덱싱 결과의 타입 — Target이 TArrayIndexExprNode(ArrName[Index]) 형태인
-        // 경우. 지금까지 GetExprClrType에 이 분기가 없어서 "fClassGenericParam[templateName].Count"처럼
-        // 필드에 담긴 Dictionary<string,List<string>> 등을 ArrName 인덱싱으로 표현한 식(자기컴파일 파서가
-        // 실제로 생성하는 패턴) 뒤에 ".Member"가 이어지면 System.Object로 폴백해 "타입 System.Object에
-        // 멤버 Count가 없습니다"로 실패했다(셀프호스팅 컴파일 실제 사례). EmitExpr의 TArrayIndexExprNode
-        // 처리부(2632행 부근)와 동일한 순서로 ArrName의 실제 CLR 타입을 찾은 뒤, 배열이면 원소 타입,
-        // 그 외(List<T>/Dictionary<K,V> 등)는 InferIndexerResultType의 Item 인덱서 판별 로직을 재사용한다.
-        else if e is TArrayIndexExprNode then
-        begin
-          var _aiG90:=TArrayIndexExprNode(e);
-          var _aiBaseT90: System.Type := nil;
-          var _aiFb90: FieldBuilder;
-          // [Stage 109 재적용] HasClrType은 SetClrType이 호출된 적 있는 변수만 true다 —
-          // "chars: array of char := s.ToCharArray" 같은 array-of 지역/전역 변수는
-          // 선언 시 SetClrType이 호출된 적이 없어 HasClrType이 항상 false였고, 그러면
-          // 아래 두 분기가 전부 스킵되어 _aiBaseT90이 nil로 남아 System.Object로
-          // 잘못 폴백했다(자기컴파일 실제 재현: StripCommentsForUsesScan/ExpandIncludes의
-          // chars[i]). HasClrType이 실패해도 Loc.LocalType(선언된 CLR 타입, 항상 존재)을
-          // 마지막 수단으로 직접 조회한다.
-          if fLocalScope.Has(_aiG90.ArrName) then
-          begin
-            if fLocalScope.HasClrType(_aiG90.ArrName) then
-              _aiBaseT90:=fLocalScope.GetClrType(_aiG90.ArrName)
-            else
-              _aiBaseT90:=fLocalScope.GetLoc(_aiG90.ArrName).LocalType;
-          end
-          else if fGlobalScope.Has(_aiG90.ArrName) then
-          begin
-            if fGlobalScope.HasClrType(_aiG90.ArrName) then
-              _aiBaseT90:=fGlobalScope.GetClrType(_aiG90.ArrName)
-            else
-              _aiBaseT90:=fGlobalScope.GetLoc(_aiG90.ArrName).LocalType;
-          end
-          else if (fCurClassName<>'') and TryFindFieldBuilder(fCurClassName, _aiG90.ArrName, _aiFb90) then
-            _aiBaseT90:=_aiFb90.FieldType;
-          if _aiBaseT90<>nil then Result:=InferIndexerResultType(_aiBaseT90, _aiG90.Index);
-        end
-        else if e is TVarRefNode then
-        begin
-          var _vn90:=TVarRefNode(e).VarName;
-          if fLocalScope.Has(_vn90) and fLocalScope.HasClrType(_vn90) then Result:=fLocalScope.GetClrType(_vn90)
-          else if fGlobalScope.Has(_vn90) and fGlobalScope.HasClrType(_vn90) then Result:=fGlobalScope.GetClrType(_vn90)
-          else if fLocalScope.Has(_vn90) and fLocalScope.HasClassName(_vn90) then Result:=FindExternalAncestorType(fLocalScope.GetClassName(_vn90))
-          else if fGlobalScope.Has(_vn90) and fGlobalScope.HasClassName(_vn90) then Result:=FindExternalAncestorType(fGlobalScope.GetClassName(_vn90));
-        end
-        else if e is TFieldReadExprNode then
-        begin
-          var _fnm90:=TFieldReadExprNode(e).FieldName;
-          if TryFindFieldBuilder(fCurClassName, _fnm90, _fb90) then Result:=_fb90.FieldType
-          else
-          begin
-            // [Stage 95 버그 수정] ClientSize처럼 자기 클래스가 직접 선언한 필드가 아니라
-            // 외부 상속 타입(Form → ScrollableControl → Control 등)의 프로퍼티/필드일 때
-            // 폴백이 없어서 함수 맨 위의 기본값 System.Object로 그냥 떨어졌다. 그 결과
-            // "self.ClientSize.Height"처럼 체인으로 이어지는 바깥쪽 .Height가 System.Object
-            // 위에서 Height를 찾다가 "타입 System.Object에 멤버 Height가 없습니다"로 터졌다.
-            // IsChainStartSegment/EmitQualifierChainLoad가 이미 쓰는 것과 같은
-            // FindExternalAncestorType 폴백을 여기도 추가한다.
-            var _extAnc90:=FindExternalAncestorType(fCurClassName);
-            if _extAnc90<>nil then
-            begin
-              var _extPi90:=SafeGetProperty(_extAnc90, _fnm90);
-              if _extPi90<>nil then Result:=_extPi90.PropertyType
-              else
-              begin
-                var _extFi90:=_extAnc90.GetField(_fnm90);
-                if _extFi90<>nil then Result:=_extFi90.FieldType;
-              end;
-            end;
-          end;
-        end
-        else if e is TNewObjectExprNode then
-        begin
-          var _no90:=TNewObjectExprNode(e);
-          var _no90ElemT: System.Type;
-          if _no90.IsExternalType then _no90ElemT:=ResolveExternalType(_no90.ClassName)
-          else if fBuiltTypes.ContainsKey(_no90.ClassName) then _no90ElemT:=fBuiltTypes[_no90.ClassName]
-          else _no90ElemT:=nil;
-          if _no90ElemT<>nil then
-          begin
-            // [Stage 96] new Type[N](...)는 원소 타입이 아니라 배열 타입(Type[])을 낳는다 —
-            // TChainedMemberExprNode 등이 이 노드를 Inner로 삼아 체인을 이어갈 때
-            // (예: new T[N](...).Length) 잘못된 타입으로 멤버를 찾지 않도록 한다.
-            if _no90.ArraySizeExpr<>nil then Result:=_no90ElemT.MakeArrayType()
-            else Result:=_no90ElemT;
-          end;
-        end
-        // [자기컴파일 버그 수정] (a - b).ToString / (a + b).Foo 처럼 산술 이항식 바로 뒤에
-        // 멤버/메서드가 체이닝되는 경우 — GetExprClrType에 TBinOpNode 분기가 아예 없어서
-        // 지금까지 무조건 맨 위 기본값 System.Object로 폴백했다. EmitExpr의
-        // TChainedMemberExprNode 처리부는 이 타입을 보고 "값 타입이면 지역변수에 담아
-        // 주소를 취해 Call, 아니면 Callvirt"를 결정하는데(1013행대), System.Object는
-        // IsValueType=false이므로 박싱/주소 취득 과정을 건너뛰고 스택에 그대로 남아있는
-        // 원시 int32 값 위에 곧바로 Callvirt를 걸어버렸다 — 참조가 아닌 원시값을 객체
-        // 포인터로 오인하는 손상된 IL이라, 실행 시 관리되는 예외조차 못 띄우고 프로세스가
-        // 아무 메시지 없이 죽는다(실제 재현: Main.pas의 "(compileOrder.Count - 1).ToString").
-        // InferType의 TBinOpNode 분기(문자열 > 실수 > int64 > 정수 승격, boAnd/boOr는
-        // 항상 논리형)와 동일한 규칙을 CLR 타입으로 그대로 옮긴다.
-        else if e is TBinOpNode then
-        begin
-          var _bo90:=TBinOpNode(e);
-          var _boLt90:=GetExprClrType(_bo90.Left);
-          var _boRt90:=GetExprClrType(_bo90.Right);
-          if (_bo90.Op=boAnd) or (_bo90.Op=boOr) then Result:=typeof(boolean)
-          else if (_boLt90=typeof(string)) or (_boRt90=typeof(string)) then Result:=typeof(string)
-          else if (_boLt90=typeof(double)) or (_boRt90=typeof(double)) then Result:=typeof(double)
-          else if (_boLt90=typeof(int64)) or (_boRt90=typeof(int64)) then Result:=typeof(int64)
-          else Result:=typeof(integer);
-        end
-        else if e is TStrLiteralNode then Result:=typeof(string)
-        else if e is TIntLiteralNode then Result:=typeof(integer)
-        else if e is TRealLiteralNode then Result:=typeof(double)
-        else if e is TInt64LiteralNode then Result:=typeof(int64)
-        else if e is TBoolLiteralNode then Result:=typeof(boolean)
-        else if e is TCharLiteralNode then Result:=typeof(char)
-        else if e is TLengthExprNode then Result:=typeof(integer)   // ← 추가: Length(x).Method 체이닝 시 필요
-        else if e is TIntToStrNode then Result:=typeof(string)      // ← 추가: 
-        else if e is TBoolToStrNode then Result:=typeof(string);    // ← 추가: 
+          // [Stage 117/118 버그 수정 - 메서드 크기/분기복잡도] GetExprClrType이 원래 15개
+          // 안팎의 if/else-if 분기를 가진 단일 함수(약 270줄)였는데, self-compile된
+          // 바이너리에서 이 함수 진입 시점에 BadImageFormatException(HRESULT 0x8007000B)이
+          // 재현됨 — Stage 111(ParsePrimary)/112(ParsePrimaryIdent)/115(InferTypeMethodCallA)와
+          // 동일한 "메서드 크기/분기복잡도" 패턴. Stage 117에서 한 번(TArrayIndexExprNode부터
+          // 리터럴까지를 GetExprClrTypeTail로) 분리했으나 재현되어(사용자 재확인), Stage 118에서
+          // 추가로 TChainedMemberExprNode를 GetExprClrTypeChainedMember로, 그리고 이 자리의
+          // TExternalIndexExprNode도 GetExprClrTypeTail로 함께 옮겼다 — ParsePrimary가
+          // 두 단계 분리 끝에야 해결됐던 것과 같은 이유로, 한 번에 더 잘게 쪼갠다.
+          var _tail117:=GetExprClrTypeTail(e);
+          if _tail117<>nil then Result:=_tail117;
+        end;
       except
         Result:=typeof(System.Object); // 실패하면 안전한 폴백(멤버를 못 찾으면 호출부가 명확한 예외를 던짐)
       end;
       if Result=nil then Result:=typeof(System.Object);
+    end;
+
+    // [Stage 117] GetExprClrType에서 분리된 뒷부분 분기들 — 로직은 원본과 동일, 함수만 나눔.
+    // 반환값이 nil이면 "해당 분기 중 아무것도 매치하지 않았거나, 매치했어도 값을 못 찾음"을
+    // 뜻하며, 호출부(GetExprClrType)는 원래처럼 System.Object 기본값을 유지한다.
+    function GetExprClrTypeTail(e: TExprNode): System.Type;
+    var _fb90: FieldBuilder;
+    begin
+      Result:=nil;
+      // [Stage 118] TExternalIndexExprNode 분기 — Qualifier[Index] (obj[i], obj[i][j],
+      // obj[i].Field 등). 지금까지 GetExprClrType에 이 분기가 아예 없어서, obj[i] 뒤에
+      // .Member가 체이닝되는 식(예: "map[key].Value")은 무조건 System.Object로 폴백해
+      // "타입 System.Object에 멤버 Value가 없습니다"로 실패했다(DescribeExprChain으로 처음
+      // 확인된 실제 사례). EmitExpr의 TExternalIndexExprNode 처리부와 동일한 순서로
+      // (Qualifier 체인 → 인덱싱 → IndexExpr2/ExtraIndices → MemberName) 타입만 추론한다.
+      // (Stage 118에서 GetExprClrType 크기를 더 줄이기 위해 GetExprClrTypeTail로 이동, 로직 동일)
+      if e is TExternalIndexExprNode then
+      begin
+        var _eiG90:=TExternalIndexExprNode(e);
+        var _eiSegs90:=SplitByDot(_eiG90.Qualifier);
+        if IsChainStartSegment(_eiSegs90[0]) then
+        begin
+          var _eiBaseT90:=InferQualifierChainType(_eiSegs90);
+          var _eiResT90:=InferIndexerResultType(_eiBaseT90, _eiG90.IndexExpr);
+          if _eiG90.IndexExpr2<>nil then _eiResT90:=InferIndexerResultType(_eiResT90, _eiG90.IndexExpr2);
+          if _eiG90.ExtraIndices<>nil then
+            foreach var _eiExtra90 in _eiG90.ExtraIndices do
+              _eiResT90:=InferIndexerResultType(_eiResT90, _eiExtra90);
+          if _eiResT90<>nil then
+          begin
+            if _eiG90.MemberName='' then Result:=_eiResT90
+            else
+            begin
+              var _eiPi90:=SafeGetProperty(_eiResT90, _eiG90.MemberName);
+              if _eiPi90<>nil then Result:=_eiPi90.PropertyType
+              else
+              begin
+                var _eiFi90:=_eiResT90.GetField(_eiG90.MemberName);
+                if _eiFi90<>nil then Result:=_eiFi90.FieldType;
+              end;
+            end;
+          end;
+        end;
+      end
+      // [버그 수정] Target[Index] 인덱싱 결과의 타입 — Target이 TArrayIndexExprNode(ArrName[Index]) 형태인
+      // 경우. 지금까지 GetExprClrType에 이 분기가 없어서 "fClassGenericParam[templateName].Count"처럼
+      // 필드에 담긴 Dictionary<string,List<string>> 등을 ArrName 인덱싱으로 표현한 식(자기컴파일 파서가
+      // 실제로 생성하는 패턴) 뒤에 ".Member"가 이어지면 System.Object로 폴백해 "타입 System.Object에
+      // 멤버 Count가 없습니다"로 실패했다(셀프호스팅 컴파일 실제 사례). EmitExpr의 TArrayIndexExprNode
+      // 처리부(2632행 부근)와 동일한 순서로 ArrName의 실제 CLR 타입을 찾은 뒤, 배열이면 원소 타입,
+      // 그 외(List<T>/Dictionary<K,V> 등)는 InferIndexerResultType의 Item 인덱서 판별 로직을 재사용한다.
+      else if e is TArrayIndexExprNode then
+      begin
+        var _aiG90:=TArrayIndexExprNode(e);
+        var _aiBaseT90: System.Type := nil;
+        var _aiFb90: FieldBuilder;
+        // [Stage 109 재적용] HasClrType은 SetClrType이 호출된 적 있는 변수만 true다 —
+        // "chars: array of char := s.ToCharArray" 같은 array-of 지역/전역 변수는
+        // 선언 시 SetClrType이 호출된 적이 없어 HasClrType이 항상 false였고, 그러면
+        // 아래 두 분기가 전부 스킵되어 _aiBaseT90이 nil로 남아 System.Object로
+        // 잘못 폴백했다(자기컴파일 실제 재현: StripCommentsForUsesScan/ExpandIncludes의
+        // chars[i]). HasClrType이 실패해도 Loc.LocalType(선언된 CLR 타입, 항상 존재)을
+        // 마지막 수단으로 직접 조회한다.
+        if fLocalScope.Has(_aiG90.ArrName) then
+        begin
+          if fLocalScope.HasClrType(_aiG90.ArrName) then
+            _aiBaseT90:=fLocalScope.GetClrType(_aiG90.ArrName)
+          else
+            _aiBaseT90:=fLocalScope.GetLoc(_aiG90.ArrName).LocalType;
+        end
+        else if fGlobalScope.Has(_aiG90.ArrName) then
+        begin
+          if fGlobalScope.HasClrType(_aiG90.ArrName) then
+            _aiBaseT90:=fGlobalScope.GetClrType(_aiG90.ArrName)
+          else
+            _aiBaseT90:=fGlobalScope.GetLoc(_aiG90.ArrName).LocalType;
+        end
+        else if (fCurClassName<>'') and TryFindFieldBuilder(fCurClassName, _aiG90.ArrName, _aiFb90) then
+          _aiBaseT90:=_aiFb90.FieldType;
+        if _aiBaseT90<>nil then Result:=InferIndexerResultType(_aiBaseT90, _aiG90.Index);
+      end
+      else if e is TVarRefNode then
+      begin
+        var _vn90:=TVarRefNode(e).VarName;
+        if fLocalScope.Has(_vn90) and fLocalScope.HasClrType(_vn90) then Result:=fLocalScope.GetClrType(_vn90)
+        else if fGlobalScope.Has(_vn90) and fGlobalScope.HasClrType(_vn90) then Result:=fGlobalScope.GetClrType(_vn90)
+        else if fLocalScope.Has(_vn90) and fLocalScope.HasClassName(_vn90) then Result:=FindExternalAncestorType(fLocalScope.GetClassName(_vn90))
+        else if fGlobalScope.Has(_vn90) and fGlobalScope.HasClassName(_vn90) then Result:=FindExternalAncestorType(fGlobalScope.GetClassName(_vn90));
+      end
+      else if e is TFieldReadExprNode then
+      begin
+        var _fnm90:=TFieldReadExprNode(e).FieldName;
+        if TryFindFieldBuilder(fCurClassName, _fnm90, _fb90) then Result:=_fb90.FieldType
+        else
+        begin
+          // [Stage 95 버그 수정] ClientSize처럼 자기 클래스가 직접 선언한 필드가 아니라
+          // 외부 상속 타입(Form → ScrollableControl → Control 등)의 프로퍼티/필드일 때
+          // 폴백이 없어서 함수 맨 위의 기본값 System.Object로 그냥 떨어졌다. 그 결과
+          // "self.ClientSize.Height"처럼 체인으로 이어지는 바깥쪽 .Height가 System.Object
+          // 위에서 Height를 찾다가 "타입 System.Object에 멤버 Height가 없습니다"로 터졌다.
+          // IsChainStartSegment/EmitQualifierChainLoad가 이미 쓰는 것과 같은
+          // FindExternalAncestorType 폴백을 여기도 추가한다.
+          var _extAnc90:=FindExternalAncestorType(fCurClassName);
+          if _extAnc90<>nil then
+          begin
+            var _extPi90:=SafeGetProperty(_extAnc90, _fnm90);
+            if _extPi90<>nil then Result:=_extPi90.PropertyType
+            else
+            begin
+              var _extFi90:=_extAnc90.GetField(_fnm90);
+              if _extFi90<>nil then Result:=_extFi90.FieldType;
+            end;
+          end;
+        end;
+      end
+      else if e is TNewObjectExprNode then
+      begin
+        var _no90:=TNewObjectExprNode(e);
+        var _no90ElemT: System.Type;
+        if _no90.IsExternalType then _no90ElemT:=ResolveExternalType(_no90.ClassName)
+        else if fBuiltTypes.ContainsKey(_no90.ClassName) then _no90ElemT:=fBuiltTypes[_no90.ClassName]
+        else _no90ElemT:=nil;
+        if _no90ElemT<>nil then
+        begin
+          // [Stage 96] new Type[N](...)는 원소 타입이 아니라 배열 타입(Type[])을 낳는다 —
+          // TChainedMemberExprNode 등이 이 노드를 Inner로 삼아 체인을 이어갈 때
+          // (예: new T[N](...).Length) 잘못된 타입으로 멤버를 찾지 않도록 한다.
+          if _no90.ArraySizeExpr<>nil then Result:=_no90ElemT.MakeArrayType()
+          else Result:=_no90ElemT;
+        end;
+      end
+      // [자기컴파일 버그 수정] (a - b).ToString / (a + b).Foo 처럼 산술 이항식 바로 뒤에
+      // 멤버/메서드가 체이닝되는 경우 — GetExprClrType에 TBinOpNode 분기가 아예 없어서
+      // 지금까지 무조건 맨 위 기본값 System.Object로 폴백했다. EmitExpr의
+      // TChainedMemberExprNode 처리부는 이 타입을 보고 "값 타입이면 지역변수에 담아
+      // 주소를 취해 Call, 아니면 Callvirt"를 결정하는데(1013행대), System.Object는
+      // IsValueType=false이므로 박싱/주소 취득 과정을 건너뛰고 스택에 그대로 남아있는
+      // 원시 int32 값 위에 곧바로 Callvirt를 걸어버렸다 — 참조가 아닌 원시값을 객체
+      // 포인터로 오인하는 손상된 IL이라, 실행 시 관리되는 예외조차 못 띄우고 프로세스가
+      // 아무 메시지 없이 죽는다(실제 재현: Main.pas의 "(compileOrder.Count - 1).ToString").
+      // InferType의 TBinOpNode 분기(문자열 > 실수 > int64 > 정수 승격, boAnd/boOr는
+      // 항상 논리형)와 동일한 규칙을 CLR 타입으로 그대로 옮긴다.
+      else if e is TBinOpNode then
+      begin
+        var _bo90:=TBinOpNode(e);
+        var _boLt90:=GetExprClrType(_bo90.Left);
+        var _boRt90:=GetExprClrType(_bo90.Right);
+        if (_bo90.Op=boAnd) or (_bo90.Op=boOr) then Result:=typeof(boolean)
+        else if (_boLt90=typeof(string)) or (_boRt90=typeof(string)) then Result:=typeof(string)
+        else if (_boLt90=typeof(double)) or (_boRt90=typeof(double)) then Result:=typeof(double)
+        else if (_boLt90=typeof(int64)) or (_boRt90=typeof(int64)) then Result:=typeof(int64)
+        else Result:=typeof(integer);
+      end
+      else if e is TStrLiteralNode then Result:=typeof(string)
+      else if e is TIntLiteralNode then Result:=typeof(integer)
+      else if e is TRealLiteralNode then Result:=typeof(double)
+      else if e is TInt64LiteralNode then Result:=typeof(int64)
+      else if e is TBoolLiteralNode then Result:=typeof(boolean)
+      else if e is TCharLiteralNode then Result:=typeof(char)
+      else if e is TLengthExprNode then Result:=typeof(integer)   // ← 추가: Length(x).Method 체이닝 시 필요
+      else if e is TIntToStrNode then Result:=typeof(string)      // ← 추가: 
+      else if e is TBoolToStrNode then Result:=typeof(string);    // ← 추가: 
     end;
 
     // [Stage 48] 외부 생성자/메서드에 인자를 하나씩 넣을 때, 기대하는 매개변수 타입이
