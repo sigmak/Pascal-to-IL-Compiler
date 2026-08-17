@@ -1333,10 +1333,17 @@
         var _cmi4IsNil5b:=(_cmi4=nil);
         var _cmi4IsNilStr5b:=_cmi4IsNil5b.ToString;
         Writeln('[MARK-ITMCC-5b] ResolveMethodByArity 호출부 복귀 직후, _cmi4=nil? '+_cmi4IsNilStr5b);
+{ // 2026.08.17 not 사용이 문제를 일으켜서 주석처리후 아래에 수정함.
         var _cmi4Ok:=(_cmi4<>nil);
         var _cmi4NotOk:=not _cmi4Ok;
         var _cmi4NotOkStr:=_cmi4NotOk.ToString;
         Writeln('[MARK-ITMCC-6] ResolveMethodByArity 반환 완료, _cmi4=nil? '+_cmi4NotOkStr);
+}
+        var _cmi4Ok:=(_cmi4<>nil);
+        var _cmi4IsNil6:=(_cmi4=nil);
+        var _cmi4IsNilStr6:=_cmi4IsNil6.ToString;
+        Writeln('[MARK-ITMCC-6] ResolveMethodByArity 반환 완료, _cmi4=nil? '+_cmi4IsNilStr6);
+
         if _cmi4Ok then _cmi4Ok:=(_cmi4.ReturnType=typeof(string));
         if _cmi4Ok then r:=vtString
         else r:=vtInteger;
