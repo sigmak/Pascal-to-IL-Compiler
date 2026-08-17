@@ -710,43 +710,50 @@
     // 이후 세그먼트들은 직전 결과 타입 위에서 프로퍼티(우선) 또는 필드를 순서대로 읽어
     // 내려간다. 끝나고 나면 스택엔 마지막 세그먼트가 가리키는 값이 남고, finalType은 그 값의
     // 실제 CLR 타입이다 — 호출부는 이 타입 위에서 메서드/프로퍼티를 마저 찾으면 된다.
-    procedure EmitQualifierChainLoad(aIL: ILGenerator; segs: List<string>; var finalType: System.Type);
-    var i: integer; curType: System.Type; pi: PropertyInfo; fi: System.Reflection.FieldInfo;
-        firstFb: FieldBuilder; first: string; extSelf: System.Type;
-        localClsName78: string;
-        mi101: MethodInfo; // [버그 수정] 외부 CLR 타입의 괄호 없는 무인자 메서드(예: sb.ToString.Trim)용
+    // [Stage 139 분할 — 자기컴파일 IL 손상 수정] EmitQualifierChainLoad는 InferQualifierChainType과
+    // 같은 판별 순서를 따르는 "쌍둥이" 함수이면서, 실제 IL까지 방출하다 보니 코드가 더 크다
+    // (분할 전: 약 180줄, 첫 세그먼트 판별 7분기 + 루프 안 4~5분기 중첩, 로컬 변수 18개,
+    // .maxstack 111 / 코드 크기 2001바이트로 ildasm에서 확인됨). InferQualifierChainType 쪽은
+    // 이미 (Stage 123) InferQualifierChainFindLocalClassName / InferQualifierChainStepExternalMember /
+    // InferQualifierChainStep으로 쪼개 안전해졌지만, 이 Emit 쪽 쌍둥이는 foreach 하나만
+    // FindLocalClassNameForTypeBuilder 호출로 바꿨을 뿐 함수 자체는 여전히 하나의 큰 함수로
+    // 남아 있었다 — 그 결과 gen1(자기컴파일 결과물)이 정확히 src.Length.ToString() 같은 값
+    // 타입 체인을 처음 방출할 때 BadImageFormatException으로 죽는 문제가 재현됐다(Stage 110
+    // 자기컴파일 로그 확인 — InferQualifierChainType 계열 마크는 전부 정상 통과하고, 마크가
+    // 하나도 없는 이 함수로 진입하는 시점에서 죽는다). Infer 쪽과 동일하게 첫 세그먼트 판별과
+    // 루프 스텝을 별도 함수로 뽑아 EmitQualifierChainLoad 자체를 얇은 디스패처로 만든다.
+    function EmitQualifierChainFirstSegment(aIL: ILGenerator; first: string): System.Type;
+    var pi: PropertyInfo; firstFb: FieldBuilder; extSelf: System.Type;
     begin
-      first:=segs[0];
+      Writeln('[MARK-EQCFS-0] 진입, first="'+first+'"');
       if (first='Result') and (fResultLocal<>nil) then
       begin
         aIL.Emit(OpCodes.Ldloc, fResultLocal);
-        curType:=fResultLocal.LocalType;
+        Result:=fResultLocal.LocalType;
       end
       else if TryFindFieldBuilder(fCurClassName, first, firstFb) then
       begin
         aIL.Emit(OpCodes.Ldarg_0);
         aIL.Emit(OpCodes.Ldfld, firstFb);
-        curType:=firstFb.FieldType;
+        Result:=firstFb.FieldType;
       end
       else if (fLocalScope.Has(first) or fGlobalScope.Has(first))
               and (fLocalScope.HasClrType(first) or fGlobalScope.HasClrType(first)) then
       begin
         if fLocalScope.Has(first) then aIL.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(first))
         else aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(first));
-        if fLocalScope.HasClrType(first) then curType:=fLocalScope.GetClrType(first)
-        else curType:=fGlobalScope.GetClrType(first);
+        if fLocalScope.HasClrType(first) then Result:=fLocalScope.GetClrType(first)
+        else Result:=fGlobalScope.GetClrType(first);
       end
       // [Stage 85 후속 수정] first가 외부 CLR 타입(HasClrType)이 아니라 로컬에서 정의한
       // 클래스의 인스턴스 변수(예: c: Counter)일 수 있다 — GetVarClassName으로 확인하고
-      // fTypeBuilders에서 그 클래스의 TypeBuilder를 curType으로 쓴다. 이게 없으면
-      // "c.Value" 같은 체인의 첫 세그먼트가 이도저도 아니라고 오판돼 아래 else의
-      // "self가 상속한 외부 타입" 경로로 빠지고 결국 알 수 없는 한정자 예외가 난다.
+      // fTypeBuilders에서 그 클래스의 TypeBuilder를 curType으로 쓴다.
       else if (fLocalScope.Has(first) or fGlobalScope.Has(first))
               and (GetVarClassName(first)<>'') and fTypeBuilders.ContainsKey(GetVarClassName(first)) then
       begin
         if fLocalScope.Has(first) then aIL.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(first))
         else aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(first));
-        curType:=fTypeBuilders[GetVarClassName(first)];
+        Result:=fTypeBuilders[GetVarClassName(first)];
       end
       // [버그 수정] IsChainStartSegment와 동일 — incName[1]처럼 원시 타입 지역/전역 변수가
       // 체인의 시작점인 경우, ClrType/ClassName 둘 다 스코프에 없으므로 실제 로드 코드도
@@ -758,7 +765,7 @@
       begin
         if fLocalScope.Has(first) then aIL.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(first))
         else aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(first));
-        curType:=VTC(GetVarType(first), '');
+        Result:=VTC(GetVarType(first), '');
       end
       else
       begin
@@ -768,7 +775,7 @@
           aIL.Emit(OpCodes.Ldarg_0);
           pi:=SafeGetProperty(extSelf, first);
           aIL.Emit(OpCodes.Callvirt, pi.GetGetMethod);
-          curType:=pi.PropertyType;
+          Result:=pi.PropertyType;
         end
         else if fInstanceMethods.ContainsKey(fCurClassName)
                 and fInstanceMethods[fCurClassName].ContainsKey(first)
@@ -778,115 +785,121 @@
         begin
           // [버그 수정] IsChainStartSegment와 동일한 이유 — "Cur.Line"처럼 체인의
           // 첫 세그먼트가 괄호 없이 호출하는 인자 없는 로컬 인스턴스 메서드인 경우.
-          // (GetParameters() 대신 fMethodParamClrTypes로 판별 — 미완성 TypeBuilder라 리플렉션 불가)
           aIL.Emit(OpCodes.Ldarg_0);
           aIL.Emit(OpCodes.Callvirt, fInstanceMethods[fCurClassName][first]);
-          curType:=fInstanceMethods[fCurClassName][first].ReturnType;
+          Result:=fInstanceMethods[fCurClassName][first].ReturnType;
         end
         else
           raise new Exception('알 수 없는 한정자 "'+first+'" (연쇄 속성 접근의 시작점을 찾을 수 없습니다)');
       end;
+      Writeln('[MARK-EQCFS-1] 반환 직전, Result="'+Result.ToString+'"');
+    end;
 
-      for i:=1 to segs.Count-1 do
+    // [Stage 139 분할] EmitQualifierChainLoad 루프 몸통 중 "로컬 클래스도 아니고 로컬
+    // getter/무인자메서드/필드도 아닌" 나머지 경우 — 외부 CLR 타입 프로퍼티/필드/무인자
+    // 메서드를 리플렉션으로 찾아 실제로 Callvirt/Ldfld를 방출하는 부분만 뽑아냈다.
+    // InferQualifierChainStepExternalMember와 판별 순서는 같지만 이쪽은 IL도 함께 낸다.
+    function EmitQualifierChainStepExternalMember(aIL: ILGenerator; curType: System.Type; localClsName78: string; segName: string): System.Type;
+    var pi: PropertyInfo; fi: System.Reflection.FieldInfo; mi101: MethodInfo;
+        _reflT100: System.Type; _P1EmptyTypesLocal1: array of System.Type;
+    begin
+      Writeln('[MARK-EQCSE-0] 진입, curType="'+curType.ToString+'" segName="'+segName+'"');
+      // 외부 CLR 타입(TreeView 등) — 기존 GetProperty/GetField 경로
+      // [Stage 100] curType이 로컬 TypeBuilder인데(localClsName78<>'') 로컬 getter/무인자메서드/
+      // 필드에 다 안 걸렸다면, 이 멤버는 로컬 클래스가 상속만 받은 외부 조상 타입의 것이다.
+      // curType(아직 CreateType 전인 TypeBuilder) 그대로 GetProperty/GetField를 부르면
+      // TypeBuilder는 리플렉션 조회 자체를 지원하지 않아 NotSupportedException이 난다.
+      _reflT100:=curType;
+      if (localClsName78<>'') and (FindExternalAncestorType(localClsName78)<>nil) then
+        _reflT100:=FindExternalAncestorType(localClsName78);
+
+      pi:=SafeGetProperty(_reflT100, segName);
+      if pi<>nil then
       begin
-        // [Stage 78 수정] curType이 아직 CreateType되지 않은 로컬 TypeBuilder이면
-        // GetProperty/GetField가 NotSupportedException을 던진다.
-        // fTypeBuilders를 역방향으로 조회해 클래스명을 찾고, fFieldBuilders에서 직접 FieldBuilder를 가져온다.
-        // [버그 수정] 이 자리에 있던 인라인 foreach(fTypeBuilders 역방향 조회)를
-        // FindLocalClassNameForTypeBuilder 호출로 교체한다. InferQualifierChainType
-        // 쪽의 동일한 foreach는 이미 (Stage 123) InferQualifierChainFindLocalClassName으로
-        // 뽑아내 고쳤는데, 이 함수(EmitQualifierChainLoad, 실제 IL 방출 쪽)의 쌍둥이
-        // foreach는 그 리팩터링이 누락되어 있었다. PascalABC.NET의 foreach는 암묵적으로
-        // try/finally로 감싸지는데, 이게 큰 함수(EmitQualifierChainLoad) 안에 인라인으로
-        // 남아 있으면 gen1(자기컴파일 결과물) 안에서 JIT 시점에 IL이 깨지는 문제가
-        // 재현된다(Stage 111/112/113과 동일 계열 — 실제로 src.Length.ToString() 같은
-        // 값 타입 체인을 처음 방출할 때 BadImageFormatException으로 나타났다).
-        // FindLocalClassNameForTypeBuilder는 이미 별도의 작은 함수로 분리되어 있고
-        // (원래 다른 자기컴파일 버그 수정으로 도입됨), 참조 비교뿐 아니라 이름 비교도
-        // 지원해 더 안전하므로 그대로 재사용한다.
-        if curType is TypeBuilder then
-          localClsName78:=FindLocalClassNameForTypeBuilder(curType)
-        else
-          localClsName78:='';
-
-        if (localClsName78<>'') and fInstanceMethods.ContainsKey(localClsName78)
-           and fInstanceMethods[localClsName78].ContainsKey('get_'+segs[i]) then
+        aIL.Emit(OpCodes.Callvirt, pi.GetGetMethod);
+        Result:=pi.PropertyType;
+      end
+      else
+      begin
+        fi:=_reflT100.GetField(segName);
+        if fi<>nil then
         begin
-          // [Stage 85] 로컬 클래스의 프로퍼티 getter (필드가 아니라 read 접근자 메서드를
-          // 호출해야 하는 경우, 예: property Enabled: boolean read FEnabled write SetEnabled;)
-          var localGetM85: MethodBuilder := fInstanceMethods[localClsName78]['get_'+segs[i]];
-          aIL.Emit(OpCodes.Callvirt, localGetM85);
-          curType:=localGetM85.ReturnType;
-        end
-        // [Stage 89] 괄호 없이 부른 인자 없는 메서드 — 예: w.GetValue.ToString처럼 Pascal
-        // 관례상 인자 없는 함수는 괄호를 생략할 수 있다. 프로퍼티(get_ 접두)도 필드도 아니고
-        // 실제 메서드 이름과 일치하면 그냥 호출한다(인자 개수 불일치는 원래 소스가 괄호 없이
-        // 쓸 수 있는 진짜 무인자 메서드라는 전제하에 검사하지 않는다).
-        else if (localClsName78<>'') and fInstanceMethods.ContainsKey(localClsName78)
-           and fInstanceMethods[localClsName78].ContainsKey(segs[i]) then
-        begin
-          var localM89: MethodBuilder := fInstanceMethods[localClsName78][segs[i]];
-          aIL.Emit(OpCodes.Callvirt, localM89);
-          curType:=localM89.ReturnType;
-        end
-        else if (localClsName78<>'') and fFieldBuilders.ContainsKey(localClsName78)
-           and fFieldBuilders[localClsName78].ContainsKey(segs[i]) then
-        begin
-          // 로컬 클래스의 필드 — FieldBuilder로 Ldfld (private 접근도 같은 어셈블리 안에서 IL 수준으로는 허용)
-          var localFb78: FieldBuilder := fFieldBuilders[localClsName78][segs[i]];
-          aIL.Emit(OpCodes.Ldfld, localFb78);
-          curType:=localFb78.FieldType;
+          aIL.Emit(OpCodes.Ldfld, fi);
+          Result:=fi.FieldType;
         end
         else
         begin
-          // 외부 CLR 타입(TreeView 등) — 기존 GetProperty/GetField 경로
-          // [Stage 100] curType이 로컬 TypeBuilder인데(localClsName78<>'') 위 세 검사(로컬
-          // getter/무인자메서드/필드)에 다 안 걸렸다면, 이 멤버는 로컬 클래스가 상속만 받은
-          // 외부 조상 타입(예: FormChild : DockContent의 DockPanel 프로퍼티)의 것이다.
-          // curType(아직 CreateType 전인 TypeBuilder) 그대로 GetProperty/GetField를 부르면
-          // TypeBuilder는 리플렉션 조회 자체를 지원하지 않아 NotSupportedException
-          // ("The invoked member is not supported in a dynamic module.")이 난다 — 외부 조상
-          // 타입으로 바꿔서 조회한다.
-          // [버그 수정 - Stage 93] TableLayoutPanel.Controls처럼 파생 타입이 'new'로 같은
-          // 이름의 프로퍼티를 다른 반환 타입으로 가리는 경우 curType.GetProperty(name)이
-          // AmbiguousMatchException을 던진다 — SafeGetProperty가 가장 파생된 선언으로
-          // 소거해서 찾아준다.
-          var _reflT100:=curType;
-          if (localClsName78<>'') and (FindExternalAncestorType(localClsName78)<>nil) then
-            _reflT100:=FindExternalAncestorType(localClsName78);
-
-          pi:=SafeGetProperty(_reflT100, segs[i]);
-          if pi<>nil then
-          begin
-            aIL.Emit(OpCodes.Callvirt, pi.GetGetMethod);
-            curType:=pi.PropertyType;
-          end
-          else
-          begin
-            fi:=_reflT100.GetField(segs[i]);
-            if fi<>nil then
-            begin
-              aIL.Emit(OpCodes.Ldfld, fi);
-              curType:=fi.FieldType;
-            end
-            else
-            begin
-              // [버그 수정] 프로퍼티도 필드도 아니면, Pascal 관례상 괄호를 생략한 인자 없는
-              // 메서드일 수 있다 (예: dirSb.ToString.Trim — StringBuilder.ToString()은 프로퍼티가
-              // 아니라 메서드다). 로컬 클래스에는 이미 이 처리(위 [Stage 89])가 있었지만 외부
-              // CLR 타입에는 빠져 있어서 곧장 "속성/필드가 없습니다"로 실패했다.
-              var _P1EmptyTypesLocal1: array of System.Type;
-              _P1EmptyTypesLocal1:=System.Type.EmptyTypes;
-              mi101:=_reflT100.GetMethod(segs[i], _P1EmptyTypesLocal1);
-              if mi101=nil then
-                raise new Exception('타입 "'+_reflT100.FullName+'"에 속성/필드/무인자 메서드 "'+segs[i]+'"가 없습니다 (연쇄 접근 중 — 경로: '+string.Join('.', segs)+')');
-              aIL.Emit(OpCodes.Callvirt, mi101);
-              curType:=mi101.ReturnType;
-            end;
-          end;
+          // [버그 수정] 프로퍼티도 필드도 아니면, Pascal 관례상 괄호를 생략한 인자 없는
+          // 메서드일 수 있다 (예: dirSb.ToString.Trim).
+          _P1EmptyTypesLocal1:=System.Type.EmptyTypes;
+          mi101:=_reflT100.GetMethod(segName, _P1EmptyTypesLocal1);
+          if mi101=nil then
+            raise new Exception('타입 "'+_reflT100.FullName+'"에 속성/필드/무인자 메서드 "'+segName+'"가 없습니다 (연쇄 접근 중)');
+          aIL.Emit(OpCodes.Callvirt, mi101);
+          Result:=mi101.ReturnType;
         end;
       end;
+      Writeln('[MARK-EQCSE-1] 반환 직전, Result="'+Result.ToString+'"');
+    end;
+
+    // [Stage 139 분할] EmitQualifierChainLoad 루프의 한 스텝(세그먼트 하나 처리)만 담당하는
+    // 얇은 함수. 로컬 클래스 판별(FindLocalClassNameForTypeBuilder 재사용) → 로컬 getter /
+    // 로컬 무인자메서드 / 로컬 필드 순으로 확인하고, 아니면 EmitQualifierChainStepExternalMember로 위임한다.
+    function EmitQualifierChainStep(aIL: ILGenerator; segs: List<string>; i: integer; curType: System.Type): System.Type;
+    var localClsName78: string;
+    begin
+      Writeln('[MARK-EQCS-0] 진입, i='+i.ToString+' segs[i]="'+segs[i]+'" curType="'+curType.ToString+'"');
+      if curType is TypeBuilder then
+        localClsName78:=FindLocalClassNameForTypeBuilder(curType)
+      else
+        localClsName78:='';
+
+      if (localClsName78<>'') and fInstanceMethods.ContainsKey(localClsName78)
+         and fInstanceMethods[localClsName78].ContainsKey('get_'+segs[i]) then
+      begin
+        // [Stage 85] 로컬 클래스의 프로퍼티 getter
+        var localGetM85: MethodBuilder := fInstanceMethods[localClsName78]['get_'+segs[i]];
+        aIL.Emit(OpCodes.Callvirt, localGetM85);
+        Result:=localGetM85.ReturnType;
+      end
+      // [Stage 89] 괄호 없이 부른 인자 없는 메서드
+      else if (localClsName78<>'') and fInstanceMethods.ContainsKey(localClsName78)
+         and fInstanceMethods[localClsName78].ContainsKey(segs[i]) then
+      begin
+        var localM89: MethodBuilder := fInstanceMethods[localClsName78][segs[i]];
+        aIL.Emit(OpCodes.Callvirt, localM89);
+        Result:=localM89.ReturnType;
+      end
+      else if (localClsName78<>'') and fFieldBuilders.ContainsKey(localClsName78)
+         and fFieldBuilders[localClsName78].ContainsKey(segs[i]) then
+      begin
+        // 로컬 클래스의 필드 — FieldBuilder로 Ldfld
+        var localFb78: FieldBuilder := fFieldBuilders[localClsName78][segs[i]];
+        aIL.Emit(OpCodes.Ldfld, localFb78);
+        Result:=localFb78.FieldType;
+      end
+      else
+      begin
+        Writeln('[MARK-EQCS-1] 외부 CLR 타입 경로 — EmitQualifierChainStepExternalMember 호출 직전');
+        Result:=EmitQualifierChainStepExternalMember(aIL, curType, localClsName78, segs[i]);
+      end;
+      Writeln('[MARK-EQCS-2] 반환 직전, Result="'+Result.ToString+'"');
+    end;
+
+    // [Stage 76] 점(.)으로 연결된 한정자 체인("MainMenu.Items", "FileMenu.DropDownItems" 등)을
+    // 첫 세그먼트부터 차례로 로드한다. [Stage 139 분할] 이후로는 얇은 디스패처만 남는다 —
+    // 큰 함수 하나에 모든 분기가 들어있으면 gen1(자기컴파일 결과물) JIT 시점에 IL이 깨지는
+    // 문제가 이 프로젝트에서 반복적으로 확인된 패턴이라, 첫 세그먼트 판별과 루프 스텝을
+    // EmitQualifierChainFirstSegment / EmitQualifierChainStep(ExternalMember)으로 뽑아냈다.
+    procedure EmitQualifierChainLoad(aIL: ILGenerator; segs: List<string>; var finalType: System.Type);
+    var i: integer; curType: System.Type;
+    begin
+      Writeln('[MARK-EQCL-0] 진입, segs.Count='+segs.Count.ToString+' first="'+segs[0]+'"');
+      curType:=EmitQualifierChainFirstSegment(aIL, segs[0]);
+      for i:=1 to segs.Count-1 do
+        curType:=EmitQualifierChainStep(aIL, segs, i, curType);
       finalType:=curType;
+      Writeln('[MARK-EQCL-1] 반환 직전, finalType="'+finalType.ToString+'"');
     end;
 
     // [Stage 76 확장] EmitQualifierChainLoad와 완전히 같은 판별 순서를 따르되, IL을 전혀 방출하지
@@ -1280,102 +1293,114 @@
     end;
 
     // [Stage 116] 분기 1/4 — ObjName이 점(.)으로 연결된 체인인 경우.
-    function InferTypeMethodCallAChain(_mc4: TMethodCallExprNode; var r: TVarType): boolean;
+    // [Stage 140 분할 — 자기컴파일 IL 손상 수정] InferTypeMethodCallAChain은 원래 두 개의
+    // 완전히 다른 경로를 한 함수 안에 같이 담고 있었다: (1) IsChainStartSegment=true인 경우의
+    // 체인 타입 추론(위쪽 if 분기), (2) 외부 네임스페이스/정적 멤버 조회(아래쪽 else 분기) —
+    // 그리고 이 else 분기 안에는 try/except가 두 개나 들어 있다(ResolveExternalType /
+    // ResolveOrEmitStaticChain 호출부). 이 프로젝트에서 반복 확인된 패턴대로, try/except나
+    // foreach가 들어있는 코드가 큰 함수 안에 같이 있으면 그 함수 전체의 IL이 gen1(자기컴파일
+    // 결과물) JIT 시점에 깨진다 — 실제로 Stage 110 자기컴파일 로그에서 else 분기는 전혀
+    // 실행되지 않는데도(입력이 항상 체인 경로), if 분기 안의 MARK-ITMCC-6에서
+    // "_cmi4NotOk.ToString"이 정상값("False") 대신 "0"을 찍고 그 직후 BadImageFormatException으로
+    // 죽는 것으로 확인됐다(gen0 정상 실행 로그에서는 같은 지점이 항상 "False"). 두 경로를
+    // 완전히 별도 함수로 분리해, try/except가 있는 else 경로가 if 경로의 IL에 영향을
+    // 주지 않도록 한다.
+    function InferTypeMethodCallAChainQualified(_mc4: TMethodCallExprNode; _chainSegs4: List<string>; var r: TVarType): boolean;
     var _itmccB0: boolean;
     begin
       Result:=true;
-      var _chainSegs4:=SplitByDot(_mc4.ObjName);
-      Writeln('[MARK-ITMCC-0] 진입, ObjName="'+_mc4.ObjName+'" MethodName="'+_mc4.MethodName+'"');
-      if IsChainStartSegment(_chainSegs4[0]) then
-      begin
-        Writeln('[MARK-ITMCC-1] IsChainStartSegment=true — InferQualifierChainType 호출 직전');
-        // 첫 세그먼트가 실제 필드/변수/self 상속 프로퍼티 — 체인을 끝까지 타입만 추적한다.
-        var _chainType4:=InferQualifierChainType(_chainSegs4);
-        Writeln('[MARK-ITMCC-2] InferQualifierChainType 반환 완료, _chainType4="'+_chainType4.ToString+'" — SafeGetProperty 호출 직전');
-        var _cpi4:=SafeGetProperty(_chainType4, _mc4.MethodName);
-        _itmccB0 := (_cpi4 = nil);
-        Writeln('[MARK-ITMCC-3] SafeGetProperty 반환 완료, _cpi4=nil? '+_itmccB0.ToString);
-        // [자기컴파일 버그 수정 - Stage 110] "(_cpi4<>nil) and (_cpi4.PropertyType=...)"는
-        // gen0가 자기 자신을 컴파일할 때 방출하는 and의 IL이 short-circuit이 아니어서,
-        // _cpi4=nil이어도 뒤쪽 _cpi4.PropertyType을 그대로 평가해 NullReferenceException이
-        // 난다(src.Length.ToString()에서 실제 재현 — ToString은 프로퍼티가 아니라
-        // SafeGetProperty가 nil을 반환함). 기존 5개 파일에서 쓴 것과 동일한 _okNNN 패턴으로
-        // nil 체크와 멤버 접근을 완전히 분리된 if로 나눈다.
-        var _cpi4Ok:=(_cpi4<>nil);
-        if _cpi4Ok then _cpi4Ok:=(_cpi4.PropertyType=typeof(string));
-        Writeln('[MARK-ITMCC-4] _cpi4Ok(프로퍼티+string) 판정 완료='+_cpi4Ok.ToString);
-        if _cpi4Ok then r:=vtString
-        else
-        begin
-          Writeln('[MARK-ITMCC-5] else 분기 — ResolveMethodByArity 호출 직전');
-          var _cmi4:=ResolveMethodByArity(_chainType4, _mc4.MethodName, _mc4.Args, false);
-          // [진단] RMBA-3(함수 내부 마지막 줄)은 찍히는데 ITMCC-6은 안 찍히는 문제를 좁히기
-          // 위한 임시 마크. 이게 찍히면 "호출→복귀" 자체는 무사히 됐고 범인은 그 아래(_cmi4Ok
-          // 계산 또는 Writeln)이며, 안 찍히면 ResolveMethodByArity 함수 자체(특히 foreach가
-          // 남아있는 본체)가 반환 시점에 손상된 IL을 내는 것이 확정된다. 원인 확인 후 지워도 됨.
-          // (여기서도 불리언 체이닝 anti-pattern을 피하려고 중간 변수로 분리해 둔다.)
-          var _cmi4IsNil5b:=(_cmi4=nil);
-          var _cmi4IsNilStr5b:=_cmi4IsNil5b.ToString;
-          Writeln('[MARK-ITMCC-5b] ResolveMethodByArity 호출부 복귀 직후, _cmi4=nil? '+_cmi4IsNilStr5b);
-          var _cmi4Ok:=(_cmi4<>nil);
-          // [자기컴파일 버그 수정 - 진짜 근본 원인] ".ToString()"을 "not X"처럼 그 자리에서
-          // 계산되는 식에 곧바로 체이닝하면(예: (not _cmi4Ok).ToString) — 이미 선언된 순수
-          // 변수 위에서 부르는 ".ToString()"(예: classHasAbstractMethod.ToString, _cpi4Ok.ToString,
-          // 둘 다 이 파일에서 검증된 정상 패턴)과 달리 gen0가 손상된 IL을 방출해 self-host
-          // 빌드에서 NullReferenceException으로 이어진다(실제 재현: RMBA-3/ITMCC-5b까지는
-          // 정상 출력되고 바로 이 줄에서 죽음 — 이전에 시도했던 "문자열 접합 밖으로 빼기"
-          // 수정만으로는 부족했다. "계산식.ToString()" 자체가 문제이지, 접합 여부는 무관했다).
-          // "not _cmi4Ok" 결과를 먼저 순수 변수에 담아 확정한 뒤, 그 변수 위에서만 ToString을 부른다.
-          var _cmi4NotOk:=not _cmi4Ok;
-          var _cmi4NotOkStr:=_cmi4NotOk.ToString;
-          Writeln('[MARK-ITMCC-6] ResolveMethodByArity 반환 완료, _cmi4=nil? '+_cmi4NotOkStr);
-          if _cmi4Ok then _cmi4Ok:=(_cmi4.ReturnType=typeof(string));
-          if _cmi4Ok then r:=vtString
-          else r:=vtInteger;
-        end;
-        Writeln('[MARK-ITMCC-7] InferTypeMethodCallAChain 반환 직전, r 확정 완료');
-      end
+      Writeln('[MARK-ITMCC-1] IsChainStartSegment=true — InferQualifierChainType 호출 직전');
+      // 첫 세그먼트가 실제 필드/변수/self 상속 프로퍼티 — 체인을 끝까지 타입만 추적한다.
+      var _chainType4:=InferQualifierChainType(_chainSegs4);
+      Writeln('[MARK-ITMCC-2] InferQualifierChainType 반환 완료, _chainType4="'+_chainType4.ToString+'" — SafeGetProperty 호출 직전');
+      var _cpi4:=SafeGetProperty(_chainType4, _mc4.MethodName);
+      _itmccB0 := (_cpi4 = nil);
+      Writeln('[MARK-ITMCC-3] SafeGetProperty 반환 완료, _cpi4=nil? '+_itmccB0.ToString);
+      // [자기컴파일 버그 수정 - Stage 110] "(_cpi4<>nil) and (_cpi4.PropertyType=...)"는
+      // gen0가 자기 자신을 컴파일할 때 방출하는 and의 IL이 short-circuit이 아니어서,
+      // _cpi4=nil이어도 뒤쪽 _cpi4.PropertyType을 그대로 평가해 NullReferenceException이
+      // 난다(src.Length.ToString()에서 실제 재현 — ToString은 프로퍼티가 아니라
+      // SafeGetProperty가 nil을 반환함). 기존 5개 파일에서 쓴 것과 동일한 _okNNN 패턴으로
+      // nil 체크와 멤버 접근을 완전히 분리된 if로 나눈다.
+      var _cpi4Ok:=(_cpi4<>nil);
+      if _cpi4Ok then _cpi4Ok:=(_cpi4.PropertyType=typeof(string));
+      Writeln('[MARK-ITMCC-4] _cpi4Ok(프로퍼티+string) 판정 완료='+_cpi4Ok.ToString);
+      if _cpi4Ok then r:=vtString
       else
       begin
-        // 첫 세그먼트가 진짜 외부 네임스페이스/타입 경로 — 기존 TStaticMemberExprNode와
-        // 동일한 방식으로 정적 필드/프로퍼티를 조회한다 (예: System.EventArgs.Empty).
-        // [버그 수정 - gen0 codegen 우회] var 선언에 초기화식이 없으면 아무 IL도 방출되지
-        // 않아, 이 else 분기로 들어오는 브랜치(if IsChainStartSegment... else)의 목적지가
-        // 바로 다음 줄 try 블록의 첫 명령과 겹쳐버린다(보호영역으로의 불법 진입 →
-        // BadImageFormatException, gen0의 EmitStatement/TTryStmtNode 코드젠 결함).
-        // gen0 자체를 고칠 수는 없으니, 여기서는 ":= nil" 초기화식을 명시해 실제 ldnull/stloc
-        // 명령을 하나 끼워 넣어 분기 목적지와 try 진입점이 겹치지 않게 우회한다.
-        var _staticT4: System.Type := nil;
-        try _staticT4:=ResolveExternalType(_mc4.ObjName); except _staticT4:=nil; end;
-        // [Stage 99 버그 수정] "System.Reflection.Assembly.GetExecutingAssembly"처럼
-        // ObjName 전체가 타입이 아니라 타입+무인자 정적 메서드 체인일 수 있다 — EmitExpr의
-        // 동일한 경로와 같은 방식으로 재시도한다(aIL=nil이므로 IL은 방출하지 않고 최종
-        // CLR 타입만 알아낸다).
-        if _staticT4=nil then
-        begin
-          var _isInst4: boolean;
-          try _staticT4:=ResolveOrEmitStaticChain(nil, _mc4.ObjName, _isInst4); except _staticT4:=nil; end;
-        end;
-        if _staticT4=nil then begin r:=vtInteger; exit; end;
-        var _spi4:=SafeGetProperty(_staticT4, _mc4.MethodName);
-        if (_spi4<>nil) and (_spi4.PropertyType=typeof(string)) then r:=vtString
+        Writeln('[MARK-ITMCC-5] else 분기 — ResolveMethodByArity 호출 직전');
+        var _cmi4:=ResolveMethodByArity(_chainType4, _mc4.MethodName, _mc4.Args, false);
+        var _cmi4IsNil5b:=(_cmi4=nil);
+        var _cmi4IsNilStr5b:=_cmi4IsNil5b.ToString;
+        Writeln('[MARK-ITMCC-5b] ResolveMethodByArity 호출부 복귀 직후, _cmi4=nil? '+_cmi4IsNilStr5b);
+        var _cmi4Ok:=(_cmi4<>nil);
+        var _cmi4NotOk:=not _cmi4Ok;
+        var _cmi4NotOkStr:=_cmi4NotOk.ToString;
+        Writeln('[MARK-ITMCC-6] ResolveMethodByArity 반환 완료, _cmi4=nil? '+_cmi4NotOkStr);
+        if _cmi4Ok then _cmi4Ok:=(_cmi4.ReturnType=typeof(string));
+        if _cmi4Ok then r:=vtString
+        else r:=vtInteger;
+      end;
+      Writeln('[MARK-ITMCC-7] InferTypeMethodCallAChainQualified 반환 직전, r 확정 완료');
+    end;
+
+    // [Stage 140 분할] 첫 세그먼트가 진짜 외부 네임스페이스/타입 경로인 경우(예:
+    // System.EventArgs.Empty) — 기존 TStaticMemberExprNode와 동일한 방식으로 정적
+    // 필드/프로퍼티/메서드를 조회한다. try/except 두 개를 포함한 이 경로 전체를
+    // 위 Qualified 함수와 완전히 분리된 함수로 뽑아냈다.
+    function InferTypeMethodCallAChainStatic(_mc4: TMethodCallExprNode; var r: TVarType): boolean;
+    begin
+      Result:=true;
+      Writeln('[MARK-ITMCC-S0] 진입 — 외부 네임스페이스/정적 멤버 경로');
+      // [버그 수정 - gen0 codegen 우회] var 선언에 초기화식이 없으면 아무 IL도 방출되지
+      // 않아, 이 분기의 목적지가 바로 다음 줄 try 블록의 첫 명령과 겹쳐버린다(보호영역으로의
+      // 불법 진입 → BadImageFormatException, gen0의 EmitStatement/TTryStmtNode 코드젠 결함).
+      // gen0 자체를 고칠 수는 없으니, 여기서는 ":= nil" 초기화식을 명시해 실제 ldnull/stloc
+      // 명령을 하나 끼워 넣어 분기 목적지와 try 진입점이 겹치지 않게 우회한다.
+      var _staticT4: System.Type := nil;
+      try _staticT4:=ResolveExternalType(_mc4.ObjName); except _staticT4:=nil; end;
+      // [Stage 99 버그 수정] "System.Reflection.Assembly.GetExecutingAssembly"처럼
+      // ObjName 전체가 타입이 아니라 타입+무인자 정적 메서드 체인일 수 있다 — EmitExpr의
+      // 동일한 경로와 같은 방식으로 재시도한다(aIL=nil이므로 IL은 방출하지 않고 최종
+      // CLR 타입만 알아낸다).
+      if _staticT4=nil then
+      begin
+        var _isInst4: boolean;
+        try _staticT4:=ResolveOrEmitStaticChain(nil, _mc4.ObjName, _isInst4); except _staticT4:=nil; end;
+      end;
+      if _staticT4=nil then begin r:=vtInteger; Writeln('[MARK-ITMCC-S1] _staticT4=nil, r:=vtInteger 조기 반환'); exit; end;
+      var _spi4:=SafeGetProperty(_staticT4, _mc4.MethodName);
+      if (_spi4<>nil) and (_spi4.PropertyType=typeof(string)) then r:=vtString
+      else
+      begin
+        var _sfi4:=_staticT4.GetField(_mc4.MethodName);
+        if (_sfi4<>nil) and (_sfi4.FieldType=typeof(string)) then r:=vtString
         else
         begin
-          var _sfi4:=_staticT4.GetField(_mc4.MethodName);
-          if (_sfi4<>nil) and (_sfi4.FieldType=typeof(string)) then r:=vtString
-          else
-          begin
-            // [버그 수정] 프로퍼티/필드가 아니라 "정적 메서드"인 경우(예:
-            // System.IO.Path.GetFileName(...))가 전혀 검사되지 않아 항상 vtInteger로
-            // 폴백했다. 그 결과 실제로는 string을 반환하는 외부 정적 메서드 호출이
-            // 정수로 오판되어, 문자열 연결식에서 string 참조값이 정수 변환 경로를 타
-            // 쓰레기(주소값에 가까운 숫자)로 찍히는 문제가 있었다.
-            var _smi4:=ResolveMethodByArity(_staticT4, _mc4.MethodName, _mc4.Args, true);
-            if (_smi4<>nil) and (_smi4.ReturnType=typeof(string)) then r:=vtString
-            else r:=vtInteger;
-          end;
+          // [버그 수정] 프로퍼티/필드가 아니라 "정적 메서드"인 경우(예:
+          // System.IO.Path.GetFileName(...))가 전혀 검사되지 않아 항상 vtInteger로
+          // 폴백했다. 그 결과 실제로는 string을 반환하는 외부 정적 메서드 호출이
+          // 정수로 오판되어, 문자열 연결식에서 string 참조값이 정수 변환 경로를 타
+          // 쓰레기(주소값에 가까운 숫자)로 찍히는 문제가 있었다.
+          var _smi4:=ResolveMethodByArity(_staticT4, _mc4.MethodName, _mc4.Args, true);
+          if (_smi4<>nil) and (_smi4.ReturnType=typeof(string)) then r:=vtString
+          else r:=vtInteger;
         end;
       end;
+      Writeln('[MARK-ITMCC-S2] 반환 직전');
+    end;
+
+    // [Stage 116] 분기 1/4 — ObjName이 점(.)으로 연결된 체인인 경우.
+    // [Stage 140 분할] 얇은 디스패처로 축소 — 두 경로는 위 두 함수를 참고.
+    function InferTypeMethodCallAChain(_mc4: TMethodCallExprNode; var r: TVarType): boolean;
+    var _chainSegs4: List<string>;
+    begin
+      _chainSegs4:=SplitByDot(_mc4.ObjName);
+      Writeln('[MARK-ITMCC-0] 진입, ObjName="'+_mc4.ObjName+'" MethodName="'+_mc4.MethodName+'"');
+      if IsChainStartSegment(_chainSegs4[0]) then
+        Result:=InferTypeMethodCallAChainQualified(_mc4, _chainSegs4, r)
+      else
+        Result:=InferTypeMethodCallAChainStatic(_mc4, r);
     end;
 
     // [Stage 116] 분기 2/4 — ObjName='' (Self.Method(...) / 암시적 self 호출).

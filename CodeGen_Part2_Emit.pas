@@ -31,214 +31,70 @@
       end;
     end;
 
-    procedure EmitExpr(aIL: ILGenerator; e: TExprNode);
-    var
-      lit: TIntLiteralNode; slit: TStrLiteralNode; vr: TVarRefNode;
-      b: TBinOpNode; cmp: TCompareNode; fc: TFuncCallExprNode;
-      its: TIntToStrNode; bts: TBoolToStrNode; ai: TArrayIndexExprNode; le: TLengthExprNode;
-      neo: TNewObjectExprNode; mc: TMethodCallExprNode; fr: TFieldReadExprNode;
-      loc: LocalBuilder; mb: MethodBuilder; imb: MethodBuilder;
-      ae: TExprNode; ts, cat: MethodInfo; lt, rt, at2: TVarType;
-      fb: FieldBuilder;
-      ctor: ConstructorInfo; cn: string; vtVar: TVarType;
-      _argIdx48: integer; // [Stage 48]
-      imbSelf100: MethodBuilder; // [버그 수정] Cur.Kind처럼 self의 무인자 메서드 호출 체인용
+    // [Stage 142 버그 수정 — 자기컴파일 IL 손상] Stage 141에서 EmitExpr의 바깥쪽
+    // try/finally(재귀깊이 카운터)를 EmitExprDispatch 밖으로 뺐는데도 Stage 110 self 로그가
+    // 여전히 EmitExprDispatch 진입 직후 BadImageFormatException으로 죽었다. 원인은
+    // EmitExprDispatch "자기 자신의 몸통 안"에 인라인 try/except가 4곳(mc.ObjName 정적 타입
+    // 조회 3곳 + ResolveOrEmitStaticChain 1곳)과 인라인 foreach가 1곳(ExtraIndices 순회) 그대로
+    // 남아있었던 것 — 이 프로젝트에서 반복 확인된 "큰 함수 + try/except/foreach 동거" 패턴이
+    // try/finally를 빼낸 뒤에도 그대로 재현된 것이다. SafeArrayElemType과 동일한 방식으로
+    // try/except를 별도의 작은 Safe* 함수로 뽑아 EmitExprDispatch 몸통에서 완전히 제거한다.
+    function SafeResolveExternalType(typeName: string): System.Type;
     begin
-      fEmitDepth:=fEmitDepth+1;
-      if fEmitDepth>5000 then
-        raise new Exception('[진단] EmitExpr 재귀 깊이 초과(5000) — 폭주 의심 노드: '+e.GetType.Name);
+      Result:=nil;
       try
-      if e is TIntLiteralNode then
-      begin lit:=TIntLiteralNode(e); aIL.Emit(OpCodes.Ldc_I4, lit.Value); end
+        Result:=ResolveExternalType(typeName);
+      except
+        Result:=nil;
+      end;
+    end;
 
-      // [Phase 1] 새 리터럴 노드
-      else if e is TRealLiteralNode then
-        aIL.Emit(OpCodes.Ldc_R8, TRealLiteralNode(e).Value)
+    function SafeResolveOrEmitStaticChain(aIL: ILGenerator; objName: string; var isInst: boolean): System.Type;
+    begin
+      Result:=nil;
+      isInst:=false;
+      try
+        Result:=ResolveOrEmitStaticChain(aIL, objName, isInst);
+      except
+        Result:=nil;
+      end;
+    end;
 
-      else if e is TCharLiteralNode then
-        aIL.Emit(OpCodes.Ldc_I4, integer(TCharLiteralNode(e).Value))
+    // [Stage 142] EmitExprDispatch 몸통 안의 인라인 foreach(obj[i][j][k]... 추가 인덱스 체인)도
+    // 같은 이유로 별도 함수로 뽑는다.
+    function EmitExtraIndicesChain(aIL: ILGenerator; extraIndices: List<TExprNode>; startType: System.Type): System.Type;
+    var t: System.Type;
+    begin
+      t:=startType;
+      foreach var eiExtra96 in extraIndices do
+        t:=EmitIndexerGet(aIL, t, eiExtra96);
+      Result:=t;
+    end;
 
-      else if e is TInt64LiteralNode then
-        aIL.Emit(OpCodes.Ldc_I8, TInt64LiteralNode(e).Value)
-
-      else if e is TEnumValueExprNode then
-        // [Stage 51] 열거형 값(North 등)은 CLR에서 int32 기반 Enum이므로 서수를 그대로 Ldc_I4로 방출한다.
-        aIL.Emit(OpCodes.Ldc_I4, TEnumValueExprNode(e).Ordinal)
-
-      else if e is TNilLiteralNode then
-        aIL.Emit(OpCodes.Ldnull) // [Stage 29] — 참조 타입 지역/필드 변수와만 비교·대입에 사용
-
-      else if e is TStrLiteralNode then
-      begin slit:=TStrLiteralNode(e); aIL.Emit(OpCodes.Ldstr, slit.Value); end
-
-      else if e is TResultRefNode then
-      begin
-        if fResultLocal=nil then raise new Exception('Result는 함수 안에서만');
-        aIL.Emit(OpCodes.Ldloc, fResultLocal);
-      end
-
-      else if e is TIntToStrNode then
-      begin
-        its:=TIntToStrNode(e); EmitExpr(aIL, its.Arg);
-        ts:=typeof(System.Convert).GetMethod('ToString', [typeof(integer)]);
-        aIL.Emit(OpCodes.Call, ts);
-      end
-
-      // [Stage 76] BoolToStr(expr): boolean -> 'True'/'False' 문자열
-      // [버그 수정] boolean은 값 타입(struct)이라 bool.ToString()을 인스턴스 메서드로
-      // Call하려면 스택에 "값의 주소"가 있어야 하는데, 이전 코드는 값(int32 0/1) 자체를
-      // 스택에 둔 채 Call했다 — CLR이 그 int32를 this 포인터로 오인해 역참조하면서
-      // NullReferenceException 발생. IntToStr과 동일하게 정적 메서드
-      // Convert.ToString(Boolean)을 쓰면 값 그대로(파스칼 bool의 IL 표현 = int32) 넘겨도 안전하다.
-      else if e is TBoolToStrNode then
-      begin
-        bts:=TBoolToStrNode(e);
-        EmitExpr(aIL, bts.Arg);
-        var _boolToStr:=typeof(System.Convert).GetMethod('ToString', [typeof(boolean)]);
-        aIL.Emit(OpCodes.Call, _boolToStr);
-      end
-
-      else if e is TLengthExprNode then
-      begin
-        le:=TLengthExprNode(e);
-        // [버그 수정] Length(x)에서 x가 지역변수도 전역변수도 아니라 클래스 필드인 배열
-        // (예: 메서드 본문 안에서 자기 클래스의 배열 필드를 Length()로 재는 경우)이면,
-        // 예전에는 무조건 fGlobalScope.GetLoc(le.ArrName)를 호출해 존재하지 않는 키로
-        // KeyNotFoundException이 그대로 터졌다(호출부까지 예외 타입/메시지가 그대로
-        // 전파되어 "알 수 없는 변수" 같은 우리 쪽 진단 메시지도 못 남겼다). 다른 배열
-        // 접근부(TArrayIndexExprNode 등)와 마찬가지로 필드 폴백(Ldarg_0+Ldfld)을 추가한다.
-        if fLocalScope.Has(le.ArrName) then aIL.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(le.ArrName))
-        else if fGlobalScope.Has(le.ArrName) then aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(le.ArrName))
-        else
-        begin
-          var leFb: FieldBuilder;
-          if TryFindFieldBuilder(fCurClassName, le.ArrName, leFb) then
-          begin
-            aIL.Emit(OpCodes.Ldarg_0);
-            aIL.Emit(OpCodes.Ldfld, leFb);
-          end
-          else
-            raise new Exception('알 수 없는 변수 "'+le.ArrName+'" (Length 인자로 쓰인 배열을 지역/전역 변수도, "'
-              +fCurClassName+'" 클래스의 필드도 아닌 곳에서 찾을 수 없습니다).');
-        end;
-        aIL.Emit(OpCodes.Ldlen); aIL.Emit(OpCodes.Conv_I4);
-      end
-
-      else if e is TFieldReadExprNode then
-      begin
-        // self.fieldName 읽기 (인스턴스 메서드 안) — 지역 필드 또는 외부 상속 타입의 속성/필드
-        fr:=TFieldReadExprNode(e);
-        if TryFindFieldBuilder(fCurClassName, fr.FieldName, fb) then
-        begin
-          aIL.Emit(OpCodes.Ldarg_0); // self
-          aIL.Emit(OpCodes.Ldfld, fb);
-        end
-        else
-        begin
-          var _extType:=FindExternalAncestorType(fCurClassName);
-          if _extType=nil then
-            raise new Exception('필드/속성을 찾을 수 없음: '+fCurClassName+'.'+fr.FieldName);
-          var _pi:=SafeGetProperty(_extType, fr.FieldName);
-          if _pi<>nil then
-          begin
-            var _getter:=_pi.GetGetMethod;
-            if _getter=nil then
-              raise new Exception('속성 "'+_extType.FullName+'.'+fr.FieldName+'"에 getter가 없습니다 (쓰기 전용).');
-            aIL.Emit(OpCodes.Ldarg_0);
-            aIL.Emit(OpCodes.Callvirt, _getter);
-          end
-          else
-          begin
-            var _fi:=_extType.GetField(fr.FieldName);
-            if _fi=nil then
-              raise new Exception('외부 타입 "'+_extType.FullName+'"에 필드/속성 "'+fr.FieldName+'"가 없습니다.');
-            aIL.Emit(OpCodes.Ldarg_0);
-            aIL.Emit(OpCodes.Ldfld, _fi);
-          end;
-        end;
-      end
-
-      else if e is TNewObjectExprNode then
-      begin
-        // TCounter.Create / new TCounter / new System.IO.FileStream(a,b,c) → Newobj
-        // (지역 클래스 또는 외부 타입 모두 지원. [Stage 40] 인자 있는 외부 생성자 추가)
-        neo:=TNewObjectExprNode(e);
-        if neo.ArraySizeExpr<>nil then
-        begin
-          // [Stage 96 버그 수정] new Type[N](e1,...,eN) — 배열 생성 리터럴. Stage 92에서
-          // Parser는 이 문법(ArraySizeExpr)을 인식하도록 고쳐졌지만 CodeGen 쪽은
-          // ArraySizeExpr를 아예 확인하지 않고 그냥 "생성자 인자 N개"로 오인해서
-          // N-인자 생성자를 찾다가 실패했다 — WinForms 디자이너가 흔히 내보내는
-          // "new System.Windows.Forms.ToolStripItem[9](a, b, ..., i)"(요소 9개를 그대로
-          // 채운 ToolStripItem[] 배열)에서 실제로 터졌다. Newarr로 배열을 만들고
-          // 인자들을 Stelem으로 채워 넣는다.
-          var _arrElemT96: System.Type;
-          if neo.IsExternalType then _arrElemT96:=ResolveExternalType(neo.ClassName)
-          else if fBuiltTypes.ContainsKey(neo.ClassName) then _arrElemT96:=fBuiltTypes[neo.ClassName]
-          else raise new Exception('배열 원소 타입 "'+neo.ClassName+'"을(를) 찾을 수 없습니다 (new '+neo.ClassName+'[...] 배열 생성).');
-          EmitExpr(aIL, neo.ArraySizeExpr);
-          aIL.Emit(OpCodes.Newarr, _arrElemT96);
-          for var _arrI96:=0 to neo.Args.Count-1 do
-          begin
-            aIL.Emit(OpCodes.Dup);
-            aIL.Emit(OpCodes.Ldc_I4, _arrI96);
-            EmitArgForParamType(aIL, neo.Args[_arrI96], _arrElemT96);
-            if _arrElemT96.IsValueType then aIL.Emit(OpCodes.Stelem, _arrElemT96)
-            else aIL.Emit(OpCodes.Stelem_Ref);
-          end;
-        end
-        else if neo.IsExternalType then
-        begin
-          var _extCtorType:=ResolveExternalType(neo.ClassName);
-          if neo.Args.Count=0 then
-          begin
-            var _P2EmptyTypesLocal1: array of System.Type;
-            _P2EmptyTypesLocal1:=System.Type.EmptyTypes;
-            var _extCtor:=SafeGetConstructor(_extCtorType, _P2EmptyTypesLocal1);
-            if _extCtor=nil then
-              raise new Exception('외부 타입 "'+_extCtorType.FullName+'"에 매개변수 없는 public 생성자가 없습니다.');
-            aIL.Emit(OpCodes.Newobj, _extCtor);
-          end
-          else
-          begin
-            var _extCtorN:=ResolveConstructorByArity(_extCtorType, neo.Args);
-            if _extCtorN=nil then
-              raise new Exception('외부 타입 "'+_extCtorType.FullName+'"에 인자 '+neo.Args.Count.ToString+'개짜리 public 생성자가 없습니다.');
-            var _ctorParams48:=_extCtorN.GetParameters();
-            for _argIdx48:=0 to neo.Args.Count-1 do
-              EmitArgForParamType(aIL, neo.Args[_argIdx48], _ctorParams48[_argIdx48].ParameterType);
-            aIL.Emit(OpCodes.Newobj, _extCtorN);
-          end;
-        end
-        else
-        begin
-          if not fCtorBuilders.ContainsKey(neo.ClassName) then
-            raise new Exception('알 수 없는 클래스 "'+neo.ClassName+'"');
-          // [Stage 53] abstract 메서드가 있는 클래스는 인스턴스화할 수 없다. CLR도 런타임에
-          // MemberAccessException으로 막긴 하지만, 실행 시점이 아니라 지금(컴파일 시점)
-          // 알려주는 게 훨씬 낫다.
-          // [버그 수정] PascalABC.NET의 and 완전 평가(non-short-circuit) — neo.ClassName이
-          // fAbstractMethods에 없을 때도 인덱싱이 그대로 평가되어 KeyNotFoundException을
-          // 던지던 문제. ContainsKey일 때만 Count를 보는 단계적 if로 바꾼다.
-          if fAbstractMethods.ContainsKey(neo.ClassName) then
-          begin
-            if fAbstractMethods[neo.ClassName].Count>0 then
-              raise new Exception('"'+neo.ClassName+'"은(는) abstract 메서드를 갖고 있어 인스턴스를 생성할 수 없습니다 (abstract 클래스).');
-          end;
-          // [Stage 47] 로컬(우리 컴파일러가 만든) 클래스도 매개변수 있는 생성자를 지원한다.
-          // [Stage 99] 생성자가 여러 개(오버로드)일 수 있으므로 인자 개수로 맞는 것을 고른다.
-          var _localCtorIdx:=FindLocalCtorIndex(neo.ClassName, neo.Args.Count);
-          if _localCtorIdx<0 then
-            raise new Exception('"'+neo.ClassName+'"에 인자 '+neo.Args.Count.ToString+'개짜리 생성자가 없습니다.');
-          ctor:=fCtorBuilders[neo.ClassName][_localCtorIdx];
-          var _ctorParamsLocal:=fCtorParamClrTypes[neo.ClassName][_localCtorIdx];
-          EmitArgsCoerced(aIL, neo.Args, _ctorParamsLocal);
-          aIL.Emit(OpCodes.Newobj, ctor);
-        end;
-      end
-
-      else if e is TMethodCallExprNode then
-      begin
+    // [Stage 141 분할 — 자기컴파일 IL 손상 수정] EmitExpr 자체가 ~1600줄짜리 단일 함수였고,
+    // 그 전체가 fEmitDepth 재귀깊이 카운터를 위한 try/finally 하나로 통째로 감싸여 있었다
+    // (EmitStatement가 Stage 112에서 겪었던 것과 완전히 같은 모양 — "거대한 함수 + 그 전체를
+    // 감싸는 try/finally"). 이 프로젝트에서 반복 확인된 자기컴파일 IL 손상 패턴의 정석적인
+    // 사례라, gen1(자기컴파일 결과물)이 이 함수에 처음 진입하는 순간(EmitQualifierChainLoad
+    // 호출 이전, 즉 이 함수 자신의 dispatch 코드 안에서) BadImageFormatException으로
+    // 죽는 것으로 확인됐다 — Stage 110 self 로그에서 InferTypeMethodCallAChain 계열은
+    // 전부 정상 통과하고, EmitExpr 진입 이후 아무 마크도 없이 바로 크래시가 난다.
+    // EmitStatement 때와 동일한 해법 — try/finally를 몸통 전체가 아니라 얇은 래퍼
+    // EmitExpr에만 남기고, 실제 분기 로직(원본과 100% 동일)은 EmitExprDispatch로
+    // 옮겨 try/finally 밖에 둔다. (EmitExprDispatch 자체는 여전히 크므로, 이후 단계에서
+    // EmitStatementMethodCall처럼 재귀 호출이 없는 분기들을 추가로 뽑아내는 후속 분할이
+    // 필요할 수 있다 — 우선 try/finally 중첩부터 제거해 검증한다.)
+    // [Stage 143 분할 — 자기컴파일 IL 손상 추가 수정] Stage 142에서 EmitExprDispatch 몸통의
+    // try/except·foreach를 전부 제거했는데도 Stage 110 self 로그가 정확히 같은 지점(이 함수
+    // 진입 직후, EmitQualifierChainLoad 호출 이전)에서 여전히 BadImageFormatException으로
+    // 죽었다 — try/except·foreach 동거뿐 아니라 "메서드 자체의 크기"도 gen1 JIT 시점 IL 손상의
+    // 원인이 될 수 있다는 뜻으로 판단. EmitExprDispatch 안에서 압도적으로 큰 단일 분기인
+    // TMethodCallExprNode 처리부(~700줄)를, EmitStatement에서 EmitStatementMethodCall을 뽑아냈던
+    // 것과 똑같은 방식으로 별도 함수로 분리한다. 내용은 원본과 100% 동일 — 위치만 옮겼다.
+    procedure EmitExprMethodCallBranch(aIL: ILGenerator; e: TExprNode);
+    var mc: TMethodCallExprNode; imb: MethodBuilder; fb: FieldBuilder; cn: string;
+        vtVar: TVarType; imbSelf100: MethodBuilder;
+    begin
         // c.GetValue → Ldloc c + Call TCounter::GetValue
         mc:=TMethodCallExprNode(e);
         // [Stage 76 확장] ObjName 자체가 점(.)으로 연결된 체인이면(예: "MainMenu.Items.Count")
@@ -337,13 +193,11 @@
             // 실제 타입이 아니라 네임스페이스뿐이면(예: "System.Reflection") 아래
             // ResolveExternalType(mc.ObjName)이 실패한다 — 그 경우 ObjName+'.'+MethodName
             // 전체를 하나의 타입 이름으로 재시도해서 캐스트로 처리한다.
-            var _staticTE: System.Type := nil;
-            try _staticTE:=ResolveExternalType(mc.ObjName); except end;
+            var _staticTE: System.Type := SafeResolveExternalType(mc.ObjName);
 
             if (_staticTE=nil) and (mc.Args.Count=1) then
             begin
-              var _castTE92: System.Type := nil;
-              try _castTE92:=ResolveExternalType(mc.ObjName+'.'+mc.MethodName); except end;
+              var _castTE92: System.Type := SafeResolveExternalType(mc.ObjName+'.'+mc.MethodName);
               if _castTE92<>nil then
               begin
                 EmitExpr(aIL, mc.Args[0]);
@@ -375,7 +229,7 @@
             // 상태이므로, 이후 mc.MethodName은 정적이 아니라 인스턴스 멤버로 조회해야 한다.
             var _isInstTE: boolean := false;
             if _staticTE=nil then
-              try _staticTE:=ResolveOrEmitStaticChain(aIL, mc.ObjName, _isInstTE); except _staticTE:=nil; end;
+              _staticTE:=SafeResolveOrEmitStaticChain(aIL, mc.ObjName, _isInstTE);
 
             if _staticTE=nil then
               raise new Exception('외부 타입 "'+mc.ObjName+'"을(를) 찾을 수 없습니다. 기본 프레임워크(WinForms/WPF/System.*)가 아니라면 {$reference 어셈블리명.dll} 지시문으로 해당 타입이 들어있는 어셈블리를 먼저 등록했는지 확인하세요.');
@@ -903,8 +757,7 @@
           // ColumnHeaderStyle)일 가능성을 시도한다. 기존에는 이 케이스를 아예 시도하지
           // 않고 곧장 "알 수 없는 변수"로 던졌다 (ObjName 자체에 '.'이 있는 체인 케이스만
           // 위쪽 1364번째 줄 분기에서 static 타입 경로를 탔었음).
-          var _bareStaticT: System.Type := nil;
-          try _bareStaticT := ResolveExternalType(mc.ObjName); except end;
+          var _bareStaticT: System.Type := SafeResolveExternalType(mc.ObjName);
           if _bareStaticT <> nil then
           begin
             var _bareSpi := SafeGetProperty(_bareStaticT, mc.MethodName);
@@ -938,8 +791,212 @@
           else
             raise new Exception('알 수 없는 변수 "'+mc.ObjName+'"');
         end;
+      end;
+
+    procedure EmitExprDispatch(aIL: ILGenerator; e: TExprNode);
+    var
+      lit: TIntLiteralNode; slit: TStrLiteralNode; vr: TVarRefNode;
+      b: TBinOpNode; cmp: TCompareNode; fc: TFuncCallExprNode;
+      its: TIntToStrNode; bts: TBoolToStrNode; ai: TArrayIndexExprNode; le: TLengthExprNode;
+      neo: TNewObjectExprNode; mc: TMethodCallExprNode; fr: TFieldReadExprNode;
+      loc: LocalBuilder; mb: MethodBuilder; imb: MethodBuilder;
+      ae: TExprNode; ts, cat: MethodInfo; lt, rt, at2: TVarType;
+      fb: FieldBuilder;
+      ctor: ConstructorInfo; cn: string; vtVar: TVarType;
+      _argIdx48: integer; // [Stage 48]
+      imbSelf100: MethodBuilder; // [버그 수정] Cur.Kind처럼 self의 무인자 메서드 호출 체인용
+    begin
+      if e is TIntLiteralNode then
+      begin lit:=TIntLiteralNode(e); aIL.Emit(OpCodes.Ldc_I4, lit.Value); end
+
+      // [Phase 1] 새 리터럴 노드
+      else if e is TRealLiteralNode then
+        aIL.Emit(OpCodes.Ldc_R8, TRealLiteralNode(e).Value)
+
+      else if e is TCharLiteralNode then
+        aIL.Emit(OpCodes.Ldc_I4, integer(TCharLiteralNode(e).Value))
+
+      else if e is TInt64LiteralNode then
+        aIL.Emit(OpCodes.Ldc_I8, TInt64LiteralNode(e).Value)
+
+      else if e is TEnumValueExprNode then
+        // [Stage 51] 열거형 값(North 등)은 CLR에서 int32 기반 Enum이므로 서수를 그대로 Ldc_I4로 방출한다.
+        aIL.Emit(OpCodes.Ldc_I4, TEnumValueExprNode(e).Ordinal)
+
+      else if e is TNilLiteralNode then
+        aIL.Emit(OpCodes.Ldnull) // [Stage 29] — 참조 타입 지역/필드 변수와만 비교·대입에 사용
+
+      else if e is TStrLiteralNode then
+      begin slit:=TStrLiteralNode(e); aIL.Emit(OpCodes.Ldstr, slit.Value); end
+
+      else if e is TResultRefNode then
+      begin
+        if fResultLocal=nil then raise new Exception('Result는 함수 안에서만');
+        aIL.Emit(OpCodes.Ldloc, fResultLocal);
       end
 
+      else if e is TIntToStrNode then
+      begin
+        its:=TIntToStrNode(e); EmitExpr(aIL, its.Arg);
+        ts:=typeof(System.Convert).GetMethod('ToString', [typeof(integer)]);
+        aIL.Emit(OpCodes.Call, ts);
+      end
+
+      // [Stage 76] BoolToStr(expr): boolean -> 'True'/'False' 문자열
+      // [버그 수정] boolean은 값 타입(struct)이라 bool.ToString()을 인스턴스 메서드로
+      // Call하려면 스택에 "값의 주소"가 있어야 하는데, 이전 코드는 값(int32 0/1) 자체를
+      // 스택에 둔 채 Call했다 — CLR이 그 int32를 this 포인터로 오인해 역참조하면서
+      // NullReferenceException 발생. IntToStr과 동일하게 정적 메서드
+      // Convert.ToString(Boolean)을 쓰면 값 그대로(파스칼 bool의 IL 표현 = int32) 넘겨도 안전하다.
+      else if e is TBoolToStrNode then
+      begin
+        bts:=TBoolToStrNode(e);
+        EmitExpr(aIL, bts.Arg);
+        var _boolToStr:=typeof(System.Convert).GetMethod('ToString', [typeof(boolean)]);
+        aIL.Emit(OpCodes.Call, _boolToStr);
+      end
+
+      else if e is TLengthExprNode then
+      begin
+        le:=TLengthExprNode(e);
+        // [버그 수정] Length(x)에서 x가 지역변수도 전역변수도 아니라 클래스 필드인 배열
+        // (예: 메서드 본문 안에서 자기 클래스의 배열 필드를 Length()로 재는 경우)이면,
+        // 예전에는 무조건 fGlobalScope.GetLoc(le.ArrName)를 호출해 존재하지 않는 키로
+        // KeyNotFoundException이 그대로 터졌다(호출부까지 예외 타입/메시지가 그대로
+        // 전파되어 "알 수 없는 변수" 같은 우리 쪽 진단 메시지도 못 남겼다). 다른 배열
+        // 접근부(TArrayIndexExprNode 등)와 마찬가지로 필드 폴백(Ldarg_0+Ldfld)을 추가한다.
+        if fLocalScope.Has(le.ArrName) then aIL.Emit(OpCodes.Ldloc, fLocalScope.GetLoc(le.ArrName))
+        else if fGlobalScope.Has(le.ArrName) then aIL.Emit(OpCodes.Ldloc, fGlobalScope.GetLoc(le.ArrName))
+        else
+        begin
+          var leFb: FieldBuilder;
+          if TryFindFieldBuilder(fCurClassName, le.ArrName, leFb) then
+          begin
+            aIL.Emit(OpCodes.Ldarg_0);
+            aIL.Emit(OpCodes.Ldfld, leFb);
+          end
+          else
+            raise new Exception('알 수 없는 변수 "'+le.ArrName+'" (Length 인자로 쓰인 배열을 지역/전역 변수도, "'
+              +fCurClassName+'" 클래스의 필드도 아닌 곳에서 찾을 수 없습니다).');
+        end;
+        aIL.Emit(OpCodes.Ldlen); aIL.Emit(OpCodes.Conv_I4);
+      end
+
+      else if e is TFieldReadExprNode then
+      begin
+        // self.fieldName 읽기 (인스턴스 메서드 안) — 지역 필드 또는 외부 상속 타입의 속성/필드
+        fr:=TFieldReadExprNode(e);
+        if TryFindFieldBuilder(fCurClassName, fr.FieldName, fb) then
+        begin
+          aIL.Emit(OpCodes.Ldarg_0); // self
+          aIL.Emit(OpCodes.Ldfld, fb);
+        end
+        else
+        begin
+          var _extType:=FindExternalAncestorType(fCurClassName);
+          if _extType=nil then
+            raise new Exception('필드/속성을 찾을 수 없음: '+fCurClassName+'.'+fr.FieldName);
+          var _pi:=SafeGetProperty(_extType, fr.FieldName);
+          if _pi<>nil then
+          begin
+            var _getter:=_pi.GetGetMethod;
+            if _getter=nil then
+              raise new Exception('속성 "'+_extType.FullName+'.'+fr.FieldName+'"에 getter가 없습니다 (쓰기 전용).');
+            aIL.Emit(OpCodes.Ldarg_0);
+            aIL.Emit(OpCodes.Callvirt, _getter);
+          end
+          else
+          begin
+            var _fi:=_extType.GetField(fr.FieldName);
+            if _fi=nil then
+              raise new Exception('외부 타입 "'+_extType.FullName+'"에 필드/속성 "'+fr.FieldName+'"가 없습니다.');
+            aIL.Emit(OpCodes.Ldarg_0);
+            aIL.Emit(OpCodes.Ldfld, _fi);
+          end;
+        end;
+      end
+
+      else if e is TNewObjectExprNode then
+      begin
+        // TCounter.Create / new TCounter / new System.IO.FileStream(a,b,c) → Newobj
+        // (지역 클래스 또는 외부 타입 모두 지원. [Stage 40] 인자 있는 외부 생성자 추가)
+        neo:=TNewObjectExprNode(e);
+        if neo.ArraySizeExpr<>nil then
+        begin
+          // [Stage 96 버그 수정] new Type[N](e1,...,eN) — 배열 생성 리터럴. Stage 92에서
+          // Parser는 이 문법(ArraySizeExpr)을 인식하도록 고쳐졌지만 CodeGen 쪽은
+          // ArraySizeExpr를 아예 확인하지 않고 그냥 "생성자 인자 N개"로 오인해서
+          // N-인자 생성자를 찾다가 실패했다 — WinForms 디자이너가 흔히 내보내는
+          // "new System.Windows.Forms.ToolStripItem[9](a, b, ..., i)"(요소 9개를 그대로
+          // 채운 ToolStripItem[] 배열)에서 실제로 터졌다. Newarr로 배열을 만들고
+          // 인자들을 Stelem으로 채워 넣는다.
+          var _arrElemT96: System.Type;
+          if neo.IsExternalType then _arrElemT96:=ResolveExternalType(neo.ClassName)
+          else if fBuiltTypes.ContainsKey(neo.ClassName) then _arrElemT96:=fBuiltTypes[neo.ClassName]
+          else raise new Exception('배열 원소 타입 "'+neo.ClassName+'"을(를) 찾을 수 없습니다 (new '+neo.ClassName+'[...] 배열 생성).');
+          EmitExpr(aIL, neo.ArraySizeExpr);
+          aIL.Emit(OpCodes.Newarr, _arrElemT96);
+          for var _arrI96:=0 to neo.Args.Count-1 do
+          begin
+            aIL.Emit(OpCodes.Dup);
+            aIL.Emit(OpCodes.Ldc_I4, _arrI96);
+            EmitArgForParamType(aIL, neo.Args[_arrI96], _arrElemT96);
+            if _arrElemT96.IsValueType then aIL.Emit(OpCodes.Stelem, _arrElemT96)
+            else aIL.Emit(OpCodes.Stelem_Ref);
+          end;
+        end
+        else if neo.IsExternalType then
+        begin
+          var _extCtorType:=ResolveExternalType(neo.ClassName);
+          if neo.Args.Count=0 then
+          begin
+            var _P2EmptyTypesLocal1: array of System.Type;
+            _P2EmptyTypesLocal1:=System.Type.EmptyTypes;
+            var _extCtor:=SafeGetConstructor(_extCtorType, _P2EmptyTypesLocal1);
+            if _extCtor=nil then
+              raise new Exception('외부 타입 "'+_extCtorType.FullName+'"에 매개변수 없는 public 생성자가 없습니다.');
+            aIL.Emit(OpCodes.Newobj, _extCtor);
+          end
+          else
+          begin
+            var _extCtorN:=ResolveConstructorByArity(_extCtorType, neo.Args);
+            if _extCtorN=nil then
+              raise new Exception('외부 타입 "'+_extCtorType.FullName+'"에 인자 '+neo.Args.Count.ToString+'개짜리 public 생성자가 없습니다.');
+            var _ctorParams48:=_extCtorN.GetParameters();
+            for _argIdx48:=0 to neo.Args.Count-1 do
+              EmitArgForParamType(aIL, neo.Args[_argIdx48], _ctorParams48[_argIdx48].ParameterType);
+            aIL.Emit(OpCodes.Newobj, _extCtorN);
+          end;
+        end
+        else
+        begin
+          if not fCtorBuilders.ContainsKey(neo.ClassName) then
+            raise new Exception('알 수 없는 클래스 "'+neo.ClassName+'"');
+          // [Stage 53] abstract 메서드가 있는 클래스는 인스턴스화할 수 없다. CLR도 런타임에
+          // MemberAccessException으로 막긴 하지만, 실행 시점이 아니라 지금(컴파일 시점)
+          // 알려주는 게 훨씬 낫다.
+          // [버그 수정] PascalABC.NET의 and 완전 평가(non-short-circuit) — neo.ClassName이
+          // fAbstractMethods에 없을 때도 인덱싱이 그대로 평가되어 KeyNotFoundException을
+          // 던지던 문제. ContainsKey일 때만 Count를 보는 단계적 if로 바꾼다.
+          if fAbstractMethods.ContainsKey(neo.ClassName) then
+          begin
+            if fAbstractMethods[neo.ClassName].Count>0 then
+              raise new Exception('"'+neo.ClassName+'"은(는) abstract 메서드를 갖고 있어 인스턴스를 생성할 수 없습니다 (abstract 클래스).');
+          end;
+          // [Stage 47] 로컬(우리 컴파일러가 만든) 클래스도 매개변수 있는 생성자를 지원한다.
+          // [Stage 99] 생성자가 여러 개(오버로드)일 수 있으므로 인자 개수로 맞는 것을 고른다.
+          var _localCtorIdx:=FindLocalCtorIndex(neo.ClassName, neo.Args.Count);
+          if _localCtorIdx<0 then
+            raise new Exception('"'+neo.ClassName+'"에 인자 '+neo.Args.Count.ToString+'개짜리 생성자가 없습니다.');
+          ctor:=fCtorBuilders[neo.ClassName][_localCtorIdx];
+          var _ctorParamsLocal:=fCtorParamClrTypes[neo.ClassName][_localCtorIdx];
+          EmitArgsCoerced(aIL, neo.Args, _ctorParamsLocal);
+          aIL.Emit(OpCodes.Newobj, ctor);
+        end;
+      end
+
+      else if e is TMethodCallExprNode then
+        EmitExprMethodCallBranch(aIL, e)
       else if e is TExternalIndexExprNode then
       begin
         // [Stage 78] obj[i] — 대부분의 .NET 컬렉션이 따르는 관례(기본 인덱서 = "Item"
@@ -958,8 +1015,7 @@
         if eiN.IndexExpr2<>nil then
           eiResultType:=EmitIndexerGet(aIL, eiResultType, eiN.IndexExpr2);
         if eiN.ExtraIndices<>nil then
-          foreach var eiExtra96 in eiN.ExtraIndices do
-            eiResultType:=EmitIndexerGet(aIL, eiResultType, eiExtra96);
+          eiResultType:=EmitExtraIndicesChain(aIL, eiN.ExtraIndices, eiResultType);
         if (eiN.MemberName<>'') and (eiN.MethodArgs<>nil) then
         begin
           // [Stage 95] obj[i].Method(args) — 인덱싱 결과(스택에 이미 올라와 있음)에 대해
@@ -1651,6 +1707,15 @@
       end
 
       else raise new Exception('알 수 없는 식 노드: '+e.GetType.Name);
+    end;
+
+    procedure EmitExpr(aIL: ILGenerator; e: TExprNode);
+    begin
+      fEmitDepth:=fEmitDepth+1;
+      if fEmitDepth>5000 then
+        raise new Exception('[진단] EmitExpr 재귀 깊이 초과(5000) — 폭주 의심 노드: '+e.GetType.Name);
+      try
+        EmitExprDispatch(aIL, e);
       finally
         fEmitDepth:=fEmitDepth-1;
       end;
