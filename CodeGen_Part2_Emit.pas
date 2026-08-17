@@ -285,11 +285,10 @@
               // 넘어갔다 — TypeBuilder는 아직 완성되지 않아 리플렉션 조회가 안 되므로(또는 필드를
               // 아예 못 찾으므로) "타입에 메서드가 없습니다"로 잘못 실패했다. EmitQualifierChainLoad
               // 내부와 동일한 방식으로 먼저 로컬 클래스 멤버인지 확인한다.
+              // [110번째 자기컴파일 버그 수정] 인라인 foreach 대신 FindLocalClassNameForTypeBuilder 재사용.
               var _localClsE:='';
               if _chainTypeE is TypeBuilder then
-                foreach var _tbKvpE in fTypeBuilders do
-                  if _tbKvpE.Value = TypeBuilder(_chainTypeE) then
-                  begin _localClsE:=_tbKvpE.Key; break; end;
+                _localClsE:=FindLocalClassNameForTypeBuilder(_chainTypeE);
 
               if (_localClsE<>'') and fInstanceMethods.ContainsKey(_localClsE)
                  and fInstanceMethods[_localClsE].ContainsKey('get_'+mc.MethodName) and (mc.Args.Count=0) then
@@ -733,11 +732,12 @@
           // TryFindFieldBuilder(fCurClassName, mcs.ObjName, qfb) 분기)와 같은 방식으로, 로컬
           // 클래스 이름을 fTypeBuilders에서 역조회해 메타데이터 기반 경로
           // (FindInstanceMethod/FindExternalAncestorType)로 처리한다.
+          // [110번째 자기컴파일 버그 수정] 인라인 foreach(암묵적 try/finally) 대신
+          // FindLocalClassNameForTypeBuilder 재사용 — 큰 함수 안 인라인 foreach가
+          // gen1 JIT 시점에 IL을 깨뜨리는 문제(Stage 111/112/113 계열) 예방.
           var _localClsExpr98:string:='';
           if _qType is TypeBuilder then
-            foreach var _tbKvpExpr98 in fTypeBuilders do
-              if _tbKvpExpr98.Value = TypeBuilder(_qType) then
-              begin _localClsExpr98:=_tbKvpExpr98.Key; break; end;
+            _localClsExpr98:=FindLocalClassNameForTypeBuilder(_qType);
 
           if _localClsExpr98<>'' then
           begin
@@ -2725,11 +2725,10 @@
           // GetProperty가 NotSupportedException을 던진다 (예: f.Editor.OpenFile(...)에서
           // Editor 필드 타입 TCodeEditorPanel이 로컬 클래스인 경우). 2689번째 줄 근처의
           // 단일 필드 분기에 적용한 것과 동일한 우회를 여기(다중 세그먼트 체인)에도 적용한다.
+          // [110번째 자기컴파일 버그 수정] 인라인 foreach 대신 FindLocalClassNameForTypeBuilder 재사용.
           var chainLocalCls:string:='';
           if chainType is TypeBuilder then
-            foreach var tbKvpChain in fTypeBuilders do
-              if tbKvpChain.Value = TypeBuilder(chainType) then
-              begin chainLocalCls:=tbKvpChain.Key; break; end;
+            chainLocalCls:=FindLocalClassNameForTypeBuilder(chainType);
 
           if chainLocalCls<>'' then
           begin
@@ -3008,11 +3007,10 @@
           // fTypeBuilders를 역방향 조회해 클래스명을 찾고, 그 경우엔 Reflection
           // (GetProperty/ResolveMethodByArity) 대신 메타데이터 기반 경로
           // (FindInstanceMethod/FindInstanceMethodParamTypes)로 처리한다.
+          // [110번째 자기컴파일 버그 수정] 인라인 foreach 대신 FindLocalClassNameForTypeBuilder 재사용.
           var localClsNameFB:string:='';
           if qTargetType is TypeBuilder then
-            foreach var tbKvpFB in fTypeBuilders do
-              if tbKvpFB.Value = TypeBuilder(qTargetType) then
-              begin localClsNameFB:=tbKvpFB.Key; break; end;
+            localClsNameFB:=FindLocalClassNameForTypeBuilder(qTargetType);
 
           if localClsNameFB<>'' then
           begin
@@ -3921,12 +3919,10 @@
           // 동일하게 SetClassName도 등록해 TryFindFieldBuilder 경로를 타게 한다.
           if forInVarClrType is TypeBuilder then
           begin
-            foreach var _kvpFor102 in fTypeBuilders do
-              if _kvpFor102.Value = TypeBuilder(forInVarClrType) then
-              begin
-                fLocalScope.SetClassName(fis.VarName, _kvpFor102.Key);
-                break;
-              end;
+            // [110번째 자기컴파일 버그 수정] 인라인 foreach 대신 FindLocalClassNameForTypeBuilder 재사용.
+            var _forInLocalCls102:=FindLocalClassNameForTypeBuilder(forInVarClrType);
+            if _forInLocalCls102<>'' then
+              fLocalScope.SetClassName(fis.VarName, _forInLocalCls102);
           end;
         end;
 

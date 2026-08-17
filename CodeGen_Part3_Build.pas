@@ -988,6 +988,20 @@
       else if e is TIntLiteralNode then Result:=typeof(integer)
       else if e is TBoolLiteralNode then Result:=typeof(boolean)
       else if e is TNilLiteralNode then Result:=nil // nil은 어떤 참조 타입에도 들어갈 수 있으므로 중립
+      // [버그 수정] fMethodsCache[key] := Result; 처럼 함수 자신의 반환값(Result)이 배열
+      // 매개변수(Dictionary<string, array of MethodInfo>의 Item 세터 등) 자리에 인자로 오는
+      // 경우 — 지금까지 InferArgClrType에 TResultRefNode 분기가 아예 없어서(Parser는 "Result"를
+      // TVarRefNode가 아니라 전용 TResultRefNode로 만듦) 무조건 nil로 폴백했다. nil은
+      // EmitArgForParamType의 "스칼라 값 하나가 배열 매개변수 자리에 옴" 분기(2598줄 부근)를
+      // 오발동시켜, 이미 배열인 Result를 억지로 1개짜리 배열에 담으려다 그 안의 안전장치가
+      // 원소 타입(MethodInfo)으로 Castclass를 방출해 실제로는 배열(MethodInfo[])인 값에
+      // 대해 실행 시 InvalidCastException("MethodInfo[]를 MethodInfo로 캐스팅할 수 없습니다")으로
+      // 터졌다(self-host 재현: SafeGetMethods의 fMethodsCache[key]:=Result). GetExprClrType에
+      // 이미 있는 동일 패턴(fResultLocal.LocalType)을 여기도 그대로 적용한다.
+      else if e is TResultRefNode then
+      begin
+        if fResultLocal<>nil then Result:=fResultLocal.LocalType;
+      end
       else if e is TVarRefNode then
       begin
         var vn50:=TVarRefNode(e).VarName;
@@ -1399,9 +1413,14 @@
     end;
 
     function SafeGetMethods(t: System.Type; flags: BindingFlags): array of MethodInfo;
+    var _sgmTypeName: string;
     begin
-      if t.GetType().Name = 'TypeBuilderInstantiation' then
+      Writeln('[MARK-SGM-0] 진입, t="'+t.ToString+'"');
+      _sgmTypeName := t.GetType().Name;
+      Writeln('[MARK-SGM-0b] t.GetType().Name="'+_sgmTypeName+'"');
+      if _sgmTypeName = 'TypeBuilderInstantiation' then
       begin
+        Writeln('[MARK-SGM-TBI-0] TBI 분기 진입');
         var openT := t.GetGenericTypeDefinition();
         var openMis := openT.GetMethods(flags);
         var bound := new System.Collections.Generic.List<MethodInfo>();
@@ -1409,13 +1428,15 @@
           if openMis[i86].DeclaringType = openT then
             bound.Add(TypeBuilder.GetMethod(t, openMis[i86]));
         Result := bound.ToArray();
+        Writeln('[MARK-SGM-TBI-1] TBI 분기 완료');
       end
       // [Stage 100 버그 수정] TypeBuilderInstantiation이 아니라 "그냥" 아직 CreateType 안
       // 된 로컬 클래스의 TypeBuilder 자체가 넘어온 경우도 t.GetMethods가 똑같이
       // NotSupportedException을 던진다. 이런 경우는 우리가 이미 fInstanceMethods에
       // 그 클래스의 메서드를 다 알고 있으니, 리플렉션 없이 바로 그걸 돌려준다.
-      else if (t.GetType().Name = 'TypeBuilder') and (FindLocalClassNameForTypeBuilder(t) <> '') then
+      else if (_sgmTypeName = 'TypeBuilder') and (FindLocalClassNameForTypeBuilder(t) <> '') then
       begin
+        Writeln('[MARK-SGM-LOCAL-0] 로컬 TypeBuilder 분기 진입');
         var _localCls100b := FindLocalClassNameForTypeBuilder(t);
         var _bound100b := new System.Collections.Generic.List<MethodInfo>();
         var _seenNames100b := new HashSet<string>;
@@ -1436,15 +1457,29 @@
             if not _seenNames100b.Contains(_objMi100b.Name) then
               _bound100b.Add(_objMi100b);
         Result := _bound100b.ToArray();
+        Writeln('[MARK-SGM-LOCAL-1] 로컬 TypeBuilder 분기 완료');
       end
       else
       begin
+        Writeln('[MARK-SGM-2] else 분기 진입 (외부 완성 타입)');
         // [성능] 완성된 외부 타입에서의 GetMethods(flags)는 같은 (타입,flags) 조합에 대해
         // 결과가 변하지 않으므로 캐시한다. AssemblyQualifiedName이 nil인 특수한 경우(드묾)엔
         // 캐시를 건너뛰고 항상 직접 조회한다.
         if t.AssemblyQualifiedName <> nil then
         begin
-          var _mCacheKey := t.AssemblyQualifiedName + '|' + flags.ToString;
+          // [자기컴파일 버그 수정 - 진짜 근본 원인] BindingFlags(enum)의 .ToString()은
+          // EmitExpr의 원시타입 특수 케이스(Convert.ToString(T))에 vtEnum이 빠져 있어
+          // 일반 리플렉션 경로로 새는데, 이 경로가 nested 로컬 함수의 enum 매개변수에
+          // 대해서는 아직 검증되지 않아 self-host 빌드에서 조용히 크래시했다(중간 변수로
+          // 분리해도 재현 — Stage138류 체이닝 문제가 아니라 enum 자체의 codegen 문제).
+          // 캐시 키는 사람이 읽을 필요 없이 flags 값마다 고유하기만 하면 되므로, enum을
+          // 정수로 캐스팅해 이미 검증된 vtInteger.ToString 경로(Convert.ToString(Integer))만
+          // 타도록 우회한다.
+          var _flagsInt50: integer := integer(flags);
+          var _flagsStr50: string := _flagsInt50.ToString;
+          Writeln('[MARK-SGM-3] flags.ToString 완료="'+_flagsStr50+'" — 캐시 키 조합 직전');
+          var _mCacheKey := t.AssemblyQualifiedName + '|' + _flagsStr50;
+          Writeln('[MARK-SGM-4] 캐시 키 조합 완료 — ContainsKey 조회 직전');
           if fMethodsCache.ContainsKey(_mCacheKey) then
             Result := fMethodsCache[_mCacheKey]
           else
@@ -1452,10 +1487,12 @@
             Result := t.GetMethods(flags);
             fMethodsCache[_mCacheKey] := Result;
           end;
+          Writeln('[MARK-SGM-5] 캐시 경로 완료');
         end
         else
           Result := t.GetMethods(flags);
       end;
+      Writeln('[MARK-SGM-6] SafeGetMethods 반환 직전');
     end;
 
     // GetConstructor(Type[]) 대용 — 인자 타입 배열로 생성자를 찾는다.
@@ -1624,11 +1661,50 @@
         Result := itemProp.PropertyType;
     end;
 
+    // [Stage 141 분할] ResolveMethodByArity의 foreach 본문(if/else+for+while 3중 중첩)이
+    // Stage 111/112/113과 동일 계열의 "foreach(암묵적 try/finally) 안에 무거운 중첩 제어흐름"
+    // 위험 패턴이었다 — Test110 재현 케이스(ResolveMethodByArity(Int32,"ToString",...) 호출,
+    // Int32.ToString 오버로드 4개라 이 본문이 여러 차례 반복 실행됨)에서 SGP-4/ITMCC-5까지
+    // 찍힌 뒤 예외 없이(2>&1로도 안 잡힘 — 순수 IL 손상 크래시) 조용히 죽는 것으로 확인.
+    // 후보 하나를 채점하는 로직 전체를 foreach 밖 별도 함수로 뽑아 foreach 본문을 최소화한다.
+    function TryScoreMethodCandidate(mi: MethodInfo; args: List<TExprNode>; argCount: integer;
+      _isUncreatedLocal: boolean; _localClsRMBA: string; var score: integer): boolean;
+    var ps50: array of System.Type; psInfo50: array of ParameterInfo;
+        _pj50, i50: integer; argType50: System.Type; _tscOk: boolean;
+    begin
+      Result:=false;
+      score:=0;
+      if _isUncreatedLocal and fMethodParamClrTypes.ContainsKey(_localClsRMBA)
+         and fMethodParamClrTypes[_localClsRMBA].ContainsKey(mi.Name) then
+        ps50:=fMethodParamClrTypes[_localClsRMBA][mi.Name]
+      else
+      begin
+        psInfo50:=mi.GetParameters;
+        ps50:=new System.Type[psInfo50.Length];
+        for _pj50:=0 to psInfo50.Length-1 do
+          ps50[_pj50]:=psInfo50[_pj50].ParameterType;
+      end;
+      _tscOk:=(ps50.Length=argCount);
+      if _tscOk then
+      begin
+        i50:=0;
+        while i50<argCount do
+        begin
+          argType50:=InferArgClrType(args[i50]);
+          score:=score+ScoreParamMatch(ps50[i50], argType50);
+          i50:=i50+1;
+        end;
+        Result:=true;
+      end;
+    end;
+
     function ResolveMethodByArity(t: System.Type; mname: string; args: List<TExprNode>; isStatic: boolean): MethodInfo;
     var flags: BindingFlags; mi: MethodInfo; argCount: integer;
       bestScore: integer; bestMi: MethodInfo; found: boolean;
       _localClsRMBA: string; _isUncreatedLocal: boolean;
+      _rmbaScore: integer; _rmbaScored: boolean;
     begin
+      Writeln('[MARK-RMBA-0] 진입, t="'+t.ToString+'" mname="'+mname+'"');
       if isStatic then flags:=BindingFlags.Public or BindingFlags.Static
       else flags:=BindingFlags.Public or BindingFlags.Instance;
       argCount:=args.Count;
@@ -1640,34 +1716,16 @@
       // fMethodParamClrTypes[클래스명][메서드명]을 그대로 파라미터 타입 목록으로 쓴다.
       _localClsRMBA:=FindLocalClassNameForTypeBuilder(t);
       _isUncreatedLocal:=(_localClsRMBA<>'') and (t.GetType().Name='TypeBuilder');
+      Writeln('[MARK-RMBA-1] SafeGetMethods 호출 직전 — foreach 진입');
       foreach mi in SafeGetMethods(t, flags) do
         if mi.Name=mname then
         begin
-          var ps50: array of System.Type;
-          if _isUncreatedLocal and fMethodParamClrTypes.ContainsKey(_localClsRMBA)
-             and fMethodParamClrTypes[_localClsRMBA].ContainsKey(mi.Name) then
-            ps50:=fMethodParamClrTypes[_localClsRMBA][mi.Name]
-          else
-          begin
-            var psInfo50:=mi.GetParameters;
-            ps50:=new System.Type[psInfo50.Length];
-            for var _pj50:=0 to psInfo50.Length-1 do
-              ps50[_pj50]:=psInfo50[_pj50].ParameterType;
-          end;
-          if ps50.Length=argCount then
-          begin
-            var score50:=0;
-            var i50:=0;
-            while i50<argCount do
-            begin
-              var argType50:=InferArgClrType(args[i50]);
-              score50:=score50+ScoreParamMatch(ps50[i50], argType50);
-              i50:=i50+1;
-            end;
-            if (not found) or (score50>bestScore) then
-            begin bestScore:=score50; bestMi:=mi; found:=true; end;
-          end;
+          _rmbaScored:=TryScoreMethodCandidate(mi, args, argCount, _isUncreatedLocal, _localClsRMBA, _rmbaScore);
+          if _rmbaScored then
+            if (not found) or (_rmbaScore>bestScore) then
+            begin bestScore:=_rmbaScore; bestMi:=mi; found:=true; end;
         end;
+      Writeln('[MARK-RMBA-2] foreach 종료, found='+found.ToString);
       Result:=bestMi;
       // [Stage 104] t에 인스턴스/정적 메서드로 mname(args)가 없으면, .NET 확장 메서드
       // (this 매개변수를 첫 인자로 받는 정적 메서드 — 예: Assembly.GetCustomAttribute)에서
@@ -1677,6 +1735,7 @@
       // 실제 사례: GetExecutingAssembly().GetCustomAttribute(typeof(X))).
       if Result=nil then
         Result:=TryResolveExtensionMethod(t, mname, args);
+      Writeln('[MARK-RMBA-3] ResolveMethodByArity 반환 직전');
     end;
 
     // [Stage 104] 확장 메서드 폴백 — 반환된 MethodInfo.IsStatic=true이므로, 호출부는
@@ -1777,80 +1836,223 @@
     // 패턴에서 특히 발생하기 쉬움). 여기서 실제 반환 타입을 리플렉션으로 미리 찾아준다.
     // 흔한 경로(외부 정적 타입.메서드, 필드/지역변수.메서드)만 다루고, 판별 불가능한
     // 경우엔 기존과 동일하게 nil을 돌려줘 호출부가 기존 폴백을 쓰도록 한다.
+    // ── [자기컴파일 버그 수정 - Stage 124] TryResolveMethodCallClrType 분해 ──
+    // 이 함수는 원래 195줄 안에 중첩 if 안에서 곧장 exit하는 지점이 15곳 넘게
+    // 흩어져 있었다. Test_stage110 재현: host 빌드 exe(정상 로그)는
+    // "src.Length.ToString()"의 타입을 이 함수로 두 번째로 조회할 때도 문제
+    // 없이 끝까지 도는데, self 빌드 exe는 이 함수 진입 직전(직전 함수인
+    // InferTypeMethodCallAChain 호출은 이미 성공적으로 끝난 뒤)에서 예외 로그
+    // 한 줄 없이 그냥 멈춘다 — 1164행 부근에 기록된 TryFindFieldBuilder와
+    // 완전히 같은 증상(중첩 if 안의 exit로 인한 분기 목적지 충돌 의심,
+    // access violation 추정)이다. 그때와 동일한 처방을 적용한다: exit를
+    // 전부 없애고, 각 분기를 별도 함수로 쪼갠 뒤 "아직 결정 안 됨" 가드
+    // 변수로 순차 실행되게 한다.
+
+    // 분기 1: ObjCastType이 명시된 경우.
+    function TRMCT_Cast(mc: TMethodCallExprNode): System.Type;
+    begin
+      Result:=nil;
+      try
+        Result:=ResolveExternalType(mc.ObjCastType);
+      except
+        Result:=nil;
+      end;
+    end;
+
+    // 분기 2a: ObjName이 점(.) 체인이고 첫 세그먼트가 실제 변수/필드인 경우.
+    function TRMCT_ChainViaVar(chainSegs52: List<string>): System.Type;
+    begin
+      Result:=nil;
+      try
+        Result:=InferQualifierChainType(chainSegs52);
+      except
+        Result:=nil;
+      end;
+    end;
+
+    // 분기 2b: ObjName이 점(.) 체인이지만 첫 세그먼트가 변수가 아닌 경우
+    // (외부 정적 타입/네임스페이스 경로). castT92<>nil인 경우는 qType이 아니라
+    // 이 메서드 호출식 자체가 "그 타입으로의 캐스트"라는 뜻이라 hasDirect로
+    // 별도 보고한다(공용 멤버 조회를 건너뛰어야 함 — 기존 exit와 동일 효과).
+    function TRMCT_StaticChain(mc: TMethodCallExprNode; var isInst: boolean;
+                                var hasDirect: boolean; var directResult: System.Type): System.Type;
+    var qType: System.Type; castT92: System.Type; chainIsInst92: boolean;
+    begin
+      isInst:=false;
+      hasDirect:=false;
+      directResult:=nil;
+      qType:=nil;
+      try qType:=ResolveExternalType(mc.ObjName); except qType:=nil; end;
+      if (qType=nil) and (mc.Args.Count=1) then
+      begin
+        castT92:=nil;
+        try castT92:=ResolveExternalType(mc.ObjName+'.'+mc.MethodName); except castT92:=nil; end;
+        if castT92<>nil then
+        begin
+          hasDirect:=true;
+          directResult:=castT92;
+        end;
+      end;
+      if (not hasDirect) and (qType=nil) then
+      begin
+        chainIsInst92:=false;
+        try qType:=ResolveOrEmitStaticChain(nil, mc.ObjName, chainIsInst92); except qType:=nil; end;
+        if (qType<>nil) and chainIsInst92 then isInst:=true;
+      end;
+      Result:=qType;
+    end;
+
+    // 분기 6/7: ObjName이 로컬에서 정의한 클래스의 인스턴스 변수인 경우
+    // (필드/getter/메서드를 직접 찾으면 hasDirect, 못 찾으면 qType으로
+    // 외부 조상 타입을 돌려줘 공용 멤버 조회로 이어간다).
+    function TRMCT_LocalClassMember(cn: string; mc: TMethodCallExprNode;
+                                     var hasDirect: boolean; var directResult: System.Type): System.Type;
+    var fb: FieldBuilder; mb: MethodBuilder; _done: boolean;
+    begin
+      Result:=nil;
+      hasDirect:=false;
+      directResult:=nil;
+      _done:=false;
+      if (not _done) and (mc.Args.Count=0) and TryFindFieldBuilder(cn, mc.MethodName, fb) then
+      begin
+        hasDirect:=true;
+        directResult:=fb.FieldType;
+        _done:=true;
+      end;
+      if (not _done) and DictDictHas(fInstanceMethods, cn, 'get_'+mc.MethodName) then
+      begin
+        hasDirect:=true;
+        directResult:=fInstanceMethods[cn]['get_'+mc.MethodName].ReturnType;
+        _done:=true;
+      end;
+      if (not _done) and TryFindInstanceMethod(cn, mc.MethodName, mb) then
+      begin
+        hasDirect:=true;
+        directResult:=mb.ReturnType;
+        _done:=true;
+      end;
+      if not _done then
+        Result:=FindExternalAncestorType(cn);
+    end;
+
+    // 분기 9: ObjName=''인 암시적 self 메서드 호출. 항상 직접 최종 결과이며
+    // (성공하든 실패하든) 공용 멤버 조회로 이어지지 않는다 — 기존 마지막
+    // "exit;"와 동일한 의미.
+    function TRMCT_SelfMember(mc: TMethodCallExprNode): System.Type;
+    var selfMb: MethodBuilder; selfExtType: System.Type; selfPi: PropertyInfo;
+        selfMi: MethodInfo; _done: boolean;
+    begin
+      Result:=nil;
+      _done:=false;
+      if (not _done) and TryFindInstanceMethod(fCurClassName, mc.MethodName, selfMb) then
+      begin
+        Result:=selfMb.ReturnType;
+        _done:=true;
+      end;
+      if not _done then
+      begin
+        selfExtType:=FindExternalAncestorType(fCurClassName);
+        if selfExtType<>nil then
+        begin
+          selfPi:=SafeGetProperty(selfExtType, mc.MethodName);
+          if (mc.Args.Count=0) and (selfPi<>nil) and (selfPi.GetGetMethod<>nil) then
+            Result:=selfPi.PropertyType
+          else
+          begin
+            selfMi:=ResolveMethodByArity(selfExtType, mc.MethodName, mc.Args, false);
+            if selfMi<>nil then Result:=selfMi.ReturnType;
+          end;
+        end;
+      end;
+    end;
+
+    // qType이 결정된 뒤(캐스트/체인/필드/스코프 변수 경로 공통) 실제로
+    // mc.MethodName을 그 위에서 찾는 공용 마무리 단계.
+    function TRMCT_MemberOnQType(qType: System.Type; mc: TMethodCallExprNode; qTypeIsStatic92: boolean): System.Type;
+    var localCls: string; fb100: FieldBuilder; pi: PropertyInfo; mi: MethodInfo; _done: boolean;
+    begin
+      Result:=nil;
+      _done:=false;
+      localCls:=FindLocalClassNameForTypeBuilder(qType);
+      if (localCls<>'') and fInstanceMethods.ContainsKey(localCls) then
+      begin
+        if (not _done) and (mc.Args.Count=0) and fInstanceMethods[localCls].ContainsKey('get_'+mc.MethodName) then
+        begin
+          Result:=fInstanceMethods[localCls]['get_'+mc.MethodName].ReturnType;
+          _done:=true;
+        end;
+        if (not _done) and TryFindFieldBuilder(localCls, mc.MethodName, fb100) then
+        begin
+          Result:=fb100.FieldType;
+          _done:=true;
+        end;
+        if (not _done) and fInstanceMethods[localCls].ContainsKey(mc.MethodName) then
+        begin
+          Result:=fInstanceMethods[localCls][mc.MethodName].ReturnType;
+          _done:=true;
+        end;
+      end;
+      if not _done then
+      begin
+        pi:=SafeGetProperty(qType, mc.MethodName);
+        if (mc.Args.Count=0) and (pi<>nil) and (pi.GetGetMethod<>nil) then
+          Result:=pi.PropertyType
+        else
+        begin
+          mi:=ResolveMethodByArity(qType, mc.MethodName, mc.Args, qTypeIsStatic92 and (mc.ObjName.IndexOf('.')>=0));
+          if mi<>nil then Result:=mi.ReturnType;
+        end;
+      end;
+    end;
+
+    // [Stage 76 버그수정 #3] "var img := System.Drawing.Image.FromFile(path);"처럼 외부
+    // static/instance 메서드 호출 결과를 지역 변수에 담을 때, 그동안 TInlineVarStmtNode
+    // 처리부는 이 경우(ValueExpr이 TNewObjectExprNode가 아닌 TMethodCallExprNode)를
+    // 별도로 보지 않고 VTC(vtObject, '') 폴백으로 무조건 System.Object 타입 지역 변수를
+    // 만들었다. 그러면 IL 지역 슬롯의 선언 타입이 System.Object로 굳어져서, 이후
+    // "NewToolButton.Image := img;"처럼 더 구체적인 타입(System.Drawing.Image)을 기대하는
+    // 자리에 Ldloc으로 그 값을 올리면 검증기가 보는 스택 타입은 여전히 System.Object라
+    // 명시적 Castclass 없이는 대입이 안 맞아 실행 시 InvalidProgramException으로 이어질
+    // 수 있었다(아이콘 로드처럼 객체를 반환하는 외부 메서드 호출을 변수에 담아 재사용하는
+    // 패턴에서 특히 발생하기 쉬움). 여기서 실제 반환 타입을 리플렉션으로 미리 찾아준다.
+    // 흔한 경로(외부 정적 타입.메서드, 필드/지역변수.메서드)만 다루고, 판별 불가능한
+    // 경우엔 기존과 동일하게 nil을 돌려줘 호출부가 기존 폴백을 쓰도록 한다.
+    // [Stage 124 재작성] 아래 몸통은 이제 exit 없는 순수 if/elseif 디스패처만
+    // 남는다 — 실제 판별 로직은 위 TRMCT_* 헬퍼들로 옮겼다.
     function TryResolveMethodCallClrType(mc: TMethodCallExprNode): System.Type;
-    var qType: System.Type; pi: PropertyInfo; mi: MethodInfo; fb52: FieldBuilder;
+    var qType: System.Type; fb52: FieldBuilder;
         qTypeIsStatic92: boolean; // [버그 수정] 아래 static-chain 폴백(ResolveOrEmitStaticChain) 경로용 — 주석 참고
+        chainSegs52: List<string>; isInst92: boolean;
+        hasDirect: boolean; directResult: System.Type;
     begin
       Result:=nil;
       qTypeIsStatic92:=true; // 기본값: 기존 동작(ObjName에 점이 있으면 정적 호출로 간주)과 동일
+      qType:=nil;
+      hasDirect:=false;
+      directResult:=nil;
       try
         if mc.ObjCastType<>'' then
-        begin
-          qType:=ResolveExternalType(mc.ObjCastType);
-        end
+          qType:=TRMCT_Cast(mc)
         else if (mc.ObjName<>'') and (mc.ObjName.IndexOf('.')>=0) then
         begin
-          var chainSegs52:=SplitByDot(mc.ObjName);
+          chainSegs52:=SplitByDot(mc.ObjName);
           if IsChainStartSegment(chainSegs52[0]) then
+          begin
             // [버그 수정] "evInfo.EventHandlerType.GetMethod('Invoke')"처럼 ObjName 자체가
-            // 지역변수로 시작하는 체인(예: evInfo.EventHandlerType)인 경우, 예전에는 여기서
-            // 그냥 exit해 버려 Result가 nil로 남았다. 그러면 var 타입 추론 분기(TInlineVarStmtNode)가
-            // InferType(TMethodCallExprNode)의 기본 폴백(vtInteger→Int32)으로 지역변수
-            // "lamInvoke"를 System.Int32로 잘못 DeclareLocal 했고, 이후
-            // "lamInvoke.GetParameters"가 "타입 System.Int32에 메서드 GetParameters가
-            // 없습니다"로 실패했다(자기컴파일 중 실제 재현됨). EmitQualifierChainLoad와
-            // 완전히 같은 판별을 IL 방출 없이 수행하는 InferQualifierChainType이 정확히
-            // 이 목적으로 이미 존재하므로(1052행, 1945행에서 이미 재사용 중), 여기서도
-            // 재사용해 체인의 최종 타입(qType)을 구하고 아래 mc.MethodName 조회 로직으로
-            // 계속 이어간다 — 실패하면 이 함수를 감싼 try/except가 기존과 동일하게 nil로
-            // 조용히 폴백한다.
-            begin
-              qType:=InferQualifierChainType(chainSegs52);
-              // 체인의 시작점이 지역/전역 변수·필드(인스턴스)이므로, 아래 421행 부근의
-              // "ObjName에 점이 있으면 정적 호출"이라는 (진짜 정적 타입 체인만을 위한) 기본
-              // 가정이 이 경우엔 틀리다 — qType은 인스턴스이지 정적 타입 자체가 아니므로
-              // ResolveMethodByArity를 인스턴스 호출로 수행해야 한다.
-              qTypeIsStatic92:=false;
-            end
+            // 지역변수로 시작하는 체인(예: evInfo.EventHandlerType)인 경우, EmitQualifierChainLoad와
+            // 완전히 같은 판별을 IL 방출 없이 수행하는 InferQualifierChainType을 재사용해 체인의
+            // 최종 타입(qType)을 구하고 아래 mc.MethodName 조회 로직으로 계속 이어간다.
+            isInst92:=false;
+            qType:=TRMCT_ChainViaVar(chainSegs52);
+            // 체인의 시작점이 지역/전역 변수·필드(인스턴스)이므로, "ObjName에 점이 있으면
+            // 정적 호출"이라는 (진짜 정적 타입 체인만을 위한) 기본 가정이 이 경우엔 틀리다.
+            qTypeIsStatic92:=false;
+          end
           else
           begin
-            qType:=nil;
-            try qType:=ResolveExternalType(mc.ObjName); except end; // 외부 정적 타입 경로 (예: System.Drawing.Image)
-            // [Stage 92] "(TypeName(expr)).member"가 괄호로 한 번 더 싸여 있으면 Parser가
-            // 캐스트를 정적 호출(ObjName=한정자, MethodName=마지막 세그먼트)로 잘못 넘긴다
-            // (EmitExpr의 TMethodCallExprNode 처리에 있는 것과 짝을 이루는 보정). ObjName이
-            // 실제 타입이 아니라 네임스페이스뿐이면 위에서 qType이 nil이 되는데, 이때
-            // ObjName+MethodName 전체가 진짜 타입이면 이 식 자체가 "그 타입으로의 캐스트"이므로
-            // CLR 타입은 qType 위의 멤버가 아니라 캐스트 대상 타입 그 자체다.
-            if (qType=nil) and (mc.Args.Count=1) then
-            begin
-              var _castT92: System.Type := nil;
-              try _castT92:=ResolveExternalType(mc.ObjName+'.'+mc.MethodName); except end;
-              if _castT92<>nil then begin Result:=_castT92; exit; end;
-            end;
-            // [버그 수정] ObjName 자체가 타입이 아니라 "타입.정적프로퍼티" 형태의 다단계
-            // 정적 체인(예: "System.AppDomain.CurrentDomain" — AppDomain 타입의 CurrentDomain
-            // 정적 프로퍼티)이면 위 ResolveExternalType(mc.ObjName) 시도는 무조건 실패해
-            // qType이 nil로 남는다. 그 결과 이 함수 전체가 nil을 반환해 GetExprClrType이
-            // System.Object로 폴백하고, "System.AppDomain.CurrentDomain.GetAssemblies()"의
-            // 결과 타입(Assembly[])을 몰라 foreach 순회 변수가 System.Object로 선언되어
-            // 버렸다(_asm.GetType(name)처럼 1-인자 GetType 호출이 System.Object에는
-            // 없다는 오류로 이어짐 — 셀프호스팅 컴파일 실제 사례). EmitExpr의 정적 체인
-            // 호출 경로(1138행 부근)와 동일하게 ResolveOrEmitStaticChain으로 재시도한다
-            // (aIL=nil이면 IL을 방출하지 않고 타입만 계산한다).
-            if qType=nil then
-            begin
-              var _chainIsInst92: boolean;
-              try qType:=ResolveOrEmitStaticChain(nil, mc.ObjName, _chainIsInst92); except qType:=nil; end;
-              // ResolveOrEmitStaticChain은 성공하면 항상 "체인의 마지막 세그먼트가 프로퍼티/메서드를
-              // 거쳐 나온 인스턴스"를 돌려준다(예: AppDomain 타입 자체가 아니라 그 CurrentDomain
-              // 프로퍼티가 돌려주는 AppDomain 인스턴스) — 그 위의 mc.MethodName 호출은 항상 인스턴스
-              // 호출이어야 한다. 아래 481행 부근의 기존 판별식(mc.ObjName에 점이 있으면 무조건 정적
-              // 호출)을 그대로 쓰면 "System.AppDomain.CurrentDomain.GetAssemblies()"의 GetAssemblies를
-              // (존재하지 않는) 정적 메서드로 찾다가 실패해 nil을 반환 → GetExprClrType이 다시
-              // System.Object로 폴백하는 문제가 있었다.
-              if (qType<>nil) and _chainIsInst92 then qTypeIsStatic92:=false;
-            end;
+            isInst92:=false;
+            qType:=TRMCT_StaticChain(mc, isInst92, hasDirect, directResult);
+            if isInst92 then qTypeIsStatic92:=false;
           end;
         end
         else if fLocalScope.Has(mc.ObjName) and fLocalScope.HasClrType(mc.ObjName) then
@@ -1860,118 +2062,46 @@
         else if (fCurClassName<>'') and TryFindFieldBuilder(fCurClassName, mc.ObjName, fb52) then
           qType:=fb52.FieldType
         // [Stage 77] "var dlg := new TNewProjectDialog;" 처럼 사용자 정의 클래스의 인스턴스는
-        // ClrType이 아니라 ClassName으로만 스코프에 기록된다(TypeBuilder는 CreateType() 전엔
-        // GetMethods/GetProperty가 온전히 동작하지 않으므로). 그래서 "var res := dlg.ShowDialog;"
-        // 처럼 그 위에서 상속받은 외부 메서드(Form.ShowDialog 등)를 호출한 결과를 담을 때는
-        // 이 함수가 무조건 nil로 빠져 잘못된 기본 타입(vtInteger→Int32)으로 지역 변수가
-        // 선언됐다. 사용자 클래스의 외부 조상 타입(FindExternalAncestorType, 이미 완성된
-        // 진짜 reflection Type이라 TypeBuilder 제약이 없다)에서 대신 찾는다.
+        // ClrType이 아니라 ClassName으로만 스코프에 기록된다. "var res := dlg.ShowDialog;"처럼
+        // 그 위에서 상속받은 외부 메서드(Form.ShowDialog 등)를 호출한 결과를 담을 때는 사용자
+        // 클래스의 외부 조상 타입에서 대신 찾는다(TRMCT_LocalClassMember).
         else if fLocalScope.Has(mc.ObjName) and fLocalScope.HasClassName(mc.ObjName) then
-        begin
-          // [자기컴파일 버그 수정] cimpl89.Parameters처럼 로컬(우리가 만드는) 클래스 인스턴스의
-          // 필드/프로퍼티를 곧장 참조하는 식은, 여기서 곧장 FindExternalAncestorType으로
-          // 넘어가면(원래 이 분기는 "w.Title"처럼 외부 상속 타입의 멤버를 찾기 위한 것) 그
-          // 클래스 자신의 필드는 못 찾고 System.Object로 폴백해버린다(EmitExpr의 실제 방출
-          // 경로 — 2156행 부근 TryFindFieldBuilder(cn,...) — 는 이미 이걸 올바르게 처리하는데
-          // 타입 추론 전용인 이 함수만 그 경로가 없었다). TryFindFieldBuilder/fInstanceMethods로
-          // 먼저 로컬 클래스 자신의 필드/getter/메서드를 찾고, 없을 때만 기존처럼 외부 조상
-          // 타입에서 찾는다.
-          var _mcCn:=fLocalScope.GetClassName(mc.ObjName);
-          var _mcFb: FieldBuilder;
-          if (mc.Args.Count=0) and TryFindFieldBuilder(_mcCn, mc.MethodName, _mcFb) then
-          begin Result:=_mcFb.FieldType; exit; end;
-          if DictDictHas(fInstanceMethods, _mcCn, 'get_'+mc.MethodName) then
-          begin Result:=fInstanceMethods[_mcCn]['get_'+mc.MethodName].ReturnType; exit; end;
-          var _mcMb: MethodBuilder;
-          if TryFindInstanceMethod(_mcCn, mc.MethodName, _mcMb) then
-          begin Result:=_mcMb.ReturnType; exit; end;
-          qType:=FindExternalAncestorType(_mcCn);
-        end
+          qType:=TRMCT_LocalClassMember(fLocalScope.GetClassName(mc.ObjName), mc, hasDirect, directResult)
         else if fGlobalScope.Has(mc.ObjName) and fGlobalScope.HasClassName(mc.ObjName) then
-        begin
-          var _mcCnG:=fGlobalScope.GetClassName(mc.ObjName);
-          var _mcFbG: FieldBuilder;
-          if (mc.Args.Count=0) and TryFindFieldBuilder(_mcCnG, mc.MethodName, _mcFbG) then
-          begin Result:=_mcFbG.FieldType; exit; end;
-          if DictDictHas(fInstanceMethods, _mcCnG, 'get_'+mc.MethodName) then
-          begin Result:=fInstanceMethods[_mcCnG]['get_'+mc.MethodName].ReturnType; exit; end;
-          var _mcMbG: MethodBuilder;
-          if TryFindInstanceMethod(_mcCnG, mc.MethodName, _mcMbG) then
-          begin Result:=_mcMbG.ReturnType; exit; end;
-          qType:=FindExternalAncestorType(_mcCnG);
-        end
+          qType:=TRMCT_LocalClassMember(fGlobalScope.GetClassName(mc.ObjName), mc, hasDirect, directResult)
         // [버그 수정] string/정수/실수 등 원시 타입 지역·전역 변수는 ClrType도 ClassName도
-        // 스코프에 기록되지 않는다(BuildStaticFunc 등의 지역변수 등록 루프가 vtObject/vtInterface일
-        // 때만 채워 넣기 때문 — GetVarType 자체는 항상 정확하다). 그래서 "dirText.Substring(1).Trim"
-        // 처럼 원시 타입 메서드 호출 결과 위에 체이닝이 이어지면, 이 함수가 무조건 nil로 빠져
-        // GetExprClrType이 System.Object로 폴백하고, 그 위에서 Trim을 찾다가 "타입
-        // System.Object에 멤버 Trim가 없습니다"로 실패했다. VTC(GetVarType(...), '')와 동일한
-        // 매핑으로 실제 CLR 타입을 채워준다.
+        // 스코프에 기록되지 않는다. VTC(GetVarType(...), '')와 동일한 매핑으로 실제 CLR
+        // 타입을 채워준다.
         else if (fLocalScope.Has(mc.ObjName) or fGlobalScope.Has(mc.ObjName))
                 and ((GetVarType(mc.ObjName)=vtString) or (GetVarType(mc.ObjName)=vtInteger)
                      or (GetVarType(mc.ObjName)=vtInt64) or (GetVarType(mc.ObjName)=vtReal)
                      or (GetVarType(mc.ObjName)=vtBoolean) or (GetVarType(mc.ObjName)=vtChar)) then
           qType:=VTC(GetVarType(mc.ObjName), '')
-        // [Stage 100 버그 수정] mc.ObjName=''인 암시적 self 메서드 호출(예: "PeekAt(1).Kind"의 PeekAt(1))은 여기서
-        // 전혀 처리되지 않아 그냥 마지막 else exit로 떨어지고(qType가 정해지지 않음) Result가 함수 첫줄의
-        // 기본값 typeof(System.Object)로 그대로 남아 버려진다 — 그 결과 "PeekAt(1).Kind"의 Inner 타입이 항상
-        // System.Object로 폴백되어 ".Kind"가 "타입 System.Object에 멤버 Kind가 없습니다"로 실패했다(셀프호스팅
-        // 컴파일 실제 사례). EmitExpr의 TMethodCallExprNode/ObjName='' 분기(위 1975행 부근)와 동일한 순서로
-        // "자기 클래스(상속 포함) 인스턴스 메서드" → "외부 상속 타입의 메서드/프로퍼티" 순서로 찾는다.
+        // [Stage 100 버그 수정] mc.ObjName=''인 암시적 self 메서드 호출(예: "PeekAt(1).Kind"의
+        // PeekAt(1))은 "자기 클래스(상속 포함) 인스턴스 메서드" → "외부 상속 타입의
+        // 메서드/프로퍼티" 순서로 찾는다(TRMCT_SelfMember). 항상 직접 결과이며 공용
+        // 멤버 조회로 이어지지 않는다.
         else if mc.ObjName='' then
         begin
-          var _selfMb100: MethodBuilder;
-          if TryFindInstanceMethod(fCurClassName, mc.MethodName, _selfMb100) then
-          begin
-            Result:=_selfMb100.ReturnType;
-            exit;
-          end;
-          var _selfExtType100:=FindExternalAncestorType(fCurClassName);
-          if _selfExtType100<>nil then
-          begin
-            var _selfPi100:=SafeGetProperty(_selfExtType100, mc.MethodName);
-            if (mc.Args.Count=0) and (_selfPi100<>nil) and (_selfPi100.GetGetMethod<>nil) then
-            begin Result:=_selfPi100.PropertyType; exit; end;
-            var _selfMi100:=ResolveMethodByArity(_selfExtType100, mc.MethodName, mc.Args, false);
-            if _selfMi100<>nil then Result:=_selfMi100.ReturnType;
-          end;
-          exit;
-        end
-        else
-          exit;
-
-        if qType=nil then exit;
-        // [자기컴파일 버그 수정] qType이 아직 CreateType되지 않은 로컬(우리가 지금 만들고
-        // 있는) 클래스의 TypeBuilder이면, 바로 아래 SafeGetProperty/ResolveMethodByArity가
-        // NotSupportedException을 던진다(TypeBuilder는 CreateType 전엔 완전한 리플렉션을
-        // 지원하지 않음) — 그러면 이 함수를 감싼 try/except가 조용히 Result:=nil로
-        // 빠지고, 호출부인 GetExprClrType은 결국 typeof(System.Object)로 잘못 단정해버린다
-        // (실제 사례: "foreach var _cd68 in fProg.ClassDecls do" — fProg 필드의 타입이
-        // 우리가 만들고 있는 로컬 클래스 TProgramNode라 ClassDecls 필드를 못 찾고
-        // System.Object로 폴백 → 이후 "_cd68.Name"이 "타입 System.Object에 메서드 Name가
-        // 없습니다"로 실패). TChainedMemberExprNode 분기(Stage 101 수정)와 동일하게,
-        // SafeGetProperty를 시도하기 전에 로컬 클래스 딕셔너리(fInstanceMethods/
-        // fFieldBuilders)로 먼저 조회한다.
-        var _mcLocalCls100:=FindLocalClassNameForTypeBuilder(qType);
-        if (_mcLocalCls100<>'') and fInstanceMethods.ContainsKey(_mcLocalCls100) then
-        begin
-          if (mc.Args.Count=0) and fInstanceMethods[_mcLocalCls100].ContainsKey('get_'+mc.MethodName) then
-          begin Result:=fInstanceMethods[_mcLocalCls100]['get_'+mc.MethodName].ReturnType; exit; end;
-          var _mcFb100: FieldBuilder;
-          if TryFindFieldBuilder(_mcLocalCls100, mc.MethodName, _mcFb100) then
-          begin Result:=_mcFb100.FieldType; exit; end;
-          if fInstanceMethods[_mcLocalCls100].ContainsKey(mc.MethodName) then
-          begin Result:=fInstanceMethods[_mcLocalCls100][mc.MethodName].ReturnType; exit; end;
+          hasDirect:=true;
+          directResult:=TRMCT_SelfMember(mc);
         end;
-        pi:=SafeGetProperty(qType, mc.MethodName);
-        if (mc.Args.Count=0) and (pi<>nil) and (pi.GetGetMethod<>nil) then
-        begin Result:=pi.PropertyType; exit; end;
-        mi:=ResolveMethodByArity(qType, mc.MethodName, mc.Args, qTypeIsStatic92 and (mc.ObjName.IndexOf('.')>=0));
-        if mi<>nil then Result:=mi.ReturnType;
+        // 위 어느 분기에도 걸리지 않으면 qType=nil, hasDirect=false로 남고 아래에서
+        // 자연히 Result=nil로 끝난다 (기존 마지막 "else exit;"와 동일한 효과).
+
+        if hasDirect then
+          Result:=directResult
+        else if qType<>nil then
+          // [자기컴파일 버그 수정] qType이 아직 CreateType되지 않은 로컬(우리가 지금 만들고
+          // 있는) 클래스의 TypeBuilder이면 SafeGetProperty/ResolveMethodByArity가
+          // NotSupportedException을 던질 수 있다 — TRMCT_MemberOnQType 안에서 로컬 클래스
+          // 딕셔너리(fInstanceMethods/fFieldBuilders)를 먼저 조회해 이를 피한다.
+          Result:=TRMCT_MemberOnQType(qType, mc, qTypeIsStatic92);
       except
         Result:=nil; // 무엇이든 실패하면 조용히 중립 폴백(기존 동작 유지)
       end;
     end;
+
 
     // [진단] TExternalIndexExprNode(obj[i]) 타입 추론용 — EmitIndexerGet(5630행 부근)과 정확히
     // 같은 "배열이면 원소 타입, 아니면 Item 인덱서 프로퍼티" 판별 로직이지만 IL을 방출하지
@@ -2551,7 +2681,7 @@
     // targetType의 memberName 속성(setter)이나 필드에 valueExpr 값을 설정한다.
     procedure EmitPropertyOrFieldSet(aIL: ILGenerator; targetType: System.Type; memberName: string; valueExpr: TExprNode);
     var pi: PropertyInfo; fi: System.Reflection.FieldInfo; setr: MethodInfo;
-        localClsName85: string; tbKvp85: System.Collections.Generic.KeyValuePair<string, TypeBuilder>;
+        localClsName85: string;
     begin
       // [Stage 57] Button1.Text := 'a'; 같은 Qualifier.Field 대입 경로. 목표 속성/필드의
       // 실제 CLR 타입을 이미 알고 있으므로 EmitArgForParamType으로 char→string 승격.
@@ -2561,13 +2691,15 @@
       // targetType.GetProperty/GetField가 NotSupportedException("Type has not been created.")을
       // 던진다. Stage 78에서 EmitQualifierChainLoad/InferQualifierChainType 두 곳은 이미
       // fTypeBuilders 역방향 조회로 고쳤지만, 여기(대입 경로)는 그대로 남아있던 알려진 취약점이다.
-      // 같은 패턴으로: fTypeBuilders를 역방향 조회해 클래스명을 찾고, 프로퍼티 setter
-      // (set_MemberName)나 일반 필드를 fInstanceMethods/fFieldBuilders에서 직접 찾는다.
-      localClsName85:='';
+      // [110번째 자기컴파일 버그 수정] 여기 있던 인라인 foreach(fTypeBuilders 역방향 조회,
+      // 암묵적 try/finally 포함)를 EmitQualifierChainLoad와 동일하게
+      // FindLocalClassNameForTypeBuilder 호출로 교체한다 — 큰 함수 안의 인라인 foreach가
+      // gen1 JIT 시점에 IL을 깨뜨리는 문제(Stage 111/112/113과 동일 계열)를 여기서도
+      // 예방한다.
       if targetType is TypeBuilder then
-        foreach tbKvp85 in fTypeBuilders do
-          if tbKvp85.Value = TypeBuilder(targetType) then
-          begin localClsName85:=tbKvp85.Key; break; end;
+        localClsName85:=FindLocalClassNameForTypeBuilder(targetType)
+      else
+        localClsName85:='';
 
       if (localClsName85<>'') and fInstanceMethods.ContainsKey(localClsName85)
          and fInstanceMethods[localClsName85].ContainsKey('set_'+memberName) then
