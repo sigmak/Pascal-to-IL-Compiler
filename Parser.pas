@@ -4562,8 +4562,16 @@ type
     // 맹글링된 실제 이름으로 바꿔주고, 아니면(최상위/외부 이름) 그대로 돌려준다.
     function ResolveCallName(n: string): string;
     begin
-      if (fCurNestedAlias<>nil) and fCurNestedAlias.ContainsKey(n) then Result:=fCurNestedAlias[n]
-      else Result:=n;
+      // [자기컴파일 버그 수정] "(A<>nil) and A.ContainsKey(n)" 형태의 and 단락평가가
+      // gen1(self-host) IL에서 깨져서 A가 nil인데도 .ContainsKey가 호출되어
+      // NullReferenceException이 발생하는 사례 재현됨(ResolveCallName 호출 지점).
+      // and의 단락평가에 의존하지 않도록 중첩 if로 명시적으로 분리한다.
+      Result:=n;
+      if fCurNestedAlias<>nil then
+      begin
+        if fCurNestedAlias.ContainsKey(n) then
+          Result:=fCurNestedAlias[n];
+      end;
     end;
 
     procedure ParseParams(aP: List<TParamDef>);
