@@ -834,6 +834,58 @@
           EmitMCB_Fallback(aIL, mc);
     end;
 
+    // [Stage 1xx][자기컴파일 버그 수정 2026.08] EmitExprDispatch(916줄)에서 TCompareNode
+    // 분기 본체를 분리한 함수. 로직은 원본과 완전히 동일 — 함수만 나눴다.
+    // (EmitExprDispatch 자체가 너무 커서 self-host 시 IL이 손상되던 문제의 수정.
+    // ParseStatement, GetExprClrTypeTail과 동일한 "대형 dispatch 함수 분리" 패턴.)
+    procedure EmitExprCompareBranch(aIL: ILGenerator; cmp: TCompareNode);
+    begin
+      Writeln('[MARK-ECB-0] EmitExprCompareBranch 진입');
+      // [자기컴파일 버그 수정 — 실제 사례] 문자열 비교("System.IO.Path.GetExtension(x).ToLower
+      // = '.pabcproj'" 같은 식)를 지금까지는 숫자 비교와 똑같이 raw Ceq로 방출했다.
+      // Ceq는 값 타입엔 값 비교지만, string은 참조 타입이라 CLR의 ceq는 "참조가 같은가"만
+      // 본다 — 리터럴 문자열은 어셈블리 내에서 인턴되어 같은 참조를 공유하는 경우가
+      // 많아 우연히 맞는 것처럼 보이지만, ToLower/Trim/Substring/Concat 등 런타임에
+      // 새로 만들어진 문자열은 내용이 같아도 별개 인스턴스라 항상 false로 나온다.
+      // 이 때문에 자기컴파일된 실행파일의 ".pabcproj 확장자 검사" 같은 실제 조건문이
+      // 늘 거짓으로 평가되는 조용한 논리 오류가 있었다(컴파일 자체는 성공하니 지금까지
+      // 드러나지 않았다). 피연산자 중 하나라도 string이면 String.Equals(문자열,문자열)
+      // (동등)이나 String.CompareOrdinal(문자열,문자열)(대소 비교)을 대신 호출한다.
+      var _cmpLt90:=GetExprClrType(cmp.Left);
+      var _cmpRt90:=GetExprClrType(cmp.Right);
+      var _cmpIsStr90:=((_cmpLt90<>nil) and (_cmpLt90=typeof(string)))
+                     or ((_cmpRt90<>nil) and (_cmpRt90=typeof(string)));
+      EmitExpr(aIL, cmp.Left); EmitExpr(aIL, cmp.Right);
+      if _cmpIsStr90 and ((cmp.Op=cmpEq) or (cmp.Op=cmpNeq)) then
+      begin
+        var _seqMi90:=typeof(string).GetMethod('Equals', [typeof(string), typeof(string)]);
+        aIL.Emit(OpCodes.Call, _seqMi90);
+        if cmp.Op=cmpNeq then
+        begin aIL.Emit(OpCodes.Ldc_I4_0); aIL.Emit(OpCodes.Ceq); end;
+      end
+      else if _cmpIsStr90 and ((cmp.Op=cmpLt) or (cmp.Op=cmpGt) or (cmp.Op=cmpLe) or (cmp.Op=cmpGe)) then
+      begin
+        var _scmpMi90:=typeof(string).GetMethod('CompareOrdinal', [typeof(string), typeof(string)]);
+        aIL.Emit(OpCodes.Call, _scmpMi90);
+        aIL.Emit(OpCodes.Ldc_I4_0);
+        if cmp.Op=cmpLt then aIL.Emit(OpCodes.Clt)
+        else if cmp.Op=cmpGt then aIL.Emit(OpCodes.Cgt)
+        else if cmp.Op=cmpLe then
+          begin aIL.Emit(OpCodes.Cgt); aIL.Emit(OpCodes.Ldc_I4_0); aIL.Emit(OpCodes.Ceq); end
+        else if cmp.Op=cmpGe then
+          begin aIL.Emit(OpCodes.Clt); aIL.Emit(OpCodes.Ldc_I4_0); aIL.Emit(OpCodes.Ceq); end;
+      end
+      else if cmp.Op=cmpEq then aIL.Emit(OpCodes.Ceq)
+      else if cmp.Op=cmpLt then aIL.Emit(OpCodes.Clt)
+      else if cmp.Op=cmpGt then aIL.Emit(OpCodes.Cgt)
+      else if cmp.Op=cmpNeq then
+        begin aIL.Emit(OpCodes.Ceq); aIL.Emit(OpCodes.Ldc_I4_0); aIL.Emit(OpCodes.Ceq); end
+      else if cmp.Op=cmpLe then
+        begin aIL.Emit(OpCodes.Cgt); aIL.Emit(OpCodes.Ldc_I4_0); aIL.Emit(OpCodes.Ceq); end
+      else if cmp.Op=cmpGe then
+        begin aIL.Emit(OpCodes.Clt); aIL.Emit(OpCodes.Ldc_I4_0); aIL.Emit(OpCodes.Ceq); end;
+    end;
+
     procedure EmitExprDispatch(aIL: ILGenerator; e: TExprNode);
     var
       lit: TIntLiteralNode; slit: TStrLiteralNode; vr: TVarRefNode;
@@ -1130,6 +1182,7 @@
       // Callvirt가 요구하는 "주소"가 없으므로 임시 지역변수에 저장한 뒤 Ldloca+Call로 처리한다.
       else if e is TChainedMemberExprNode then
       begin
+        Writeln('[MARK-DISP-CHM] TChainedMemberExprNode 분기 진입');
         var ch90:=TChainedMemberExprNode(e);
         EmitExpr(aIL, ch90.Inner);
         var chType90:=GetExprClrType(ch90.Inner);
@@ -1245,14 +1298,18 @@
       // 여부를 이미 판별해주므로 여기서는 재구현하지 않는다.
       else if e is TChainedIndexExprNode then
       begin
+        Writeln('[MARK-DISP-CIX] TChainedIndexExprNode 분기 진입');
         var cix90:=TChainedIndexExprNode(e);
         EmitExpr(aIL, cix90.Target);
         var cixType90:=GetExprClrType(cix90.Target);
+        Writeln('[MARK-DISP-CIX2] EmitIndexerGet 호출 직전');
         EmitIndexerGet(aIL, cixType90, cix90.IndexExpr);
+        Writeln('[MARK-DISP-CIX3] EmitIndexerGet 반환 직후');
       end
 
       else if e is TArrayIndexExprNode then
       begin
+        Writeln('[MARK-DISP-AI] TArrayIndexExprNode 분기 진입');
         ai:=TArrayIndexExprNode(e);
         // [버그 수정] Length()에서 고쳤던 것과 동일한 패턴 — ai.ArrName이 지역변수도
         // 전역변수도 아니라 클래스 필드인 배열(자기 클래스의 배열 필드를 인덱싱하는 경우)
@@ -1302,7 +1359,11 @@
         // TChainedIndexExprNode가 이미 쓰고 있는 EmitIndexerGet(배열이면 Ldelem, 아니면
         // 리플렉션으로 Item 인덱서의 get을 Callvirt)으로 위임해 이 경우를 올바르게 처리한다.
         if (aiVarClrType<>nil) and (not aiVarClrType.IsArray) then
-          EmitIndexerGet(aIL, aiVarClrType, ai.Index)
+        begin
+          Writeln('[MARK-DISP-AI2] EmitIndexerGet 호출 직전, ArrName='+ai.ArrName);
+          EmitIndexerGet(aIL, aiVarClrType, ai.Index);
+          Writeln('[MARK-DISP-AI3] EmitIndexerGet 반환 직후');
+        end
         else
         begin
           EmitExpr(aIL, ai.Index);
@@ -1392,6 +1453,7 @@
 
       else if e is TBinOpNode then
       begin
+        Writeln('[MARK-DISP-BO] TBinOpNode 분기 진입');
         b:=TBinOpNode(e); lt:=InferType(b.Left); rt:=InferType(b.Right);
         // [자기컴파일 버그 수정 2026.08] 아래 단락평가(short-circuit) 분기는 진짜 Pascal
         // boolean 식(예: "(i < chars.Length) and (chars[i] <> '}')")에서만 타야 한다.
@@ -1529,50 +1591,12 @@
 
       else if e is TCompareNode then
       begin
-        cmp:=TCompareNode(e);
-        // [자기컴파일 버그 수정 — 실제 사례] 문자열 비교("System.IO.Path.GetExtension(x).ToLower
-        // = '.pabcproj'" 같은 식)를 지금까지는 숫자 비교와 똑같이 raw Ceq로 방출했다.
-        // Ceq는 값 타입엔 값 비교지만, string은 참조 타입이라 CLR의 ceq는 "참조가 같은가"만
-        // 본다 — 리터럴 문자열은 어셈블리 내에서 인턴되어 같은 참조를 공유하는 경우가
-        // 많아 우연히 맞는 것처럼 보이지만, ToLower/Trim/Substring/Concat 등 런타임에
-        // 새로 만들어진 문자열은 내용이 같아도 별개 인스턴스라 항상 false로 나온다.
-        // 이 때문에 자기컴파일된 실행파일의 ".pabcproj 확장자 검사" 같은 실제 조건문이
-        // 늘 거짓으로 평가되는 조용한 논리 오류가 있었다(컴파일 자체는 성공하니 지금까지
-        // 드러나지 않았다). 피연산자 중 하나라도 string이면 String.Equals(문자열,문자열)
-        // (동등)이나 String.CompareOrdinal(문자열,문자열)(대소 비교)을 대신 호출한다.
-        var _cmpLt90:=GetExprClrType(cmp.Left);
-        var _cmpRt90:=GetExprClrType(cmp.Right);
-        var _cmpIsStr90:=((_cmpLt90<>nil) and (_cmpLt90=typeof(string)))
-                       or ((_cmpRt90<>nil) and (_cmpRt90=typeof(string)));
-        EmitExpr(aIL, cmp.Left); EmitExpr(aIL, cmp.Right);
-        if _cmpIsStr90 and ((cmp.Op=cmpEq) or (cmp.Op=cmpNeq)) then
-        begin
-          var _seqMi90:=typeof(string).GetMethod('Equals', [typeof(string), typeof(string)]);
-          aIL.Emit(OpCodes.Call, _seqMi90);
-          if cmp.Op=cmpNeq then
-          begin aIL.Emit(OpCodes.Ldc_I4_0); aIL.Emit(OpCodes.Ceq); end;
-        end
-        else if _cmpIsStr90 and ((cmp.Op=cmpLt) or (cmp.Op=cmpGt) or (cmp.Op=cmpLe) or (cmp.Op=cmpGe)) then
-        begin
-          var _scmpMi90:=typeof(string).GetMethod('CompareOrdinal', [typeof(string), typeof(string)]);
-          aIL.Emit(OpCodes.Call, _scmpMi90);
-          aIL.Emit(OpCodes.Ldc_I4_0);
-          if cmp.Op=cmpLt then aIL.Emit(OpCodes.Clt)
-          else if cmp.Op=cmpGt then aIL.Emit(OpCodes.Cgt)
-          else if cmp.Op=cmpLe then
-            begin aIL.Emit(OpCodes.Cgt); aIL.Emit(OpCodes.Ldc_I4_0); aIL.Emit(OpCodes.Ceq); end
-          else if cmp.Op=cmpGe then
-            begin aIL.Emit(OpCodes.Clt); aIL.Emit(OpCodes.Ldc_I4_0); aIL.Emit(OpCodes.Ceq); end;
-        end
-        else if cmp.Op=cmpEq then aIL.Emit(OpCodes.Ceq)
-        else if cmp.Op=cmpLt then aIL.Emit(OpCodes.Clt)
-        else if cmp.Op=cmpGt then aIL.Emit(OpCodes.Cgt)
-        else if cmp.Op=cmpNeq then
-          begin aIL.Emit(OpCodes.Ceq); aIL.Emit(OpCodes.Ldc_I4_0); aIL.Emit(OpCodes.Ceq); end
-        else if cmp.Op=cmpLe then
-          begin aIL.Emit(OpCodes.Cgt); aIL.Emit(OpCodes.Ldc_I4_0); aIL.Emit(OpCodes.Ceq); end
-        else if cmp.Op=cmpGe then
-          begin aIL.Emit(OpCodes.Clt); aIL.Emit(OpCodes.Ldc_I4_0); aIL.Emit(OpCodes.Ceq); end;
+        // [자기컴파일 버그 수정 2026.08] EmitExprDispatch가 916줄짜리 대형 dispatch 함수라
+        // self-host 시 IL이 손상됨(GetExprClrType(cmp.Left) 완료 직후, 바로 다음 줄인
+        // GetExprClrType(cmp.Right) 진입 로그조차 안 찍히고 프로세스가 조용히 죽는 것으로
+        // 재현/확인됨 — ParseStatement/GetExprClrTypeTail과 동일한 "대형 함수" 패턴).
+        // TCompareNode 분기 본체를 EmitExprCompareBranch로 통째로 이동, 로직은 완전히 동일.
+        EmitExprCompareBranch(aIL, TCompareNode(e));
       end
 
       else if e is TFuncCallExprNode then
@@ -3858,63 +3882,8 @@
 
       else if s is TCaseStmtNode then
       begin
-        // [Stage 59] case Selector of 라벨...: 문장; ... [else 문장들] end
-        // 점프 테이블 최적화 없이 분기를 순서대로 검사하는 조건 체인으로 desugar한다:
-        //   sel := Selector (임시 로컬에 한 번만 저장, 반복 평가 방지)
-        //   각 분기: 라벨 중 하나라도 맞으면 caseBodyL로 점프, 다 안 맞으면 caseNextL로 통과
-        //     caseBodyL: 문장; goto caseEndL;
-        //     caseNextL: (다음 분기 검사로 이어짐)
-        //   모든 분기가 안 맞으면 else문장들(있으면) 실행
-        //   caseEndL:
-        // 단일값 라벨은 Ceq, 범위(lo..hi) 라벨은 Clt/Cgt 조합으로 "범위 밖이면 실패" 판정.
-        var cse:=TCaseStmtNode(s);
-        var caseSelClrType: System.Type;
-        if cse.Selector is TVarRefNode then
-          caseSelClrType:=VTC(GetVarType(TVarRefNode(cse.Selector).VarName), GetVarClassName(TVarRefNode(cse.Selector).VarName))
-        else
-          caseSelClrType:=VTC(InferType(cse.Selector), '');
-        var caseSelLoc:=aIL.DeclareLocal(caseSelClrType);
-        EmitExpr(aIL, cse.Selector);
-        aIL.Emit(OpCodes.Stloc, caseSelLoc);
-
-        var caseEndL:=aIL.DefineLabel;
-        foreach var cbr in cse.Branches do
-        begin
-          var caseBodyL:=aIL.DefineLabel;
-          var caseNextL:=aIL.DefineLabel;
-          foreach var clbl in cbr.Labels do
-          begin
-            if clbl.HighExpr=nil then
-            begin
-              aIL.Emit(OpCodes.Ldloc, caseSelLoc);
-              EmitExpr(aIL, clbl.LowExpr);
-              aIL.Emit(OpCodes.Ceq);
-              aIL.Emit(OpCodes.Brtrue, caseBodyL);
-            end
-            else
-            begin
-              var caseRangeFailL:=aIL.DefineLabel;
-              aIL.Emit(OpCodes.Ldloc, caseSelLoc);
-              EmitExpr(aIL, clbl.LowExpr);
-              aIL.Emit(OpCodes.Clt);
-              aIL.Emit(OpCodes.Brtrue, caseRangeFailL); // sel < low → 범위 밖
-              aIL.Emit(OpCodes.Ldloc, caseSelLoc);
-              EmitExpr(aIL, clbl.HighExpr);
-              aIL.Emit(OpCodes.Cgt);
-              aIL.Emit(OpCodes.Brtrue, caseRangeFailL); // sel > high → 범위 밖
-              aIL.Emit(OpCodes.Br, caseBodyL);
-              aIL.MarkLabel(caseRangeFailL);
-            end;
-          end;
-          aIL.Emit(OpCodes.Br, caseNextL);
-          aIL.MarkLabel(caseBodyL);
-          EmitStatement(aIL, cbr.Stmt);
-          aIL.Emit(OpCodes.Br, caseEndL);
-          aIL.MarkLabel(caseNextL);
-        end;
-        if cse.ElseStmts<>nil then
-          foreach var celS in cse.ElseStmts do EmitStatement(aIL, celS);
-        aIL.MarkLabel(caseEndL);
+        // [Stage 120] TCaseStmtNode 분기 본체를 EmitCaseStmt로 이동. 로직 동일, 함수만 나눔.
+        EmitCaseStmt(aIL, TCaseStmtNode(s));
       end
 
       else if s is TProcCallStmtNode then
@@ -3996,121 +3965,9 @@
 
       else if s is TForInStmtNode then
       begin
-        // [Stage 54] for VarName in CollExpr do Body
-        // "중간" 단계: 배열(T[])이든 List<T> 같은 외부 컬렉션이든, .NET IEnumerable을
-        // 구현하는 값이면 무엇이든 동일한 방식으로 순회한다 — 원소마다 특수 케이스를
-        // 나누는 대신, System.Collections.IEnumerable / IEnumerator의 (비제네릭)
-        // GetEnumerator/MoveNext/Current 3종 멤버만으로 desugar한다:
-        //
-        //   var _e := CollExpr.GetEnumerator();
-        //   goto ckL;
-        //   bdL: VarName := (T)_e.Current; Body;
-        //   ckL: if _e.MoveNext() then goto bdL;
-        //
-        // Current가 object를 돌려주므로 값 타입(정수 등)은 Unbox_Any, 참조 타입은
-        // Castclass로 VarName의 선언된 타입으로 되돌린다. 배열도 CLR에서는 참조
-        // 타입(IEnumerable 구현체)이라 별도 분기 없이 이 경로를 그대로 탄다.
-        // (배열의 값 타입 원소를 Current로 꺼낼 때 매 반복 boxing이 발생하는 점은
-        // "중간" 단계의 알려진 트레이드오프 — 다음 단계에서 IEnumerator<T> 특수화로
-        // 제거할 수 있다.)
-        var fis:=TForInStmtNode(s);
-        var forInVarLoc: LocalBuilder;
-        var forInVarClrType: System.Type;
-        if fLocalScope.Has(fis.VarName) then
-        begin
-          forInVarLoc:=fLocalScope.GetLoc(fis.VarName);
-          forInVarClrType:=VTC(GetVarType(fis.VarName), GetVarClassName(fis.VarName));
-        end
-        else if fGlobalScope.Has(fis.VarName) then
-        begin
-          forInVarLoc:=fGlobalScope.GetLoc(fis.VarName);
-          forInVarClrType:=VTC(GetVarType(fis.VarName), GetVarClassName(fis.VarName));
-        end
-        else
-        begin
-          // [Stage 102 버그 수정] "foreach var x in y do" — 위 TForStmtNode와 동일한 사유로
-          // 순회 변수가 미리 선언돼 있지 않다. 이 변수의 타입은 카운터와 달리 컬렉션의 실제
-          // 원소 타입에서 추론해야 한다: 배열이면 GetElementType, 제네릭 컬렉션(List<T>/
-          // IEnumerable<T> 등, 예: "foreach var ns in namespaceList do")이면 첫 번째 타입
-          // 인자, 그 외(비제네릭 컬렉션 등)는 object로 폴백한다 — 아래의 기존 Current
-          // Unbox_Any/Castclass 로직이 forInVarClrType을 그대로 쓰므로 그것과 맞아떨어진다.
-          //
-          // [버그 수정] Dictionary<TKey,TValue>(및 SortedDictionary/SortedList/IDictionary/
-          // IReadOnlyDictionary 등 TKey,TValue 2개짜리 딕셔너리류)는 실제로는
-          // KeyValuePair<TKey,TValue>를 순회한다 — "그 외 제네릭 컬렉션은 첫 번째 타입
-          // 인자" 규칙을 그대로 적용하면 원소 타입이 TKey(예: string)로 잘못 추론되어,
-          // 그 뒤 ".Value"/".Key" 접근이 "System.String에 메서드가 없습니다"로 깨진다
-          // (예: foreach var kv in fTypeBuilders do ... kv.Value ... — fTypeBuilders:
-          // Dictionary<string, TypeBuilder>). GetGenericArguments()[0]을 쓰기 전에
-          // 딕셔너리류인지 먼저 판별해 KeyValuePair<TKey,TValue>를 조립한다.
-          var forInCollType102:=GetExprClrType(fis.CollExpr);
-          if (forInCollType102<>nil) and forInCollType102.IsArray then
-            forInVarClrType:=forInCollType102.GetElementType
-          else if (forInCollType102<>nil) and forInCollType102.IsGenericType
-             and (forInCollType102.GetGenericArguments.Length=2)
-             and IsDictionaryLikeType102(forInCollType102) then
-            forInVarClrType:=typeof(System.Collections.Generic.KeyValuePair<System.Object,System.Object>)
-              .GetGenericTypeDefinition.MakeGenericType(forInCollType102.GetGenericArguments)
-          else if (forInCollType102<>nil) and forInCollType102.IsGenericType
-             and (forInCollType102.GetGenericArguments.Length>=1) then
-            forInVarClrType:=forInCollType102.GetGenericArguments()[0]
-          else
-            forInVarClrType:=typeof(System.Object);
-          forInVarLoc:=aIL.DeclareLocal(forInVarClrType);
-          var forInVt102:=VarTypeTagFromClrType(forInVarClrType);
-          fLocalScope.Declare(fis.VarName, forInVarLoc, forInVt102);
-          if forInVt102=vtObject then fLocalScope.SetClrType(fis.VarName, forInVarClrType);
-          // [버그 수정] foreach 원소 타입이 로컬(자기 자신 소스에 정의된) 클래스의
-          // TypeBuilder일 때 SetClrType만 등록하고 SetClassName은 등록하지 않아서,
-          // InferType이 HasClrType 분기(리플렉션 프로퍼티/메서드만 확인, 로컬 클래스의
-          // FieldBuilder 필드는 못 찾음)로 먼저 걸려버렸다. 그 결과 "foreach var ps in
-          // list_of_local_class do ... ps.StringField ..." 형태의 문자열 필드 읽기가
-          // vtInteger로 오판되어 Convert.ToString(int32)가 문자열 참조 위에 잘못 호출되고,
-          // self-host 빌드 시 그 메서드의 IL 자체가 스택 타입 불일치로 깨져
-          // BadImageFormatException을 유발했다 (실제 사례: BuildClassShell_Properties의
-          // "foreach var ps in cd.Properties do ... ps.Name ..."). 일반 매개변수/지역변수와
-          // 동일하게 SetClassName도 등록해 TryFindFieldBuilder 경로를 타게 한다.
-          if forInVarClrType is TypeBuilder then
-          begin
-            // [110번째 자기컴파일 버그 수정] 인라인 foreach 대신 FindLocalClassNameForTypeBuilder 재사용.
-            var _forInLocalCls102:=FindLocalClassNameForTypeBuilder(forInVarClrType);
-            if _forInLocalCls102<>'' then
-              fLocalScope.SetClassName(fis.VarName, _forInLocalCls102);
-          end;
-        end;
-
-        EmitExpr(aIL, fis.CollExpr); // 컬렉션 참조를 스택에 올린다
-        var getEnumMI:=typeof(System.Collections.IEnumerable).GetMethod('GetEnumerator');
-        aIL.Emit(OpCodes.Callvirt, getEnumMI);
-        var forInEnumLoc:=aIL.DeclareLocal(typeof(System.Collections.IEnumerator));
-        aIL.Emit(OpCodes.Stloc, forInEnumLoc);
-
-        var forInCkL:=aIL.DefineLabel; var forInBdL:=aIL.DefineLabel;
-        // [Stage 60] continue → MoveNext 검사(forInCkL)로, break → 루프 뒤(forInEndL)로.
-        var forInEndL:=aIL.DefineLabel;
-        fLoopBreakLabels.Add(forInEndL); fLoopContinueLabels.Add(forInCkL); fLoopExceptDepths.Add(fCurExceptDepth);
-        aIL.Emit(OpCodes.Br, forInCkL);
-        aIL.MarkLabel(forInBdL);
-
-        // VarName := (T)_e.Current;
-        aIL.Emit(OpCodes.Ldloc, forInEnumLoc);
-        var getCurMI:=typeof(System.Collections.IEnumerator).GetProperty('Current').GetGetMethod;
-        aIL.Emit(OpCodes.Callvirt, getCurMI);
-        if forInVarClrType.IsValueType then aIL.Emit(OpCodes.Unbox_Any, forInVarClrType)
-        else aIL.Emit(OpCodes.Castclass, forInVarClrType);
-        aIL.Emit(OpCodes.Stloc, forInVarLoc);
-
-        EmitStatement(aIL, fis.Body);
-
-        aIL.MarkLabel(forInCkL);
-        aIL.Emit(OpCodes.Ldloc, forInEnumLoc);
-        var moveNextMI:=typeof(System.Collections.IEnumerator).GetMethod('MoveNext');
-        aIL.Emit(OpCodes.Callvirt, moveNextMI);
-        aIL.Emit(OpCodes.Brtrue, forInBdL);
-        aIL.MarkLabel(forInEndL);
-        fLoopBreakLabels.RemoveAt(fLoopBreakLabels.Count-1);
-        fLoopContinueLabels.RemoveAt(fLoopContinueLabels.Count-1);
-        fLoopExceptDepths.RemoveAt(fLoopExceptDepths.Count-1);
+        // [Stage 120] TForInStmtNode 분기 본체(가장 큰 단일 분기, ~130줄)를 EmitForInStmt로
+        // 이동. 로직 동일, 함수만 나눔.
+        EmitForInStmt(aIL, TForInStmtNode(s));
       end
 
       else if s is TRepeatStmtNode then
@@ -4146,89 +4003,8 @@
 
       else if s is TTryStmtNode then
       begin
-        var ts2:=TTryStmtNode(s);
-        // 예외 변수 로컬 선언 (on E: Exception do 가 있는 경우)
-        var exLoc: LocalBuilder := nil;
-        // [버그 수정] 중첩된 try/except가 서로 같은 이름(예: 'ex')의 예외 변수를 쓰면
-        // (자기 완결 컴파일러 테스트에서 실제로 발생 — 바깥 try의 본문 안에 또 다른
-        // try...except on ex: Exception do ... 가 들어있는 경우), 안쪽 try가 끝나며
-        // fLocalScope에서 'ex'를 무조건 지워버려서(Remove) 바깥쪽 try의 예외 변수까지
-        // 함께 사라졌다 — 그 뒤 바깥쪽 except 블록이 ex.Message를 쓰면 "선언되지 않은
-        // 예외 변수 ex" 오류로 이어졌다. 진입 전에 같은 이름의 항목이 이미 있었는지
-        // 저장해두고, 이 try가 끝나면 무조건 지우는 대신 바깥쪽 항목을 그대로 복원한다
-        // (없었으면 기존처럼 제거).
-        var hadPrevExEntry:=false;
-        var prevExLoc: LocalBuilder := nil;
-        var prevExVType: TVarType := vtString;
-        var prevExClassName: string := '';
-        var prevExClrType: System.Type := nil;
-        if (ts2.ExVarName<>'') and (ts2.ExceptStmts<>nil) then
-        begin
-          if fLocalScope.Has(ts2.ExVarName) then
-          begin
-            hadPrevExEntry:=true;
-            prevExLoc:=fLocalScope.GetLoc(ts2.ExVarName);
-            prevExVType:=fLocalScope.GetVType(ts2.ExVarName);
-            prevExClassName:=fLocalScope.GetClassName(ts2.ExVarName);
-            prevExClrType:=fLocalScope.GetClrType(ts2.ExVarName);
-          end;
-          exLoc:=aIL.DeclareLocal(typeof(Exception));
-          fLocalScope.Declare(ts2.ExVarName, exLoc, vtString); // 내부 타입은 string으로 (Message는 string)
-          // [Stage 49] .Message는 TExceptionMsgExprNode가 전용으로 처리하지만, .ToString()
-          // 같은 다른 멤버는 이게 없으면 "외부 타입 로컬 변수" 경로를 못 타서
-          // "알 수 없는 메서드"로 막혔다 — 실제 예외 객체 타입을 등록해 리플렉션 경로를 열어준다.
-          fLocalScope.SetClrType(ts2.ExVarName, typeof(Exception));
-        end;
-
-        // [버그 수정 - ildasm으로 확인됨] try가 if/else(또는 case, loop 등) 분기의 "첫 번째 문장"이면,
-        // 그 분기 진입을 위해 밖에서 뛰어드는 브랜치(brfalse/br 등)의 목적지가 .try 블록의 바로 그
-        // 첫 명령과 겹쳐버린다. CLR은 보호영역(try/catch/finally)에 "낙하(fall-through)"로만 진입할 수
-        // 있고 브랜치로 뛰어드는 것은 불법이라, JIT가 이 메서드를 로드하는 순간 BadImageFormatException을
-        // 던진다 (실제 재현: InferTypeMethodCall, self-host 빌드). Nop을 완충 지점으로 하나 끼워 넣으면
-        // 바깥의 브랜치는 이 Nop을 목적지로 삼고, .try는 그다음 명령을 낙하로 자연스럽게 얻는다.
-        aIL.Emit(OpCodes.Nop);
-        aIL.BeginExceptionBlock;
-        fCurExceptDepth:=fCurExceptDepth+1; // [Stage 60] break/continue가 이 블록을 벗어나면 Leave를 써야 함을 표시
-
-        // try 본문
-        foreach var bs in ts2.BodyStmts do EmitStatement(aIL, bs);
-
-        // except 블록
-        if ts2.ExceptStmts<>nil then
-        begin
-          // catch(Exception)
-          aIL.BeginCatchBlock(typeof(Exception));
-          if exLoc<>nil then
-            aIL.Emit(OpCodes.Stloc, exLoc) // 예외 객체 저장
-          else
-            aIL.Emit(OpCodes.Pop); // 예외 객체 버리기
-          foreach var es in ts2.ExceptStmts do EmitStatement(aIL, es);
-        end;
-
-        // finally 블록
-        if ts2.FinallyStmts<>nil then
-        begin
-          aIL.BeginFinallyBlock;
-          foreach var fs2 in ts2.FinallyStmts do EmitStatement(aIL, fs2);
-        end;
-
-        aIL.EndExceptionBlock;
-        fCurExceptDepth:=fCurExceptDepth-1; // [Stage 60]
-
-        // 예외 변수 이름을 로컬 스코프에서 정리 (스코프 종료)
-        if (ts2.ExVarName<>'') and (ts2.ExceptStmts<>nil) then
-        begin
-          if hadPrevExEntry then
-          begin
-            // 바깥쪽(또는 이전) 항목 복원 — 같은 이름을 재사용하는 중첩/연속 try가
-            // 서로를 지우지 않도록 한다.
-            fLocalScope.Declare(ts2.ExVarName, prevExLoc, prevExVType);
-            if prevExClassName<>'' then fLocalScope.SetClassName(ts2.ExVarName, prevExClassName);
-            if prevExClrType<>nil then fLocalScope.SetClrType(ts2.ExVarName, prevExClrType);
-          end
-          else
-            fLocalScope.Remove(ts2.ExVarName); // 이전에 없었으면 그냥 제거
-        end;
+        // [Stage 120] TTryStmtNode 분기 본체(~85줄)를 EmitTryStmt로 이동. 로직 동일, 함수만 나눔.
+        EmitTryStmt(aIL, TTryStmtNode(s));
       end
 
       else if s is TRaiseStmtNode then
@@ -4291,6 +4067,282 @@
       end;
       finally
         fEmitDepth:=fEmitDepth-1;
+      end;
+    end;
+
+    // [Stage 120] EmitStatement에서 분리된 TCaseStmtNode 분기 본체 — 로직 동일. Stage 112에서
+    // EmitStatement를 이미 한 번 리팩터했음에도(EmitStatementDataOps1/2 + EmitStatementMethodCall
+    // 분리) 그 이후 여러 스테이지에 걸쳐 제어흐름 분기들(TForInStmtNode/TCaseStmtNode/
+    // TTryStmtNode)이 계속 커져 남은 EmitStatement 본체가 다시 약 500줄까지 불어났다 —
+    // 사용자 로그(Test_ListBuglog_self.txt)로 확인: self-compile 바이너리가 TForInStmtNode
+    // 처리를 마치고 다음 문장(TIfStmtNode)으로 넘어가는 지점에서 아무 메시지 없이 죽음.
+    // GetExprClrType/GetExprClrTypeTail 때와 동일하게, 가장 큰 세 분기(TForInStmtNode·
+    // TCaseStmtNode·TTryStmtNode)를 한 번에 들어냈다.
+    procedure EmitCaseStmt(aIL: ILGenerator; cse: TCaseStmtNode);
+    begin
+      // [Stage 59] case Selector of 라벨...: 문장; ... [else 문장들] end
+      // 점프 테이블 최적화 없이 분기를 순서대로 검사하는 조건 체인으로 desugar한다:
+      //   sel := Selector (임시 로컬에 한 번만 저장, 반복 평가 방지)
+      //   각 분기: 라벨 중 하나라도 맞으면 caseBodyL로 점프, 다 안 맞으면 caseNextL로 통과
+      //     caseBodyL: 문장; goto caseEndL;
+      //     caseNextL: (다음 분기 검사로 이어짐)
+      //   모든 분기가 안 맞으면 else문장들(있으면) 실행
+      //   caseEndL:
+      // 단일값 라벨은 Ceq, 범위(lo..hi) 라벨은 Clt/Cgt 조합으로 "범위 밖이면 실패" 판정.
+      var caseSelClrType: System.Type;
+      if cse.Selector is TVarRefNode then
+        caseSelClrType:=VTC(GetVarType(TVarRefNode(cse.Selector).VarName), GetVarClassName(TVarRefNode(cse.Selector).VarName))
+      else
+        caseSelClrType:=VTC(InferType(cse.Selector), '');
+      var caseSelLoc:=aIL.DeclareLocal(caseSelClrType);
+      EmitExpr(aIL, cse.Selector);
+      aIL.Emit(OpCodes.Stloc, caseSelLoc);
+
+      var caseEndL:=aIL.DefineLabel;
+      foreach var cbr in cse.Branches do
+      begin
+        var caseBodyL:=aIL.DefineLabel;
+        var caseNextL:=aIL.DefineLabel;
+        foreach var clbl in cbr.Labels do
+        begin
+          if clbl.HighExpr=nil then
+          begin
+            aIL.Emit(OpCodes.Ldloc, caseSelLoc);
+            EmitExpr(aIL, clbl.LowExpr);
+            aIL.Emit(OpCodes.Ceq);
+            aIL.Emit(OpCodes.Brtrue, caseBodyL);
+          end
+          else
+          begin
+            var caseRangeFailL:=aIL.DefineLabel;
+            aIL.Emit(OpCodes.Ldloc, caseSelLoc);
+            EmitExpr(aIL, clbl.LowExpr);
+            aIL.Emit(OpCodes.Clt);
+            aIL.Emit(OpCodes.Brtrue, caseRangeFailL); // sel < low → 범위 밖
+            aIL.Emit(OpCodes.Ldloc, caseSelLoc);
+            EmitExpr(aIL, clbl.HighExpr);
+            aIL.Emit(OpCodes.Cgt);
+            aIL.Emit(OpCodes.Brtrue, caseRangeFailL); // sel > high → 범위 밖
+            aIL.Emit(OpCodes.Br, caseBodyL);
+            aIL.MarkLabel(caseRangeFailL);
+          end;
+        end;
+        aIL.Emit(OpCodes.Br, caseNextL);
+        aIL.MarkLabel(caseBodyL);
+        EmitStatement(aIL, cbr.Stmt);
+        aIL.Emit(OpCodes.Br, caseEndL);
+        aIL.MarkLabel(caseNextL);
+      end;
+      if cse.ElseStmts<>nil then
+        foreach var celS in cse.ElseStmts do EmitStatement(aIL, celS);
+      aIL.MarkLabel(caseEndL);
+    end;
+
+    // [Stage 120] EmitStatement에서 분리된 TForInStmtNode 분기 본체(원래 가장 큰 단일
+    // 분기, ~130줄) — 로직 동일. 사용자 로그가 정확히 이 분기 처리 직후(다음 문장으로
+    // 넘어가는 지점)에서 self-compile 바이너리가 죽는 것으로 확인되어 최우선으로 분리했다.
+    procedure EmitForInStmt(aIL: ILGenerator; fis: TForInStmtNode);
+    begin
+      // [Stage 54] for VarName in CollExpr do Body
+      // "중간" 단계: 배열(T[])이든 List<T> 같은 외부 컬렉션이든, .NET IEnumerable을
+      // 구현하는 값이면 무엇이든 동일한 방식으로 순회한다 — 원소마다 특수 케이스를
+      // 나누는 대신, System.Collections.IEnumerable / IEnumerator의 (비제네릭)
+      // GetEnumerator/MoveNext/Current 3종 멤버만으로 desugar한다:
+      //
+      //   var _e := CollExpr.GetEnumerator();
+      //   goto ckL;
+      //   bdL: VarName := (T)_e.Current; Body;
+      //   ckL: if _e.MoveNext() then goto bdL;
+      //
+      // Current가 object를 돌려주므로 값 타입(정수 등)은 Unbox_Any, 참조 타입은
+      // Castclass로 VarName의 선언된 타입으로 되돌린다. 배열도 CLR에서는 참조
+      // 타입(IEnumerable 구현체)이라 별도 분기 없이 이 경로를 그대로 탄다.
+      // (배열의 값 타입 원소를 Current로 꺼낼 때 매 반복 boxing이 발생하는 점은
+      // "중간" 단계의 알려진 트레이드오프 — 다음 단계에서 IEnumerator<T> 특수화로
+      // 제거할 수 있다.)
+      var forInVarLoc: LocalBuilder;
+      var forInVarClrType: System.Type;
+      if fLocalScope.Has(fis.VarName) then
+      begin
+        forInVarLoc:=fLocalScope.GetLoc(fis.VarName);
+        forInVarClrType:=VTC(GetVarType(fis.VarName), GetVarClassName(fis.VarName));
+      end
+      else if fGlobalScope.Has(fis.VarName) then
+      begin
+        forInVarLoc:=fGlobalScope.GetLoc(fis.VarName);
+        forInVarClrType:=VTC(GetVarType(fis.VarName), GetVarClassName(fis.VarName));
+      end
+      else
+      begin
+        // [Stage 102 버그 수정] "foreach var x in y do" — 위 TForStmtNode와 동일한 사유로
+        // 순회 변수가 미리 선언돼 있지 않다. 이 변수의 타입은 카운터와 달리 컬렉션의 실제
+        // 원소 타입에서 추론해야 한다: 배열이면 GetElementType, 제네릭 컬렉션(List<T>/
+        // IEnumerable<T> 등, 예: "foreach var ns in namespaceList do")이면 첫 번째 타입
+        // 인자, 그 외(비제네릭 컬렉션 등)는 object로 폴백한다 — 아래의 기존 Current
+        // Unbox_Any/Castclass 로직이 forInVarClrType을 그대로 쓰므로 그것과 맞아떨어진다.
+        //
+        // [버그 수정] Dictionary<TKey,TValue>(및 SortedDictionary/SortedList/IDictionary/
+        // IReadOnlyDictionary 등 TKey,TValue 2개짜리 딕셔너리류)는 실제로는
+        // KeyValuePair<TKey,TValue>를 순회한다 — "그 외 제네릭 컬렉션은 첫 번째 타입
+        // 인자" 규칙을 그대로 적용하면 원소 타입이 TKey(예: string)로 잘못 추론되어,
+        // 그 뒤 ".Value"/".Key" 접근이 "System.String에 메서드가 없습니다"로 깨진다
+        // (예: foreach var kv in fTypeBuilders do ... kv.Value ... — fTypeBuilders:
+        // Dictionary<string, TypeBuilder>). GetGenericArguments()[0]을 쓰기 전에
+        // 딕셔너리류인지 먼저 판별해 KeyValuePair<TKey,TValue>를 조립한다.
+        var forInCollType102:=GetExprClrType(fis.CollExpr);
+        if (forInCollType102<>nil) and forInCollType102.IsArray then
+          forInVarClrType:=forInCollType102.GetElementType
+        else if (forInCollType102<>nil) and forInCollType102.IsGenericType
+           and (forInCollType102.GetGenericArguments.Length=2)
+           and IsDictionaryLikeType102(forInCollType102) then
+          forInVarClrType:=typeof(System.Collections.Generic.KeyValuePair<System.Object,System.Object>)
+            .GetGenericTypeDefinition.MakeGenericType(forInCollType102.GetGenericArguments)
+        else if (forInCollType102<>nil) and forInCollType102.IsGenericType
+           and (forInCollType102.GetGenericArguments.Length>=1) then
+          forInVarClrType:=forInCollType102.GetGenericArguments()[0]
+        else
+          forInVarClrType:=typeof(System.Object);
+        forInVarLoc:=aIL.DeclareLocal(forInVarClrType);
+        var forInVt102:=VarTypeTagFromClrType(forInVarClrType);
+        fLocalScope.Declare(fis.VarName, forInVarLoc, forInVt102);
+        if forInVt102=vtObject then fLocalScope.SetClrType(fis.VarName, forInVarClrType);
+        // [버그 수정] foreach 원소 타입이 로컬(자기 자신 소스에 정의된) 클래스의
+        // TypeBuilder일 때 SetClrType만 등록하고 SetClassName은 등록하지 않아서,
+        // InferType이 HasClrType 분기(리플렉션 프로퍼티/메서드만 확인, 로컬 클래스의
+        // FieldBuilder 필드는 못 찾음)로 먼저 걸려버렸다. 그 결과 "foreach var ps in
+        // list_of_local_class do ... ps.StringField ..." 형태의 문자열 필드 읽기가
+        // vtInteger로 오판되어 Convert.ToString(int32)가 문자열 참조 위에 잘못 호출되고,
+        // self-host 빌드 시 그 메서드의 IL 자체가 스택 타입 불일치로 깨져
+        // BadImageFormatException을 유발했다 (실제 사례: BuildClassShell_Properties의
+        // "foreach var ps in cd.Properties do ... ps.Name ..."). 일반 매개변수/지역변수와
+        // 동일하게 SetClassName도 등록해 TryFindFieldBuilder 경로를 타게 한다.
+        if forInVarClrType is TypeBuilder then
+        begin
+          // [110번째 자기컴파일 버그 수정] 인라인 foreach 대신 FindLocalClassNameForTypeBuilder 재사용.
+          var _forInLocalCls102:=FindLocalClassNameForTypeBuilder(forInVarClrType);
+          if _forInLocalCls102<>'' then
+            fLocalScope.SetClassName(fis.VarName, _forInLocalCls102);
+        end;
+      end;
+
+      EmitExpr(aIL, fis.CollExpr); // 컬렉션 참조를 스택에 올린다
+      var getEnumMI:=typeof(System.Collections.IEnumerable).GetMethod('GetEnumerator');
+      aIL.Emit(OpCodes.Callvirt, getEnumMI);
+      var forInEnumLoc:=aIL.DeclareLocal(typeof(System.Collections.IEnumerator));
+      aIL.Emit(OpCodes.Stloc, forInEnumLoc);
+
+      var forInCkL:=aIL.DefineLabel; var forInBdL:=aIL.DefineLabel;
+      // [Stage 60] continue → MoveNext 검사(forInCkL)로, break → 루프 뒤(forInEndL)로.
+      var forInEndL:=aIL.DefineLabel;
+      fLoopBreakLabels.Add(forInEndL); fLoopContinueLabels.Add(forInCkL); fLoopExceptDepths.Add(fCurExceptDepth);
+      aIL.Emit(OpCodes.Br, forInCkL);
+      aIL.MarkLabel(forInBdL);
+
+      // VarName := (T)_e.Current;
+      aIL.Emit(OpCodes.Ldloc, forInEnumLoc);
+      var getCurMI:=typeof(System.Collections.IEnumerator).GetProperty('Current').GetGetMethod;
+      aIL.Emit(OpCodes.Callvirt, getCurMI);
+      if forInVarClrType.IsValueType then aIL.Emit(OpCodes.Unbox_Any, forInVarClrType)
+      else aIL.Emit(OpCodes.Castclass, forInVarClrType);
+      aIL.Emit(OpCodes.Stloc, forInVarLoc);
+
+      EmitStatement(aIL, fis.Body);
+
+      aIL.MarkLabel(forInCkL);
+      aIL.Emit(OpCodes.Ldloc, forInEnumLoc);
+      var moveNextMI:=typeof(System.Collections.IEnumerator).GetMethod('MoveNext');
+      aIL.Emit(OpCodes.Callvirt, moveNextMI);
+      aIL.Emit(OpCodes.Brtrue, forInBdL);
+      aIL.MarkLabel(forInEndL);
+      fLoopBreakLabels.RemoveAt(fLoopBreakLabels.Count-1);
+      fLoopContinueLabels.RemoveAt(fLoopContinueLabels.Count-1);
+      fLoopExceptDepths.RemoveAt(fLoopExceptDepths.Count-1);
+    end;
+
+    // [Stage 120] EmitStatement에서 분리된 TTryStmtNode 분기 본체(~85줄) — 로직 동일.
+    procedure EmitTryStmt(aIL: ILGenerator; ts2: TTryStmtNode);
+    begin
+      // 예외 변수 로컬 선언 (on E: Exception do 가 있는 경우)
+      var exLoc: LocalBuilder := nil;
+      // [버그 수정] 중첩된 try/except가 서로 같은 이름(예: 'ex')의 예외 변수를 쓰면
+      // (자기 완결 컴파일러 테스트에서 실제로 발생 — 바깥 try의 본문 안에 또 다른
+      // try...except on ex: Exception do ... 가 들어있는 경우), 안쪽 try가 끝나며
+      // fLocalScope에서 'ex'를 무조건 지워버려서(Remove) 바깥쪽 try의 예외 변수까지
+      // 함께 사라졌다 — 그 뒤 바깥쪽 except 블록이 ex.Message를 쓰면 "선언되지 않은
+      // 예외 변수 ex" 오류로 이어졌다. 진입 전에 같은 이름의 항목이 이미 있었는지
+      // 저장해두고, 이 try가 끝나면 무조건 지우는 대신 바깥쪽 항목을 그대로 복원한다
+      // (없었으면 기존처럼 제거).
+      var hadPrevExEntry:=false;
+      var prevExLoc: LocalBuilder := nil;
+      var prevExVType: TVarType := vtString;
+      var prevExClassName: string := '';
+      var prevExClrType: System.Type := nil;
+      if (ts2.ExVarName<>'') and (ts2.ExceptStmts<>nil) then
+      begin
+        if fLocalScope.Has(ts2.ExVarName) then
+        begin
+          hadPrevExEntry:=true;
+          prevExLoc:=fLocalScope.GetLoc(ts2.ExVarName);
+          prevExVType:=fLocalScope.GetVType(ts2.ExVarName);
+          prevExClassName:=fLocalScope.GetClassName(ts2.ExVarName);
+          prevExClrType:=fLocalScope.GetClrType(ts2.ExVarName);
+        end;
+        exLoc:=aIL.DeclareLocal(typeof(Exception));
+        fLocalScope.Declare(ts2.ExVarName, exLoc, vtString); // 내부 타입은 string으로 (Message는 string)
+        // [Stage 49] .Message는 TExceptionMsgExprNode가 전용으로 처리하지만, .ToString()
+        // 같은 다른 멤버는 이게 없으면 "외부 타입 로컬 변수" 경로를 못 타서
+        // "알 수 없는 메서드"로 막혔다 — 실제 예외 객체 타입을 등록해 리플렉션 경로를 열어준다.
+        fLocalScope.SetClrType(ts2.ExVarName, typeof(Exception));
+      end;
+
+      // [버그 수정 - ildasm으로 확인됨] try가 if/else(또는 case, loop 등) 분기의 "첫 번째 문장"이면,
+      // 그 분기 진입을 위해 밖에서 뛰어드는 브랜치(brfalse/br 등)의 목적지가 .try 블록의 바로 그
+      // 첫 명령과 겹쳐버린다. CLR은 보호영역(try/catch/finally)에 "낙하(fall-through)"로만 진입할 수
+      // 있고 브랜치로 뛰어드는 것은 불법이라, JIT가 이 메서드를 로드하는 순간 BadImageFormatException을
+      // 던진다 (실제 재현: InferTypeMethodCall, self-host 빌드). Nop을 완충 지점으로 하나 끼워 넣으면
+      // 바깥의 브랜치는 이 Nop을 목적지로 삼고, .try는 그다음 명령을 낙하로 자연스럽게 얻는다.
+      aIL.Emit(OpCodes.Nop);
+      aIL.BeginExceptionBlock;
+      fCurExceptDepth:=fCurExceptDepth+1; // [Stage 60] break/continue가 이 블록을 벗어나면 Leave를 써야 함을 표시
+
+      // try 본문
+      foreach var bs in ts2.BodyStmts do EmitStatement(aIL, bs);
+
+      // except 블록
+      if ts2.ExceptStmts<>nil then
+      begin
+        // catch(Exception)
+        aIL.BeginCatchBlock(typeof(Exception));
+        if exLoc<>nil then
+          aIL.Emit(OpCodes.Stloc, exLoc) // 예외 객체 저장
+        else
+          aIL.Emit(OpCodes.Pop); // 예외 객체 버리기
+        foreach var es in ts2.ExceptStmts do EmitStatement(aIL, es);
+      end;
+
+      // finally 블록
+      if ts2.FinallyStmts<>nil then
+      begin
+        aIL.BeginFinallyBlock;
+        foreach var fs2 in ts2.FinallyStmts do EmitStatement(aIL, fs2);
+      end;
+
+      aIL.EndExceptionBlock;
+      fCurExceptDepth:=fCurExceptDepth-1; // [Stage 60]
+
+      // 예외 변수 이름을 로컬 스코프에서 정리 (스코프 종료)
+      if (ts2.ExVarName<>'') and (ts2.ExceptStmts<>nil) then
+      begin
+        if hadPrevExEntry then
+        begin
+          // 바깥쪽(또는 이전) 항목 복원 — 같은 이름을 재사용하는 중첩/연속 try가
+          // 서로를 지우지 않도록 한다.
+          fLocalScope.Declare(ts2.ExVarName, prevExLoc, prevExVType);
+          if prevExClassName<>'' then fLocalScope.SetClassName(ts2.ExVarName, prevExClassName);
+          if prevExClrType<>nil then fLocalScope.SetClrType(ts2.ExVarName, prevExClrType);
+        end
+        else
+          fLocalScope.Remove(ts2.ExVarName); // 이전에 없었으면 그냥 제거
       end;
     end;
 

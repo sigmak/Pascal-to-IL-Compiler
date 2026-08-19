@@ -983,6 +983,7 @@
     function InferArgClrType(e: TExprNode): System.Type;
     var vt: TVarType;
     begin
+      Writeln('[MARK-IACT-0] InferArgClrType 진입, e.GetType.Name='+e.GetType.Name);
       Result:=nil;
       if e is TStrLiteralNode then Result:=typeof(string)
       else if e is TIntLiteralNode then Result:=typeof(integer)
@@ -1591,9 +1592,34 @@
     // (이중 인덱싱) 지원을 위해 같은 로직을 두 번 적용해야 해서 재사용 가능하게 분리했다.
     // 호출 전에 baseType 값의 인스턴스가 이미 스택에 올라가 있어야 하며, 호출 후에는
     // get_Item 결과(다음 단계 인덱싱 또는 최종 값)가 스택에 남는다. Result는 그 결과의 CLR 타입.
+    // [자기컴파일 버그 수정 2026.08] EmitIndexerGet 안의 "foreach cand in SafeGetProperties(...)
+    // + 내부 if + ScoreParamMatch 호출 + 대입" 본문이 TryScoreMethodCandidate(Stage 141) /
+    // ResolveMethodByArity(Stage 141)와 동일 계열의 "foreach(암묵적 try/finally) 안에 무거운
+    // 중첩 제어흐름" 위험 패턴이었다. 실제로 Test_ListBug.pas(List<string>의 Item 인덱서 탐색,
+    // 즉 lst[lst.Count-1] 처리 중)에서 MARK-EIG-2(foreach 진입 직전)까지 찍히고 foreach 안에서
+    // NullReferenceException — ScoreParamMatch/SafeGetProperties 자체는 각각 nil 방어 및
+    // try/except로 결백이 확인됐으므로, 로직 버그가 아니라 foreach 본문 자체의 self-host IL
+    // 손상으로 추정된다. Stage 141과 동일하게 foreach 본문 전체를 별도 함수로 뽑아
+    // EmitIndexerGet 쪽 foreach를 최소화한다. 로직은 원본과 완전히 동일.
+    function FindItemIndexerProperty(baseType: System.Type; idxArgType: System.Type): PropertyInfo;
+    var _fiipBest: PropertyInfo; _fiipBestScore: integer;
+    begin
+      _fiipBest:=nil; _fiipBestScore:=System.Int32.MinValue;
+      foreach var cand in SafeGetProperties(baseType, BindingFlags.Public or BindingFlags.Instance) do
+      begin
+        if (cand.Name='Item') and (cand.GetIndexParameters.Length=1) and (cand.GetGetMethod<>nil) then
+        begin
+          var score:=ScoreParamMatch(cand.GetIndexParameters()[0].ParameterType, idxArgType);
+          if (_fiipBest=nil) or (score>_fiipBestScore) then begin _fiipBestScore:=score; _fiipBest:=cand; end;
+        end;
+      end;
+      Result:=_fiipBest;
+    end;
+
     function EmitIndexerGet(aIL: ILGenerator; baseType: System.Type; idxExpr: TExprNode): System.Type;
     var idxArgType: System.Type; itemProp: PropertyInfo; bestScore: integer;
     begin
+      Writeln('[MARK-EIG-0] EmitIndexerGet 진입, baseType='+baseType.FullName);
       // [버그 수정] s[i] — Pascal 문자열 변수를 직접 인덱싱하는 경우(예: incName[1]).
       // 두 가지가 배열/일반 컬렉션과 다르다: (1) Pascal 문자열은 1-based인데 .NET
       // String의 실제 인덱서는 0-based이므로 인덱스에서 1을 빼야 한다. (2) System.String의
@@ -1626,21 +1652,19 @@
         Result:=elemT96;
         exit;
       end;
+      Writeln('[MARK-EIG-1] InferArgClrType 호출 직전');
       idxArgType:=InferArgClrType(idxExpr);
-      itemProp:=nil; bestScore:=System.Int32.MinValue;
-      foreach var cand in SafeGetProperties(baseType, BindingFlags.Public or BindingFlags.Instance) do
-      begin
-        if (cand.Name='Item') and (cand.GetIndexParameters.Length=1) and (cand.GetGetMethod<>nil) then
-        begin
-          var score:=ScoreParamMatch(cand.GetIndexParameters()[0].ParameterType, idxArgType);
-          if (itemProp=nil) or (score>bestScore) then begin bestScore:=score; itemProp:=cand; end;
-        end;
-      end;
+      Writeln('[MARK-EIG-2] InferArgClrType 완료 — FindItemIndexerProperty 호출 직전');
+      itemProp:=FindItemIndexerProperty(baseType, idxArgType);
+      Writeln('[MARK-EIG-3] FindItemIndexerProperty 반환, itemProp=nil? '+(itemProp=nil).ToString);
       if itemProp=nil then
         raise new Exception('타입 "'+baseType.FullName+'"에는 인덱서(Item)가 없습니다.');
       var idxParams:=itemProp.GetIndexParameters();
+      Writeln('[MARK-EIG-4] EmitArgForParamType 호출 직전');
       EmitArgForParamType(aIL, idxExpr, idxParams[0].ParameterType);
+      Writeln('[MARK-EIG-5] EmitArgForParamType 완료 — Callvirt 직전');
       aIL.Emit(OpCodes.Callvirt, itemProp.GetGetMethod);
+      Writeln('[MARK-EIG-6] Callvirt 완료');
       // [자기컴파일 버그 수정] baseType이 TypeBuilderInstantiation(예:
       // "fTemplateImpls: Dictionary<string, List<TMethodImplNode>>"처럼, 값 타입이 아직
       // CreateType 안 된 로컬 클래스를 담은 제네릭 컬렉션)이면 itemProp.PropertyType(위
@@ -2110,6 +2134,7 @@
     function InferIndexerResultType(baseType: System.Type; idxExpr: TExprNode): System.Type;
     var idxArgType97: System.Type; itemProp97: PropertyInfo; bestScore97: integer; _isTBI97: boolean;
     begin
+      Writeln('[MARK-IIRT-0] InferIndexerResultType 진입');
       Result:=nil;
       if baseType=nil then exit;
       if baseType=typeof(string) then begin Result:=typeof(char); exit; end;
@@ -2214,6 +2239,7 @@
     // 이 함수 시작값(System.Object)이 그대로 남아 원본과 동일한 결과가 된다.
     function GetExprClrTypeChainedMember(e: TExprNode): System.Type;
     begin
+      Writeln('[MARK-GECTCM-0] GetExprClrTypeChainedMember 진입');
       Result:=typeof(System.Object);
       var _ch90:=TChainedMemberExprNode(e);
       var _innerT90:=GetExprClrType(_ch90.Inner);
@@ -2262,6 +2288,7 @@
 
     function GetExprClrType(e: TExprNode): System.Type;
     begin
+      Writeln('[MARK-GECT-0] GetExprClrType 진입, e.GetType.Name='+e.GetType.Name);
       Result:=typeof(System.Object);
       try
         if e is TTypeOfExprNode then
@@ -2371,7 +2398,19 @@
     function GetExprClrTypeTail(e: TExprNode): System.Type;
     var _fb90: FieldBuilder;
     begin
+      Writeln('[MARK-GECTT-0] GetExprClrTypeTail 진입');
       Result:=nil;
+
+      // [진단 강화] 세 분기(TExternalIndexExprNode/TArrayIndexExprNode/TVarRefNode)의
+      // "is" 판별을 미리 변수로 뽑고, TVarRefNode 내부의 각 Has/HasClrType/HasClassName
+      // 호출 직후마다 로그를 찍어 정확히 어느 한 줄에서 gen1이 죽는지 특정한다.
+      var _isExtIdx90:=e is TExternalIndexExprNode;
+      Writeln('[MARK-GECTT-A] is TExternalIndexExprNode 판별 완료='+_isExtIdx90.ToString);
+      var _isArrIdx90:=e is TArrayIndexExprNode;
+      Writeln('[MARK-GECTT-B] is TArrayIndexExprNode 판별 완료='+_isArrIdx90.ToString);
+      var _isVarRef90:=e is TVarRefNode;
+      Writeln('[MARK-GECTT-C] is TVarRefNode 판별 완료='+_isVarRef90.ToString);
+
       // [Stage 118] TExternalIndexExprNode 분기 — Qualifier[Index] (obj[i], obj[i][j],
       // obj[i].Field 등). 지금까지 GetExprClrType에 이 분기가 아예 없어서, obj[i] 뒤에
       // .Member가 체이닝되는 식(예: "map[key].Value")은 무조건 System.Object로 폴백해
@@ -2379,33 +2418,10 @@
       // 확인된 실제 사례). EmitExpr의 TExternalIndexExprNode 처리부와 동일한 순서로
       // (Qualifier 체인 → 인덱싱 → IndexExpr2/ExtraIndices → MemberName) 타입만 추론한다.
       // (Stage 118에서 GetExprClrType 크기를 더 줄이기 위해 GetExprClrTypeTail로 이동, 로직 동일)
-      if e is TExternalIndexExprNode then
+      if _isExtIdx90 then
       begin
-        var _eiG90:=TExternalIndexExprNode(e);
-        var _eiSegs90:=SplitByDot(_eiG90.Qualifier);
-        if IsChainStartSegment(_eiSegs90[0]) then
-        begin
-          var _eiBaseT90:=InferQualifierChainType(_eiSegs90);
-          var _eiResT90:=InferIndexerResultType(_eiBaseT90, _eiG90.IndexExpr);
-          if _eiG90.IndexExpr2<>nil then _eiResT90:=InferIndexerResultType(_eiResT90, _eiG90.IndexExpr2);
-          if _eiG90.ExtraIndices<>nil then
-            foreach var _eiExtra90 in _eiG90.ExtraIndices do
-              _eiResT90:=InferIndexerResultType(_eiResT90, _eiExtra90);
-          if _eiResT90<>nil then
-          begin
-            if _eiG90.MemberName='' then Result:=_eiResT90
-            else
-            begin
-              var _eiPi90:=SafeGetProperty(_eiResT90, _eiG90.MemberName);
-              if _eiPi90<>nil then Result:=_eiPi90.PropertyType
-              else
-              begin
-                var _eiFi90:=_eiResT90.GetField(_eiG90.MemberName);
-                if _eiFi90<>nil then Result:=_eiFi90.FieldType;
-              end;
-            end;
-          end;
-        end;
+        // [Stage 119] TExternalIndexExprNode 분기 본체를 GetExprClrTypeTailExtIndex로 이동.
+        Result:=GetExprClrTypeTailExtIndex(TExternalIndexExprNode(e));
       end
       // [버그 수정] Target[Index] 인덱싱 결과의 타입 — Target이 TArrayIndexExprNode(ArrName[Index]) 형태인
       // 경우. 지금까지 GetExprClrType에 이 분기가 없어서 "fClassGenericParam[templateName].Count"처럼
@@ -2414,43 +2430,25 @@
       // 멤버 Count가 없습니다"로 실패했다(셀프호스팅 컴파일 실제 사례). EmitExpr의 TArrayIndexExprNode
       // 처리부(2632행 부근)와 동일한 순서로 ArrName의 실제 CLR 타입을 찾은 뒤, 배열이면 원소 타입,
       // 그 외(List<T>/Dictionary<K,V> 등)는 InferIndexerResultType의 Item 인덱서 판별 로직을 재사용한다.
-      else if e is TArrayIndexExprNode then
+      else if _isArrIdx90 then
       begin
-        var _aiG90:=TArrayIndexExprNode(e);
-        var _aiBaseT90: System.Type := nil;
-        var _aiFb90: FieldBuilder;
-        // [Stage 109 재적용] HasClrType은 SetClrType이 호출된 적 있는 변수만 true다 —
-        // "chars: array of char := s.ToCharArray" 같은 array-of 지역/전역 변수는
-        // 선언 시 SetClrType이 호출된 적이 없어 HasClrType이 항상 false였고, 그러면
-        // 아래 두 분기가 전부 스킵되어 _aiBaseT90이 nil로 남아 System.Object로
-        // 잘못 폴백했다(자기컴파일 실제 재현: StripCommentsForUsesScan/ExpandIncludes의
-        // chars[i]). HasClrType이 실패해도 Loc.LocalType(선언된 CLR 타입, 항상 존재)을
-        // 마지막 수단으로 직접 조회한다.
-        if fLocalScope.Has(_aiG90.ArrName) then
-        begin
-          if fLocalScope.HasClrType(_aiG90.ArrName) then
-            _aiBaseT90:=fLocalScope.GetClrType(_aiG90.ArrName)
-          else
-            _aiBaseT90:=fLocalScope.GetLoc(_aiG90.ArrName).LocalType;
-        end
-        else if fGlobalScope.Has(_aiG90.ArrName) then
-        begin
-          if fGlobalScope.HasClrType(_aiG90.ArrName) then
-            _aiBaseT90:=fGlobalScope.GetClrType(_aiG90.ArrName)
-          else
-            _aiBaseT90:=fGlobalScope.GetLoc(_aiG90.ArrName).LocalType;
-        end
-        else if (fCurClassName<>'') and TryFindFieldBuilder(fCurClassName, _aiG90.ArrName, _aiFb90) then
-          _aiBaseT90:=_aiFb90.FieldType;
-        if _aiBaseT90<>nil then Result:=InferIndexerResultType(_aiBaseT90, _aiG90.Index);
+        // [Stage 119] TArrayIndexExprNode 분기 본체를 GetExprClrTypeTailArrIndex로 이동.
+        Result:=GetExprClrTypeTailArrIndex(TArrayIndexExprNode(e));
       end
-      else if e is TVarRefNode then
+      // [진단 강화 2026.08] 원래 "fLocalScope.Has(_vn90) and fLocalScope.HasClrType(_vn90)"
+      // 식의 4단 and 사슬이었다. Scope.pas의 Has/HasClrType/HasClassName 자체는 안전하게
+      // 짜여 있어(KeyNotFoundException 등은 안 남) 논리적으로 예외를 던질 일이 없는데도,
+      // gen1(자기 자신이 컴파일한 바이너리)에서 이 자리를 반복 통과할 때 아무 예외 메시지도
+      // 없이 프로세스가 죽는 문제가 재현됐다. 이전 1차 수정(and 결과를 _okNNN 변수에
+      // 담기만 함)으로는 증상이 그대로였으므로, 이번엔 Has/HasClrType/HasClassName
+      // 호출 하나하나 사이에 Writeln을 끼워 넣어 정확히 어느 한 호출에서 멈추는지
+      // 특정한다. (진단용 임시 코드 — 원인 확정 후 다시 정리 예정)
+      else if _isVarRef90 then
       begin
-        var _vn90:=TVarRefNode(e).VarName;
-        if fLocalScope.Has(_vn90) and fLocalScope.HasClrType(_vn90) then Result:=fLocalScope.GetClrType(_vn90)
-        else if fGlobalScope.Has(_vn90) and fGlobalScope.HasClrType(_vn90) then Result:=fGlobalScope.GetClrType(_vn90)
-        else if fLocalScope.Has(_vn90) and fLocalScope.HasClassName(_vn90) then Result:=FindExternalAncestorType(fLocalScope.GetClassName(_vn90))
-        else if fGlobalScope.Has(_vn90) and fGlobalScope.HasClassName(_vn90) then Result:=FindExternalAncestorType(fGlobalScope.GetClassName(_vn90));
+        // [Stage 119] TVarRefNode 분기 본체(4단 중첩, ~57줄 — Tail 안에서 가장 크고 복잡한
+        // 단일 분기였다)를 GetExprClrTypeTailVarRef로 이동. 로직/진단 로그 동일, 함수만 나눔.
+        Result:=GetExprClrTypeTailVarRef(TVarRefNode(e).VarName);
+        Writeln('[MARK-GECTT-VR8] TVarRefNode 분기 끝');
       end
       else if e is TFieldReadExprNode then
       begin
@@ -2525,6 +2523,135 @@
       else if e is TLengthExprNode then Result:=typeof(integer)   // ← 추가: Length(x).Method 체이닝 시 필요
       else if e is TIntToStrNode then Result:=typeof(string)      // ← 추가: 
       else if e is TBoolToStrNode then Result:=typeof(string);    // ← 추가: 
+    end;
+
+    // [Stage 119] GetExprClrTypeTail에서 분리된 TExternalIndexExprNode 분기 본체 — 로직 동일,
+    // 함수만 나눔. Stage 117/118과 같은 "메서드 크기/분기복잡도" 패턴이 GetExprClrTypeTail
+    // 자체(약 227줄, 14개 분기)에서도 재현되어(사용자 로그로 확인: TVarRefNode 분기 끝
+    // 직후 아무 메시지도 없이 프로세스가 죽음), Tail 안에서 가장 큰 세 분기
+    // (TExternalIndexExprNode/TArrayIndexExprNode/TVarRefNode)를 한 번에 들어냈다 —
+    // Stage 111→112, Stage 117→118 모두 첫 분리 한 번으로는 부족했던 전례를 따른다.
+    function GetExprClrTypeTailExtIndex(_eiG90: TExternalIndexExprNode): System.Type;
+    begin
+      Result:=nil;
+      var _eiSegs90:=SplitByDot(_eiG90.Qualifier);
+      if IsChainStartSegment(_eiSegs90[0]) then
+      begin
+        var _eiBaseT90:=InferQualifierChainType(_eiSegs90);
+        var _eiResT90:=InferIndexerResultType(_eiBaseT90, _eiG90.IndexExpr);
+        if _eiG90.IndexExpr2<>nil then _eiResT90:=InferIndexerResultType(_eiResT90, _eiG90.IndexExpr2);
+        if _eiG90.ExtraIndices<>nil then
+          foreach var _eiExtra90 in _eiG90.ExtraIndices do
+            _eiResT90:=InferIndexerResultType(_eiResT90, _eiExtra90);
+        if _eiResT90<>nil then
+        begin
+          if _eiG90.MemberName='' then Result:=_eiResT90
+          else
+          begin
+            var _eiPi90:=SafeGetProperty(_eiResT90, _eiG90.MemberName);
+            if _eiPi90<>nil then Result:=_eiPi90.PropertyType
+            else
+            begin
+              var _eiFi90:=_eiResT90.GetField(_eiG90.MemberName);
+              if _eiFi90<>nil then Result:=_eiFi90.FieldType;
+            end;
+          end;
+        end;
+      end;
+    end;
+
+    // [Stage 119] GetExprClrTypeTail에서 분리된 TArrayIndexExprNode 분기 본체 — 로직 동일.
+    function GetExprClrTypeTailArrIndex(_aiG90: TArrayIndexExprNode): System.Type;
+    var _aiFb90: FieldBuilder;
+    begin
+      Result:=nil;
+      var _aiBaseT90: System.Type := nil;
+      // [Stage 109 재적용] HasClrType은 SetClrType이 호출된 적 있는 변수만 true다 —
+      // "chars: array of char := s.ToCharArray" 같은 array-of 지역/전역 변수는
+      // 선언 시 SetClrType이 호출된 적이 없어 HasClrType이 항상 false였고, 그러면
+      // 아래 두 분기가 전부 스킵되어 _aiBaseT90이 nil로 남아 System.Object로
+      // 잘못 폴백했다(자기컴파일 실제 재현: StripCommentsForUsesScan/ExpandIncludes의
+      // chars[i]). HasClrType이 실패해도 Loc.LocalType(선언된 CLR 타입, 항상 존재)을
+      // 마지막 수단으로 직접 조회한다.
+      if fLocalScope.Has(_aiG90.ArrName) then
+      begin
+        if fLocalScope.HasClrType(_aiG90.ArrName) then
+          _aiBaseT90:=fLocalScope.GetClrType(_aiG90.ArrName)
+        else
+          _aiBaseT90:=fLocalScope.GetLoc(_aiG90.ArrName).LocalType;
+      end
+      else if fGlobalScope.Has(_aiG90.ArrName) then
+      begin
+        if fGlobalScope.HasClrType(_aiG90.ArrName) then
+          _aiBaseT90:=fGlobalScope.GetClrType(_aiG90.ArrName)
+        else
+          _aiBaseT90:=fGlobalScope.GetLoc(_aiG90.ArrName).LocalType;
+      end
+      else if (fCurClassName<>'') and TryFindFieldBuilder(fCurClassName, _aiG90.ArrName, _aiFb90) then
+        _aiBaseT90:=_aiFb90.FieldType;
+      if _aiBaseT90<>nil then Result:=InferIndexerResultType(_aiBaseT90, _aiG90.Index);
+    end;
+
+    // [Stage 119] GetExprClrTypeTail에서 분리된 TVarRefNode 분기 본체(4단 중첩, Tail 안에서
+    // 가장 크고 복잡한 단일 분기였다 — 사용자 로그에서 셀프컴파일 바이너리가 정확히 이
+    // 분기 끝(VR8) 직후 아무 메시지 없이 죽는 것으로 확인됨). 로직/진단 로그는 원본과 동일,
+    // 함수만 나눴다.
+    function GetExprClrTypeTailVarRef(_vn90: string): System.Type;
+    begin
+      Result:=nil;
+      Writeln('[MARK-GECTT-VR1] VarName='+_vn90);
+
+      var _hasLoc90:=fLocalScope.Has(_vn90);
+      Writeln('[MARK-GECTT-VR2] fLocalScope.Has 완료='+_hasLoc90.ToString);
+
+      var _hasLocClr90:=false;
+      if _hasLoc90 then _hasLocClr90:=fLocalScope.HasClrType(_vn90);
+      Writeln('[MARK-GECTT-VR3] fLocalScope.HasClrType 완료='+_hasLocClr90.ToString);
+
+      if _hasLoc90 and _hasLocClr90 then
+      begin
+        Result:=fLocalScope.GetClrType(_vn90);
+        Writeln('[MARK-GECTT-VR3b] fLocalScope.GetClrType 완료');
+      end
+      else
+      begin
+        var _hasGlob90:=fGlobalScope.Has(_vn90);
+        Writeln('[MARK-GECTT-VR4] fGlobalScope.Has 완료='+_hasGlob90.ToString);
+
+        var _hasGlobClr90:=false;
+        if _hasGlob90 then _hasGlobClr90:=fGlobalScope.HasClrType(_vn90);
+        Writeln('[MARK-GECTT-VR5] fGlobalScope.HasClrType 완료='+_hasGlobClr90.ToString);
+
+        if _hasGlob90 and _hasGlobClr90 then
+        begin
+          Result:=fGlobalScope.GetClrType(_vn90);
+          Writeln('[MARK-GECTT-VR5b] fGlobalScope.GetClrType 완료');
+        end
+        else
+        begin
+          var _hasLocCls90:=false;
+          if _hasLoc90 then _hasLocCls90:=fLocalScope.HasClassName(_vn90);
+          Writeln('[MARK-GECTT-VR6] fLocalScope.HasClassName 완료='+_hasLocCls90.ToString);
+
+          if _hasLoc90 and _hasLocCls90 then
+          begin
+            Result:=FindExternalAncestorType(fLocalScope.GetClassName(_vn90));
+            Writeln('[MARK-GECTT-VR6b] FindExternalAncestorType(local) 완료');
+          end
+          else
+          begin
+            var _hasGlobCls90:=false;
+            if _hasGlob90 then _hasGlobCls90:=fGlobalScope.HasClassName(_vn90);
+            Writeln('[MARK-GECTT-VR7] fGlobalScope.HasClassName 완료='+_hasGlobCls90.ToString);
+
+            if _hasGlob90 and _hasGlobCls90 then
+            begin
+              Result:=FindExternalAncestorType(fGlobalScope.GetClassName(_vn90));
+              Writeln('[MARK-GECTT-VR7b] FindExternalAncestorType(global) 완료');
+            end;
+          end;
+        end;
+      end;
     end;
 
     // [Stage 48] 외부 생성자/메서드에 인자를 하나씩 넣을 때, 기대하는 매개변수 타입이

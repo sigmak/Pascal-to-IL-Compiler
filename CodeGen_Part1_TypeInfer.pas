@@ -1771,6 +1771,7 @@
     function InferTypeRest(e: TExprNode; var r: TVarType): boolean;
     var b: TBinOpNode;
     begin
+      Writeln('[MARK-ITR-0] InferTypeRest 진입, e.GetType.Name='+e.GetType.Name);
       Result:=true;
       if e is TCompareNode then // [Stage 41 수정 2026.07.11]
         r:=vtBoolean
