@@ -1601,23 +1601,91 @@
     // try/except로 결백이 확인됐으므로, 로직 버그가 아니라 foreach 본문 자체의 self-host IL
     // 손상으로 추정된다. Stage 141과 동일하게 foreach 본문 전체를 별도 함수로 뽑아
     // EmitIndexerGet 쪽 foreach를 최소화한다. 로직은 원본과 완전히 동일.
-    function FindItemIndexerProperty(baseType: System.Type; idxArgType: System.Type): PropertyInfo;
-    var _fiipBest: PropertyInfo; _fiipBestScore: integer;
+    // [자기컴파일 버그 수정 2026.08-2] 위 2026.08 수정에서 foreach를 별도 함수로 뽑아내긴
+    // 했으나, 그 foreach 본문 안에 여전히 "3중 and로 묶인 if + 중첩 if(or 조건)"가 남아있어
+    // ResolveMethodByArity가 Stage 141에서 TryScoreMethodCandidate로 완전히 평탄화됐던 것과
+    // 달리 이 함수는 절반만 고쳐진 상태였다. 로그 재분석 결과 gen1은 정확히 MARK-EIG-2
+    // (FindItemIndexerProperty 호출 직전)까지만 찍고 그 안에서 NullReferenceException 없이
+    // 죽었는데 — 이는 이미 확정된 두 패턴(① foreach 안 중첩 if-in-if 제어흐름, ② and/or
+    // 단락평가가 gen1 IL에서 깨지는 문제)이 겹친 전형적 사례다. ResolveMethodByArity와
+    // 완전히 동일한 방식으로 후보 하나를 채점하는 로직 전체를 foreach 밖 별도 함수로
+    // 마저 뽑고, and/or는 모두 명시적 중첩 if로 치환한다.
+    // [자기컴파일 버그 수정 2026.08-3] 2026.08-2 수정 후에도 gen1이 정확히 같은 지점
+    // (MARK-EIG-2 직후)에서 동일하게 죽어, foreach-in-if 가설이 틀렸거나 최소한 전부가
+    // 아니었음이 확인됐다. 이 함수 내부에는 마크가 전혀 없어 진입 자체가 되는지조차
+    // 알 수 없었으므로, 기존 진단 방법론(조밀한 MARK Writeln + 이분 탐색)을 그대로 적용해
+    // 함수 진입/루프 각 단계/헬퍼 호출 전후에 전부 마크를 심는다. 동시에 아직 이 실행
+    // 경로에서 실제로 검증된 적 없는 두 구성도 제거한다: (1) "if cond then exit;" 형태의
+    // 조기 반환(bare exit) — EmitIndexerGet 상단의 string/array 분기에도 있지만 이번
+    // 테스트 케이스에서는 실행되지 않아 self-host에서의 안전성이 미확인 상태였다.
+    // (2) "foreach var x in 함수호출(...) do"처럼 함수 반환값을 변수에 담지 않고 바로
+    // foreach 대상으로 쓰는 패턴 — 배열에 먼저 담은 뒤 인덱스 기반 while로 순회하도록
+    // 바꿔 변수를 하나로 고정한다.
+    function TryScoreItemProperty(cand: PropertyInfo; idxArgType: System.Type; var score: integer): boolean;
+    var _tsipNameOk, _tsipArityOk, _tsipGetOk: boolean;
     begin
-      _fiipBest:=nil; _fiipBestScore:=System.Int32.MinValue;
-      foreach var cand in SafeGetProperties(baseType, BindingFlags.Public or BindingFlags.Instance) do
+      Writeln('[MARK-TSIP-0] 진입, cand.Name="'+cand.Name+'"');
+      Result:=false;
+      score:=0;
+      _tsipNameOk:=(cand.Name='Item');
+      Writeln('[MARK-TSIP-1] Name 비교 완료='+_tsipNameOk.ToString);
+      if _tsipNameOk then
       begin
-        if (cand.Name='Item') and (cand.GetIndexParameters.Length=1) and (cand.GetGetMethod<>nil) then
+        _tsipArityOk:=(cand.GetIndexParameters.Length=1);
+        Writeln('[MARK-TSIP-2] Arity 비교 완료='+_tsipArityOk.ToString);
+        if _tsipArityOk then
         begin
-          var score:=ScoreParamMatch(cand.GetIndexParameters()[0].ParameterType, idxArgType);
-          if (_fiipBest=nil) or (score>_fiipBestScore) then begin _fiipBestScore:=score; _fiipBest:=cand; end;
+          _tsipGetOk:=(cand.GetGetMethod<>nil);
+          Writeln('[MARK-TSIP-3] GetGetMethod 판정 완료='+_tsipGetOk.ToString);
+          if _tsipGetOk then
+          begin
+            score:=ScoreParamMatch(cand.GetIndexParameters()[0].ParameterType, idxArgType);
+            Writeln('[MARK-TSIP-4] ScoreParamMatch 완료, score='+score.ToString);
+            Result:=true;
+          end;
         end;
       end;
+      Writeln('[MARK-TSIP-5] 반환 직전, Result='+Result.ToString);
+    end;
+
+    function FindItemIndexerProperty(baseType: System.Type; idxArgType: System.Type): PropertyInfo;
+    var _fiipBest: PropertyInfo; _fiipBestScore: integer; _fiipScore: integer; _fiipOk: boolean;
+        _fiipProps: array of PropertyInfo; _fiipI: integer; _fiipResultIsNil: boolean;
+    begin
+      Writeln('[MARK-FIIP-0] FindItemIndexerProperty 진입');
+      _fiipBest:=nil; _fiipBestScore:=System.Int32.MinValue;
+      Writeln('[MARK-FIIP-1] SafeGetProperties 호출 직전');
+      _fiipProps:=SafeGetProperties(baseType, BindingFlags.Public or BindingFlags.Instance);
+      Writeln('[MARK-FIIP-2] SafeGetProperties 반환, 개수='+_fiipProps.Length.ToString);
+      _fiipI:=0;
+      while _fiipI<_fiipProps.Length do
+      begin
+        Writeln('[MARK-FIIP-3] 루프 진입, i='+_fiipI.ToString+' cand.Name="'+_fiipProps[_fiipI].Name+'"');
+        _fiipOk:=TryScoreItemProperty(_fiipProps[_fiipI], idxArgType, _fiipScore);
+        Writeln('[MARK-FIIP-4] TryScoreItemProperty 반환, ok='+_fiipOk.ToString);
+        if _fiipOk then
+        begin
+          if _fiipBest=nil then
+          begin _fiipBestScore:=_fiipScore; _fiipBest:=_fiipProps[_fiipI]; end
+          else
+          begin
+            if _fiipScore>_fiipBestScore then
+            begin _fiipBestScore:=_fiipScore; _fiipBest:=_fiipProps[_fiipI]; end;
+          end;
+        end;
+        Writeln('[MARK-FIIP-5] 루프 하단, i='+_fiipI.ToString);
+        _fiipI:=_fiipI+1;
+      end;
+      Writeln('[MARK-FIIP-6] 루프 종료 — Result 대입 직전');
       Result:=_fiipBest;
+      // [Stage 138 패턴 적용] Result(지역변수)의 "=nil" 비교 결과를 Writeln 문자열 접합
+      // 안에서 곧바로 .ToString으로 체이닝하지 않고, 반드시 중간 boolean 변수에 먼저 담는다.
+      _fiipResultIsNil:=(Result=nil);
+      Writeln('[MARK-FIIP-7] 반환 직전, Result=nil? '+_fiipResultIsNil.ToString);
     end;
 
     function EmitIndexerGet(aIL: ILGenerator; baseType: System.Type; idxExpr: TExprNode): System.Type;
-    var idxArgType: System.Type; itemProp: PropertyInfo; bestScore: integer;
+    var idxArgType: System.Type; itemProp: PropertyInfo; bestScore: integer; _eigItemPropIsNil: boolean;
     begin
       Writeln('[MARK-EIG-0] EmitIndexerGet 진입, baseType='+baseType.FullName);
       // [버그 수정] s[i] — Pascal 문자열 변수를 직접 인덱싱하는 경우(예: incName[1]).
@@ -1656,7 +1724,10 @@
       idxArgType:=InferArgClrType(idxExpr);
       Writeln('[MARK-EIG-2] InferArgClrType 완료 — FindItemIndexerProperty 호출 직전');
       itemProp:=FindItemIndexerProperty(baseType, idxArgType);
-      Writeln('[MARK-EIG-3] FindItemIndexerProperty 반환, itemProp=nil? '+(itemProp=nil).ToString);
+      // [Stage 138 패턴 적용] itemProp(지역변수)의 "=nil" 비교를 인라인 체이닝하지 않고
+      // 중간 boolean 변수에 먼저 담는다 — SafeGetProperty에서 확정된 동일 버그 재발 방지.
+      _eigItemPropIsNil:=(itemProp=nil);
+      Writeln('[MARK-EIG-3] FindItemIndexerProperty 반환, itemProp=nil? '+_eigItemPropIsNil.ToString);
       if itemProp=nil then
         raise new Exception('타입 "'+baseType.FullName+'"에는 인덱서(Item)가 없습니다.');
       var idxParams:=itemProp.GetIndexParameters();

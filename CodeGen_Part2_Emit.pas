@@ -852,18 +852,73 @@
       // 드러나지 않았다). 피연산자 중 하나라도 string이면 String.Equals(문자열,문자열)
       // (동등)이나 String.CompareOrdinal(문자열,문자열)(대소 비교)을 대신 호출한다.
       var _cmpLt90:=GetExprClrType(cmp.Left);
+      Writeln('[MARK-ECB-1] GetExprClrType(Left) 완료');
       var _cmpRt90:=GetExprClrType(cmp.Right);
-      var _cmpIsStr90:=((_cmpLt90<>nil) and (_cmpLt90=typeof(string)))
-                     or ((_cmpRt90<>nil) and (_cmpRt90=typeof(string)));
+      Writeln('[MARK-ECB-2] GetExprClrType(Right) 완료');
+      // [자기컴파일 버그 수정 2026.08-4] 위 두 GetExprClrType 호출 직후 곧바로 이어지던
+      // "((A<>nil) and (A=X)) or ((B<>nil) and (B=X))" 4중 and/or 단락평가 식이 gen1에서
+      // 예외 메시지 없이 조용히 죽는 크래시의 실제 원인이었다(로그가 [MARK-GECTT-VR8]
+      // 직후, 다음 마크 없이 끊기는 것으로 확정 — 이 줄과 다음 GetExprClrType 호출
+      // 사이에 마크가 하나도 없었다). 이미 확정된 and/or 단락평가 손상 패턴과 동일하므로
+      // 명시적 중첩 if로 완전히 풀어쓴다.
+      var _cmpLtIsStr90: boolean;
+      _cmpLtIsStr90:=false;
+      if _cmpLt90<>nil then
+      begin
+        if _cmpLt90=typeof(string) then
+          _cmpLtIsStr90:=true;
+      end;
+      Writeln('[MARK-ECB-3] LtIsStr 판정 완료='+_cmpLtIsStr90.ToString);
+      var _cmpRtIsStr90: boolean;
+      _cmpRtIsStr90:=false;
+      if _cmpRt90<>nil then
+      begin
+        if _cmpRt90=typeof(string) then
+          _cmpRtIsStr90:=true;
+      end;
+      Writeln('[MARK-ECB-4] RtIsStr 판정 완료='+_cmpRtIsStr90.ToString);
+      var _cmpIsStr90: boolean;
+      _cmpIsStr90:=false;
+      if _cmpLtIsStr90 then _cmpIsStr90:=true;
+      if _cmpRtIsStr90 then _cmpIsStr90:=true;
+      Writeln('[MARK-ECB-5] IsStr 최종 판정='+_cmpIsStr90.ToString);
       EmitExpr(aIL, cmp.Left); EmitExpr(aIL, cmp.Right);
-      if _cmpIsStr90 and ((cmp.Op=cmpEq) or (cmp.Op=cmpNeq)) then
+      // [자기컴파일 버그 수정 2026.08-4 계속] 아래 두 조건 "_cmpIsStr90 and (A or B ...)" 도
+      // 같은 계열의 and/or 단락평가 조합이라, 아직 이 실행 경로에서 검증된 적 없으므로
+      // 선제적으로 명시적 중첩 if로 미리 풀어 플래그로 만든다.
+      var _cmpOpIsEqNeq90: boolean;
+      _cmpOpIsEqNeq90:=false;
+      if cmp.Op=cmpEq then _cmpOpIsEqNeq90:=true;
+      if cmp.Op=cmpNeq then _cmpOpIsEqNeq90:=true;
+      var _cmpOpIsRel90: boolean;
+      _cmpOpIsRel90:=false;
+      if cmp.Op=cmpLt then _cmpOpIsRel90:=true;
+      if cmp.Op=cmpGt then _cmpOpIsRel90:=true;
+      if cmp.Op=cmpLe then _cmpOpIsRel90:=true;
+      if cmp.Op=cmpGe then _cmpOpIsRel90:=true;
+      var _cmpDoStrEq90: boolean;
+      _cmpDoStrEq90:=false;
+      if _cmpIsStr90 then
+      begin
+        if _cmpOpIsEqNeq90 then
+          _cmpDoStrEq90:=true;
+      end;
+      var _cmpDoStrRel90: boolean;
+      _cmpDoStrRel90:=false;
+      if _cmpIsStr90 then
+      begin
+        if _cmpOpIsRel90 then
+          _cmpDoStrRel90:=true;
+      end;
+      Writeln('[MARK-ECB-6] 연산자 분류 완료, DoStrEq='+_cmpDoStrEq90.ToString+' DoStrRel='+_cmpDoStrRel90.ToString);
+      if _cmpDoStrEq90 then
       begin
         var _seqMi90:=typeof(string).GetMethod('Equals', [typeof(string), typeof(string)]);
         aIL.Emit(OpCodes.Call, _seqMi90);
         if cmp.Op=cmpNeq then
         begin aIL.Emit(OpCodes.Ldc_I4_0); aIL.Emit(OpCodes.Ceq); end;
       end
-      else if _cmpIsStr90 and ((cmp.Op=cmpLt) or (cmp.Op=cmpGt) or (cmp.Op=cmpLe) or (cmp.Op=cmpGe)) then
+      else if _cmpDoStrRel90 then
       begin
         var _scmpMi90:=typeof(string).GetMethod('CompareOrdinal', [typeof(string), typeof(string)]);
         aIL.Emit(OpCodes.Call, _scmpMi90);
