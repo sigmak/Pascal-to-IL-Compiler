@@ -1699,7 +1699,11 @@
         else raise new Exception('선언되지 않은 예외 변수 "'+emn.VarName+'"');
         var getMsgMI:=typeof(Exception).GetMethod('get_Message');
         if getMsgMI=nil then
-          getMsgMI:=typeof(Exception).GetProperty('Message').GetGetMethod;
+        begin
+          // [Stage 122] typeof(X).GetProperty(Y).GetGetMethod 한 식 체이닝 — 중간 변수로 분리.
+          var _excMsgPi:=typeof(Exception).GetProperty('Message');
+          getMsgMI:=_excMsgPi.GetGetMethod;
+        end;
         aIL.Emit(OpCodes.Callvirt, getMsgMI);
       end
 
@@ -1719,7 +1723,9 @@
         aIL.Emit(OpCodes.Callvirt, getTypeMI);
         var typeNamePropName:='Name';
         if rtn.WantFullName then typeNamePropName:='FullName';
-        var typeNameGetMI:=typeof(System.Type).GetProperty(typeNamePropName).GetGetMethod;
+        // [Stage 122] typeof(X).GetProperty(Y).GetGetMethod 한 식 체이닝 — 중간 변수로 분리.
+        var _typeNamePi:=typeof(System.Type).GetProperty(typeNamePropName);
+        var typeNameGetMI:=_typeNamePi.GetGetMethod;
         aIL.Emit(OpCodes.Callvirt, typeNameGetMI);
       end
 
@@ -1865,7 +1871,11 @@
       aIL.Emit(OpCodes.Callvirt, getEnumMI);
       enumLoc:=aIL.DeclareLocal(typeof(System.Collections.IEnumerator));
       aIL.Emit(OpCodes.Stloc, enumLoc);
-      getCurMI:=typeof(System.Collections.IEnumerator).GetProperty('Current').GetGetMethod;
+      // [Stage 122] typeof(X).GetProperty(Y).GetGetMethod 한 식 체이닝 패턴 — EmitForInStmt에서
+      // 실제 self-host 크래시로 확인된 것과 동일한 코드 형태라 같은 계열 위험으로 보고
+      // 선제적으로 중간 변수로 풀어쓴다(로직 동일, MethodInfo 값은 그대로).
+      var _seqCurPi:=typeof(System.Collections.IEnumerator).GetProperty('Current');
+      getCurMI:=_seqCurPi.GetGetMethod;
       moveNextMI:=typeof(System.Collections.IEnumerator).GetMethod('MoveNext');
       listOpenT:=System.Type.GetType('System.Collections.Generic.List`1');
 
@@ -3527,13 +3537,18 @@
         if fLocalScope.Has(sl.ArrName) then aIL.Emit(OpCodes.Ldloca, fLocalScope.GetLoc(sl.ArrName))
         else aIL.Emit(OpCodes.Ldloca, fGlobalScope.GetLoc(sl.ArrName));
         EmitExpr(aIL, sl.NewSize);
+        // [Stage 123 버그 수정 — 자기컴파일, Stage 122와 동일 패턴] typeof(X).GetMethod(Y).MakeGenericMethod(Z)
+        // 한 식 체이닝 — EmitForInStmt(Stage 122)에서 확인된 것과 완전히 동일한 유형의 리플렉션
+        // 2단 체이닝. GetMethod 결과를 중간 변수(resizeMI102)에 먼저 담고 그 위에서
+        // MakeGenericMethod를 호출하도록 분리해 self-compile 시 IL 손상을 예방한다.
+        var resizeMI102:=typeof(System.Array).GetMethod('Resize');
         if at2=vtStrArray then
-          rm:=typeof(System.Array).GetMethod('Resize').MakeGenericMethod([typeof(string)])
+          rm:=resizeMI102.MakeGenericMethod([typeof(string)])
         // [Stage 90] array of object
         else if at2=vtObjArray then
-          rm:=typeof(System.Array).GetMethod('Resize').MakeGenericMethod([typeof(System.Object)])
+          rm:=resizeMI102.MakeGenericMethod([typeof(System.Object)])
         else
-          rm:=typeof(System.Array).GetMethod('Resize').MakeGenericMethod([typeof(integer)]);
+          rm:=resizeMI102.MakeGenericMethod([typeof(integer)]);
         aIL.Emit(OpCodes.Call, rm);
       end
 
@@ -4196,8 +4211,128 @@
     // [Stage 120] EmitStatement에서 분리된 TForInStmtNode 분기 본체(원래 가장 큰 단일
     // 분기, ~130줄) — 로직 동일. 사용자 로그가 정확히 이 분기 처리 직후(다음 문장으로
     // 넘어가는 지점)에서 self-compile 바이너리가 죽는 것으로 확인되어 최우선으로 분리했다.
+    // [Stage 121 버그 수정 — 재발, 자기컴파일] EmitForInStmt(Stage 120에서 이미 EmitStatement에서
+    // 분리됐음)가 그 자체로 여전히 ~116줄에, "변수 미선언" 케이스의 타입 추론 로직(GetExprClrType
+    // 호출 + 배열/딕셔너리/제네릭 3중 분기 + TypeBuilder 폴백)만으로도 50줄 넘게 차지하고
+    // 있었다. 사용자 로그(신규 Test_ListBuglog_self.txt)로 재확인: [MARK-GECTT-END](이번에
+    // GetExprClrTypeTail 자체는 끝까지 통과)가 찍힌 뒤, 그 호출자인 EmitForInStmt 안에서 다음
+    // 마크 없이 그대로 죽는다 — GetExprClrTypeTail 때와 완전히 동일한 "분리했지만 아직도 큼"
+    // 패턴이 한 단계 바깥(호출자)에서 재현된 것. ParsePrimary(111→112), GetExprClrType(117→118),
+    // GetExprClrTypeTail(119→120) 모두 같은 이유로 두 번째 분리가 필요했던 전례를 따라, "변수
+    // 미선언" 분기 본체를 EmitForInStmtInferVar로 통째로 들어내고 단계마다 진단 마크를 추가한다.
+    function EmitForInStmtInferVar(aIL: ILGenerator; fis: TForInStmtNode; var forInVarLoc: LocalBuilder): System.Type;
+    var forInVarClrType: System.Type;
+    begin
+      Writeln('[MARK-EFIS-IV-0] EmitForInStmtInferVar 진입');
+      // [Stage 102 버그 수정] "foreach var x in y do" — 위 TForStmtNode와 동일한 사유로
+      // 순회 변수가 미리 선언돼 있지 않다. 이 변수의 타입은 카운터와 달리 컬렉션의 실제
+      // 원소 타입에서 추론해야 한다: 배열이면 GetElementType, 제네릭 컬렉션(List<T>/
+      // IEnumerable<T> 등, 예: "foreach var ns in namespaceList do")이면 첫 번째 타입
+      // 인자, 그 외(비제네릭 컬렉션 등)는 object로 폴백한다 — 아래의 기존 Current
+      // Unbox_Any/Castclass 로직이 forInVarClrType을 그대로 쓰므로 그것과 맞아떨어진다.
+      //
+      // [버그 수정] Dictionary<TKey,TValue>(및 SortedDictionary/SortedList/IDictionary/
+      // IReadOnlyDictionary 등 TKey,TValue 2개짜리 딕셔너리류)는 실제로는
+      // KeyValuePair<TKey,TValue>를 순회한다 — "그 외 제네릭 컬렉션은 첫 번째 타입
+      // 인자" 규칙을 그대로 적용하면 원소 타입이 TKey(예: string)로 잘못 추론되어,
+      // 그 뒤 ".Value"/".Key" 접근이 "System.String에 메서드가 없습니다"로 깨진다
+      // (예: foreach var kv in fTypeBuilders do ... kv.Value ... — fTypeBuilders:
+      // Dictionary<string, TypeBuilder>). GetGenericArguments()[0]을 쓰기 전에
+      // 딕셔너리류인지 먼저 판별해 KeyValuePair<TKey,TValue>를 조립한다.
+      var forInCollType102:=GetExprClrType(fis.CollExpr);
+      Writeln('[MARK-EFIS-IV-1] GetExprClrType(CollExpr) 완료');
+      if (forInCollType102<>nil) and forInCollType102.IsArray then
+        forInVarClrType:=forInCollType102.GetElementType
+      else if (forInCollType102<>nil) and forInCollType102.IsGenericType
+         and (forInCollType102.GetGenericArguments.Length=2)
+         and IsDictionaryLikeType102(forInCollType102) then
+        forInVarClrType:=typeof(System.Collections.Generic.KeyValuePair<System.Object,System.Object>)
+          .GetGenericTypeDefinition.MakeGenericType(forInCollType102.GetGenericArguments)
+      else if (forInCollType102<>nil) and forInCollType102.IsGenericType
+         and (forInCollType102.GetGenericArguments.Length>=1) then
+        forInVarClrType:=forInCollType102.GetGenericArguments()[0]
+      else
+        forInVarClrType:=typeof(System.Object);
+      Writeln('[MARK-EFIS-IV-2] 원소 타입 판정 완료');
+      forInVarLoc:=aIL.DeclareLocal(forInVarClrType);
+      var forInVt102:=VarTypeTagFromClrType(forInVarClrType);
+      fLocalScope.Declare(fis.VarName, forInVarLoc, forInVt102);
+      if forInVt102=vtObject then fLocalScope.SetClrType(fis.VarName, forInVarClrType);
+      Writeln('[MARK-EFIS-IV-3] fLocalScope.Declare 완료');
+      // [버그 수정] foreach 원소 타입이 로컬(자기 자신 소스에 정의된) 클래스의
+      // TypeBuilder일 때 SetClrType만 등록하고 SetClassName은 등록하지 않아서,
+      // InferType이 HasClrType 분기(리플렉션 프로퍼티/메서드만 확인, 로컬 클래스의
+      // FieldBuilder 필드는 못 찾음)로 먼저 걸려버렸다. 그 결과 "foreach var ps in
+      // list_of_local_class do ... ps.StringField ..." 형태의 문자열 필드 읽기가
+      // vtInteger로 오판되어 Convert.ToString(int32)가 문자열 참조 위에 잘못 호출되고,
+      // self-host 빌드 시 그 메서드의 IL 자체가 스택 타입 불일치로 깨져
+      // BadImageFormatException을 유발했다 (실제 사례: BuildClassShell_Properties의
+      // "foreach var ps in cd.Properties do ... ps.Name ..."). 일반 매개변수/지역변수와
+      // 동일하게 SetClassName도 등록해 TryFindFieldBuilder 경로를 타게 한다.
+      if forInVarClrType is TypeBuilder then
+      begin
+        // [110번째 자기컴파일 버그 수정] 인라인 foreach 대신 FindLocalClassNameForTypeBuilder 재사용.
+        var _forInLocalCls102:=FindLocalClassNameForTypeBuilder(forInVarClrType);
+        if _forInLocalCls102<>'' then
+          fLocalScope.SetClassName(fis.VarName, _forInLocalCls102);
+      end;
+      Writeln('[MARK-EFIS-IV-4] EmitForInStmtInferVar 반환 직전');
+      Result:=forInVarClrType;
+    end;
+
+    // [Stage 125 버그 수정 — 자기컴파일, 원인 재확정] Stage 124의 "3개의 &Label var(byref)
+    // 매개변수" 함수 시그니처 자체가 새로운 미검증 코드 모양이었다: 재검증 결과 크래시 지점이
+    // 다시 [MARK-EFIS-2] 직후로 되돌아갔다(EmitForInStmtSetupLoop 호출/반환 자체가 깨짐).
+    // 이 코드베이스 전체를 뒤져봐도 "구조체(값 타입) var 매개변수 여러 개"를 쓰는 함수는
+    // 이번이 처음이었다 — 기존 EmitForInStmtInferVar의 var 매개변수는 참조 타입(LocalBuilder)
+    // 1개뿐이었다. 검증되지 않은 모양을 새로 만드는 대신, 이미 전역에서 널리 쓰이고 검증된
+    // "배열 반환" 패턴으로 바꿔 값 타입 var 매개변수 자체를 없앤다.
+    function EmitForInStmtSetupLoop(aIL: ILGenerator): array of &Label;
+    var forInCkL102, forInBdL102, forInEndL102: &Label;
+    begin
+      // [Stage 126 진단] Stage 124(var byref 구조체 3개)와 Stage 125(array of &Label 반환)가
+      // 시그니처는 완전히 다른데도 바이트 단위로 동일한 지점에서 죽었다 — 매개변수 전달 방식이
+      // 아니라 "이 위치에 새 로컬 중첩 함수를 추가/호출하는 행위 자체"가 원인일 가능성을 확인하기
+      // 위한 최소 진단. 함수 진입 직후 첫 줄에만 마크를 심어, 크래시가 호출(Call 명령어) 단계인지
+      // 함수 본문 진입 이후인지를 가른다.
+      Writeln('[MARK-EFISSL-0] EmitForInStmtSetupLoop 진입 직후');
+      forInCkL102:=aIL.DefineLabel;
+      Writeln('[MARK-EFISSL-1] forInCkL102 DefineLabel 완료');
+      forInBdL102:=aIL.DefineLabel;
+      Writeln('[MARK-EFISSL-2] forInBdL102 DefineLabel 완료');
+      // [Stage 60] continue → MoveNext 검사(forInCkL)로, break → 루프 뒤(forInEndL)로.
+      forInEndL102:=aIL.DefineLabel;
+      Writeln('[MARK-EFISSL-3] forInEndL102 DefineLabel 완료');
+      fLoopBreakLabels.Add(forInEndL102);
+      Writeln('[MARK-EFISSL-4] fLoopBreakLabels.Add 완료');
+      fLoopContinueLabels.Add(forInCkL102);
+      Writeln('[MARK-EFISSL-5] fLoopContinueLabels.Add 완료');
+      fLoopExceptDepths.Add(fCurExceptDepth);
+      Writeln('[MARK-EFISSL-6] fLoopExceptDepths.Add 완료');
+      aIL.Emit(OpCodes.Br, forInCkL102);
+      Writeln('[MARK-EFISSL-7] Br 방출 완료');
+      aIL.MarkLabel(forInBdL102);
+      Writeln('[MARK-EFISSL-8] MarkLabel 완료');
+      Result:=[forInCkL102, forInBdL102, forInEndL102];
+      Writeln('[MARK-EFISSL-9] Result 배열 리터럴 대입 완료');
+    end;
+
+    // [Stage 124] "VarName := (T)_e.Current;" 대입 블록도 동일 사유로 별도 함수로 분리.
+    procedure EmitForInStmtAssignCurrent(aIL: ILGenerator; forInEnumLoc: LocalBuilder;
+      forInVarClrType: System.Type; forInVarLoc: LocalBuilder);
+    begin
+      aIL.Emit(OpCodes.Ldloc, forInEnumLoc);
+      var forInCurPi:=typeof(System.Collections.IEnumerator).GetProperty('Current');
+      var getCurMI:=forInCurPi.GetGetMethod;
+      aIL.Emit(OpCodes.Callvirt, getCurMI);
+      if forInVarClrType.IsValueType then aIL.Emit(OpCodes.Unbox_Any, forInVarClrType)
+      else aIL.Emit(OpCodes.Castclass, forInVarClrType);
+      aIL.Emit(OpCodes.Stloc, forInVarLoc);
+    end;
+
     procedure EmitForInStmt(aIL: ILGenerator; fis: TForInStmtNode);
     begin
+      Writeln('[MARK-EFIS-0] EmitForInStmt 진입');
       // [Stage 54] for VarName in CollExpr do Body
       // "중간" 단계: 배열(T[])이든 List<T> 같은 외부 컬렉션이든, .NET IEnumerable을
       // 구현하는 값이면 무엇이든 동일한 방식으로 순회한다 — 원소마다 특수 케이스를
@@ -4228,80 +4363,28 @@
         forInVarClrType:=VTC(GetVarType(fis.VarName), GetVarClassName(fis.VarName));
       end
       else
-      begin
-        // [Stage 102 버그 수정] "foreach var x in y do" — 위 TForStmtNode와 동일한 사유로
-        // 순회 변수가 미리 선언돼 있지 않다. 이 변수의 타입은 카운터와 달리 컬렉션의 실제
-        // 원소 타입에서 추론해야 한다: 배열이면 GetElementType, 제네릭 컬렉션(List<T>/
-        // IEnumerable<T> 등, 예: "foreach var ns in namespaceList do")이면 첫 번째 타입
-        // 인자, 그 외(비제네릭 컬렉션 등)는 object로 폴백한다 — 아래의 기존 Current
-        // Unbox_Any/Castclass 로직이 forInVarClrType을 그대로 쓰므로 그것과 맞아떨어진다.
-        //
-        // [버그 수정] Dictionary<TKey,TValue>(및 SortedDictionary/SortedList/IDictionary/
-        // IReadOnlyDictionary 등 TKey,TValue 2개짜리 딕셔너리류)는 실제로는
-        // KeyValuePair<TKey,TValue>를 순회한다 — "그 외 제네릭 컬렉션은 첫 번째 타입
-        // 인자" 규칙을 그대로 적용하면 원소 타입이 TKey(예: string)로 잘못 추론되어,
-        // 그 뒤 ".Value"/".Key" 접근이 "System.String에 메서드가 없습니다"로 깨진다
-        // (예: foreach var kv in fTypeBuilders do ... kv.Value ... — fTypeBuilders:
-        // Dictionary<string, TypeBuilder>). GetGenericArguments()[0]을 쓰기 전에
-        // 딕셔너리류인지 먼저 판별해 KeyValuePair<TKey,TValue>를 조립한다.
-        var forInCollType102:=GetExprClrType(fis.CollExpr);
-        if (forInCollType102<>nil) and forInCollType102.IsArray then
-          forInVarClrType:=forInCollType102.GetElementType
-        else if (forInCollType102<>nil) and forInCollType102.IsGenericType
-           and (forInCollType102.GetGenericArguments.Length=2)
-           and IsDictionaryLikeType102(forInCollType102) then
-          forInVarClrType:=typeof(System.Collections.Generic.KeyValuePair<System.Object,System.Object>)
-            .GetGenericTypeDefinition.MakeGenericType(forInCollType102.GetGenericArguments)
-        else if (forInCollType102<>nil) and forInCollType102.IsGenericType
-           and (forInCollType102.GetGenericArguments.Length>=1) then
-          forInVarClrType:=forInCollType102.GetGenericArguments()[0]
-        else
-          forInVarClrType:=typeof(System.Object);
-        forInVarLoc:=aIL.DeclareLocal(forInVarClrType);
-        var forInVt102:=VarTypeTagFromClrType(forInVarClrType);
-        fLocalScope.Declare(fis.VarName, forInVarLoc, forInVt102);
-        if forInVt102=vtObject then fLocalScope.SetClrType(fis.VarName, forInVarClrType);
-        // [버그 수정] foreach 원소 타입이 로컬(자기 자신 소스에 정의된) 클래스의
-        // TypeBuilder일 때 SetClrType만 등록하고 SetClassName은 등록하지 않아서,
-        // InferType이 HasClrType 분기(리플렉션 프로퍼티/메서드만 확인, 로컬 클래스의
-        // FieldBuilder 필드는 못 찾음)로 먼저 걸려버렸다. 그 결과 "foreach var ps in
-        // list_of_local_class do ... ps.StringField ..." 형태의 문자열 필드 읽기가
-        // vtInteger로 오판되어 Convert.ToString(int32)가 문자열 참조 위에 잘못 호출되고,
-        // self-host 빌드 시 그 메서드의 IL 자체가 스택 타입 불일치로 깨져
-        // BadImageFormatException을 유발했다 (실제 사례: BuildClassShell_Properties의
-        // "foreach var ps in cd.Properties do ... ps.Name ..."). 일반 매개변수/지역변수와
-        // 동일하게 SetClassName도 등록해 TryFindFieldBuilder 경로를 타게 한다.
-        if forInVarClrType is TypeBuilder then
-        begin
-          // [110번째 자기컴파일 버그 수정] 인라인 foreach 대신 FindLocalClassNameForTypeBuilder 재사용.
-          var _forInLocalCls102:=FindLocalClassNameForTypeBuilder(forInVarClrType);
-          if _forInLocalCls102<>'' then
-            fLocalScope.SetClassName(fis.VarName, _forInLocalCls102);
-        end;
-      end;
+        // [Stage 121] "변수 미선언" 분기 본체를 EmitForInStmtInferVar로 이동. 로직 동일.
+        forInVarClrType:=EmitForInStmtInferVar(aIL, fis, forInVarLoc);
+      Writeln('[MARK-EFIS-1] 변수/타입 확정 완료');
 
       EmitExpr(aIL, fis.CollExpr); // 컬렉션 참조를 스택에 올린다
       var getEnumMI:=typeof(System.Collections.IEnumerable).GetMethod('GetEnumerator');
       aIL.Emit(OpCodes.Callvirt, getEnumMI);
       var forInEnumLoc:=aIL.DeclareLocal(typeof(System.Collections.IEnumerator));
       aIL.Emit(OpCodes.Stloc, forInEnumLoc);
+      Writeln('[MARK-EFIS-2] GetEnumerator 방출 완료');
 
-      var forInCkL:=aIL.DefineLabel; var forInBdL:=aIL.DefineLabel;
-      // [Stage 60] continue → MoveNext 검사(forInCkL)로, break → 루프 뒤(forInEndL)로.
-      var forInEndL:=aIL.DefineLabel;
-      fLoopBreakLabels.Add(forInEndL); fLoopContinueLabels.Add(forInCkL); fLoopExceptDepths.Add(fCurExceptDepth);
-      aIL.Emit(OpCodes.Br, forInCkL);
-      aIL.MarkLabel(forInBdL);
+      var forInLabels102:=EmitForInStmtSetupLoop(aIL);
+      var forInCkL:=forInLabels102[0];
+      var forInBdL:=forInLabels102[1];
+      var forInEndL:=forInLabels102[2];
+      Writeln('[MARK-EFIS-2Z] EmitForInStmtSetupLoop 반환 직전');
 
-      // VarName := (T)_e.Current;
-      aIL.Emit(OpCodes.Ldloc, forInEnumLoc);
-      var getCurMI:=typeof(System.Collections.IEnumerator).GetProperty('Current').GetGetMethod;
-      aIL.Emit(OpCodes.Callvirt, getCurMI);
-      if forInVarClrType.IsValueType then aIL.Emit(OpCodes.Unbox_Any, forInVarClrType)
-      else aIL.Emit(OpCodes.Castclass, forInVarClrType);
-      aIL.Emit(OpCodes.Stloc, forInVarLoc);
+      EmitForInStmtAssignCurrent(aIL, forInEnumLoc, forInVarClrType, forInVarLoc);
+      Writeln('[MARK-EFIS-3] Current 대입 완료 — Body 진입 직전');
 
       EmitStatement(aIL, fis.Body);
+      Writeln('[MARK-EFIS-4] Body 방출 완료');
 
       aIL.MarkLabel(forInCkL);
       aIL.Emit(OpCodes.Ldloc, forInEnumLoc);
@@ -4312,7 +4395,9 @@
       fLoopBreakLabels.RemoveAt(fLoopBreakLabels.Count-1);
       fLoopContinueLabels.RemoveAt(fLoopContinueLabels.Count-1);
       fLoopExceptDepths.RemoveAt(fLoopExceptDepths.Count-1);
+      Writeln('[MARK-EFIS-END] EmitForInStmt 반환 직전');
     end;
+
 
     // [Stage 120] EmitStatement에서 분리된 TTryStmtNode 분기 본체(~85줄) — 로직 동일.
     procedure EmitTryStmt(aIL: ILGenerator; ts2: TTryStmtNode);

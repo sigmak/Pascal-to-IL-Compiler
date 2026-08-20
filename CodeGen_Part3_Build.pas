@@ -2467,7 +2467,6 @@
     // 반환값이 nil이면 "해당 분기 중 아무것도 매치하지 않았거나, 매치했어도 값을 못 찾음"을
     // 뜻하며, 호출부(GetExprClrType)는 원래처럼 System.Object 기본값을 유지한다.
     function GetExprClrTypeTail(e: TExprNode): System.Type;
-    var _fb90: FieldBuilder;
     begin
       Writeln('[MARK-GECTT-0] GetExprClrTypeTail 진입');
       Result:=nil;
@@ -2521,71 +2520,104 @@
         Result:=GetExprClrTypeTailVarRef(TVarRefNode(e).VarName);
         Writeln('[MARK-GECTT-VR8] TVarRefNode 분기 끝');
       end
+      // [Stage 120 버그 수정 — 재발] Stage 119에서 ExtIndex/ArrIndex/VarRef 세 분기를
+      // 들어냈음에도, 남은 TFieldReadExprNode/TNewObjectExprNode/TBinOpNode 및 리터럴
+      // 체인까지 합쳐 GetExprClrTypeTail이 여전히 ~140줄짜리 10여 분기 단일 함수였고,
+      // 자기컴파일 로그에서 [MARK-GECTT-VR8] 직후 다음 마크 없이 그대로 죽는 것이
+      // 그대로 재현됐다(Test_ListBuglog_self.txt). Stage 111→112, 117→118과 동일하게
+      // "한 번의 분리로는 부족함" 전례를 따라 남은 모든 분기를 마저 각각의 함수로
+      // 들어내고, 이 함수는 is-판별 후 위임만 하는 얇은 디스패처로 만든다.
       else if e is TFieldReadExprNode then
+        Result:=GetExprClrTypeTailFieldRead(TFieldReadExprNode(e).FieldName)
+      else if e is TNewObjectExprNode then
+        Result:=GetExprClrTypeTailNewObject(TNewObjectExprNode(e))
+      else if e is TBinOpNode then
+        Result:=GetExprClrTypeTailBinOp(TBinOpNode(e))
+      else
+        Result:=GetExprClrTypeTailLiteral(e);
+      Writeln('[MARK-GECTT-END] GetExprClrTypeTail 반환 직전');
+    end;
+
+    // [Stage 120] GetExprClrTypeTail에서 분리된 TFieldReadExprNode 분기 본체 — 로직 동일,
+    // 함수만 나눔.
+    function GetExprClrTypeTailFieldRead(_fnm90: string): System.Type;
+    var _fb90: FieldBuilder;
+    begin
+      Result:=nil;
+      if TryFindFieldBuilder(fCurClassName, _fnm90, _fb90) then Result:=_fb90.FieldType
+      else
       begin
-        var _fnm90:=TFieldReadExprNode(e).FieldName;
-        if TryFindFieldBuilder(fCurClassName, _fnm90, _fb90) then Result:=_fb90.FieldType
-        else
+        // [Stage 95 버그 수정] ClientSize처럼 자기 클래스가 직접 선언한 필드가 아니라
+        // 외부 상속 타입(Form → ScrollableControl → Control 등)의 프로퍼티/필드일 때
+        // 폴백이 없어서 함수 맨 위의 기본값 System.Object로 그냥 떨어졌다. 그 결과
+        // "self.ClientSize.Height"처럼 체인으로 이어지는 바깥쪽 .Height가 System.Object
+        // 위에서 Height를 찾다가 "타입 System.Object에 멤버 Height가 없습니다"로 터졌다.
+        // IsChainStartSegment/EmitQualifierChainLoad가 이미 쓰는 것과 같은
+        // FindExternalAncestorType 폴백을 여기도 추가한다.
+        var _extAnc90:=FindExternalAncestorType(fCurClassName);
+        if _extAnc90<>nil then
         begin
-          // [Stage 95 버그 수정] ClientSize처럼 자기 클래스가 직접 선언한 필드가 아니라
-          // 외부 상속 타입(Form → ScrollableControl → Control 등)의 프로퍼티/필드일 때
-          // 폴백이 없어서 함수 맨 위의 기본값 System.Object로 그냥 떨어졌다. 그 결과
-          // "self.ClientSize.Height"처럼 체인으로 이어지는 바깥쪽 .Height가 System.Object
-          // 위에서 Height를 찾다가 "타입 System.Object에 멤버 Height가 없습니다"로 터졌다.
-          // IsChainStartSegment/EmitQualifierChainLoad가 이미 쓰는 것과 같은
-          // FindExternalAncestorType 폴백을 여기도 추가한다.
-          var _extAnc90:=FindExternalAncestorType(fCurClassName);
-          if _extAnc90<>nil then
+          var _extPi90:=SafeGetProperty(_extAnc90, _fnm90);
+          if _extPi90<>nil then Result:=_extPi90.PropertyType
+          else
           begin
-            var _extPi90:=SafeGetProperty(_extAnc90, _fnm90);
-            if _extPi90<>nil then Result:=_extPi90.PropertyType
-            else
-            begin
-              var _extFi90:=_extAnc90.GetField(_fnm90);
-              if _extFi90<>nil then Result:=_extFi90.FieldType;
-            end;
+            var _extFi90:=_extAnc90.GetField(_fnm90);
+            if _extFi90<>nil then Result:=_extFi90.FieldType;
           end;
         end;
-      end
-      else if e is TNewObjectExprNode then
+      end;
+    end;
+
+    // [Stage 120] GetExprClrTypeTail에서 분리된 TNewObjectExprNode 분기 본체 — 로직 동일,
+    // 함수만 나눔.
+    function GetExprClrTypeTailNewObject(_no90: TNewObjectExprNode): System.Type;
+    var _no90ElemT: System.Type;
+    begin
+      Result:=nil;
+      if _no90.IsExternalType then _no90ElemT:=ResolveExternalType(_no90.ClassName)
+      else if fBuiltTypes.ContainsKey(_no90.ClassName) then _no90ElemT:=fBuiltTypes[_no90.ClassName]
+      else _no90ElemT:=nil;
+      if _no90ElemT<>nil then
       begin
-        var _no90:=TNewObjectExprNode(e);
-        var _no90ElemT: System.Type;
-        if _no90.IsExternalType then _no90ElemT:=ResolveExternalType(_no90.ClassName)
-        else if fBuiltTypes.ContainsKey(_no90.ClassName) then _no90ElemT:=fBuiltTypes[_no90.ClassName]
-        else _no90ElemT:=nil;
-        if _no90ElemT<>nil then
-        begin
-          // [Stage 96] new Type[N](...)는 원소 타입이 아니라 배열 타입(Type[])을 낳는다 —
-          // TChainedMemberExprNode 등이 이 노드를 Inner로 삼아 체인을 이어갈 때
-          // (예: new T[N](...).Length) 잘못된 타입으로 멤버를 찾지 않도록 한다.
-          if _no90.ArraySizeExpr<>nil then Result:=_no90ElemT.MakeArrayType()
-          else Result:=_no90ElemT;
-        end;
-      end
-      // [자기컴파일 버그 수정] (a - b).ToString / (a + b).Foo 처럼 산술 이항식 바로 뒤에
-      // 멤버/메서드가 체이닝되는 경우 — GetExprClrType에 TBinOpNode 분기가 아예 없어서
-      // 지금까지 무조건 맨 위 기본값 System.Object로 폴백했다. EmitExpr의
-      // TChainedMemberExprNode 처리부는 이 타입을 보고 "값 타입이면 지역변수에 담아
-      // 주소를 취해 Call, 아니면 Callvirt"를 결정하는데(1013행대), System.Object는
-      // IsValueType=false이므로 박싱/주소 취득 과정을 건너뛰고 스택에 그대로 남아있는
-      // 원시 int32 값 위에 곧바로 Callvirt를 걸어버렸다 — 참조가 아닌 원시값을 객체
-      // 포인터로 오인하는 손상된 IL이라, 실행 시 관리되는 예외조차 못 띄우고 프로세스가
-      // 아무 메시지 없이 죽는다(실제 재현: Main.pas의 "(compileOrder.Count - 1).ToString").
-      // InferType의 TBinOpNode 분기(문자열 > 실수 > int64 > 정수 승격, boAnd/boOr는
-      // 항상 논리형)와 동일한 규칙을 CLR 타입으로 그대로 옮긴다.
-      else if e is TBinOpNode then
-      begin
-        var _bo90:=TBinOpNode(e);
-        var _boLt90:=GetExprClrType(_bo90.Left);
-        var _boRt90:=GetExprClrType(_bo90.Right);
-        if (_bo90.Op=boAnd) or (_bo90.Op=boOr) then Result:=typeof(boolean)
-        else if (_boLt90=typeof(string)) or (_boRt90=typeof(string)) then Result:=typeof(string)
-        else if (_boLt90=typeof(double)) or (_boRt90=typeof(double)) then Result:=typeof(double)
-        else if (_boLt90=typeof(int64)) or (_boRt90=typeof(int64)) then Result:=typeof(int64)
-        else Result:=typeof(integer);
-      end
-      else if e is TStrLiteralNode then Result:=typeof(string)
+        // [Stage 96] new Type[N](...)는 원소 타입이 아니라 배열 타입(Type[])을 낳는다 —
+        // TChainedMemberExprNode 등이 이 노드를 Inner로 삼아 체인을 이어갈 때
+        // (예: new T[N](...).Length) 잘못된 타입으로 멤버를 찾지 않도록 한다.
+        if _no90.ArraySizeExpr<>nil then Result:=_no90ElemT.MakeArrayType()
+        else Result:=_no90ElemT;
+      end;
+    end;
+
+    // [Stage 120] GetExprClrTypeTail에서 분리된 TBinOpNode 분기 본체 — 로직 동일, 함수만 나눔.
+    // [자기컴파일 버그 수정] (a - b).ToString / (a + b).Foo 처럼 산술 이항식 바로 뒤에
+    // 멤버/메서드가 체이닝되는 경우 — GetExprClrType에 TBinOpNode 분기가 아예 없어서
+    // 지금까지 무조건 맨 위 기본값 System.Object로 폴백했다. EmitExpr의
+    // TChainedMemberExprNode 처리부는 이 타입을 보고 "값 타입이면 지역변수에 담아
+    // 주소를 취해 Call, 아니면 Callvirt"를 결정하는데(1013행대), System.Object는
+    // IsValueType=false이므로 박싱/주소 취득 과정을 건너뛰고 스택에 그대로 남아있는
+    // 원시 int32 값 위에 곧바로 Callvirt를 걸어버렸다 — 참조가 아닌 원시값을 객체
+    // 포인터로 오인하는 손상된 IL이라, 실행 시 관리되는 예외조차 못 띄우고 프로세스가
+    // 아무 메시지 없이 죽는다(실제 재현: Main.pas의 "(compileOrder.Count - 1).ToString").
+    // InferType의 TBinOpNode 분기(문자열 > 실수 > int64 > 정수 승격, boAnd/boOr는
+    // 항상 논리형)와 동일한 규칙을 CLR 타입으로 그대로 옮긴다.
+    function GetExprClrTypeTailBinOp(_bo90: TBinOpNode): System.Type;
+    var _boLt90, _boRt90: System.Type;
+    begin
+      _boLt90:=GetExprClrType(_bo90.Left);
+      _boRt90:=GetExprClrType(_bo90.Right);
+      if (_bo90.Op=boAnd) or (_bo90.Op=boOr) then Result:=typeof(boolean)
+      else if (_boLt90=typeof(string)) or (_boRt90=typeof(string)) then Result:=typeof(string)
+      else if (_boLt90=typeof(double)) or (_boRt90=typeof(double)) then Result:=typeof(double)
+      else if (_boLt90=typeof(int64)) or (_boRt90=typeof(int64)) then Result:=typeof(int64)
+      else Result:=typeof(integer);
+    end;
+
+    // [Stage 120] GetExprClrTypeTail에서 분리된 리터럴/내장 변환 노드 체인 — 로직 동일,
+    // 함수만 나눔. 개별 분기는 한 줄씩이라 작지만, 합쳐서 GetExprClrTypeTail 본체에 남아
+    // 있으면 여전히 분기 수를 늘려 전체 함수 크기/복잡도에 기여하므로 통째로 들어낸다.
+    function GetExprClrTypeTailLiteral(e: TExprNode): System.Type;
+    begin
+      Result:=nil;
+      if e is TStrLiteralNode then Result:=typeof(string)
       else if e is TIntLiteralNode then Result:=typeof(integer)
       else if e is TRealLiteralNode then Result:=typeof(double)
       else if e is TInt64LiteralNode then Result:=typeof(int64)
@@ -4132,7 +4164,10 @@
       ngIl.Emit(OpCodes.Ldarg_0); ngIl.Emit(OpCodes.Ldfld, curFB);
       if elemClrType.IsValueType then ngIl.Emit(OpCodes.Box, elemClrType);
       ngIl.Emit(OpCodes.Ret);
-      clTB.DefineMethodOverride(getCurNG, typeof(System.Collections.IEnumerator).GetProperty('Current').GetGetMethod);
+      // [Stage 123 버그 수정 — 자기컴파일, Stage 122와 동일 패턴] typeof(X).GetProperty(Y).GetGetMethod
+      // 한 식 체이닝 — EmitForInStmt(Stage 122)와 동일한 유형. 중간 변수로 분리.
+      var ienumCurPi102:=typeof(System.Collections.IEnumerator).GetProperty('Current');
+      clTB.DefineMethodOverride(getCurNG, ienumCurPi102.GetGetMethod);
 
       // ---- Current: IEnumerator<T>.Current — T 그대로 반환(박싱 없음) ----
       var ienumeratorOpenT2:=System.Type.GetType('System.Collections.Generic.IEnumerator`1');
@@ -4144,7 +4179,9 @@
         elemClrType, _P3EmptyTypesLocalC4);
       var gIl:=getCurG.GetILGenerator;
       gIl.Emit(OpCodes.Ldarg_0); gIl.Emit(OpCodes.Ldfld, curFB); gIl.Emit(OpCodes.Ret);
-      clTB.DefineMethodOverride(getCurG, ienumeratorT2.GetProperty('Current').GetGetMethod);
+      // [Stage 123 버그 수정 — 자기컴파일, Stage 122와 동일 패턴] 체이닝된 GetProperty(...).GetGetMethod 분리.
+      var ienumTCurPi102:=ienumeratorT2.GetProperty('Current');
+      clTB.DefineMethodOverride(getCurG, ienumTCurPi102.GetGetMethod);
 
       // ---- GetEnumerator: IEnumerable(비제네릭) — 1차 제약: 재사용 없이 자기 자신을 그대로 돌려준다
       // (한 번만 순회 가능 — 같은 시퀀스를 두 번 foreach하면 이미 소진된 상태를 공유한다. 다시 순회하려면
