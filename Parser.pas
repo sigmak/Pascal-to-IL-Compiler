@@ -2403,211 +2403,15 @@ type
       Result:=new TLambdaExprNode(ps, ParseStatement);
     end;
 
-    function ParseStatement: TStmtNode;
+    // [자기컴파일 버그 수정 - 신규] ParseStatement의 tkIdent 분기를 분리한 함수.
+    // nt는 이미 소비된 식별자 토큰(호출 시점의 Cur 이전 토큰)이며, 이 함수 진입 시점의
+    // Cur는 nt 바로 다음 토큰이다 (기존 인라인 코드와 동일한 파서 상태).
+    function ParseStatementIdentBranch(nt: TToken): TStmtNode;
     var
-      nt: TToken; rhs, idx, sz: TExprNode;
-      comp: TCompoundStmtNode; cond: TExprNode;
-      tS, eS, bS: TStmtNode; pcn: TProcCallStmtNode;
+      rhs, idx: TExprNode;
+      pcn: TProcCallStmtNode;
       mcs: TMethodCallStmtNode;
     begin
-      // [자기컴파일 버그 수정 - Stage 138과 동일 클래스] "Cur.Kind.ToString"/"Cur.Text"/
-      // "Cur.Line.ToString"처럼 체인 표현식을 문자열 접합(+) 안에서 곧바로 쓰면 gen0가
-      // 자기 자신을 컴파일할 때 잘못된 IL을 방출한다(Cur.Text가 문자열이 아니라 정수/해시값
-      // 같은 쓰레기로 찍히는 실제 재현 사례). 중간 로컬 변수를 거치도록 분리한다.
-      var _psTok:=Cur;
-      var _psKindStr:=_psTok.Kind.ToString;
-      var _psText:=_psTok.Text;
-      var _psLineStr:=_psTok.Line.ToString;
-      Writeln('[MARK-PS] ParseStatement 진입, Cur.Kind='+_psKindStr+', Cur.Text="'+_psText+'", line='+_psLineStr);
-      if Cur.Kind=tkWriteln then
-      begin
-        fPos:=fPos+1;
-        // [Stage 96 수정] 'Writeln;' (괄호 자체가 없음) 과 'Writeln();' (빈 괄호) 모두
-        // 표준 Pascal에서 "인자 없이 줄바꿈만 출력"하는 유효한 호출이다. 기존 코드는
-        // Expect(tkLParen)을 무조건 요구해서 'Writeln;'이 "예상 tkLParen 실제
-        // tkSemicolon" 파스 오류로 실패했다. 이제 괄호가 없거나 바로 닫히면 빈 줄
-        // 출력(TWritelnStringStmtNode(''))으로 처리한다.
-        if (Cur.Kind<>tkLParen) then
-        begin
-          Result:=new TWritelnStringStmtNode('');
-        end
-        else if (fPos+1<fTokens.Count) and (fTokens[fPos+1].Kind=tkRParen) then
-        begin
-          fPos:=fPos+2; // '(' 와 ')' 소비
-          Result:=new TWritelnStringStmtNode('');
-        end
-        else
-        begin
-          fPos:=fPos+1; rhs:=ParseExpr;
-          // [Stage 90] writeln(a, b, c, ...) — 콤마로 이어지는 추가 인자 지원.
-          // (기존에는 인자를 정확히 1개만 받았고, 콤마가 나오면 "예상 tkRParen 실제 tkComma" 에러.)
-          if Cur.Kind=tkComma then
-          begin
-            var wArgs:=new List<TExprNode>; wArgs.Add(rhs);
-            while Cur.Kind=tkComma do begin fPos:=fPos+1; wArgs.Add(ParseExpr); end;
-            Expect(tkRParen);
-            var wNode90:=new TWritelnArgsStmtNode;
-            wNode90.Args:=wArgs;
-            Result:=wNode90;
-          end
-          else
-          begin
-            Expect(tkRParen);
-            if rhs is TStrLiteralNode then
-              Result:=new TWritelnStringStmtNode(TStrLiteralNode(rhs).Value)
-            else Result:=new TWritelnExprStmtNode(rhs);
-          end;
-        end;
-      end
-
-      // [Stage 75] Readln; 또는 Readln(변수);
-      // 렉서는 식별자 대소문자를 정규화하지 않고 원문 그대로 보존하므로(Writeln 등
-      // 진짜 예약어와 달리 Readln은 tkIdent로 들어온다), .ToLower로 비교해야 한다.
-      else if (Cur.Kind=tkIdent) and (Cur.Text.ToLower='readln') then
-      begin
-        fPos:=fPos+1;
-        if Cur.Kind=tkLParen then
-        begin
-          fPos:=fPos+1;
-          rhs:=ParseExpr; // 대입 대상 변수 식
-          Expect(tkRParen);
-          Result:=new TReadlnStmtNode(rhs);
-        end
-        else
-          Result:=new TReadlnStmtNode(nil); // 인자 없음 — Enter 대기
-      end
-
-      else if Cur.Kind=tkResult then
-      begin
-        fPos:=fPos+1;
-        if Cur.Kind=tkDot then
-        begin
-          // [자기컴파일] Result.FuncNames.AddRange(...); 처럼 Result 값에 체이닝하는 문장.
-          // 일반 식별자의 '.' 체이닝(위쪽 tkIdent 분기)과 같은 패턴이지만 시작 세그먼트가
-          // 'Result'라는 점만 다르다 — CodeGen의 IsChainStartSegment/EmitQualifierChainLoad가
-          // 'Result'를 인식하도록 함께 손봤다.
-          var rsegs:=new List<string>; rsegs.Add('Result');
-          while Cur.Kind=tkDot do begin fPos:=fPos+1; rsegs.Add(ExpectMemberName); end;
-          var rmname:=rsegs[rsegs.Count-1];
-          var rqualifier:=string.Join('.', rsegs.GetRange(0, rsegs.Count-1));
-          if Cur.Kind=tkAssign then
-          begin
-            fPos:=fPos+1;
-            var rfas:=new TFieldAssignStmtNode(rmname, ParseExpr);
-            rfas.Qualifier:=rqualifier;
-            Result:=rfas;
-          end
-          else
-          begin
-            var rmcs:=new TMethodCallStmtNode(rqualifier, rmname);
-            if Cur.Kind=tkLParen then
-            begin
-              fPos:=fPos+1;
-              if Cur.Kind<>tkRParen then
-              begin
-                rmcs.Args.Add(ParseExpr);
-                while Cur.Kind=tkComma do begin fPos:=fPos+1; rmcs.Args.Add(ParseExpr); end;
-              end;
-              Expect(tkRParen);
-            end;
-            Result:=rmcs;
-          end;
-        end
-        else
-        begin
-          Expect(tkAssign);
-          Result:=new TResultAssignStmtNode(ParseExpr);
-        end;
-      end
-
-      else if Cur.Kind=tkSetLength then
-      begin
-        fPos:=fPos+1; Expect(tkLParen);
-        nt:=Expect(tkIdent); Expect(tkComma);
-        sz:=ParseExpr;
-        // [Stage 67] SetLength(arr, rows, cols) — 2차원 배열 초기화
-        if Cur.Kind=tkComma then
-        begin
-          fPos:=fPos+1;
-          var cols2:=ParseExpr; Expect(tkRParen);
-          Result:=new TSetLengthMatrix2DStmtNode(nt.Text, sz, cols2, '');
-        end
-        else
-        begin
-          Expect(tkRParen);
-          Result:=new TSetLengthStmtNode(nt.Text, sz);
-        end;
-      end
-
-      // [Stage 48 / 자기컴파일 확장] var x := 식; 뿐 아니라 var x: Type; / var x: Type := 식; /
-      // var a, b: Type; 형태도 지원한다(자기 자신의 소스에서 흔히 쓰이던 패턴인데 그동안
-      // "var x := 식"의 타입 추론 형태만 지원돼 있었다). 이름들을 먼저 콤마로 모은 뒤,
-      // 뒤따르는 토큰이 ':'(타입 명시)인지 아니면 바로 ':='(기존 추론 방식)인지로 갈라진다.
-      // [주의] 세미콜론은 이 함수가 아니라 ParseStatementsUntilEnd 호출부가 소비하므로 여기서는
-      // Expect(tkSemicolon)을 하지 않는다(기존 관례와 동일).
-      else if Cur.Kind=tkVar then
-      begin
-        fPos:=fPos+1;
-        var ivNames:=new List<string>;
-        ivNames.Add(Expect(tkIdent).Text);
-        while Cur.Kind=tkComma do begin fPos:=fPos+1; ivNames.Add(Expect(tkIdent).Text); end;
-
-        if Cur.Kind=tkColon then
-        begin
-          // 명시적 타입: var a, b: Type; 또는 var a: Type := 식;
-          fPos:=fPos+1; // ':' 소비
-          var ivIsExt: boolean; var ivCn: string;
-          var ivVt:=ParseParamTypeExt(ivIsExt, ivCn);
-          if (ivVt=vtGeneric) or (ivVt=vtGenericArray) or (ivVt=vtMatrix) then ivCn:=fLastGenericName;
-          var ivInit: TExprNode := nil;
-          if Cur.Kind=tkAssign then
-          begin
-            if ivNames.Count>1 then
-              raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString
-                +': 여러 변수를 한 번에 선언할 때는 초기화식을 함께 쓸 수 없습니다 (예: "var a, b: 타입;")');
-            fPos:=fPos+1; ivInit:=ParseExpr;
-          end;
-          var ivCompound:=new TCompoundStmtNode;
-          foreach var ivNm in ivNames do
-          begin
-            var ivNode:=new TInlineVarStmtNode(ivNm, ivInit);
-            ivNode.HasExplicitType:=true; ivNode.ExplicitVarType:=ivVt;
-            ivNode.ExplicitClassName:=ivCn; ivNode.ExplicitIsExternal:=ivIsExt;
-            ivCompound.Statements.Add(ivNode);
-            fCurParams.Add(ivNm); // 이후 문장에서 이 이름을 필드로 오인하지 않도록 지역변수로 등록
-            if (ivVt=vtIntArray) or (ivVt=vtStrArray) or (ivVt=vtGenericArray) or (ivVt=vtObjArray) then
-              fArrayNames.Add(ivNm)
-            else if ivIsExt and IsIndexerCapableExternalType(ivCn) then
-              begin if not fArrayNames.Contains(ivNm) then fArrayNames.Add(ivNm); end;
-          end;
-          if ivNames.Count=1 then Result:=ivCompound.Statements[0]
-          else Result:=ivCompound;
-        end
-        else
-        begin
-          // 기존 방식: var x := 식; (타입 명시 없이 여러 개는 지원하지 않음 — 표준 Pascal에도 없음)
-          if ivNames.Count>1 then
-            raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString
-              +': 타입 없이 여러 변수를 한 번에 선언할 수 없습니다 (":=" 는 이름 하나만 지원)');
-          Expect(tkAssign);
-          var ivInferExpr:=ParseExpr;
-          Result:=new TInlineVarStmtNode(ivNames[0], ivInferExpr);
-          fCurParams.Add(ivNames[0]); // 이후 문장에서 이 이름을 필드로 오인하지 않도록 지역변수로 등록
-          // [버그 수정] "var closedTypes74e:=new System.Type[n];"처럼 타입 추론 분기에서도
-          // ArraySizeExpr가 있는 배열 생성식이면 진짜 배열이므로 fArrayNames에 등록해야 한다.
-          // 위 "타입 명시" 분기(2294행)만 등록을 하고 있어서, 이후 "closedTypes74e[i]:=x" 같은
-          // 대입이 fArrayNames.Contains 검사에 걸려 진짜 배열 대입(Stelem) 경로를 못 타고
-          // 외부 컬렉션 인덱서 대입(리플렉션 set_Item 탐색) 경로로 잘못 빠졌다 — 진짜 배열은
-          // 리플렉션에 set_Item을 노출하지 않으므로 "메서드 set_Item가 없습니다"로 실패했다
-          // (자기컴파일 중 실제 재현됨).
-          if (ivInferExpr is TNewObjectExprNode) and (TNewObjectExprNode(ivInferExpr).ArraySizeExpr<>nil) then
-            begin if not fArrayNames.Contains(ivNames[0]) then fArrayNames.Add(ivNames[0]); end;
-        end;
-      end
-
-      else if Cur.Kind=tkIdent then
-      begin
-        nt:=Cur; fPos:=fPos+1;
 
         // 변수.메서드 → 메서드 호출 문장 (반환값 버림)
         // 또는 System.Windows.Forms.Application.Run(f) 처럼 여러 단계 점(.)으로
@@ -2977,6 +2781,219 @@ type
           else
             Result:=new TAssignStmtNode(nt.Text, rhs);
         end;
+    end;
+
+    function ParseStatement: TStmtNode;
+    var
+      nt: TToken; rhs, idx, sz: TExprNode;
+      comp: TCompoundStmtNode; cond: TExprNode;
+      tS, eS, bS: TStmtNode; pcn: TProcCallStmtNode;
+      mcs: TMethodCallStmtNode;
+    begin
+      // [자기컴파일 버그 수정 - Stage 138과 동일 클래스] "Cur.Kind.ToString"/"Cur.Text"/
+      // "Cur.Line.ToString"처럼 체인 표현식을 문자열 접합(+) 안에서 곧바로 쓰면 gen0가
+      // 자기 자신을 컴파일할 때 잘못된 IL을 방출한다(Cur.Text가 문자열이 아니라 정수/해시값
+      // 같은 쓰레기로 찍히는 실제 재현 사례). 중간 로컬 변수를 거치도록 분리한다.
+      var _psTok:=Cur;
+      var _psKindStr:=_psTok.Kind.ToString;
+      var _psText:=_psTok.Text;
+      var _psLineStr:=_psTok.Line.ToString;
+      Writeln('[MARK-PS] ParseStatement 진입, Cur.Kind='+_psKindStr+', Cur.Text="'+_psText+'", line='+_psLineStr);
+      if Cur.Kind=tkWriteln then
+      begin
+        fPos:=fPos+1;
+        // [Stage 96 수정] 'Writeln;' (괄호 자체가 없음) 과 'Writeln();' (빈 괄호) 모두
+        // 표준 Pascal에서 "인자 없이 줄바꿈만 출력"하는 유효한 호출이다. 기존 코드는
+        // Expect(tkLParen)을 무조건 요구해서 'Writeln;'이 "예상 tkLParen 실제
+        // tkSemicolon" 파스 오류로 실패했다. 이제 괄호가 없거나 바로 닫히면 빈 줄
+        // 출력(TWritelnStringStmtNode(''))으로 처리한다.
+        if (Cur.Kind<>tkLParen) then
+        begin
+          Result:=new TWritelnStringStmtNode('');
+        end
+        else if (fPos+1<fTokens.Count) and (fTokens[fPos+1].Kind=tkRParen) then
+        begin
+          fPos:=fPos+2; // '(' 와 ')' 소비
+          Result:=new TWritelnStringStmtNode('');
+        end
+        else
+        begin
+          fPos:=fPos+1; rhs:=ParseExpr;
+          // [Stage 90] writeln(a, b, c, ...) — 콤마로 이어지는 추가 인자 지원.
+          // (기존에는 인자를 정확히 1개만 받았고, 콤마가 나오면 "예상 tkRParen 실제 tkComma" 에러.)
+          if Cur.Kind=tkComma then
+          begin
+            var wArgs:=new List<TExprNode>; wArgs.Add(rhs);
+            while Cur.Kind=tkComma do begin fPos:=fPos+1; wArgs.Add(ParseExpr); end;
+            Expect(tkRParen);
+            var wNode90:=new TWritelnArgsStmtNode;
+            wNode90.Args:=wArgs;
+            Result:=wNode90;
+          end
+          else
+          begin
+            Expect(tkRParen);
+            if rhs is TStrLiteralNode then
+              Result:=new TWritelnStringStmtNode(TStrLiteralNode(rhs).Value)
+            else Result:=new TWritelnExprStmtNode(rhs);
+          end;
+        end;
+      end
+
+      // [Stage 75] Readln; 또는 Readln(변수);
+      // 렉서는 식별자 대소문자를 정규화하지 않고 원문 그대로 보존하므로(Writeln 등
+      // 진짜 예약어와 달리 Readln은 tkIdent로 들어온다), .ToLower로 비교해야 한다.
+      else if (Cur.Kind=tkIdent) and (Cur.Text.ToLower='readln') then
+      begin
+        fPos:=fPos+1;
+        if Cur.Kind=tkLParen then
+        begin
+          fPos:=fPos+1;
+          rhs:=ParseExpr; // 대입 대상 변수 식
+          Expect(tkRParen);
+          Result:=new TReadlnStmtNode(rhs);
+        end
+        else
+          Result:=new TReadlnStmtNode(nil); // 인자 없음 — Enter 대기
+      end
+
+      else if Cur.Kind=tkResult then
+      begin
+        fPos:=fPos+1;
+        if Cur.Kind=tkDot then
+        begin
+          // [자기컴파일] Result.FuncNames.AddRange(...); 처럼 Result 값에 체이닝하는 문장.
+          // 일반 식별자의 '.' 체이닝(위쪽 tkIdent 분기)과 같은 패턴이지만 시작 세그먼트가
+          // 'Result'라는 점만 다르다 — CodeGen의 IsChainStartSegment/EmitQualifierChainLoad가
+          // 'Result'를 인식하도록 함께 손봤다.
+          var rsegs:=new List<string>; rsegs.Add('Result');
+          while Cur.Kind=tkDot do begin fPos:=fPos+1; rsegs.Add(ExpectMemberName); end;
+          var rmname:=rsegs[rsegs.Count-1];
+          var rqualifier:=string.Join('.', rsegs.GetRange(0, rsegs.Count-1));
+          if Cur.Kind=tkAssign then
+          begin
+            fPos:=fPos+1;
+            var rfas:=new TFieldAssignStmtNode(rmname, ParseExpr);
+            rfas.Qualifier:=rqualifier;
+            Result:=rfas;
+          end
+          else
+          begin
+            var rmcs:=new TMethodCallStmtNode(rqualifier, rmname);
+            if Cur.Kind=tkLParen then
+            begin
+              fPos:=fPos+1;
+              if Cur.Kind<>tkRParen then
+              begin
+                rmcs.Args.Add(ParseExpr);
+                while Cur.Kind=tkComma do begin fPos:=fPos+1; rmcs.Args.Add(ParseExpr); end;
+              end;
+              Expect(tkRParen);
+            end;
+            Result:=rmcs;
+          end;
+        end
+        else
+        begin
+          Expect(tkAssign);
+          Result:=new TResultAssignStmtNode(ParseExpr);
+        end;
+      end
+
+      else if Cur.Kind=tkSetLength then
+      begin
+        fPos:=fPos+1; Expect(tkLParen);
+        nt:=Expect(tkIdent); Expect(tkComma);
+        sz:=ParseExpr;
+        // [Stage 67] SetLength(arr, rows, cols) — 2차원 배열 초기화
+        if Cur.Kind=tkComma then
+        begin
+          fPos:=fPos+1;
+          var cols2:=ParseExpr; Expect(tkRParen);
+          Result:=new TSetLengthMatrix2DStmtNode(nt.Text, sz, cols2, '');
+        end
+        else
+        begin
+          Expect(tkRParen);
+          Result:=new TSetLengthStmtNode(nt.Text, sz);
+        end;
+      end
+
+      // [Stage 48 / 자기컴파일 확장] var x := 식; 뿐 아니라 var x: Type; / var x: Type := 식; /
+      // var a, b: Type; 형태도 지원한다(자기 자신의 소스에서 흔히 쓰이던 패턴인데 그동안
+      // "var x := 식"의 타입 추론 형태만 지원돼 있었다). 이름들을 먼저 콤마로 모은 뒤,
+      // 뒤따르는 토큰이 ':'(타입 명시)인지 아니면 바로 ':='(기존 추론 방식)인지로 갈라진다.
+      // [주의] 세미콜론은 이 함수가 아니라 ParseStatementsUntilEnd 호출부가 소비하므로 여기서는
+      // Expect(tkSemicolon)을 하지 않는다(기존 관례와 동일).
+      else if Cur.Kind=tkVar then
+      begin
+        fPos:=fPos+1;
+        var ivNames:=new List<string>;
+        ivNames.Add(Expect(tkIdent).Text);
+        while Cur.Kind=tkComma do begin fPos:=fPos+1; ivNames.Add(Expect(tkIdent).Text); end;
+
+        if Cur.Kind=tkColon then
+        begin
+          // 명시적 타입: var a, b: Type; 또는 var a: Type := 식;
+          fPos:=fPos+1; // ':' 소비
+          var ivIsExt: boolean; var ivCn: string;
+          var ivVt:=ParseParamTypeExt(ivIsExt, ivCn);
+          if (ivVt=vtGeneric) or (ivVt=vtGenericArray) or (ivVt=vtMatrix) then ivCn:=fLastGenericName;
+          var ivInit: TExprNode := nil;
+          if Cur.Kind=tkAssign then
+          begin
+            if ivNames.Count>1 then
+              raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString
+                +': 여러 변수를 한 번에 선언할 때는 초기화식을 함께 쓸 수 없습니다 (예: "var a, b: 타입;")');
+            fPos:=fPos+1; ivInit:=ParseExpr;
+          end;
+          var ivCompound:=new TCompoundStmtNode;
+          foreach var ivNm in ivNames do
+          begin
+            var ivNode:=new TInlineVarStmtNode(ivNm, ivInit);
+            ivNode.HasExplicitType:=true; ivNode.ExplicitVarType:=ivVt;
+            ivNode.ExplicitClassName:=ivCn; ivNode.ExplicitIsExternal:=ivIsExt;
+            ivCompound.Statements.Add(ivNode);
+            fCurParams.Add(ivNm); // 이후 문장에서 이 이름을 필드로 오인하지 않도록 지역변수로 등록
+            if (ivVt=vtIntArray) or (ivVt=vtStrArray) or (ivVt=vtGenericArray) or (ivVt=vtObjArray) then
+              fArrayNames.Add(ivNm)
+            else if ivIsExt and IsIndexerCapableExternalType(ivCn) then
+              begin if not fArrayNames.Contains(ivNm) then fArrayNames.Add(ivNm); end;
+          end;
+          if ivNames.Count=1 then Result:=ivCompound.Statements[0]
+          else Result:=ivCompound;
+        end
+        else
+        begin
+          // 기존 방식: var x := 식; (타입 명시 없이 여러 개는 지원하지 않음 — 표준 Pascal에도 없음)
+          if ivNames.Count>1 then
+            raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString
+              +': 타입 없이 여러 변수를 한 번에 선언할 수 없습니다 (":=" 는 이름 하나만 지원)');
+          Expect(tkAssign);
+          var ivInferExpr:=ParseExpr;
+          Result:=new TInlineVarStmtNode(ivNames[0], ivInferExpr);
+          fCurParams.Add(ivNames[0]); // 이후 문장에서 이 이름을 필드로 오인하지 않도록 지역변수로 등록
+          // [버그 수정] "var closedTypes74e:=new System.Type[n];"처럼 타입 추론 분기에서도
+          // ArraySizeExpr가 있는 배열 생성식이면 진짜 배열이므로 fArrayNames에 등록해야 한다.
+          // 위 "타입 명시" 분기(2294행)만 등록을 하고 있어서, 이후 "closedTypes74e[i]:=x" 같은
+          // 대입이 fArrayNames.Contains 검사에 걸려 진짜 배열 대입(Stelem) 경로를 못 타고
+          // 외부 컬렉션 인덱서 대입(리플렉션 set_Item 탐색) 경로로 잘못 빠졌다 — 진짜 배열은
+          // 리플렉션에 set_Item을 노출하지 않으므로 "메서드 set_Item가 없습니다"로 실패했다
+          // (자기컴파일 중 실제 재현됨).
+          if (ivInferExpr is TNewObjectExprNode) and (TNewObjectExprNode(ivInferExpr).ArraySizeExpr<>nil) then
+            begin if not fArrayNames.Contains(ivNames[0]) then fArrayNames.Add(ivNames[0]); end;
+        end;
+      end
+
+      else if Cur.Kind=tkIdent then
+      begin
+        nt:=Cur; fPos:=fPos+1;
+        // [자기컴파일 버그 수정 - 신규] 이 분기는 원래 약 370줄짜리 중첩 if/else
+        // 블록이었다. ParsePrimary/GetExprClrType/EmitForInStmt 등에서 반복적으로
+        // 확인된 "메서드 크기/분기 복잡도" 자기컴파일 IL 손상 패턴과 동일한 위험군이라
+        // 판단해, 동일한 표준 조치(함수 분리)를 선제 적용한다. 로직은 그대로,
+        // ParseStatementIdentBranch로 옮겼을 뿐이다.
+        Result:=ParseStatementIdentBranch(nt);
       end
 
       // [Stage 30] self.Xxx := ...; / self.Xxx(...); / self.Event += Handler; 문장.
@@ -3083,6 +3100,7 @@ type
         fPos:=fPos+1; comp:=new TCompoundStmtNode;
         ParseStatementsUntilEnd(comp.Statements); // [Stage 58] panic-mode 오류 복구
         Expect(tkEnd); Result:=comp;
+        Writeln('[MARK-CBEND] begin...end 블록 파싱 완료, line='+Cur.Line.ToString);
       end
 
       else if Cur.Kind=tkIf then
@@ -3097,6 +3115,7 @@ type
       begin
         fPos:=fPos+1; cond:=ParseExpr; Expect(tkDo); bS:=ParseStatement;
         Result:=new TWhileStmtNode(cond, bS);
+        Writeln('[MARK-WHEND] while 문 파싱 완료, line='+Cur.Line.ToString);
       end
 
       // [Stage 60] repeat 문장들 [;문장들...] until Condition
@@ -3687,6 +3706,15 @@ type
           var savedGP1:=fCurGenericParams; fCurGenericParams:=genParamNames;
           while Cur.Kind<>tkEnd do
           begin
+            // [진단 추가] 클래스 멤버 파싱 루프의 매 반복 시작 지점 마커. ParseStatement 계열
+            // 함수들에는 이미 마커가 있지만, 이 루프 자체와 인라인 메서드 본문 파싱 완료 후
+            // "다음 멤버로 넘어가는" 구간에는 마커가 전혀 없어서 정확한 크래시 지점을 못 잡고
+            // 있다. cn(클래스명)/Cur.Kind/Cur.Text/Cur.Line을 매 반복마다 찍어 어디까지
+            // 진행됐는지 확인한다.
+            var _cmlKindStr:=Cur.Kind.ToString;
+            var _cmlText:=Cur.Text;
+            var _cmlLineStr:=Cur.Line.ToString;
+            Writeln('[MARK-CML] 클래스멤버루프 진입, cn="'+cn+'", Cur.Kind='+_cmlKindStr+', Cur.Text="'+_cmlText+'", line='+_cmlLineStr);
             // [Stage 58] 클래스 멤버(필드/메서드/프로퍼티/생성자 시그니처) 하나가 깨져도
             // 클래스 전체를 버리지 않고 그 멤버 하나만 건너뛴다.
             var memberStartPos:=fPos;
@@ -3981,10 +4009,14 @@ type
 
                 Expect(tkBegin);
                 var inlComp:=new TCompoundStmtNode;
+                Writeln('[MARK-INLM-A] 인라인 메서드 본문 ParseStatementsUntilEnd 진입 직전, mname="'+mname+'"');
                 ParseStatementsUntilEnd(inlComp.Statements); // [Stage 58] panic-mode 오류 복구
+                Writeln('[MARK-INLM-B] 인라인 메서드 본문 ParseStatementsUntilEnd 반환 직전, mname="'+mname+'"');
                 Expect(tkEnd); Expect(tkSemicolon);
+                Writeln('[MARK-INLM-C] 인라인 메서드 Expect(tkEnd/tkSemicolon) 완료, mname="'+mname+'"');
                 inlImpl.Body:=inlComp;
                 fProg.MethodImpls.Add(inlImpl);
+                Writeln('[MARK-INLM-D] 인라인 메서드 등록 완료, mname="'+mname+'"');
 
                 fCurClass:=savedClass88c; fCurFunc:=savedFunc88c;
                 fCurParams:=savedParams88c; fCurMethodParamNames:=savedMethodParamNames88c;

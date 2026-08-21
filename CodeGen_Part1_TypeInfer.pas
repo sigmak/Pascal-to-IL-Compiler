@@ -1334,6 +1334,62 @@
     // 타는데도 함수 진입 자체가 죽었다 — Stage 111/112와 동일한 "실행되지 않는 분기까지
     // 포함한 전체 함수 IL이 gen0 코드젠에서 깨진다" 패턴으로 보고, 4개 분기를 각각
     // 별도 함수로 완전히 분리한다. 디스패처는 순수 if-elseif만 남긴다.
+    // [자기컴파일 버그 수정 — MARK-CML 재발 원인] ObjName이 점(.) 없는 단일 세그먼트이면서
+    // 그 자체가 "괄호 없이 호출한 인자 없는 로컬 인스턴스 메서드"인 경우(예: "Cur.Text" —
+    // function Cur: TToken; begin Result:=fTokens[fPos]; end; 를 괄호 없이 호출한 뒤 .Text로
+    // 그 반환값의 필드에 접근). 다중 세그먼트 체인(예: "MainMenu.Items.Count")에 대해서는
+    // IsChainStartLocalNiladicMethod/InferQualifierChainType이 이미 이 케이스를 처리하지만,
+    // 여기 단일 세그먼트 경로(InferTypeMethodCallA의 4개 분기: 체인/self/지역CLR변수/
+    // 로컬클래스변수)에는 대응 분기가 없어 전부 실패하고, InferTypeMethodCallB의 마지막
+    // 폴백이 "Cur"를 외부 정적 타입 이름으로 오인해 조회에 실패한 뒤 무조건 vtInteger를
+    // 돌려줬다. 그 결과 "var _cmlText:=Cur.Text;"가 int32 지역변수로 선언된 채 string
+    // 참조값이 그대로 대입되어, 실행 시 Cur.Text 자리에 메모리 주소 같은 숫자가 찍히는
+    // 문제로 이어졌다(자기컴파일 로그 MARK-CML에서 재현됨). 조건 판별은 자기호출 self-host
+    // 손상을 피하기 위해 and 체인 대신 단계별 boolean 변수로 분리한다.
+    function InferTypeMethodCallANiladic(_mc4: TMethodCallExprNode; var r: TVarType): boolean;
+    var _niHasIM, _niHasIMName, _niHasPT, _niHasPTName, _niZeroArg: boolean;
+    begin
+      Result:=false;
+      _niHasIM:=fInstanceMethods.ContainsKey(fCurClassName);
+      _niHasIMName:=false;
+      if _niHasIM then _niHasIMName:=fInstanceMethods[fCurClassName].ContainsKey(_mc4.ObjName);
+      _niHasPT:=false;
+      if _niHasIMName then _niHasPT:=fMethodParamClrTypes.ContainsKey(fCurClassName);
+      _niHasPTName:=false;
+      if _niHasPT then _niHasPTName:=fMethodParamClrTypes[fCurClassName].ContainsKey(_mc4.ObjName);
+      _niZeroArg:=false;
+      if _niHasPTName then _niZeroArg:=(fMethodParamClrTypes[fCurClassName][_mc4.ObjName].Length=0);
+      if _niZeroArg then
+      begin
+        Result:=true;
+        var _niObjRetType:=fInstanceMethods[fCurClassName][_mc4.ObjName].ReturnType;
+        var _niPi:=SafeGetProperty(_niObjRetType, _mc4.MethodName);
+        var _niPiOk:=(_niPi<>nil);
+        if _niPiOk then _niPiOk:=(_niPi.PropertyType=typeof(string));
+        if _niPiOk then r:=vtString
+        else
+        begin
+          // [버그 수정] _niObjRetType이 아직 CreateType 전인 로컬 TypeBuilder(예: TToken처럼
+          // 우리가 만드는 중인 클래스)면, System.Type.GetField를 직접 호출하는 순간
+          // System.NotSupportedException("유형이 만들어지기 전에 호출된 멤버는 지원되지
+          // 않습니다")이 나서 컴파일 자체가 죽는다(실제 재현: TParser.ParseExternalGenericTypeArg
+          // 본문 생성 중 TToken.GetField("Text") 호출). SafeGetField는 TypeBuilder면
+          // fFieldBuilders 딕셔너리로, 아니면 try/except로 감싼 리플렉션으로 안전하게 처리한다.
+          var _niFi:=SafeGetField(_niObjRetType, _mc4.MethodName);
+          var _niFiOk:=(_niFi<>nil);
+          if _niFiOk then _niFiOk:=(_niFi.FieldType=typeof(string));
+          if _niFiOk then r:=vtString
+          else
+          begin
+            var _niMi:=ResolveMethodByArity(_niObjRetType, _mc4.MethodName, _mc4.Args, false);
+            var _niMiOk:=(_niMi<>nil);
+            if _niMiOk then _niMiOk:=(_niMi.ReturnType=typeof(string));
+            if _niMiOk then r:=vtString else r:=vtInteger;
+          end;
+        end;
+      end;
+    end;
+
     function InferTypeMethodCallA(e: TExprNode; var r: TVarType): boolean;
     begin
       Result:=true;
@@ -1352,6 +1408,8 @@
         InferTypeMethodCallALocal(_mc4, r)
       else if (_mc4.ObjCastType='') and (GetVarClassName(_mc4.ObjName)<>'') then
         InferTypeMethodCallA2(_mc4, r)
+      else if (_mc4.ObjCastType='') and InferTypeMethodCallANiladic(_mc4, r) then
+        Result:=true
       else Result:=false;
     end;
 

@@ -2751,6 +2751,30 @@
             begin
               Result:=FindExternalAncestorType(fGlobalScope.GetClassName(_vn90));
               Writeln('[MARK-GECTT-VR7b] FindExternalAncestorType(global) 완료');
+            end
+            else
+            begin
+              // [버그 수정] "Cur.Text"처럼 괄호 없이 호출하는 인자 없는 로컬 인스턴스
+              // 메서드(예: function Cur: TToken;)가 체인의 시작(Inner)인 경우 — 여기까지
+              // 오면 "Cur"는 fLocalScope/fGlobalScope 어디에도 변수로 없으므로 위 분기들이
+              // 전부 실패해 nil이 그대로 반환되고, 호출부 GetExprClrType은 초기값
+              // System.Object로 폴백해버린다. 그 결과 "Cur.Text" 전체가 System.Object로
+              // 오판되어 TInlineVarStmtNode가 최종적으로 InferType의 vtInteger 폴백을
+              // 쓰게 되고, "var _cmlText:=Cur.Text;"가 int32 지역변수로 잘못 선언된 채
+              // 문자열 참조가 대입되어 실행 시 Cur.Text 자리에 메모리 주소 같은 숫자가
+              // 찍히는 문제로 이어졌다(자기컴파일 로그 MARK-CML에서 실제 재현됨).
+              // IsChainStartLocalNiladicMethod(CodeGen_Part1_TypeInfer.pas)와 동일한
+              // 조건으로 로컬 클래스의 인자 0개 인스턴스 메서드인지 확인하고, 맞으면
+              // 그 메서드의 반환 타입을 그대로 돌려준다.
+              if fInstanceMethods.ContainsKey(fCurClassName)
+                 and fInstanceMethods[fCurClassName].ContainsKey(_vn90)
+                 and fMethodParamClrTypes.ContainsKey(fCurClassName)
+                 and fMethodParamClrTypes[fCurClassName].ContainsKey(_vn90)
+                 and (fMethodParamClrTypes[fCurClassName][_vn90].Length=0) then
+              begin
+                Result:=fInstanceMethods[fCurClassName][_vn90].ReturnType;
+                Writeln('[MARK-GECTT-VR9] 괄호없는 무인자 로컬 인스턴스 메서드로 인식, ReturnType 사용');
+              end;
             end;
           end;
         end;

@@ -1167,9 +1167,17 @@ end;
 // 종료합니다" 프롬프트까지 정상적으로 도달하게 한다. 스레드 진입점은 이제 이 절차를 가리킨다.
 procedure RunCompilerBody;
 begin
-  //Writeln('[MARK-STACKPROBE-START]');
-  //StackProbe(0, 500000);
-  //Writeln('[MARK-STACKPROBE-END] 500000 깊이 재귀 생존');
+  // [진단 재활성화] gen1(self.exe)이 자기 자신을 컴파일할 때 ParseStatement 분리(함수 크기
+  // 축소) 패치를 적용해도 run_log-self.txt가 정확히 같은 지점에서 조용히(예외 메시지 없이)
+  // 끊기는 현상이 재현됨 — 코드 크기/분기 복잡도 손상 패턴이 아니라, gen1 실행 파일 내부에
+  // 구워진 "new System.Threading.Thread(RunCompilerBody, CompilerThreadStackSize)" 호출이
+  // 실제로는 256MB 스택이 아니라 기본(약 1MB) 스택으로 스레드를 만들고 있을 가능성을 확인하기
+  // 위해 재귀 스택 프로브를 켠다. gen0(host)에서 실행하면 500000까지 생존해야 정상이고,
+  // gen1(self)에서 훨씬 얕은 깊이(예: 수만 단위)에서 죽으면 "생성자 오버로드 해석 버그로
+  // int stackSize 인자가 무시됨" 가설이 확정된다.
+  Writeln('[MARK-STACKPROBE-START]');
+  StackProbe(0, 500000);
+  Writeln('[MARK-STACKPROBE-END] 500000 깊이 재귀 생존');
   try
     RunCompilerBodyInner;
   except
