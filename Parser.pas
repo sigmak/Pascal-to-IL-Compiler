@@ -3490,6 +3490,204 @@ type
     end;
 
     // type 섹션: IFoo = interface ... end;  또는  TClassName = class ... end;
+    // [오버사이즈 함수 분리] 원래 ParseTypeSection 안에 인라인돼 있던 "메서드 시그니처 뒤
+    // 본문(88c) 또는 virtual/override/abstract 지시자 뒤 본문" 처리 블록을 별도 프로시저로
+    // 뽑아냈다. ParseTypeSection이 800줄이 넘는 단일 프로시저였던 것이 gen0의 자기컴파일
+    // 시 이 안의 큰 if/else 분기가 broken IL로 이어지는 원인으로 확인됐다(hasBody가 True로
+    // 정상 출력됐음에도 true 분기 실행이 스킵되고 바깥 루프로 새는 증상). 분리 후에는
+    // ParseTypeSection의 크기가 줄어 gen1에서도 이 분기가 정상적으로 컴파일되어야 한다.
+    procedure ParseSignatureBodyOrDirectives(cn: string; mname: string; isFunc: boolean; sig: TMethodSignature; cd: TClassDeclNode);
+    begin
+      var _sig88cIsBegin: boolean := (Cur.Kind=tkBegin);
+      var _sig88cIsVar: boolean := (Cur.Kind=tkVar);
+      var _sig88cIsConst: boolean := (Cur.Kind=tkConst);
+      var _sig88cHasBody: boolean := _sig88cIsBegin or _sig88cIsVar or _sig88cIsConst;
+      // [자기컴파일 버그 수정] 아래 로그 한 줄에 .ToString() 호출 5개를 체이닝해서 한
+      // 문자열 연결식에 직접 몰아넣었던 것이 실제 원인이었다(함수 크기 문제가 아니었음).
+      // 이미 확립된 "체이닝된 .ToString/멤버 호출은 지역변수로 분리" 패턴(위 MARK-CML의
+      // _cmlKindStr/_cmlLineStr 방식)을 그대로 따라, 각 .ToString() 결과를 먼저 지역변수에
+      // 담은 뒤 연결한다.
+      var _sig88cKindStr:=Cur.Kind.ToString;
+      var _sig88cIsBeginStr:=_sig88cIsBegin.ToString;
+      var _sig88cIsVarStr:=_sig88cIsVar.ToString;
+      var _sig88cIsConstStr:=_sig88cIsConst.ToString;
+      var _sig88cHasBodyStr:=_sig88cHasBody.ToString;
+      Writeln('[MARK-SIG88C-A] mname="'+mname+'" Cur.Kind='+_sig88cKindStr
+        +' isBegin='+_sig88cIsBeginStr+' isVar='+_sig88cIsVarStr
+        +' isConst='+_sig88cIsConstStr+' hasBody='+_sig88cHasBodyStr);
+      if _sig88cHasBody then
+      begin
+        cd.Methods.Add(sig);
+        Writeln('[MARK-SIG88C-A1] cd.Methods.Add 완료, mname="'+mname+'"');
+        // [자기컴파일 버그 수정] fClassMethods[cn][mname]:=isFunc; 같은 이중 인덱서 "대입"
+        // 체이닝이 진짜 원인이었다 — fClassMethods: Dictionary<string, Dictionary<string,
+        // boolean>>인데, 코드베이스 다른 곳(_preMethDict/_methDict127/_methDict128 등)은
+        // 전부 fClassMethods[cn]을 먼저 지역변수로 뽑아낸 뒤 접근하는 확립된 패턴을 따르는데
+        // 여기 두 곳(88c 본문/지시자 분기)만 그 패턴을 안 따르고 있었다.
+        var _sig88cMethDict:=fClassMethods[cn];
+        _sig88cMethDict[mname]:=isFunc;
+        Writeln('[MARK-SIG88C-A2] fClassMethods 등록 완료, mname="'+mname+'"');
+        if sig.IsGeneric then
+        begin
+          if not fGenericMethodNames.Contains(mname) then fGenericMethodNames.Add(mname);
+          fMethodGenericParam[mname]:=sig.GenericParamNames;
+          fMethodGenericConstraint[mname]:=sig.GenericParamConstraints;
+        end;
+        Writeln('[MARK-SIG88C-A3] IsGeneric 분기 통과, mname="'+mname+'"');
+
+        var inlImpl:=new TMethodImplNode(cn, mname, isFunc, sig.ReturnType);
+        inlImpl.ReturnGenericName:=sig.ReturnGenericName;
+        inlImpl.ReturnClassName:=sig.ReturnClassName; // [버그 수정] BuildMethodBody의 Result 지역변수 타입 정확화
+        inlImpl.ParamNames.AddRange(sig.ParamNames);
+        inlImpl.ParamTypes.AddRange(sig.ParamTypes);
+        Writeln('[MARK-SIG88C-A4] inlImpl 생성/AddRange 완료, mname="'+mname+'", ParamCount='+sig.ParamTypes.Count.ToString);
+        for var pgi88c:=0 to sig.ParamTypes.Count-1 do
+        begin
+          if (sig.ParamTypes[pgi88c]=vtGeneric) or (sig.ParamTypes[pgi88c]=vtGenericArray) then
+            inlImpl.ParamGenericNames.Add(sig.ParamClassNames[pgi88c])
+          else
+            inlImpl.ParamGenericNames.Add('');
+          if (sig.ParamTypes[pgi88c]=vtIntArray) or (sig.ParamTypes[pgi88c]=vtStrArray) or (sig.ParamTypes[pgi88c]=vtGenericArray) or (sig.ParamTypes[pgi88c]=vtObjArray) then
+            if not fArrayNames.Contains(sig.ParamNames[pgi88c]) then fArrayNames.Add(sig.ParamNames[pgi88c]);
+          // [Stage 98] List<T>/Dictionary<K,V> 등 인덱서를 갖는 외부 제네릭 컬렉션 매개변수.
+          if sig.ParamIsExternal[pgi88c] and IsIndexerCapableExternalType(sig.ParamClassNames[pgi88c]) then
+            if not fArrayNames.Contains(sig.ParamNames[pgi88c]) then fArrayNames.Add(sig.ParamNames[pgi88c]);
+        end;
+        Writeln('[MARK-SIG88C-A5] 매개변수 루프 완료, mname="'+mname+'"');
+
+        var savedClass88c:=fCurClass; var savedFunc88c:=fCurFunc;
+        var savedParams88c:=fCurParams; var savedMethodParamNames88c:=fCurMethodParamNames;
+        fCurClass:=cn; fCurFunc:=mname;
+        fCurParams:=new List<string>;
+        foreach var pnCp88c in inlImpl.ParamNames do fCurParams.Add(pnCp88c);
+        fCurMethodParamNames:=new List<string>;
+        foreach var pnCp88c2 in inlImpl.ParamNames do fCurMethodParamNames.Add(pnCp88c2);
+        Writeln('[MARK-SIG88C-A6] fCurParams/fCurMethodParamNames 설정 완료, mname="'+mname+'"');
+
+        if (Cur.Kind=tkVar) or (Cur.Kind=tkConst) then
+        begin
+          Writeln('[MARK-SIG88C-A7] ParseLocalDeclSections 진입 직전, mname="'+mname+'"');
+          ParseLocalDeclSections(inlImpl.LocalVars, inlImpl.ConstDecls);
+          Writeln('[MARK-SIG88C-A8] ParseLocalDeclSections 반환 직전, mname="'+mname+'", LocalVarCount='+inlImpl.LocalVars.Count.ToString);
+          foreach var lvcp88c in inlImpl.LocalVars do fCurParams.Add(lvcp88c.Name);
+          foreach var lccp88c in inlImpl.ConstDecls do fCurParams.Add(lccp88c.Name);
+        end;
+
+        Expect(tkBegin);
+        var inlComp:=new TCompoundStmtNode;
+        Writeln('[MARK-INLM-A] 인라인 메서드 본문 ParseStatementsUntilEnd 진입 직전, mname="'+mname+'"');
+        ParseStatementsUntilEnd(inlComp.Statements); // [Stage 58] panic-mode 오류 복구
+        Writeln('[MARK-INLM-B] 인라인 메서드 본문 ParseStatementsUntilEnd 반환 직전, mname="'+mname+'"');
+        Expect(tkEnd); Expect(tkSemicolon);
+        Writeln('[MARK-INLM-C] 인라인 메서드 Expect(tkEnd/tkSemicolon) 완료, mname="'+mname+'"');
+        inlImpl.Body:=inlComp;
+        fProg.MethodImpls.Add(inlImpl);
+        Writeln('[MARK-INLM-D] 인라인 메서드 등록 완료, mname="'+mname+'"');
+
+        fCurClass:=savedClass88c; fCurFunc:=savedFunc88c;
+        fCurParams:=savedParams88c; fCurMethodParamNames:=savedMethodParamNames88c;
+      end
+      else
+      begin
+        // [Stage 53] 메서드 지시자: virtual;/override;/abstract; — 순서·조합 무관하게 여러 개 허용
+        // (예: "procedure Foo; virtual; abstract;"). 지시자마다 세미콜론이 따라온다.
+        while (Cur.Kind=tkVirtual) or (Cur.Kind=tkOverride) or (Cur.Kind=tkAbstract) do
+        begin
+          if Cur.Kind=tkVirtual then sig.IsVirtual:=true
+          else if Cur.Kind=tkOverride then sig.IsOverride:=true
+          else sig.IsAbstract:=true;
+          fPos:=fPos+1;
+          Expect(tkSemicolon);
+        end;
+        // [Stage 74] 1차 제약: 제네릭 메서드는 virtual/override/abstract와 조합하지 않는다
+        // (CLR 제네릭 가상 메서드의 override 슬롯 매칭까지는 아직 다루지 않음).
+        if sig.IsGeneric and (sig.IsVirtual or sig.IsOverride or sig.IsAbstract) then
+        begin
+          var _sig88cLineStrB:=Cur.Line.ToString;
+          var _sig88cColStrB:=Cur.Column.ToString;
+          raise new Exception('줄 '+_sig88cLineStrB+', 열 '+_sig88cColStrB+': 제네릭 메서드 "'+mname
+            +'"는 virtual/override/abstract와 함께 쓸 수 없습니다 (Stage 74, 1차 제약)');
+        end;
+        cd.Methods.Add(sig);
+        // [자기컴파일 버그 수정] -A와 동일: 이중 인덱서 대입 체이닝 대신 지역변수 경유.
+        var _sig88cMethDictB:=fClassMethods[cn];
+        _sig88cMethDictB[mname]:=isFunc;
+        if sig.IsGeneric then
+        begin
+          if not fGenericMethodNames.Contains(mname) then fGenericMethodNames.Add(mname);
+          fMethodGenericParam[mname]:=sig.GenericParamNames;
+          fMethodGenericConstraint[mname]:=sig.GenericParamConstraints;
+        end;
+        // [자기컴파일 버그 수정] virtual;/override;/abstract; 지시자 "다음"에도
+        // [Stage 88c]처럼 곧바로 본문(begin...end;)이 올 수 있다 — 예:
+        // "function GetAccessors(nonPublic: boolean): array of MethodInfo; override;
+        //  begin ... end;" (CodeGen.pas의 TBoundGenericPropertyInfo 실제 사례).
+        // 위 [Stage 88c] 분기는 지시자가 오기 "전"에 tkBegin인지만 확인해서, 지시자가
+        // 하나라도 있으면 이 경로(else)로 빠지고 그 뒤엔 본문 검사가 아예 없어 시그니처만
+        // 등록한 채 끝나버렸다 — 그 결과 뒤따르는 "begin"이 클래스 멤버로 잘못 해석되어
+        // "클래스 선언 안에서 알 수 없는 토큰 begin" 오류로 이어졌다. abstract 메서드는
+        // 원래 본문이 없어야 하므로(위 fAbstractMethods 표시), 이 분기는 사실상
+        // virtual/override 뒤에 본문이 오는 경우를 위한 것이다.
+        var _sig88cIsBeginB: boolean := (Cur.Kind=tkBegin);
+        var _sig88cIsVarB: boolean := (Cur.Kind=tkVar);
+        var _sig88cIsConstB: boolean := (Cur.Kind=tkConst);
+        var _sig88cHasBodyB: boolean := _sig88cIsBeginB or _sig88cIsVarB or _sig88cIsConstB;
+        // [자기컴파일 버그 수정] -A와 동일한 이유로 .ToString() 체이닝을 지역변수로 분리.
+        var _sig88cKindStrB:=Cur.Kind.ToString;
+        var _sig88cIsBeginStrB:=_sig88cIsBeginB.ToString;
+        var _sig88cIsVarStrB:=_sig88cIsVarB.ToString;
+        var _sig88cIsConstStrB:=_sig88cIsConstB.ToString;
+        var _sig88cHasBodyStrB:=_sig88cHasBodyB.ToString;
+        Writeln('[MARK-SIG88C-B] mname="'+mname+'" Cur.Kind='+_sig88cKindStrB
+          +' isBegin='+_sig88cIsBeginStrB+' isVar='+_sig88cIsVarStrB
+          +' isConst='+_sig88cIsConstStrB+' hasBody='+_sig88cHasBodyStrB);
+        if _sig88cHasBodyB then
+        begin
+          var inlImplMod:=new TMethodImplNode(cn, mname, isFunc, sig.ReturnType);
+          inlImplMod.ReturnGenericName:=sig.ReturnGenericName;
+          inlImplMod.ReturnClassName:=sig.ReturnClassName;
+          inlImplMod.ParamNames.AddRange(sig.ParamNames);
+          inlImplMod.ParamTypes.AddRange(sig.ParamTypes);
+          for var pgiMod:=0 to sig.ParamTypes.Count-1 do
+          begin
+            if (sig.ParamTypes[pgiMod]=vtGeneric) or (sig.ParamTypes[pgiMod]=vtGenericArray) then
+              inlImplMod.ParamGenericNames.Add(sig.ParamClassNames[pgiMod])
+            else
+              inlImplMod.ParamGenericNames.Add('');
+            if (sig.ParamTypes[pgiMod]=vtIntArray) or (sig.ParamTypes[pgiMod]=vtStrArray) or (sig.ParamTypes[pgiMod]=vtGenericArray) or (sig.ParamTypes[pgiMod]=vtObjArray) then
+              if not fArrayNames.Contains(sig.ParamNames[pgiMod]) then fArrayNames.Add(sig.ParamNames[pgiMod]);
+            if sig.ParamIsExternal[pgiMod] and IsIndexerCapableExternalType(sig.ParamClassNames[pgiMod]) then
+              if not fArrayNames.Contains(sig.ParamNames[pgiMod]) then fArrayNames.Add(sig.ParamNames[pgiMod]);
+          end;
+
+          var savedClassMod:=fCurClass; var savedFuncMod:=fCurFunc;
+          var savedParamsMod:=fCurParams; var savedMethodParamNamesMod:=fCurMethodParamNames;
+          fCurClass:=cn; fCurFunc:=mname;
+          fCurParams:=new List<string>;
+          foreach var pnCpMod in inlImplMod.ParamNames do fCurParams.Add(pnCpMod);
+          fCurMethodParamNames:=new List<string>;
+          foreach var pnCpMod2 in inlImplMod.ParamNames do fCurMethodParamNames.Add(pnCpMod2);
+
+          if (Cur.Kind=tkVar) or (Cur.Kind=tkConst) then
+          begin
+            ParseLocalDeclSections(inlImplMod.LocalVars, inlImplMod.ConstDecls);
+            foreach var lvcpMod in inlImplMod.LocalVars do fCurParams.Add(lvcpMod.Name);
+            foreach var lccpMod in inlImplMod.ConstDecls do fCurParams.Add(lccpMod.Name);
+          end;
+
+          Expect(tkBegin);
+          var inlCompMod:=new TCompoundStmtNode;
+          ParseStatementsUntilEnd(inlCompMod.Statements); // [Stage 58] panic-mode 오류 복구
+          Expect(tkEnd); Expect(tkSemicolon);
+          inlImplMod.Body:=inlCompMod;
+          fProg.MethodImpls.Add(inlImplMod);
+
+          fCurClass:=savedClassMod; fCurFunc:=savedFuncMod;
+          fCurParams:=savedParamsMod; fCurMethodParamNames:=savedMethodParamNamesMod;
+        end;
+      end;
+    end;
+
     procedure ParseTypeSection(aProg: TProgramNode);
     var
       cn: string; cd: TClassDeclNode; idecl: TInterfaceDeclNode;
@@ -3963,144 +4161,18 @@ type
               // 없는 토큰 var" 오류로 이어졌다. 이 분기 안쪽은 이미 var/const를 처리하므로
               // (아래 ParseLocalDeclSections 호출), 진입 조건만 넓히면 된다.
               Expect(tkSemicolon);
-              if (Cur.Kind=tkBegin) or (Cur.Kind=tkVar) or (Cur.Kind=tkConst) then
-              begin
-                cd.Methods.Add(sig);
-                fClassMethods[cn][mname]:=isFunc;
-                if sig.IsGeneric then
-                begin
-                  if not fGenericMethodNames.Contains(mname) then fGenericMethodNames.Add(mname);
-                  fMethodGenericParam[mname]:=sig.GenericParamNames;
-                  fMethodGenericConstraint[mname]:=sig.GenericParamConstraints;
-                end;
-
-                var inlImpl:=new TMethodImplNode(cn, mname, isFunc, sig.ReturnType);
-                inlImpl.ReturnGenericName:=sig.ReturnGenericName;
-                inlImpl.ReturnClassName:=sig.ReturnClassName; // [버그 수정] BuildMethodBody의 Result 지역변수 타입 정확화
-                inlImpl.ParamNames.AddRange(sig.ParamNames);
-                inlImpl.ParamTypes.AddRange(sig.ParamTypes);
-                for var pgi88c:=0 to sig.ParamTypes.Count-1 do
-                begin
-                  if (sig.ParamTypes[pgi88c]=vtGeneric) or (sig.ParamTypes[pgi88c]=vtGenericArray) then
-                    inlImpl.ParamGenericNames.Add(sig.ParamClassNames[pgi88c])
-                  else
-                    inlImpl.ParamGenericNames.Add('');
-                  if (sig.ParamTypes[pgi88c]=vtIntArray) or (sig.ParamTypes[pgi88c]=vtStrArray) or (sig.ParamTypes[pgi88c]=vtGenericArray) or (sig.ParamTypes[pgi88c]=vtObjArray) then
-                    if not fArrayNames.Contains(sig.ParamNames[pgi88c]) then fArrayNames.Add(sig.ParamNames[pgi88c]);
-                  // [Stage 98] List<T>/Dictionary<K,V> 등 인덱서를 갖는 외부 제네릭 컬렉션 매개변수.
-                  if sig.ParamIsExternal[pgi88c] and IsIndexerCapableExternalType(sig.ParamClassNames[pgi88c]) then
-                    if not fArrayNames.Contains(sig.ParamNames[pgi88c]) then fArrayNames.Add(sig.ParamNames[pgi88c]);
-                end;
-
-                var savedClass88c:=fCurClass; var savedFunc88c:=fCurFunc;
-                var savedParams88c:=fCurParams; var savedMethodParamNames88c:=fCurMethodParamNames;
-                fCurClass:=cn; fCurFunc:=mname;
-                fCurParams:=new List<string>;
-                foreach var pnCp88c in inlImpl.ParamNames do fCurParams.Add(pnCp88c);
-                fCurMethodParamNames:=new List<string>;
-                foreach var pnCp88c2 in inlImpl.ParamNames do fCurMethodParamNames.Add(pnCp88c2);
-
-                if (Cur.Kind=tkVar) or (Cur.Kind=tkConst) then
-                begin
-                  ParseLocalDeclSections(inlImpl.LocalVars, inlImpl.ConstDecls);
-                  foreach var lvcp88c in inlImpl.LocalVars do fCurParams.Add(lvcp88c.Name);
-                  foreach var lccp88c in inlImpl.ConstDecls do fCurParams.Add(lccp88c.Name);
-                end;
-
-                Expect(tkBegin);
-                var inlComp:=new TCompoundStmtNode;
-                Writeln('[MARK-INLM-A] 인라인 메서드 본문 ParseStatementsUntilEnd 진입 직전, mname="'+mname+'"');
-                ParseStatementsUntilEnd(inlComp.Statements); // [Stage 58] panic-mode 오류 복구
-                Writeln('[MARK-INLM-B] 인라인 메서드 본문 ParseStatementsUntilEnd 반환 직전, mname="'+mname+'"');
-                Expect(tkEnd); Expect(tkSemicolon);
-                Writeln('[MARK-INLM-C] 인라인 메서드 Expect(tkEnd/tkSemicolon) 완료, mname="'+mname+'"');
-                inlImpl.Body:=inlComp;
-                fProg.MethodImpls.Add(inlImpl);
-                Writeln('[MARK-INLM-D] 인라인 메서드 등록 완료, mname="'+mname+'"');
-
-                fCurClass:=savedClass88c; fCurFunc:=savedFunc88c;
-                fCurParams:=savedParams88c; fCurMethodParamNames:=savedMethodParamNames88c;
-              end
-              else
-              begin
-              // [Stage 53] 메서드 지시자: virtual;/override;/abstract; — 순서·조합 무관하게 여러 개 허용
-              // (예: "procedure Foo; virtual; abstract;"). 지시자마다 세미콜론이 따라온다.
-              while (Cur.Kind=tkVirtual) or (Cur.Kind=tkOverride) or (Cur.Kind=tkAbstract) do
-              begin
-                if Cur.Kind=tkVirtual then sig.IsVirtual:=true
-                else if Cur.Kind=tkOverride then sig.IsOverride:=true
-                else sig.IsAbstract:=true;
-                fPos:=fPos+1;
-                Expect(tkSemicolon);
-              end;
-              // [Stage 74] 1차 제약: 제네릭 메서드는 virtual/override/abstract와 조합하지 않는다
-              // (CLR 제네릭 가상 메서드의 override 슬롯 매칭까지는 아직 다루지 않음).
-              if sig.IsGeneric and (sig.IsVirtual or sig.IsOverride or sig.IsAbstract) then
-                raise new Exception('줄 '+Cur.Line.ToString+', 열 '+Cur.Column.ToString+': 제네릭 메서드 "'+mname
-                  +'"는 virtual/override/abstract와 함께 쓸 수 없습니다 (Stage 74, 1차 제약)');
-              cd.Methods.Add(sig);
-              fClassMethods[cn][mname]:=isFunc;
-              if sig.IsGeneric then
-              begin
-                if not fGenericMethodNames.Contains(mname) then fGenericMethodNames.Add(mname);
-                fMethodGenericParam[mname]:=sig.GenericParamNames;
-                fMethodGenericConstraint[mname]:=sig.GenericParamConstraints;
-              end;
-              // [자기컴파일 버그 수정] virtual;/override;/abstract; 지시자 "다음"에도
-              // [Stage 88c]처럼 곧바로 본문(begin...end;)이 올 수 있다 — 예:
-              // "function GetAccessors(nonPublic: boolean): array of MethodInfo; override;
-              //  begin ... end;" (CodeGen.pas의 TBoundGenericPropertyInfo 실제 사례).
-              // 위 [Stage 88c] 분기는 지시자가 오기 "전"에 tkBegin인지만 확인해서, 지시자가
-              // 하나라도 있으면 이 경로(else)로 빠지고 그 뒤엔 본문 검사가 아예 없어 시그니처만
-              // 등록한 채 끝나버렸다 — 그 결과 뒤따르는 "begin"이 클래스 멤버로 잘못 해석되어
-              // "클래스 선언 안에서 알 수 없는 토큰 begin" 오류로 이어졌다. abstract 메서드는
-              // 원래 본문이 없어야 하므로(위 fAbstractMethods 표시), 이 분기는 사실상
-              // virtual/override 뒤에 본문이 오는 경우를 위한 것이다.
-              if (Cur.Kind=tkBegin) or (Cur.Kind=tkVar) or (Cur.Kind=tkConst) then
-              begin
-                var inlImplMod:=new TMethodImplNode(cn, mname, isFunc, sig.ReturnType);
-                inlImplMod.ReturnGenericName:=sig.ReturnGenericName;
-                inlImplMod.ReturnClassName:=sig.ReturnClassName;
-                inlImplMod.ParamNames.AddRange(sig.ParamNames);
-                inlImplMod.ParamTypes.AddRange(sig.ParamTypes);
-                for var pgiMod:=0 to sig.ParamTypes.Count-1 do
-                begin
-                  if (sig.ParamTypes[pgiMod]=vtGeneric) or (sig.ParamTypes[pgiMod]=vtGenericArray) then
-                    inlImplMod.ParamGenericNames.Add(sig.ParamClassNames[pgiMod])
-                  else
-                    inlImplMod.ParamGenericNames.Add('');
-                  if (sig.ParamTypes[pgiMod]=vtIntArray) or (sig.ParamTypes[pgiMod]=vtStrArray) or (sig.ParamTypes[pgiMod]=vtGenericArray) or (sig.ParamTypes[pgiMod]=vtObjArray) then
-                    if not fArrayNames.Contains(sig.ParamNames[pgiMod]) then fArrayNames.Add(sig.ParamNames[pgiMod]);
-                  if sig.ParamIsExternal[pgiMod] and IsIndexerCapableExternalType(sig.ParamClassNames[pgiMod]) then
-                    if not fArrayNames.Contains(sig.ParamNames[pgiMod]) then fArrayNames.Add(sig.ParamNames[pgiMod]);
-                end;
-
-                var savedClassMod:=fCurClass; var savedFuncMod:=fCurFunc;
-                var savedParamsMod:=fCurParams; var savedMethodParamNamesMod:=fCurMethodParamNames;
-                fCurClass:=cn; fCurFunc:=mname;
-                fCurParams:=new List<string>;
-                foreach var pnCpMod in inlImplMod.ParamNames do fCurParams.Add(pnCpMod);
-                fCurMethodParamNames:=new List<string>;
-                foreach var pnCpMod2 in inlImplMod.ParamNames do fCurMethodParamNames.Add(pnCpMod2);
-
-                if (Cur.Kind=tkVar) or (Cur.Kind=tkConst) then
-                begin
-                  ParseLocalDeclSections(inlImplMod.LocalVars, inlImplMod.ConstDecls);
-                  foreach var lvcpMod in inlImplMod.LocalVars do fCurParams.Add(lvcpMod.Name);
-                  foreach var lccpMod in inlImplMod.ConstDecls do fCurParams.Add(lccpMod.Name);
-                end;
-
-                Expect(tkBegin);
-                var inlCompMod:=new TCompoundStmtNode;
-                ParseStatementsUntilEnd(inlCompMod.Statements); // [Stage 58] panic-mode 오류 복구
-                Expect(tkEnd); Expect(tkSemicolon);
-                inlImplMod.Body:=inlCompMod;
-                fProg.MethodImpls.Add(inlImplMod);
-
-                fCurClass:=savedClassMod; fCurFunc:=savedFuncMod;
-                fCurParams:=savedParamsMod; fCurMethodParamNames:=savedMethodParamNamesMod;
-              end;
-              end;
+              // [오버사이즈 함수 분리] 이 시그니처 뒤 "본문 있음/지시자" 처리 블록(88c 인라인
+              // 메서드 + virtual/override/abstract 지시자 뒤 본문) 전체를 ParseTypeSection에서
+              // 별도 헬퍼 ParseSignatureBodyOrDirectives로 뽑아냈다. gen0가 자기 자신(gen1)을
+              // 컴파일할 때 ParseTypeSection이 800줄이 넘는 단일 프로시저였고, 그 안의 큰
+              // if/else 분기(특히 이 블록)가 broken IL로 이어져 _sig88cHasBody가 True로
+              // 정상 계산·출력됐음에도 true 분기 본문([MARK-INLM-A] 등)이 전혀 실행되지 않고
+              // 곧바로 바깥 클래스멤버 루프로 새는 증상이 재현됐다(예: Lexer.pas의
+              // "function ReadIdent: TToken; var sl,sc: integer; ... begin ... end;").
+              // 지금까지 확립된 "오버사이즈 함수 → gen0가 자기 자신용 IL을 깨뜨림" 패턴과
+              // 동일하므로, BuildClassShell/EmitExprDispatch/ParseStatement 때와 같은 방식으로
+              // 이 블록을 작은 함수로 쪼갠다.
+              ParseSignatureBodyOrDirectives(cn, mname, isFunc, sig, cd);
             end
 
             // 필드 선언: fname1, fname2, ... : type;
@@ -4296,19 +4368,27 @@ type
     var vt: TVarType; ns: List<string>; cn: string; isExt: boolean;
     begin
       Expect(tkVar);
+      Writeln('[MARK-LVS-0] ParseLocalVarSection 진입, Cur.Kind='+Cur.Kind.ToString+', Cur.Text="'+Cur.Text+'"');
       while (Cur.Kind<>tkBegin) and (Cur.Kind<>tkConst)
         and (Cur.Kind<>tkFunction) and (Cur.Kind<>tkProcedure) and (Cur.Kind<>tkVar) do // [Stage 61] const 섹션과 교차 가능, [Stage 65] 지역 서브프로그램 앞에서 정지, [Stage 67] 연속된 var 섹션도 정지
       begin
+        var _lvsFirstNameStr:=Cur.Text;
+        Writeln('[MARK-LVS-1] var 그룹 시작, 첫 이름="'+_lvsFirstNameStr+'"');
         ns:=new List<string>; ns.Add(Expect(tkIdent).Text);
         while Cur.Kind=tkComma do begin fPos:=fPos+1; ns.Add(Expect(tkIdent).Text); end;
+        var _lvsNameCountStr:=ns.Count.ToString;
+        Writeln('[MARK-LVS-2] 이름 목록 완료, count='+_lvsNameCountStr);
         Expect(tkColon);
         // [Stage 41] 기존에는 여기서 클래스/인터페이스/기본타입만 직접 처리하고 점(.)으로 연결된
         // 외부 .NET 타입(예: var sb: System.Text.StringBuilder;)은 지원하지 않았다. 매개변수/필드에서
         // 이미 쓰던 ParseParamTypeExt(지역클래스/인터페이스/외부타입/제네릭 모두 처리)로 통일한다.
+        Writeln('[MARK-LVS-3] ParseParamTypeExt 진입 직전, Cur.Kind='+Cur.Kind.ToString+', Cur.Text="'+Cur.Text+'"');
         vt:=ParseParamTypeExt(isExt, cn);
+        Writeln('[MARK-LVS-4] ParseParamTypeExt 반환, vt='+vt.ToString);
         if (vt=vtGeneric) or (vt=vtGenericArray) then cn:=fLastGenericName; // [Stage 36/37] 제네릭 지역변수(예: var temp: T; var arr: array of T;)의 타입 매개변수 이름 보존
         if vt=vtMatrix then cn:=fLastGenericName; // [Stage 67] 2차원 배열 원소 타입 이름 보존
         Expect(tkSemicolon);
+        Writeln('[MARK-LVS-5] 세미콜론 소비 완료, 다음 Cur.Kind='+Cur.Kind.ToString+', Cur.Text="'+Cur.Text+'"');
         foreach var nm in ns do
         begin
           aList.Add(new TVarDecl(nm, vt, cn, isExt));
@@ -4317,7 +4397,9 @@ type
           if isExt and IsIndexerCapableExternalType(cn) then // [Stage 98] List<T>/Dictionary<K,V> 지역변수 인덱싱 지원
             begin if not fArrayNames.Contains(nm) then fArrayNames.Add(nm); end;
         end;
+        Writeln('[MARK-LVS-6] var 그룹 하나 등록 완료, 루프 재검사 직전');
       end;
+      Writeln('[MARK-LVS-7] ParseLocalVarSection 반환 직전');
     end;
 
     // [Stage 61] 함수/프로시저/메서드/생성자 본문 안의 지역 const 선언(const 섹션)을 파싱한다.
