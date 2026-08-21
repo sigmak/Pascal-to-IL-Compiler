@@ -473,6 +473,44 @@ type
           Result:=argName; exit;
         end;
         while Cur.Kind=tkDot do begin fPos:=fPos+1; argName:=argName+'.'+ExpectQualNamePart; end;
+
+        // [버그 수정 2026.08 — 자기컴파일] List<&Label>/Dictionary<K,&Label>처럼 제네릭 타입
+        // 인자 자리의 "점 없는 단순 이름"은 지금까지 uses 절(fImportedNamespaces)을 전혀
+        // 참고하지 않고 문자열 그대로 CodeGen.ResolveWellKnownShortName의 고정 단축이름표로
+        // 넘어갔다. 그 표는 현재 파일의 uses 문맥을 모르므로 'Label'을 무조건
+        // System.Windows.Forms.Label로 매겨버려서, 이 컴파일러 자신의 소스(uses 절에
+        // System.Reflection.Emit 포함)가 쓰는 "&Label"(=System.Reflection.Emit.Label, IL
+        // 라벨 구조체)까지 WinForms 컨트롤로 잘못 해석되는 사고가 났다(자기컴파일 재현:
+        // fLoopBreakLabels: List<&Label> → List<System.Windows.Forms.Label>로 잘못 빌드되어
+        // 실제 System.Reflection.Emit.Label 구조체 값을 Add하는 순간 스택 타입 불일치로
+        // 검증 실패 IL → 네이티브 크래시). ParseParamTypeExt/ParseVarType의 비제네릭 타입
+        // 자리는 이미 uses 절 네임스페이스를 검색해 올바르게 찾는데(772줄 부근), 제네릭 타입
+        // 인자 자리만 이 검색이 빠져 있었다 — 동일한 검색을 여기도 추가한다.
+        // 로컬 클래스/열거형/제네릭 매개변수/제네릭 클래스 이름은 건드리지 않아야
+        // ResolveGenericArgClrType의 fBuiltTypes/fBuiltEnums/fCurGenericSubst 경로가
+        // 계속 정상 동작한다(예: List<TToken>은 그대로 둬야 함).
+        if (not argName.Contains('.')) and (Cur.Kind<>tkLt)
+           and (not fClassNames.Contains(argName)) and (not fEnumNames.Contains(argName))
+           and (not fCurGenericParams.Contains(argName)) and (not fGenericClassNames.Contains(argName)) then
+        begin
+          var _searchNsGA129:=new List<string>(fImportedNamespaces);
+          if not _searchNsGA129.Contains('System') then _searchNsGA129.Add('System');
+          var _foundGA129:=false;
+          foreach var _nsGA129 in _searchNsGA129 do
+          begin
+            if _foundGA129 then break;
+            var _fullGA129:=_nsGA129+'.'+argName;
+            try
+              var _tGA129:=System.Type.GetType(_fullGA129);
+              if _tGA129=nil then
+                foreach var _asmGA129 in System.AppDomain.CurrentDomain.GetAssemblies() do
+                begin _tGA129:=_asmGA129.GetType(_fullGA129); if _tGA129<>nil then break; end;
+              if _tGA129<>nil then begin argName:=_fullGA129; _foundGA129:=true; end;
+            except
+            end;
+          end;
+        end;
+
         if Cur.Kind=tkLt then // 중첩된 외부 제네릭 타입 인자 (예: Dictionary<string, List<string>>)
         begin
           fPos:=fPos+1;

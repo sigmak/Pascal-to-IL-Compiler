@@ -2845,6 +2845,26 @@
           end
           else ivClrType:=VTC(ivVt, '');
         end
+        else if ivs.ValueExpr is TFieldReadExprNode then
+        begin
+          // [자기컴파일 버그 수정 2026.08] "var forInCkL:=fForInTmpCkL;"처럼 필드를 그대로
+          // 지역변수에 옮겨 담는 경우 — 위의 TVarRefNode/TChainedMemberExprNode 등과 똑같은
+          // 부류의 누락이었다. 이 분기가 없으면 InferType(TFieldReadExprNode)가 string/bool/
+          // double/char/int64 외의 필드(예: &Label = System.Reflection.Emit.Label 구조체)를
+          // 전부 vtInteger로 폴백시켜(Part1_TypeInfer.pas InferTypeLiteralsAndFields 참고)
+          // 4바이트 정수 로컬로 선언해버린다. 그 결과 실제로는 Label 구조체 값을 담고 있는데
+          // int32 슬롯에 잘못 저장된 상태로 이후 "aIL.MarkLabel(forInCkL)"에 넘겨져
+          // ArgumentException("레이블이 잘못되었습니다")로 터졌다(자기컴파일 재현:
+          // EmitForInStmt의 fForInTmpCkL/BdL/EndL → forInCkL/BdL/EndL 복사).
+          // GetExprClrTypeTailFieldRead는 이미 FieldBuilder.FieldType(또는 외부 조상 타입의
+          // 프로퍼티/필드)을 정확히 돌려주므로(2543행 부근) 재사용한다.
+          var ivFrT129:=GetExprClrType(ivs.ValueExpr);
+          if (ivFrT129<>nil) and (ivFrT129<>typeof(System.Object)) then
+          begin
+            ivClrType:=ivFrT129; ivIsExternal:=true; ivVt:=vtObject;
+          end
+          else ivClrType:=VTC(ivVt, '');
+        end
         else
           ivClrType:=VTC(ivVt, '');
         end; // [자기컴파일] HasExplicitType else 종료
@@ -4280,21 +4300,26 @@
       Result:=forInVarClrType;
     end;
 
-    // [Stage 125 버그 수정 — 자기컴파일, 원인 재확정] Stage 124의 "3개의 &Label var(byref)
-    // 매개변수" 함수 시그니처 자체가 새로운 미검증 코드 모양이었다: 재검증 결과 크래시 지점이
-    // 다시 [MARK-EFIS-2] 직후로 되돌아갔다(EmitForInStmtSetupLoop 호출/반환 자체가 깨짐).
-    // 이 코드베이스 전체를 뒤져봐도 "구조체(값 타입) var 매개변수 여러 개"를 쓰는 함수는
-    // 이번이 처음이었다 — 기존 EmitForInStmtInferVar의 var 매개변수는 참조 타입(LocalBuilder)
-    // 1개뿐이었다. 검증되지 않은 모양을 새로 만드는 대신, 이미 전역에서 널리 쓰이고 검증된
-    // "배열 반환" 패턴으로 바꿔 값 타입 var 매개변수 자체를 없앤다.
-    function EmitForInStmtSetupLoop(aIL: ILGenerator): array of &Label;
+    // [Stage 127 버그 수정 — 자기컴파일, 근본 원인 확정] Stage 124("&Label var(byref)
+    // 매개변수 3개")와 Stage 125("array of &Label" 반환)가 시그니처는 전혀 다른데도 결국
+    // 둘 다 크래시났다 — 공통점은 "구조체(값 타입) 여러 개를 배열/byref로 뭉쳐 전달"하는
+    // 모양이 이 코드베이스에서 처음이었다는 것. 소스 재검토로 실제 결함을 찾았다:
+    //  1) 배열 리터럴(Result:=[a,b,c], TArrayLiteralExprNode)의 코드생성은 원소 CLR 타입을
+    //     대입 대상의 선언 타입이 아니라 "첫 원소 값"에서 InferArgClrType으로 추측한다
+    //     (EmitExprDispatch, [Stage 105] 주석 부근). 구조체 원소에서 이 추론이 실패하면
+    //     System.Object로 조용히 폴백해 Newarr System.Object/Stelem_Ref를 방출하는데, 실제
+    //     함수 반환 타입은 Label[]이라 타입이 어긋난다 — TArrayAssignStmtNode 쪽에 이미
+    //     기록된 것과 동일한 부류의 "검증 불가능한 IL → 예외 없이 네이티브 크래시
+    //     (0xc0000005)"로 이어진다.
+    //  2) 대안으로 생각한 SetLength도 안전하지 않다 — Array.Resize<T> 특수화는
+    //     vtStrArray/vtObjArray/그 외(=integer) 셋만 알아서, "array of &Label"에 SetLength를
+    //     쓰면 조용히 integer[]로 리사이즈해버린다(TSetLengthStmtNode 코드 참고).
+    // 두 경로 모두 "값에서 타입을 추측"하는 지점이 문제이므로, 타입을 절대 추측하지 않는
+    // 이미 검증된 경로 — 단순 필드 대입(Ldarg_0+Stfld, 필드 타입은 FieldBuilder.FieldType에서
+    // 그대로 가져옴) — 으로 바꾼다. 배열도, byref 구조체 매개변수도 전부 없앤다.
+    procedure EmitForInStmtSetupLoop(aIL: ILGenerator);
     var forInCkL102, forInBdL102, forInEndL102: &Label;
     begin
-      // [Stage 126 진단] Stage 124(var byref 구조체 3개)와 Stage 125(array of &Label 반환)가
-      // 시그니처는 완전히 다른데도 바이트 단위로 동일한 지점에서 죽었다 — 매개변수 전달 방식이
-      // 아니라 "이 위치에 새 로컬 중첩 함수를 추가/호출하는 행위 자체"가 원인일 가능성을 확인하기
-      // 위한 최소 진단. 함수 진입 직후 첫 줄에만 마크를 심어, 크래시가 호출(Call 명령어) 단계인지
-      // 함수 본문 진입 이후인지를 가른다.
       Writeln('[MARK-EFISSL-0] EmitForInStmtSetupLoop 진입 직후');
       forInCkL102:=aIL.DefineLabel;
       Writeln('[MARK-EFISSL-1] forInCkL102 DefineLabel 완료');
@@ -4303,9 +4328,17 @@
       // [Stage 60] continue → MoveNext 검사(forInCkL)로, break → 루프 뒤(forInEndL)로.
       forInEndL102:=aIL.DefineLabel;
       Writeln('[MARK-EFISSL-3] forInEndL102 DefineLabel 완료');
-      fLoopBreakLabels.Add(forInEndL102);
+      // [Stage 129 진단] Stage128 시도(fLoopBreakLabels를 로컬 var로 복사)는 그 자체가
+      // 컴파일 에러를 냈다 — "var x:=필드;" 형태로 List<&Label> 필드를 로컬에 복사할 때
+      // VarType 추론이 vtInteger로 잘못 떨어짐(별개의 진짜 버그, 일단 보류). 리시버는
+      // 원래대로 필드(fLoopBreakLabels)를 직접 쓰고, 구조체 인자만 로컬로 복사해 좁힌다.
+      var _endLbl129:=forInEndL102;
+      Writeln('[MARK-EFISSL-3c] forInEndL102 로컬 복사 완료');
+      fLoopBreakLabels.Add(_endLbl129);
       Writeln('[MARK-EFISSL-4] fLoopBreakLabels.Add 완료');
-      fLoopContinueLabels.Add(forInCkL102);
+      var _ckLbl129:=forInCkL102;
+      Writeln('[MARK-EFISSL-4c] forInCkL102 로컬 복사 완료');
+      fLoopContinueLabels.Add(_ckLbl129);
       Writeln('[MARK-EFISSL-5] fLoopContinueLabels.Add 완료');
       fLoopExceptDepths.Add(fCurExceptDepth);
       Writeln('[MARK-EFISSL-6] fLoopExceptDepths.Add 완료');
@@ -4313,8 +4346,14 @@
       Writeln('[MARK-EFISSL-7] Br 방출 완료');
       aIL.MarkLabel(forInBdL102);
       Writeln('[MARK-EFISSL-8] MarkLabel 완료');
-      Result:=[forInCkL102, forInBdL102, forInEndL102];
-      Writeln('[MARK-EFISSL-9] Result 배열 리터럴 대입 완료');
+      // [Stage 127] 배열 리터럴 대신 필드 3개에 각각 대입 — 값에서 타입을 추측하지 않는
+      // 이미 검증된 단일 필드 대입 경로만 사용한다.
+      fForInTmpCkL:=forInCkL102;
+      Writeln('[MARK-EFISSL-9a] fForInTmpCkL 대입 완료');
+      fForInTmpBdL:=forInBdL102;
+      Writeln('[MARK-EFISSL-9b] fForInTmpBdL 대입 완료');
+      fForInTmpEndL:=forInEndL102;
+      Writeln('[MARK-EFISSL-9] fForInTmpEndL 대입 완료');
     end;
 
     // [Stage 124] "VarName := (T)_e.Current;" 대입 블록도 동일 사유로 별도 함수로 분리.
@@ -4374,10 +4413,10 @@
       aIL.Emit(OpCodes.Stloc, forInEnumLoc);
       Writeln('[MARK-EFIS-2] GetEnumerator 방출 완료');
 
-      var forInLabels102:=EmitForInStmtSetupLoop(aIL);
-      var forInCkL:=forInLabels102[0];
-      var forInBdL:=forInLabels102[1];
-      var forInEndL:=forInLabels102[2];
+      EmitForInStmtSetupLoop(aIL);
+      var forInCkL:=fForInTmpCkL;
+      var forInBdL:=fForInTmpBdL;
+      var forInEndL:=fForInTmpEndL;
       Writeln('[MARK-EFIS-2Z] EmitForInStmtSetupLoop 반환 직전');
 
       EmitForInStmtAssignCurrent(aIL, forInEnumLoc, forInVarClrType, forInVarLoc);

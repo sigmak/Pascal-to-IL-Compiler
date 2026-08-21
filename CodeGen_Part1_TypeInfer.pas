@@ -160,6 +160,21 @@
     fLoopExceptDepths:   List<integer>;
     fCurExceptDepth: integer; // 현재 try/except/finally 중첩 깊이 (BeginExceptionBlock/EndExceptionBlock에서 증감)
 
+    // [자기컴파일 버그 수정 2026.08] EmitForInStmtSetupLoop가 "array of &Label" 결과를
+    // 돌려주던 방식(배열 리터럴 Result:=[a,b,c])을 대체하기 위한 임시 전달용 필드 3개.
+    // 원인: 배열 리터럴(TArrayLiteralExprNode) 코드생성은 원소 CLR 타입을 대입 대상의
+    // 선언 타입이 아니라 "첫 원소 값"에서 InferArgClrType으로 추측한다(CodeGen_Part2_Emit.pas
+    // EmitExprDispatch, [Stage 105] 주석 부근). 이 프로젝트 전체에서 "구조체(값 타입) 원소의
+    // 배열 리터럴"은 이번이 처음이라 검증된 적이 없다 — 추론이 실패하면 System.Object로
+    // 폴백해 Newarr System.Object / Stelem_Ref를 방출하면서 실제 함수 반환 타입(Label[])과
+    // 어긋나, TArrayAssignStmtNode 주석에 이미 기록된 것과 같은 부류의 "검증 불가능한 IL →
+    // 실행 시 예외 없이 네이티브 크래시(0xc0000005)"를 유발한다. SetLength도 대안이 못
+    // 된다 — Array.Resize<T> 특수화가 vtStrArray/vtObjArray/그 외(=integer)만 알아서,
+    // "array of &Label"을 넘기면 조용히 integer[]로 리사이즈해버린다. 반면 단순 필드
+    // 대입(Ldarg_0+Stfld)은 필드 타입을 FieldBuilder.FieldType에서 그대로 가져와 값을
+    // 추측하지 않으므로 이미 전역에서 검증된 안전한 경로다 — 그래서 배열 대신 필드 3개를 쓴다.
+    fForInTmpCkL, fForInTmpBdL, fForInTmpEndL: &Label;
+
     // [Stage 78] exit — 현재 컴파일 중인 프로시저/함수/메서드/생성자의 "몸체 끝" 라벨.
     // break/continue의 fLoopBreakLabels와 같은 원리이지만 루프가 아니라 서브프로그램
     // 단위이므로 스택이 아니라 단일 필드로 충분하다(중첩 함수/프로시저 본문은 재귀 호출이
